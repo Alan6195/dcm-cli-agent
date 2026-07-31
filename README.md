@@ -171,14 +171,26 @@ genuinely different. The receiver then merges them, and a study that had six
 series shows up with three. Took me a while to work out what was happening the
 first time.
 
-This flag gives each source series a new UID derived from the study and series
-UID together, so distinct series stay distinct:
+This flag gives each source series a new `2.25.*` UID so distinct series stay
+distinct:
 
 ```bash
 dcm send ./study --host pacs.example.org --port 11112 --called-ae ARCHIVE --rewrite-series-uid
 ```
 
-It's off unless you ask for it, because it means the peer receives something
+The new UID is derived from the Study UID, the source Series UID, and the Series
+Number. That last part is the bit that actually matters and it took me a go to
+get right. If you only hash the study and series UID, both halves of a collision
+hash to the same value and you've faithfully reproduced the merge in shiny new
+UIDs. Series Number is normally still distinct when the UIDs aren't, so that's
+what breaks the tie. If Series Number is missing it falls back to the containing
+folder.
+
+For data that isn't broken this is a no-op: one real series has one UID and one
+Series Number, so it still maps to exactly one replacement. It won't split
+series that were fine.
+
+It's off unless you ask for it, because the peer ends up with something
 different from what's on your disk. The mapping is deterministic, so re-sending
 maps onto the same series instead of creating a second copy.
 

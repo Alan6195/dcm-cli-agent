@@ -111,7 +111,14 @@ function buildRequest(entry, meta, opts) {
     throw new Error('cannot rewrite Series Instance UID: study or series UID missing');
   }
 
-  const replacement = rewrittenSeriesUid(studyUid, sourceSeries);
+  // Series Number is what still distinguishes two series that share a UID.
+  // Without it in the key, colliding series would be rewritten to a single new
+  // UID and stay merged. When it is absent, fall back to the containing folder,
+  // which is how most exports separate series on disk.
+  const discriminator =
+    dataset.getElement('SeriesNumber') ?? path.basename(path.dirname(entry.path));
+
+  const replacement = rewrittenSeriesUid(studyUid, sourceSeries, discriminator);
   dataset.setElement('SeriesInstanceUID', replacement);
   entry.rewrittenSeriesUid = replacement;
 

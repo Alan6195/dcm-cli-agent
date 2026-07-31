@@ -373,6 +373,66 @@ test('info flags colliding series UIDs', async () => {
   });
 });
 
+test('--rewrite-series-uid separates series that shared one source UID', async () => {
+  await withTempDir('dcm-rewrite', async (dir) => {
+    const src = path.join(dir, 'src');
+    const received = path.join(dir, 'received');
+    // Two genuinely different series emitted under a single Series Instance UID.
+    await fixtures(src, {
+      seriesPerStudy: 2, instancesPerSeries: 2, collidingSeriesUids: true,
+    });
+
+    const scp = await startScp({ ae: 'STORE-SCP', persist: received });
+    try {
+      const { code } = await runCommand(send, [
+        src, '--host', '127.0.0.1', '--port', String(scp.port),
+        '--called-ae', 'STORE-SCP', '--rewrite-series-uid',
+      ]);
+      assert.equal(code, 0);
+      await new Promise((r) => setTimeout(r, 400));
+
+      // The receiver lays instances out by Series Instance UID, so the number
+      // of series directories is a direct measure of whether they merged.
+      const studyDir = fs.readdirSync(received)[0];
+      const seriesDirs = fs.readdirSync(path.join(received, studyDir));
+
+      assert.equal(seriesDirs.length, 2, 'the two series must not be merged into one stack');
+      for (const seriesUid of seriesDirs) {
+        assert.match(seriesUid, /^2\.25\./, 'replacements use the UUID-derived root');
+      }
+    } finally {
+      scp.close();
+    }
+  });
+});
+
+test('without --rewrite-series-uid colliding series still merge', async () => {
+  // Confirms the previous test is measuring something real rather than an
+  // artefact of the fixture.
+  await withTempDir('dcm-merge', async (dir) => {
+    const src = path.join(dir, 'src');
+    const received = path.join(dir, 'received');
+    await fixtures(src, {
+      seriesPerStudy: 2, instancesPerSeries: 2, collidingSeriesUids: true,
+    });
+
+    const scp = await startScp({ ae: 'STORE-SCP', persist: received });
+    try {
+      const { code } = await runCommand(send, [
+        src, '--host', '127.0.0.1', '--port', String(scp.port), '--called-ae', 'STORE-SCP',
+      ]);
+      assert.equal(code, 0);
+      await new Promise((r) => setTimeout(r, 400));
+
+      const studyDir = fs.readdirSync(received)[0];
+      const seriesDirs = fs.readdirSync(path.join(received, studyDir));
+      assert.equal(seriesDirs.length, 1, 'this is the defect the flag exists to repair');
+    } finally {
+      scp.close();
+    }
+  });
+});
+
 test('anon removes identifiers, remaps UIDs and writes every instance', async () => {
   await withTempDir('dcm-anon', async (dir) => {
     const src = path.join(dir, 'src');
