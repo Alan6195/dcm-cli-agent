@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The suite starts real DIMSE receivers on loopback and transfers
+      # synthetic studies through them, so it is a genuine end-to-end check on
+      # every platform rather than unit tests alone.
+      - name: Run tests
+        run: npm test
+
+      # Packaging is the part most likely to break per-platform, so the build
+      # is exercised on every push rather than only at release time.
+      - name: Build the single executable
+        run: npm run build
+
+      - name: Smoke-test the built binary
+        shell: bash
+        run: |
+          BIN="dist/dcm"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="dist/dcm.exe"
+          "$BIN" --version
+          "$BIN" --help | grep -q "DICOM network operations"
+          "$BIN" info --help | grep -q "dcm info"
+
+      # Proves the shipped binary actually moves DICOM, not just that it runs.
+      - name: End-to-end transfer through the built binary
+        shell: bash
+        run: |
+          BIN="dist/dcm"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="dist/dcm.exe"
+          node tools/make-fixtures.js ./ci-fixtures --studies 1 --series 2 --instances 3
+          "$BIN" scp --port 11112 --ae CI-SCP --persist ./ci-received &
+          SCP_PID=$!
+          sleep 3
+          "$BIN" echo --host 127.0.0.1 --port 11112 --called-ae CI-SCP
+          "$BIN" send ./ci-fixtures --host 127.0.0.1 --port 11112 --called-ae CI-SCP --chunk 2
+          kill $SCP_PID || true

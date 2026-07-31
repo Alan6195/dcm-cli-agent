@@ -1,6 +1,6 @@
 {
   "name": "dcm-cli-agent",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A single-binary DICOM network CLI for folders of DICOM files: C-ECHO, C-STORE, C-FIND, a permissive receiver, inventory and de-identification.",
   "license": "MIT",
   "type": "commonjs",

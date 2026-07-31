@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            asset: dcm-windows-x64.exe
+            built: dist/dcm.exe
+          - os: macos-latest
+            label: macos-arm64
+            asset: dcm-macos-arm64
+            built: dist/dcm
+          - os: macos-13
+            label: macos-x64
+            asset: dcm-macos-x64
+            built: dist/dcm
+          - os: ubuntu-latest
+            label: linux-x64
+            asset: dcm-linux-x64
+            built: dist/dcm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      - name: Name the artifact for its platform
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "${{ matrix.built }}" "out/${{ matrix.asset }}"
+          chmod +x "out/${{ matrix.asset }}" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One checksum file covering every platform, so anyone can verify the
+      # download they actually took rather than trusting the release page.
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" artifacts/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            || gh release upload "$TAG" artifacts/* --repo "${{ github.repository }}" --clobber

@@ -20,31 +20,88 @@ That exits non-zero. A partial transfer is a failure, not a warning.
 
 ## Install
 
-Grab `dcm.exe` from releases and drop it somewhere on your PATH. It's
-self-contained, no Node, no runtime.
+One line. It grabs the right binary for your machine, checks it against the
+published SHA256, installs it under your own user profile and puts it on your
+PATH. No admin rights, nothing written outside your home directory.
 
-**There's no installer, and you don't run it by double-clicking it.** It's a
-command-line tool, so the exe *is* the program. If you double-click it you'll
-get a console window that prints the help and closes again, which looks like a
-crash but isn't. Run it from a terminal:
+**Windows (PowerShell):**
 
 ```powershell
-# PowerShell, from wherever you saved it
-.\dcm.exe --help
-.\dcm.exe info C:\path\to\study
+irm https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.ps1 | iex
 ```
 
-Put it in a folder on your PATH and you can just type `dcm` from anywhere.
+**macOS / Linux:**
 
-Windows SmartScreen will warn the first time, because the binary isn't
-code-signed. Check the SHA256 published with the release, then *More info →
-Run anyway*.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.sh | bash
+```
 
-If you already have Node 22+, skip the exe entirely:
+Open a new terminal and type `dcm`. That's it.
+
+<details>
+<summary>Rather do it by hand?</summary>
+
+Download the binary for your platform from
+[releases](https://github.com/Alan6195/dcm-cli-agent/releases), then let it
+install itself:
+
+```powershell
+.\dcm-windows-x64.exe install
+```
+
+```bash
+chmod +x dcm-macos-arm64 && ./dcm-macos-arm64 install
+```
+
+`dcm install --dry-run` shows exactly what it would do first. `dcm uninstall`
+reverses it.
+
+Or with Node 22+, skip the binary entirely:
 
 ```bash
 npm install -g dcm-cli-agent
 ```
+
+</details>
+
+A few things worth knowing:
+
+- **It's a command-line tool, not something you double-click.** If you do
+  double-click it you get an interactive menu rather than a window that flashes
+  and vanishes, but the real interface is the terminal.
+- **Windows SmartScreen will warn you the first time**, because the binary
+  isn't code-signed. Check the SHA256 from the release, then *More info → Run
+  anyway*.
+- **macOS quarantines downloads.** The install script clears that for you. If
+  you downloaded by hand, run `xattr -d com.apple.quarantine ./dcm`.
+
+## Not sure where to start?
+
+Just run `dcm` with no arguments. You get a menu that asks for what it needs and
+prints the command it's running, so you learn the flags as you go rather than
+having to read them first.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  ◈ N E W L U M E N                                       │
+│  DICOM CLI Agent · v0.2.0                                │
+└──────────────────────────────────────────────────────────┘
+
+  What would you like to do?
+
+   1  Test a connection
+      C-ECHO — is the peer there, and does it accept our AE Title?
+   2  Inventory a folder
+      What is in it: studies, series, modalities, sizes. Sends nothing.
+   3  Send a study
+      C-STORE a folder to a peer, reporting exactly what was acknowledged.
+   4  Receive images
+      Run a receiver that accepts everything and logs what arrives.
+   ...
+```
+
+Everything scripted or piped skips the menu entirely, so this never gets in the
+way of a cron job.
 
 ## Quickstart
 

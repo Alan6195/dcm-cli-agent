@@ -1,6 +1,7 @@
 'use strict';
 
 const log = require('./lib/log');
+const brand = require('./lib/brand');
 const { tokenize, UsageError } = require('./lib/args');
 
 const { version } = require('../package.json');
@@ -27,6 +28,8 @@ const COMMANDS = {
   info: () => require('./commands/info'),
   anon: () => require('./commands/anon'),
   explain: () => require('./commands/explain'),
+  install: () => require('./commands/install'),
+  uninstall: () => ({ run: require('./commands/install').uninstall }),
 };
 
 const USAGE = `
@@ -43,6 +46,8 @@ Commands:
   info      Inventory a folder or file: modalities, counts, sizes, syntaxes
   anon      De-identify a folder into a new directory
   explain   Explain a failed transfer log using the Anthropic API (optional)
+  install   Put this executable on your PATH so you can type 'dcm' anywhere
+  uninstall Undo install
 
 Global options:
   --verbose      Log the full association negotiation — contexts, transfer
@@ -68,47 +73,14 @@ Run 'dcm <command> --help' for details on a command.
 `.trimStart();
 
 /**
- * Keeps the console open when the executable was launched by double-clicking it.
+ * True when this looks like a person at a terminal rather than a script.
  *
- * This is a command-line tool, but it ships as a bare .exe, so people
- * reasonably double-click it expecting an installer. Windows then creates a
- * console for the process, the usage text prints, the process exits, and the
- * window disappears before anything can be read. It looks exactly like a crash.
- *
- * The heuristic is deliberately narrow: Windows, an interactive terminal, and
- * no arguments at all. Someone who typed the bare command in a shell pays one
- * keypress; someone who double-clicked gets an explanation instead of a flash.
- *
- * @returns {Promise<void>}
+ * Both streams must be interactive. Anything piped, redirected or run from CI
+ * fails this test and takes the ordinary non-interactive path, so the menu can
+ * never hang an automated run.
  */
-async function pauseSoTheWindowCanBeRead() {
-  const looksLikeDoubleClick =
-    process.platform === 'win32' &&
-    process.stdout.isTTY === true &&
-    process.stdin.isTTY === true;
-
-  if (!looksLikeDoubleClick) return;
-
-  log.out('');
-  log.out('─'.repeat(72));
-  log.out('This is a command-line tool, not an installer. There is nothing to install.');
-  log.out('');
-  log.out('If you double-clicked it, run it from a terminal instead. Open PowerShell,');
-  log.out('then point it at this file:');
-  log.out('');
-  log.out('    .\\dcm.exe info C:\\path\\to\\study');
-  log.out('');
-  log.out('To use it as `dcm` from anywhere, put it in a folder on your PATH.');
-  log.out('─'.repeat(72));
-
-  await new Promise((resolve) => {
-    process.stdout.write('\nPress Enter to close this window...');
-    process.stdin.resume();
-    process.stdin.once('data', () => {
-      process.stdin.pause();
-      resolve();
-    });
-  });
+function isInteractive() {
+  return process.stdout.isTTY === true && process.stdin.isTTY === true;
 }
 
 /**
@@ -144,11 +116,21 @@ async function main(argv) {
   const command = positionals[0];
 
   if (!command) {
+    // A bare launch from a terminal is almost always someone double-clicking
+    // the executable, or someone who does not yet know the commands. Both are
+    // better served by the menu than by a wall of flags that scrolls away.
+    // `--help` is an explicit request for the reference, so it stays literal.
+    if (!flags.has('help') && isInteractive()) {
+      // Required lazily: the menu prints USAGE, so loading it at module scope
+      // would create a cycle.
+      const menu = require('./lib/menu');
+      return menu.run(version);
+    }
+
+    log.out(brand.banner(version));
+    log.out('');
     log.out(USAGE);
-    // An explicit --help was answered; a bare launch may be a double-click.
-    if (flags.has('help')) return EXIT.OK;
-    await pauseSoTheWindowCanBeRead();
-    return EXIT.USAGE;
+    return flags.has('help') ? EXIT.OK : EXIT.USAGE;
   }
 
   const loader = COMMANDS[command];
