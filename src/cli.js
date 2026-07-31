@@ -86,6 +86,12 @@ async function main(argv) {
   // --verbose, where the full negotiation trace is exactly what is wanted.
   log.attachLibraryLogger(require('dcmjs-dimse').log);
 
+  // A dependency still calls the deprecated Buffer() constructor, and Node
+  // prints that warning straight into the middle of a transfer report. It is
+  // not actionable by anyone running this tool, so it is hidden by default and
+  // left visible under --verbose, where nothing should be filtered out.
+  process.noDeprecation = !log.isVerbose();
+
   if (flags.has('version') && positionals.length === 0) {
     log.out(version);
     return EXIT.OK;
