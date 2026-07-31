@@ -502,6 +502,81 @@ syntax each settled on, and the peer's implementation class UID and version.
 When something's wrong on the wire that's what you need, and it's usually the
 first thing I reach for.
 
+## Troubleshooting
+
+The four things I actually hit, and what they mean. All of these have been
+reproduced against a real gateway, not just against the loopback receiver.
+
+### "Calling AE Title not recognized" / reason 3
+
+```
+[A-ASSOCIATE-RJ result=1 source=1 reason=3]
+```
+
+Your calling AE Title isn't allowlisted on the far end. This is a configuration
+entry someone has to add on the receiving side, not anything wrong with your
+setup, and no amount of retrying or flag-fiddling will change it.
+
+Send whoever runs the peer the exact value you're passing to `--calling-ae`
+along with your source IP. AE Titles are case-sensitive and capped at 16
+characters.
+
+Watch out for the direction. Some gateways allowlist the **calling** AET rather
+than matching on the called one, and in that case the AE Title they give you is
+the one to put in `--calling-ae`, not `--called-ae`. If reason 3 persists with
+what you were told is the right AE Title, try it in the other slot:
+
+```bash
+dcm echo --host pacs.example.org --port 11112 --called-ae THEIR-AET --calling-ae THEIR-AET
+```
+
+### "Called AE Title not recognized" / reason 7
+
+You reached a real DICOM service but asked for a name it doesn't answer to. One
+host can serve several AE Titles on one port. Check `--called-ae`.
+
+### C-FIND returns 0x0122, or no matches, for images you know went across
+
+```
+error the peer refused the query: 0x0122 SOP Class not supported
+```
+
+A successful C-STORE means the peer *accepted* your images. It does not mean it
+can be queried for them, and plenty of gateways can't be queried at all.
+
+I've seen a production store-and-forward gateway accept images with `0x0000`,
+accept the Study Root Query/Retrieve FIND presentation context during
+negotiation, and then answer the query itself with `0x0122`. So `--verbose`
+shows a negotiation that looks completely healthy, which makes this a confusing
+one to chase — advertising a presentation context isn't a promise to implement
+the service behind it.
+
+If images are being accepted but you can't find them, query whichever system is
+actually meant to hold them rather than the one you sent to, and give it time to
+process. Also check your AE Title is permitted to query, not just to store;
+those are often separate permissions.
+
+### It sent, but fewer instances arrived than you sent
+
+That's what the three numbers are for, and it's why the run exits non-zero. Look
+at the per-instance status codes in the report — they say whether the receiver
+refused them (`0xA700` out of resources is usually transient), never answered
+(a stall, retry it), or whether the files never parsed off disk in the first
+place.
+
+### Windows says "Windows protected your PC"
+
+The binary isn't code-signed. Verify the SHA256 against the release, then *More
+info → Run anyway*.
+
+### macOS says the binary is damaged or can't be opened
+
+macOS quarantines downloads. The install script clears it; by hand:
+
+```bash
+xattr -d com.apple.quarantine ./dcm
+```
+
 ## Exit codes
 
 | Code | Meaning |
