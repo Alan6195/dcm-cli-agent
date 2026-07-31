@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output / single-executable artifacts
+dist/
+*.blob
+dcm.exe
+dcm
+
+# DICOM sample data — never commit real or synthetic studies
+*.dcm
+*.DCM
+*.dicom
+fixtures/
+samples/
+studies/
+received/
+test-data/
+
+# Receiver output (dcm scp --persist writes here by default)
+scp-store/
+
+# Local configuration and logs — connection details belong in flags/env, not files
+.env
+.env.*
+*.local.json
+config.local.*
+*.log
+logs/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

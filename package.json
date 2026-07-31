@@ -1,0 +1,49 @@
+{
+  "name": "dcm-cli-agent",
+  "version": "0.1.0",
+  "description": "A single-binary DICOM network CLI for folders of DICOM files: C-ECHO, C-STORE, C-FIND, a permissive receiver, inventory and de-identification.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/cli.js",
+  "bin": {
+    "dcm": "bin/dcm.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/unit/ test/e2e/",
+    "test:unit": "node --test test/unit/",
+    "test:e2e": "node --test test/e2e/",
+    "fixtures": "node tools/make-fixtures.js",
+    "bundle": "node tools/build.js bundle",
+    "build": "node tools/build.js all",
+    "clean": "node tools/build.js clean"
+  },
+  "keywords": [
+    "dicom",
+    "dimse",
+    "pacs",
+    "c-store",
+    "c-echo",
+    "c-find",
+    "cli"
+  ],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "dcmjs-dimse": "^0.3.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.0"
+  }
+}
