@@ -50,9 +50,21 @@ test('translates range-matched codes rather than falling through', () => {
 test('gives plain English for the codes people actually hit', () => {
   assert.match(status.describe(0x0000).plain, /acknowledged/i);
   assert.match(status.describe(0xb000).plain, /rewrote/i);
-  assert.match(status.describe(0x0122).plain, /does not accept this type/i);
+  assert.match(status.describe(0x0122).plain, /does not support this operation/i);
   assert.match(status.describe(0x0111).plain, /already holds/i);
   assert.match(status.describe(0x0124).plain, /authorisation/i);
+});
+
+test('0x0122 covers the accepted-context case, not just a rejected one', () => {
+  // A production gateway was observed accepting the Study Root FIND
+  // presentation context and then returning 0x0122 for the query itself.
+  // A hint that only says "check which contexts were accepted" sends the
+  // reader to look at something that will appear perfectly healthy.
+  const hint = status.describe(0x0122).hint;
+  assert.match(hint, /--verbose/, 'still points at the negotiation check');
+  assert.match(hint, /accepted the context and still refuses/i, 'covers the other cause');
+  assert.match(hint, /store-and-forward/i);
+  assert.match(hint, /query whichever system is meant to hold the data/i);
 });
 
 test('an unknown code is reported honestly rather than guessed at', () => {

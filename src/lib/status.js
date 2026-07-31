@@ -70,8 +70,21 @@ const EXACT = new Map([
   [0x0119, { label: 'Class/Instance conflict', plain: 'The SOP Class and SOP Instance the peer holds do not agree.' }],
   [0x0122, {
     label: 'SOP Class not supported',
-    plain: 'The receiver does not accept this type of object.',
-    hint: 'The association was accepted but this specific SOP Class was not. Run with --verbose to see which presentation contexts the peer actually accepted.',
+    plain: 'The peer does not support this operation for this type of object.',
+    // Observed against a production store-and-forward gateway: it accepted the
+    // Study Root Query/Retrieve FIND presentation context during negotiation
+    // and then returned 0x0122 for the query itself. A peer advertising a
+    // context is not a promise that it implements the service behind it, so
+    // sending people to --verbose to look for a rejected context is misleading
+    // on its own — both explanations have to be offered.
+    hint:
+      'Two different things cause this. Either the peer never accepted a presentation ' +
+      'context for this SOP Class — run with --verbose to check — or it accepted the ' +
+      'context and still refuses the operation, which store-and-forward gateways do ' +
+      'routinely because they take images without implementing query at all. If ' +
+      '--verbose shows the context was accepted, it is the second case, and the answer ' +
+      'is to query whichever system is meant to hold the data rather than the one you ' +
+      'sent it to.',
   }],
   [0x0124, {
     label: 'Not authorized',
