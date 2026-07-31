@@ -1,0 +1,28 @@
+# Normalise line endings in the repository.
+#
+# This matters more than it looks. install.sh is fetched straight from
+# raw.githubusercontent.com and piped into bash on macOS and Linux. If it is
+# ever stored with CRLF, bash reads the carriage return as part of the
+# interpreter path and fails with "bad interpreter: /usr/bin/env bash^M" —
+# a confusing error that has nothing to do with what the script does.
+#
+# Committing this file with a Windows checkout is exactly how that happens, so
+# the rule is explicit rather than left to core.autocrlf.
+
+* text=auto eol=lf
+
+# Shell scripts must be LF on every platform, including Windows checkouts.
+*.sh text eol=lf
+
+# PowerShell is conventionally CRLF on Windows and handles both.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never touch binaries.
+*.exe binary
+*.dcm binary
+*.wasm binary
+*.blob binary
+*.png binary
+*.ico binary
