@@ -1,8 +1,13 @@
 # DCM CLI Agent
 
+[![CI](https://github.com/Alan6195/dcm-cli-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Alan6195/dcm-cli-agent/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Alan6195/dcm-cli-agent)](https://github.com/Alan6195/dcm-cli-agent/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A single-binary DICOM CLI for pushing folders of DICOM around. C-ECHO, C-STORE,
 C-FIND, a receiver that logs everything, plus inventory and de-identification.
-No runtime to install on the box you're running it from.
+No runtime to install on the box you're running it from. Windows, macOS and
+Linux.
 
 I wrote this because every DICOM transfer tool I've used answers the wrong
 question. They tell you the association succeeded. What I need to know is
