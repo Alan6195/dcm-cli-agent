@@ -59,6 +59,25 @@ jobs:
       - run: npm test
       - run: npm run build
 
+      # A tag can very easily end up on a commit that predates the version
+      # bump, in which case the release publishes binaries that report the
+      # previous version. That has happened, and nothing caught it until
+      # someone installed the release and read --version. Fail the build
+      # instead.
+      - name: The binary's version must match the tag
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          EXPECTED="${TAG#v}"
+          BIN="dist/dcm"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="dist/dcm.exe"
+          ACTUAL="$("$BIN" --version | tr -d '\r\n')"
+          echo "tag=$TAG expected=$EXPECTED actual=$ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Tag $TAG expects version $EXPECTED but the binary reports $ACTUAL. The tag is probably on a commit older than the version bump in package.json."
+            exit 1
+          fi
+
       - name: Name the artifact for its platform
         shell: bash
         run: |
