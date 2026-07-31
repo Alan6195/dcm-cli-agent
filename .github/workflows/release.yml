@@ -24,18 +24,27 @@ jobs:
             label: windows-x64
             asset: dcm-windows-x64.exe
             built: dist/dcm.exe
+            arch: x64
           - os: macos-latest
             label: macos-arm64
             asset: dcm-macos-arm64
             built: dist/dcm
-          - os: macos-13
+            arch: arm64
+          # Intel Macs are built on the Apple Silicon runner using an x64
+          # Node under Rosetta 2. A SEA is a copy of the running Node binary,
+          # so an x64 Node produces an x64 executable. The dedicated macos-13
+          # runner label is being retired and can queue indefinitely, which
+          # would block every release behind a runner that never arrives.
+          - os: macos-latest
             label: macos-x64
             asset: dcm-macos-x64
             built: dist/dcm
+            arch: x64
           - os: ubuntu-latest
             label: linux-x64
             asset: dcm-linux-x64
             built: dist/dcm
+            arch: x64
 
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +52,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          architecture: ${{ matrix.arch }}
           cache: npm
 
       - run: npm ci
@@ -55,6 +65,25 @@ jobs:
           mkdir -p out
           cp "${{ matrix.built }}" "out/${{ matrix.asset }}"
           chmod +x "out/${{ matrix.asset }}" || true
+
+      # A binary labelled x64 that is actually arm64 fails on the machine it was
+      # published for, and the label is the only thing anyone downloading it has
+      # to go on. Check what was really produced rather than trusting the name.
+      - name: Verify the binary matches the architecture it is named for
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          asset="out/${{ matrix.asset }}"
+          info="$(file -b "$asset")"
+          echo "$asset -> $info"
+          case "${{ matrix.arch }}" in
+            x64)
+              echo "$info" | grep -Eq 'x86[-_]64|x86_64' \
+                || { echo "::error::${{ matrix.asset }} is not x86-64: $info"; exit 1; } ;;
+            arm64)
+              echo "$info" | grep -Eq 'arm64|aarch64' \
+                || { echo "::error::${{ matrix.asset }} is not arm64: $info"; exit 1; } ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
