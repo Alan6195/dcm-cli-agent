@@ -68,6 +68,50 @@ Run 'dcm <command> --help' for details on a command.
 `.trimStart();
 
 /**
+ * Keeps the console open when the executable was launched by double-clicking it.
+ *
+ * This is a command-line tool, but it ships as a bare .exe, so people
+ * reasonably double-click it expecting an installer. Windows then creates a
+ * console for the process, the usage text prints, the process exits, and the
+ * window disappears before anything can be read. It looks exactly like a crash.
+ *
+ * The heuristic is deliberately narrow: Windows, an interactive terminal, and
+ * no arguments at all. Someone who typed the bare command in a shell pays one
+ * keypress; someone who double-clicked gets an explanation instead of a flash.
+ *
+ * @returns {Promise<void>}
+ */
+async function pauseSoTheWindowCanBeRead() {
+  const looksLikeDoubleClick =
+    process.platform === 'win32' &&
+    process.stdout.isTTY === true &&
+    process.stdin.isTTY === true;
+
+  if (!looksLikeDoubleClick) return;
+
+  log.out('');
+  log.out('─'.repeat(72));
+  log.out('This is a command-line tool, not an installer. There is nothing to install.');
+  log.out('');
+  log.out('If you double-clicked it, run it from a terminal instead. Open PowerShell,');
+  log.out('then point it at this file:');
+  log.out('');
+  log.out('    .\\dcm.exe info C:\\path\\to\\study');
+  log.out('');
+  log.out('To use it as `dcm` from anywhere, put it in a folder on your PATH.');
+  log.out('─'.repeat(72));
+
+  await new Promise((resolve) => {
+    process.stdout.write('\nPress Enter to close this window...');
+    process.stdin.resume();
+    process.stdin.once('data', () => {
+      process.stdin.pause();
+      resolve();
+    });
+  });
+}
+
+/**
  * @param {string[]} argv Arguments after the executable and script.
  * @returns {Promise<number>} Exit code.
  */
@@ -101,8 +145,10 @@ async function main(argv) {
 
   if (!command) {
     log.out(USAGE);
-    // No command at all is a usage problem unless help was asked for.
-    return flags.has('help') ? EXIT.OK : EXIT.USAGE;
+    // An explicit --help was answered; a bare launch may be a double-click.
+    if (flags.has('help')) return EXIT.OK;
+    await pauseSoTheWindowCanBeRead();
+    return EXIT.USAGE;
   }
 
   const loader = COMMANDS[command];

@@ -20,10 +20,27 @@ That exits non-zero. A partial transfer is a failure, not a warning.
 
 ## Install
 
-Grab `dcm.exe` from releases, drop it on your PATH. It's self-contained, no
-Node, no installer. Or build it yourself, see below.
+Grab `dcm.exe` from releases and drop it somewhere on your PATH. It's
+self-contained, no Node, no runtime.
 
-If you already have Node 22+:
+**There's no installer, and you don't run it by double-clicking it.** It's a
+command-line tool, so the exe *is* the program. If you double-click it you'll
+get a console window that prints the help and closes again, which looks like a
+crash but isn't. Run it from a terminal:
+
+```powershell
+# PowerShell, from wherever you saved it
+.\dcm.exe --help
+.\dcm.exe info C:\path\to\study
+```
+
+Put it in a folder on your PATH and you can just type `dcm` from anywhere.
+
+Windows SmartScreen will warn the first time, because the binary isn't
+code-signed. Check the SHA256 published with the release, then *More info →
+Run anyway*.
+
+If you already have Node 22+, skip the exe entirely:
 
 ```bash
 npm install -g dcm-cli-agent
