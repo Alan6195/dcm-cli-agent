@@ -173,6 +173,44 @@ const ACTIONS = [
   },
   {
     key: '6',
+    label: 'Inspect DICOM tags',
+    detail: 'Dump the tags in a file or folder. Never prints pixel data.',
+    async build(rl) {
+      const target = await ask(rl, 'folder', 'File or folder', { required: true });
+      const filter = await ask(rl, 'tagFilter', 'Filter by keyword or value (blank for everything)', {});
+      const argv = [target];
+      if (filter) argv.push('--filter', filter);
+      return { command: 'tags', argv };
+    },
+  },
+  {
+    key: '7',
+    label: 'Change or remove tags',
+    detail: 'Edit tag values and write the result. Writes a copy; never edits in place from here.',
+    async build(rl) {
+      const target = await ask(rl, 'folder', 'File or folder', { required: true });
+      const out = await ask(rl, 'editOut', 'Write the edited copy to', { required: true });
+      const set = await ask(rl, 'editSet', 'Set a tag (Keyword=Value, blank to skip)', {});
+      const remove = await ask(rl, 'editRemove', 'Remove a tag (Keyword, blank to skip)', {});
+
+      if (!set && !remove) {
+        throw new Error('Nothing to do — give at least one tag to set or remove.');
+      }
+
+      const argv = [target, '--out', out];
+      if (set) argv.push('--set', set);
+      if (remove) argv.push('--remove', remove);
+
+      // The menu deliberately never offers --in-place. Overwriting a study is
+      // something to do on purpose from a command line, not by picking a
+      // number off a list.
+      const dry = await confirm(rl, 'Show what would change first, without writing?', true);
+      if (dry) argv.push('--dry-run');
+      return { command: 'edit', argv };
+    },
+  },
+  {
+    key: '8',
     label: 'De-identify a folder',
     detail: 'Copy a folder with identifiers removed, for sharing or testing.',
     async build(rl) {
@@ -182,7 +220,7 @@ const ACTIONS = [
     },
   },
   {
-    key: '7',
+    key: '9',
     label: 'Install as a `dcm` command',
     detail: 'Put this on your PATH so you can type `dcm` in any terminal.',
     async build(rl) {

@@ -383,6 +383,78 @@ Study 1/1  1.2.840.113619.2.55.3.604688.1
 `--json` for scripting. `--series` for the per-series breakdown, which also
 flags colliding Series Instance UIDs.
 
+### dcm tags
+
+Dumps the DICOM tags in a file or folder. Reads metadata only and never prints
+pixel data, so it's safe to point at anything.
+
+```bash
+dcm tags ./study/instance-1.dcm
+```
+
+```
+(0008,0016) UI SOPClassUID                        1.2.840.10008.5.1.4.1.1.2
+(0008,0018) UI SOPInstanceUID                     1.2.840.113619.2.55.3.604688.1.1
+(0008,0060) CS Modality                           CT
+(0008,0080) LO InstitutionName                    ST ELSEWHERE
+(0010,0010) PN PatientName                        DOE^JANE
+(0010,0020) LO PatientID                          12345
+(0020,000D) UI StudyInstanceUID                   1.2.840.113619.2.55.3.604688.1
+(7FE0,0010) ox PixelData                          <not read — metadata only>
+```
+
+Point it at a folder and it shows one representative file per series, which is
+usually what you want. `--all` dumps every file.
+
+```bash
+dcm tags ./study --filter Patient          # substring on keyword, tag or value
+dcm tags ./study --filter "/Patient|Study/" # or a regex
+dcm tags ./study --value "DOE^JANE" --all   # which files still carry this?
+dcm tags ./study --private                  # private and unrecognised tags only
+dcm tags ./study --json
+```
+
+`--value` is the one I reach for most: it answers "which instances still have
+an identifier in them" without opening anything.
+
+### dcm edit
+
+Changes or removes tags and writes the result.
+
+```bash
+dcm edit ./study --set PatientID=TEST001 --remove InstitutionName --out ./edited
+```
+
+```
+  set     (0010,0020) PatientID = "TEST001"
+  remove  (0008,0080) InstitutionName
+instances found     823
+would change        823
+written             823
+
+OK — 823 instance(s) written.
+```
+
+The key can be a keyword (`PatientID`), a punctuated tag (`(0010,0020)`) or a
+bare hex tag (`00100020`), because people copy tags from all three. `--set` and
+`--remove` are repeatable.
+
+You have to say where the output goes — `--out <dir>` to write copies, or
+`--in-place` to overwrite. There's deliberately no default, because the
+difference between writing a copy and overwriting a study isn't something to
+get wrong by leaving a flag off. `--dry-run` shows what would change first.
+
+Editing UIDs is refused unless you pass `--force`. Study, Series and SOP
+Instance UIDs are what tie a study together and what receivers use to recognise
+it, so rewriting them on some instances and not others splits a study, and
+reusing one that exists elsewhere collides with it. If you want fresh UIDs
+across a whole study, `dcm anon` remaps them consistently and keeps the
+relationships intact.
+
+`--in-place` writes to a temporary file and renames over the original, so an
+interrupted write can't leave a truncated file where a valid instance used to
+be.
+
 ### dcm anon
 
 De-identifies a folder into a new directory. Never touches the source.

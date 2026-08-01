@@ -1,15 +1,26 @@
-{
+﻿{
   "name": "dcm-cli-agent",
-  "version": "0.2.1",
-  "description": "A single-binary DICOM network CLI for folders of DICOM files: C-ECHO, C-STORE, C-FIND, a permissive receiver, inventory and de-identification.",
+  "version": "0.3.0",
+  "description": "A single-binary DICOM CLI for folders of DICOM files: C-ECHO, C-STORE, C-FIND, a permissive receiver, tag inspection and editing, inventory and de-identification.",
   "license": "MIT",
   "type": "commonjs",
   "main": "src/cli.js",
   "bin": {
     "dcm": "bin/dcm.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Alan6195/dcm-cli-agent.git"
+  },
+  "homepage": "https://github.com/Alan6195/dcm-cli-agent#readme",
+  "bugs": {
+    "url": "https://github.com/Alan6195/dcm-cli-agent/issues"
+  },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin/",
@@ -37,6 +48,7 @@
   ],
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
+    "dcmjs": "^0.50.3",
     "dcmjs-dimse": "^0.3.3"
   },
   "devDependencies": {

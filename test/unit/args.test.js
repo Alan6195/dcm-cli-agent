@@ -29,6 +29,38 @@ test('key=value pairs survive parsing as data, not flags', () => {
   assert.equal(flags.size, 0);
 });
 
+test('a boolean flag does not swallow a following matching key', () => {
+  // `dcm find --study PatientID=12345` must keep the matching key. Consuming
+  // it as the value of --study loses the key silently and asks the peer a
+  // different question than the one that was typed.
+  const { flags, pairs } = tokenize(['--study', 'PatientID=12345']);
+  assert.equal(flags.get('study'), true);
+  assert.deepEqual(pairs, [['PatientID', '12345']]);
+});
+
+test('but --set and --remove do take a Key=Value as their value', () => {
+  // The mirror case: `dcm edit --set PatientID=TEST001` must consume the pair,
+  // or the edit silently does nothing. These two requirements conflict, so the
+  // flags that take pair-shaped values are named explicitly.
+  const { flags, pairs } = tokenize([
+    '--set', 'PatientID=TEST001',
+    '--remove', 'InstitutionName',
+    '--out', './edited',
+  ]);
+  assert.equal(flags.get('set'), 'PatientID=TEST001');
+  assert.equal(flags.get('remove'), 'InstitutionName');
+  assert.equal(flags.get('out'), './edited');
+  assert.deepEqual(pairs, [], 'nothing should leak into positional pairs');
+});
+
+test('repeated --set accumulates rather than clobbering', () => {
+  const { flags } = tokenize([
+    '--set', 'PatientID=A',
+    '--set', 'PatientName=DOE^JANE',
+  ]);
+  assert.deepEqual(flags.get('set'), ['PatientID=A', 'PatientName=DOE^JANE']);
+});
+
 test('a repeated flag is an error rather than a silent last-wins', () => {
   const { flags } = tokenize(['--calling-ae', 'A', '--calling-ae', 'B']);
   assert.throws(() => resolve(flags, { name: 'calling-ae' }), /more than once/);

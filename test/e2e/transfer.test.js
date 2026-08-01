@@ -13,6 +13,8 @@ const send = require('../../src/commands/send');
 const info = require('../../src/commands/info');
 const find = require('../../src/commands/find');
 const anon = require('../../src/commands/anon');
+const tags = require('../../src/commands/tags');
+const edit = require('../../src/commands/edit');
 
 /** Generates a fixture tree inside a temp dir. */
 async function fixtures(dir, opts = {}) {
@@ -430,6 +432,170 @@ test('without --rewrite-series-uid colliding series still merge', async () => {
     } finally {
       scp.close();
     }
+  });
+});
+
+test('tags dumps real tag numbers and value representations', async () => {
+  await withTempDir('dcm-tags', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1 });
+
+    const { code, stdout } = await runCommand(tags, [src, '--json']);
+    assert.equal(code, 0);
+
+    const parsed = JSON.parse(stdout);
+    const rows = parsed.results[0].tags;
+    const byKeyword = new Map(rows.map((r) => [r.keyword, r]));
+
+    assert.equal(byKeyword.get('PatientID').tag, '(0010,0020)');
+    assert.equal(byKeyword.get('PatientID').vr, 'LO');
+    assert.equal(byKeyword.get('StudyInstanceUID').tag, '(0020,000D)');
+  });
+});
+
+test('a Person Name renders as a name, not as a sequence', async () => {
+  // dcmjs represents PN as [{Alphabetic: 'DOE^JANE'}] — an array holding an
+  // object, which is shape-identical to a one-item sequence. Guessing from the
+  // shape turns every patient name into "<sequence, 1 item>".
+  await withTempDir('dcm-tags-pn', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1 });
+
+    const { stdout } = await runCommand(tags, [src, '--json']);
+    const rows = JSON.parse(stdout).results[0].tags;
+    const name = rows.find((r) => r.keyword === 'PatientName');
+
+    assert.equal(name.vr, 'PN');
+    assert.match(name.value, /SYNTHETIC\^PATIENT/);
+    assert.doesNotMatch(name.value, /sequence/i);
+  });
+});
+
+test('tags never dumps pixel data', async () => {
+  await withTempDir('dcm-tags-px', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1, rows: 32, cols: 32 });
+
+    const { stdout } = await runCommand(tags, [src, '--json']);
+    const rows = JSON.parse(stdout).results[0].tags;
+    const pixels = rows.find((r) => r.keyword === 'PixelData');
+
+    if (pixels) {
+      assert.match(pixels.value, /^<(binary|not read)/, 'pixel data must be summarised, never printed');
+      assert.ok(pixels.value.length < 80);
+    }
+  });
+});
+
+test('tags --value finds which files carry an identifier', async () => {
+  await withTempDir('dcm-tags-val', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 2, instancesPerSeries: 2 });
+
+    const found = await runCommand(tags, [src, '--value', 'SYNTH0001', '--all']);
+    assert.equal(found.code, 0);
+    assert.match(found.output, /PatientID/);
+
+    const missing = await runCommand(tags, [src, '--value', 'NOT-PRESENT-ANYWHERE']);
+    assert.equal(missing.code, 1, 'no match should be a non-zero exit');
+    assert.match(missing.output, /Nothing matched/i);
+  });
+});
+
+test('edit writes changes without touching the source', async () => {
+  await withTempDir('dcm-edit', async (dir) => {
+    const src = path.join(dir, 'src');
+    const out = path.join(dir, 'out');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 2 });
+
+    const { code, output } = await runCommand(edit, [
+      src, '--set', 'PatientID=TEST001', '--remove', 'InstitutionName', '--out', out,
+    ]);
+    assert.equal(code, 0);
+    assert.match(output, /written\s+2/);
+
+    const edited = JSON.parse((await runCommand(tags, [out, '--all', '--json'])).stdout);
+    for (const file of edited.results) {
+      const byKeyword = new Map(file.tags.map((r) => [r.keyword, r.value]));
+      assert.equal(byKeyword.get('PatientID'), 'TEST001');
+      assert.equal(byKeyword.has('InstitutionName'), false, 'removed tag must be gone');
+      // The edit must not disturb what ties the study together.
+      assert.match(byKeyword.get('StudyInstanceUID'), /^1\.2\.826\./);
+    }
+
+    const original = JSON.parse((await runCommand(tags, [src, '--all', '--json'])).stdout);
+    for (const file of original.results) {
+      const byKeyword = new Map(file.tags.map((r) => [r.keyword, r.value]));
+      assert.equal(byKeyword.get('PatientID'), 'SYNTH0001', 'source must be untouched');
+      assert.equal(byKeyword.has('InstitutionName'), true);
+    }
+  });
+});
+
+test('edit refuses to rewrite UIDs without --force', async () => {
+  // A partial UID rewrite splits a study or collides with an existing one.
+  await withTempDir('dcm-edit-uid', async (dir) => {
+    const src = path.join(dir, 'src');
+    const out = path.join(dir, 'out');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1 });
+
+    const { code, output } = await runCommand(edit, [
+      src, '--set', 'StudyInstanceUID=1.2.3', '--out', out,
+    ]);
+
+    assert.equal(code, 2, 'a refused edit is a usage error');
+    assert.match(output, /Refusing to edit StudyInstanceUID/);
+    assert.match(output, /--force/);
+    assert.match(output, /dcm anon/, 'should point at the tool that does this correctly');
+    assert.equal(fs.existsSync(out), false, 'nothing should have been written');
+  });
+});
+
+test('edit requires an explicit destination', async () => {
+  // Writing a copy and overwriting a study are too different to pick by default.
+  await withTempDir('dcm-edit-dest', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1 });
+
+    await assert.rejects(
+      () => runCommand(edit, [src, '--set', 'PatientID=X']),
+      /--out .* or --in-place/s
+    );
+  });
+});
+
+test('edit --dry-run reports the change and writes nothing', async () => {
+  await withTempDir('dcm-edit-dry', async (dir) => {
+    const src = path.join(dir, 'src');
+    const out = path.join(dir, 'out');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 2 });
+
+    const { code, output } = await runCommand(edit, [
+      src, '--set', 'PatientID=TEST001', '--out', out, '--dry-run',
+    ]);
+
+    assert.equal(code, 0);
+    assert.match(output, /would change\s+2/);
+    assert.match(output, /DRY RUN — nothing was written/);
+    assert.equal(fs.existsSync(out), false);
+  });
+});
+
+test('edit --in-place rewrites the source', async () => {
+  await withTempDir('dcm-edit-inplace', async (dir) => {
+    const src = path.join(dir, 'src');
+    await fixtures(src, { seriesPerStudy: 1, instancesPerSeries: 1 });
+
+    const { code } = await runCommand(edit, [
+      src, '--set', 'PatientID=INPLACE1', '--in-place',
+    ]);
+    assert.equal(code, 0);
+
+    const after = JSON.parse((await runCommand(tags, [src, '--json'])).stdout);
+    const byKeyword = new Map(after.results[0].tags.map((r) => [r.keyword, r.value]));
+    assert.equal(byKeyword.get('PatientID'), 'INPLACE1');
+    // The file must still be readable DICOM, not a truncated write.
+    assert.match(byKeyword.get('SOPInstanceUID'), /^1\.2\.826\./);
   });
 });
 

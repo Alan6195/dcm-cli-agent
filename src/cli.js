@@ -26,6 +26,8 @@ const COMMANDS = {
   scp: () => require('./commands/scp'),
   find: () => require('./commands/find'),
   info: () => require('./commands/info'),
+  tags: () => require('./commands/tags'),
+  edit: () => require('./commands/edit'),
   anon: () => require('./commands/anon'),
   explain: () => require('./commands/explain'),
   install: () => require('./commands/install'),
@@ -44,6 +46,8 @@ Commands:
   scp       Run a permissive receiver that logs everything
   find      Query a peer (C-FIND) at study, series or worklist level
   info      Inventory a folder or file: modalities, counts, sizes, syntaxes
+  tags      Dump the DICOM tags in a file or folder
+  edit      Change or remove tags and write the result
   anon      De-identify a folder into a new directory
   explain   Explain a failed transfer log using the Anthropic API (optional)
   install   Put this executable on your PATH so you can type 'dcm' anywhere

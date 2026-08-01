@@ -59,7 +59,8 @@ function tokenize(argv) {
       // the query key disappears silently and the peer is asked a different
       // question than the one that was typed.
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--') || looksLikePair(next)) {
+      const takesPair = PAIR_VALUED_FLAGS.has(body);
+      if (next === undefined || next.startsWith('--') || (looksLikePair(next) && !takesPair)) {
         setFlag(flags, body, true);
       } else {
         setFlag(flags, body, next);
@@ -91,6 +92,17 @@ function tokenize(argv) {
 function looksLikePair(token) {
   return /^[A-Za-z][A-Za-z0-9]*=/.test(token);
 }
+
+/**
+ * Flags whose value is legitimately `Key=Value` shaped.
+ *
+ * Two commands want opposite things from the same token. `dcm find --study
+ * PatientID=12345` needs the pair left alone as a matching key, or the query
+ * silently loses it. `dcm edit --set PatientID=TEST001` needs the pair consumed
+ * as the flag's value, or the edit silently does nothing. A general rule cannot
+ * satisfy both, so the flags that take pair-shaped values are named here.
+ */
+const PAIR_VALUED_FLAGS = new Set(['set', 'remove', 'filter', 'value']);
 
 /** Repeated flags accumulate into an array rather than clobbering. */
 function setFlag(flags, name, value) {
