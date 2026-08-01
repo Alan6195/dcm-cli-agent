@@ -74,9 +74,17 @@ A few things worth knowing:
 - **It's a command-line tool, not something you double-click.** If you do
   double-click it you get an interactive menu rather than a window that flashes
   and vanishes, but the real interface is the terminal.
-- **Windows SmartScreen will warn you the first time**, because the binary
-  isn't code-signed. Check the SHA256 from the release, then *More info → Run
-  anyway*.
+- **The binaries aren't code-signed**, and I'm not planning to sign them —
+  a certificate costs real money for a tool a handful of people use. Use the
+  one-line installer and this costs you nothing: it fetches over PowerShell
+  rather than a browser, so Windows never applies the mark that triggers
+  SmartScreen, and it clears the mark anyway if one is present.
+
+  If you download by hand from a browser instead, Windows *will* warn: click
+  *More info → Run anyway*. Then run `dcm install`, which strips the mark from
+  the installed copy so you're not warned again on every launch. Verify the
+  SHA256 from the release either way — that's the integrity check a signature
+  would otherwise give you.
 - **macOS quarantines downloads.** The install script clears that for you. If
   you downloaded by hand, run `xattr -d com.apple.quarantine ./dcm`.
 
@@ -638,8 +646,17 @@ place.
 
 ### Windows says "Windows protected your PC"
 
-The binary isn't code-signed. Verify the SHA256 against the release, then *More
-info → Run anyway*.
+The binaries aren't code-signed and won't be. Verify the SHA256 against the
+release, then *More info → Run anyway*.
+
+You can avoid it entirely by using the one-line installer instead of downloading
+through a browser — PowerShell doesn't apply the mark that triggers SmartScreen.
+
+If you already downloaded by hand, run `dcm install` after clicking through
+once. That strips the mark from the installed copy, so you're warned once rather
+than every single time you run `dcm`. (Windows copies the mark along with the
+file, so an installed copy of a marked binary stays marked until something
+clears it.)
 
 ### macOS says the binary is damaged or can't be opened
 

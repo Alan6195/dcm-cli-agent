@@ -106,6 +106,34 @@ test('install targets a per-user location that needs no admin rights', () => {
   assert.doesNotMatch(dir, /Program Files|\/usr\/|\/opt\//i);
 });
 
+test('installing strips the downloaded-from-the-internet mark', { skip: process.platform !== 'win32' }, () => {
+  // fs.copyFileSync carries the Zone.Identifier stream across with the file, so
+  // installing a browser-downloaded exe produces an installed copy that keeps
+  // triggering SmartScreen on every launch rather than once. Since the binaries
+  // are not code-signed, that would be permanent.
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+
+  const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'dcm-motw-'));
+  const file = pathx.join(dir, 'marked.exe');
+  try {
+    fsx.writeFileSync(file, 'not really an executable');
+    fsx.writeFileSync(`${file}:Zone.Identifier`, '[ZoneTransfer]\r\nZoneId=3');
+
+    // Confirm the fixture really is marked, or the test proves nothing.
+    assert.equal(fsx.existsSync(`${file}:Zone.Identifier`), true, 'fixture should start marked');
+
+    assert.equal(install.clearMarkOfTheWeb(file), true, 'should report having cleared a mark');
+    assert.equal(fsx.existsSync(`${file}:Zone.Identifier`), false, 'mark must be gone');
+
+    // Clearing an unmarked file is a no-op, not an error.
+    assert.equal(install.clearMarkOfTheWeb(file), false);
+  } finally {
+    fsx.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('install refuses to run from a source checkout', () => {
   // From `node bin/dcm.js`, process.execPath is the Node binary. Copying that
   // to the install directory would hand the user a copy of Node named dcm.

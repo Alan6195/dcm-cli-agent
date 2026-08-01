@@ -96,6 +96,12 @@ try {
         throw "Could not write $target. Close any running dcm windows and try again. ($($_.Exception.Message))"
     }
 
+    # Clear the downloaded-from-the-internet mark if one is present. Files
+    # fetched by Invoke-WebRequest normally have none, but Copy-Item preserves
+    # it when there is, and SmartScreen warns on every launch of a marked
+    # unsigned executable rather than only the first.
+    Unblock-File -Path $target -ErrorAction SilentlyContinue
+
     # --- PATH -----------------------------------------------------------------
     if (-not $NoPath) {
         # Read and write the registry value directly, preserving its type.

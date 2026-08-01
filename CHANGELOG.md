@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.1
+
+No code signing, so the friction from not signing is handled instead.
+
+- `dcm install` clears the downloaded-from-the-internet mark from the installed
+  binary on Windows. `fs.copyFileSync` carries that mark across with the file,
+  so installing a browser-downloaded exe previously produced an installed copy
+  that triggered SmartScreen on *every* launch rather than once. Since the
+  binaries are unsigned, that would have been permanent.
+- The one-line installer clears it too, belt and braces. It fetches over
+  PowerShell rather than a browser, so the mark is normally never applied in
+  the first place — verified empirically: the one-liner install has no mark,
+  a browser download has `ZoneId=3`.
+- Documented the accurate story: the recommended install path sees no
+  SmartScreen warning at all; only manual browser downloads do.
+- `dcm explain` is now covered by tests that stand a fake SDK in front of it
+  and assert on the request it builds — model, cache breakpoint, prefix
+  stability, redaction, refusal handling, and that the key is read from the
+  environment only. Everything except the network round-trip.
+- Release workflow can publish to npm, gated on an `NPM_TOKEN` secret.
+
 ## v0.3.0
 
 Tag inspection and editing.

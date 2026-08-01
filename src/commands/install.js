@@ -48,6 +48,35 @@ function binaryName() {
 }
 
 /**
+ * Removes the Mark of the Web from an installed binary on Windows.
+ *
+ * Windows tags anything downloaded through a browser with a Zone.Identifier
+ * alternate data stream, and SmartScreen warns on every launch of a marked,
+ * unsigned executable. `fs.copyFileSync` copies that stream along with the
+ * file, so installing a browser-downloaded exe produces an installed copy that
+ * keeps warning — not once, but every single time `dcm` is run.
+ *
+ * The mark means "this came from the internet", which was true of the download
+ * and is not a useful thing to assert about a binary the user has deliberately
+ * installed. Clearing it here is the same thing right-click → Unblock does.
+ *
+ * Best effort: a filesystem without alternate data stream support simply has
+ * nothing to remove.
+ *
+ * @param {string} target
+ * @returns {boolean} True when a mark was present and cleared.
+ */
+function clearMarkOfTheWeb(target) {
+  if (process.platform !== 'win32') return false;
+  try {
+    fs.rmSync(`${target}:Zone.Identifier`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when we are a packaged single executable rather than `node bin/dcm.js`.
  *
  * Installing a copy of the Node binary from a source checkout would produce
@@ -253,6 +282,13 @@ async function run(parsed) {
       if (process.platform !== 'win32') fs.chmodSync(target, 0o755);
       log.out('');
       log.out(`${log.color.green('installed')}  ${target}`);
+
+      if (clearMarkOfTheWeb(target)) {
+        log.out(
+          `${log.color.green('unblocked')}  cleared the downloaded-from-the-internet mark, ` +
+            'so Windows will not warn on every launch'
+        );
+      }
     } catch (err) {
       log.error(`Could not install to ${target}: ${err.message}`);
       if (err.code === 'EBUSY' || err.code === 'EPERM') {
@@ -391,4 +427,5 @@ module.exports = {
   binaryName,
   isPackagedExecutable,
   readUserPath,
+  clearMarkOfTheWeb,
 };
