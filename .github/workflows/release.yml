@@ -147,6 +147,14 @@ jobs:
     name: publish to npm
     needs: build
     runs-on: ubuntu-latest
+    # `npm publish --provenance` signs the package with a build attestation so
+    # anyone can verify it came from this repository and this workflow. That
+    # needs an OIDC token, and job-level permissions replace the workflow-level
+    # block rather than adding to it — so contents:write has to be restated
+    # here alongside id-token:write, or provenance fails at publish time.
+    permissions:
+      contents: read
+      id-token: write
     # Secrets are not available in job-level `if`, so the gate lives in the
     # step below. Without an NPM_TOKEN secret this job runs and does nothing,
     # which is the intended behaviour for anyone who has not set one up.
