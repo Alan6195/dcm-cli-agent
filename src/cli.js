@@ -30,6 +30,7 @@ const COMMANDS = {
   edit: () => require('./commands/edit'),
   anon: () => require('./commands/anon'),
   explain: () => require('./commands/explain'),
+  mcp: () => require('./commands/mcp'),
   install: () => require('./commands/install'),
   uninstall: () => ({ run: require('./commands/install').uninstall }),
 };
@@ -50,6 +51,7 @@ Commands:
   edit      Change or remove tags and write the result
   anon      De-identify a folder into a new directory
   explain   Explain a failed transfer log using the Anthropic API (optional)
+  mcp       Run an MCP server so an assistant can drive these operations
   install   Put this executable on your PATH so you can type 'dcm' anywhere
   uninstall Undo install
 

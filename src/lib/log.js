@@ -98,26 +98,55 @@ function installStreamGuards() {
   }
 }
 
+/**
+ * Output capture, used by `dcm mcp` to collect a command's output as a string
+ * rather than letting it reach the real streams — which for the MCP server are
+ * the JSON-RPC protocol channel and must not be polluted. Capturing here, at
+ * the single output chokepoint, keeps command output and protocol output
+ * cleanly separated. A stack so nested captures behave.
+ */
+const captureStack = [];
+
+function beginCapture() {
+  const sink = { out: '', err: '' };
+  captureStack.push(sink);
+  return sink;
+}
+
+function endCapture() {
+  return captureStack.pop();
+}
+
+function writeOut(text) {
+  if (captureStack.length) captureStack[captureStack.length - 1].out += text;
+  else process.stdout.write(text);
+}
+
+function writeErr(text) {
+  if (captureStack.length) captureStack[captureStack.length - 1].err += text;
+  else process.stderr.write(text);
+}
+
 /** Report output. Goes to stdout because it is the product of the command. */
 function out(msg = '') {
-  process.stdout.write(`${msg}\n`);
+  writeOut(`${msg}\n`);
 }
 
 function info(msg = '') {
-  if (level >= LEVELS.info) process.stderr.write(`${msg}\n`);
+  if (level >= LEVELS.info) writeErr(`${msg}\n`);
 }
 
 function warn(msg = '') {
-  if (level >= LEVELS.warn) process.stderr.write(`${color.yellow('warning')} ${msg}\n`);
+  if (level >= LEVELS.warn) writeErr(`${color.yellow('warning')} ${msg}\n`);
 }
 
 function error(msg = '') {
-  if (level >= LEVELS.error) process.stderr.write(`${color.red('error')} ${msg}\n`);
+  if (level >= LEVELS.error) writeErr(`${color.red('error')} ${msg}\n`);
 }
 
 /** Verbose diagnostics. Only emitted under --verbose. */
 function debug(msg = '') {
-  if (level >= LEVELS.debug) process.stderr.write(`${color.dim(`  · ${msg}`)}\n`);
+  if (level >= LEVELS.debug) writeErr(`${color.dim(`  · ${msg}`)}\n`);
 }
 
 /**
@@ -194,6 +223,8 @@ function attachLibraryLogger(dimseLog) {
 module.exports = {
   configure,
   installStreamGuards,
+  beginCapture,
+  endCapture,
   isVerbose,
   out,
   info,

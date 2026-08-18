@@ -506,6 +506,36 @@ exactly what would go over the wire:
 dcm explain --show-prompt < transfer.log
 ```
 
+### dcm mcp
+
+Runs a Model Context Protocol server over stdio, so an assistant — Claude Code,
+Claude Desktop, or anything else that speaks MCP — can drive these operations as
+tools. It is the same engine, not a second implementation: each tool builds the
+argument vector the command takes and runs it, capturing the output.
+
+Tools exposed: `dcm_echo`, `dcm_inventory`, `dcm_query`, `dcm_tags`, `dcm_send`,
+`dcm_anon`, `dcm_edit`. Connection details (host, port, AE Titles) are arguments
+to the individual tools.
+
+```bash
+# Claude Code
+claude mcp add dcm-dicom -- dcm mcp
+```
+
+```jsonc
+// Claude Desktop — claude_desktop_config.json
+{
+  "mcpServers": {
+    "dcm-dicom": { "command": "dcm", "args": ["mcp"] }
+  }
+}
+```
+
+It reads and writes JSON-RPC on stdin/stdout and is meant to be launched by the
+client, not run by hand. `dcm_send` reports the same found/sent/acknowledged
+accounting as the CLI and flags a shortfall as an error; pass `dryRun` to plan
+without connecting.
+
 ## Why it behaves the way it does
 
 Every item here is something that bit me.

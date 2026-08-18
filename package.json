@@ -44,12 +44,16 @@
     "c-store",
     "c-echo",
     "c-find",
-    "cli"
+    "cli",
+    "mcp",
+    "model-context-protocol"
   ],
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dcmjs": "^0.50.3",
-    "dcmjs-dimse": "^0.3.3"
+    "dcmjs-dimse": "^0.3.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",

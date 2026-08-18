@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+An MCP server, a desktop app, and two robustness fixes.
+
+- **`dcm mcp`** runs a Model Context Protocol server over stdio so an assistant
+  (Claude Code, Claude Desktop) can drive DICOM operations as tools:
+  `dcm_echo`, `dcm_inventory`, `dcm_query`, `dcm_tags`, `dcm_send`, `dcm_anon`,
+  `dcm_edit`. It reuses the CLI engine — each tool runs the real command and
+  captures its output — so there is no second DIMSE implementation to drift.
+  Output capture happens at the single `log` chokepoint so it never pollutes the
+  JSON-RPC channel. `claude mcp add dcm-dicom -- dcm mcp`.
+- **Desktop app** (`desktop/`): an Electron front end that reuses the engine
+  verbatim by spawning `bin/dcm.js` through Electron's own Node. Screens for
+  echo, send (with a live transfer report), a start/stop receiver, query,
+  inventory, tags, edit and de-identify — each showing the exact `dcm` command
+  it runs. Builds to Windows/macOS/Linux installers via a new workflow.
+- **Fixed** an EPIPE crash: piping report output into a reader that closes early
+  (`dcm info | head`, quitting a pager) raised an unhandled `write EPIPE` and a
+  stack trace. A closed downstream pipe now exits quietly.
+- **Fixed** an install failure on a Windows profile that has never had a user
+  PATH: `GetValueKind('Path')` throws on a missing value, which would crash the
+  install on exactly the clean machine it is most likely to run on. Both the
+  one-line installer and `dcm install` now treat that as an empty PATH.
+- Stripped a UTF-8 BOM from `package.json` (it broke strict JSON readers such as
+  electron-builder's).
+
 ## v0.3.1
 
 No code signing, so the friction from not signing is handled instead.
