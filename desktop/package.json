@@ -1,7 +1,7 @@
 {
   "name": "newlumen-dcm-desktop",
   "productName": "NewLumen DICOM",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "Desktop app for the NewLumen DICOM CLI Agent — echo, inventory, send, receive, query, tags, edit and de-identify, with a live transfer report.",
   "author": "NewLumen",

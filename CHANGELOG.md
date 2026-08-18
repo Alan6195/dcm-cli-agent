@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0
 
 An MCP server, a desktop app, and two robustness fixes.
 
