@@ -1,0 +1,93 @@
+{
+  "name": "newlumen-dcm-desktop",
+  "productName": "NewLumen DICOM",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Desktop app for the NewLumen DICOM CLI Agent — echo, inventory, send, receive, query, tags, edit and de-identify, with a live transfer report.",
+  "author": "NewLumen",
+  "license": "MIT",
+  "repository": "https://github.com/Alan6195/dcm-cli-agent",
+  "main": "main.js",
+  "scripts": {
+    "copy-engine": "node copy-engine.js",
+    "prestart": "node copy-engine.js",
+    "start": "electron .",
+    "predist": "node copy-engine.js",
+    "dist": "electron-builder",
+    "predist:win": "node copy-engine.js",
+    "dist:win": "electron-builder --win",
+    "predist:mac": "node copy-engine.js",
+    "dist:mac": "electron-builder --mac",
+    "predist:linux": "node copy-engine.js",
+    "dist:linux": "electron-builder --linux",
+    "prepack": "node copy-engine.js",
+    "pack": "electron-builder --dir"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "dcmjs": "^0.50.3",
+    "dcmjs-codecs": "^0.0.8",
+    "dcmjs-dimse": "^0.3.3"
+  },
+  "overrides": {
+    "adm-zip": "^0.6.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.newlumen.dcm.desktop",
+    "productName": "NewLumen DICOM",
+    "copyright": "Copyright © NewLumen",
+    "asar": false,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "engine/**/*",
+      "build/**/*",
+      "node_modules/**/*",
+      "!**/*.map",
+      "!test/**",
+      "!engine/test/**",
+      "!engine/tools/**"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "artifactName": "NewLumen-DICOM-${version}-${arch}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NewLumen DICOM"
+    },
+    "portable": {
+      "artifactName": "NewLumen-DICOM-${version}-${arch}-portable.${ext}"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] }
+      ],
+      "category": "public.app-category.medical",
+      "artifactName": "NewLumen-DICOM-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] }
+      ],
+      "category": "Science",
+      "artifactName": "NewLumen-DICOM-${version}-${arch}.${ext}"
+    }
+  }
+}

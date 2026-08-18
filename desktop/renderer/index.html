@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>NewLumen DICOM</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">◈</div>
+        <div class="brand-text">
+          <div class="brand-name">NEWLUMEN</div>
+          <div class="brand-sub">DICOM</div>
+        </div>
+      </div>
+
+      <div class="nav-group-label">Connectivity</div>
+      <button class="nav-item active" data-view="echo">
+        <span class="nav-ico">◎</span> Test connection
+      </button>
+      <button class="nav-item" data-view="send">
+        <span class="nav-ico">▲</span> Send a study
+      </button>
+      <button class="nav-item" data-view="receive">
+        <span class="nav-ico">▼</span> Receive images
+      </button>
+      <button class="nav-item" data-view="query">
+        <span class="nav-ico">⌕</span> Query a peer
+      </button>
+
+      <div class="nav-group-label">Local files</div>
+      <button class="nav-item" data-view="inventory">
+        <span class="nav-ico">▤</span> Inventory
+      </button>
+      <button class="nav-item" data-view="tags">
+        <span class="nav-ico">≣</span> Inspect tags
+      </button>
+      <button class="nav-item" data-view="edit">
+        <span class="nav-ico">✎</span> Edit tags
+      </button>
+      <button class="nav-item" data-view="anon">
+        <span class="nav-ico">⦸</span> De-identify
+      </button>
+
+      <div class="sidebar-footer">
+        <div id="engine-version">engine …</div>
+        <div class="sidebar-hint">Every action runs the real <code>dcm</code> command.</div>
+      </div>
+    </nav>
+
+    <!-- Main -->
+    <main class="content">
+
+      <!-- ECHO -->
+      <section class="view active" id="view-echo">
+        <header class="view-head">
+          <h1>Test a connection</h1>
+          <p>C-ECHO — is the peer there, and does it accept your AE Title? Nothing is sent.</p>
+        </header>
+        <div class="conn-host" data-conn></div>
+        <div class="form-row">
+          <label>Timeout (ms)<input type="number" id="echo-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run C-ECHO</button>
+        </div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- SEND -->
+      <section class="view" id="view-send">
+        <header class="view-head">
+          <h1>Send a study</h1>
+          <p>C-STORE a folder to a peer, then report exactly what was acknowledged. A partial transfer is a failure.</p>
+        </header>
+        <div class="form-row">
+          <label class="grow">Folder to send
+            <div class="path-pick">
+              <input type="text" id="send-folder" placeholder="Choose a folder of DICOM files…" />
+              <button class="btn ghost" data-pick="send-folder" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+        <div class="conn-host" data-conn></div>
+        <div class="form-row triple">
+          <label>Chunk size<input type="number" id="send-chunk" placeholder="200" min="1" /></label>
+          <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
+          <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="send-dryrun" checked /> Dry run first (scan &amp; plan, no connection)</label>
+          <label><input type="checkbox" id="send-norecurse" /> Don't recurse into subfolders</label>
+          <label><input type="checkbox" id="send-rewrite" /> Rewrite Series UIDs <span class="warn-inline">(changes your data)</span></label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="totals" data-totals hidden></div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- RECEIVE -->
+      <section class="view" id="view-receive">
+        <header class="view-head">
+          <h1>Receive images</h1>
+          <p>Run a permissive receiver (C-STORE SCP) that accepts everything and logs what arrives.</p>
+        </header>
+        <div class="form-row triple">
+          <label>Port<input type="number" id="scp-port" placeholder="11112" min="1" max="65535" /></label>
+          <label>Our AE Title<input type="text" id="scp-ae" placeholder="any" maxlength="16" /></label>
+          <label>Stop ack after (test)<input type="number" id="scp-rejectafter" placeholder="off" min="1" /></label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Save arriving images to
+            <div class="path-pick">
+              <input type="text" id="scp-persist" placeholder="(optional) acknowledge and discard if empty" />
+              <button class="btn ghost" data-pick="scp-persist" data-pick-mode="create">Browse…</button>
+              <button class="btn ghost" data-reveal="scp-persist">Open</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Only accept these calling AE Titles
+            <input type="text" id="scp-accept" placeholder="(optional) comma-separated allowlist" />
+          </label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Start receiver</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap tall"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- QUERY -->
+      <section class="view" id="view-query">
+        <header class="view-head">
+          <h1>Query a peer</h1>
+          <p>C-FIND. Note: a peer can accept your images and still return zero matches — storing and indexing are different.</p>
+        </header>
+        <div class="conn-host" data-conn></div>
+        <div class="form-row">
+          <div class="level-row">
+            <span class="level-label">Level</span>
+            <label><input type="radio" name="find-level" value="study" checked /> Study</label>
+            <label><input type="radio" name="find-level" value="series" /> Series</label>
+            <label><input type="radio" name="find-level" value="image" /> Image</label>
+            <label><input type="radio" name="find-level" value="mwl" /> Worklist</label>
+            <label class="limit-inline">Limit<input type="number" id="find-limit" placeholder="all" min="1" /></label>
+          </div>
+        </div>
+        <div class="kv-block">
+          <div class="kv-label">Matching keys <span class="dim">(DICOM keyword = value; wildcards * ? and date ranges allowed)</span></div>
+          <div id="find-keys" class="kv-rows"></div>
+          <button class="btn ghost small" id="find-addkey">+ Add key</button>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run C-FIND</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="result-table" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- INVENTORY -->
+      <section class="view" id="view-inventory">
+        <header class="view-head">
+          <h1>Inventory a folder</h1>
+          <p>Reads metadata only (stops before pixel data), so it's fast on big trees. Sends nothing.</p>
+        </header>
+        <div class="form-row">
+          <label class="grow">Folder or file
+            <div class="path-pick">
+              <input type="text" id="info-folder" placeholder="Choose a folder or a .dcm file…" />
+              <button class="btn ghost" data-pick="info-folder" data-pick-mode="folder">Browse…</button>
+              <button class="btn ghost" data-pick="info-folder" data-pick-mode="file">File…</button>
+            </div>
+          </label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="info-series" checked /> Break down per series (flags colliding Series UIDs)</label>
+          <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Inventory</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="inventory-result" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
+      </section>
+
+      <!-- TAGS -->
+      <section class="view" id="view-tags">
+        <header class="view-head">
+          <h1>Inspect DICOM tags</h1>
+          <p>Dump the tags in a file or folder. Reads metadata only and never prints pixel data.</p>
+        </header>
+        <div class="form-row">
+          <label class="grow">File or folder
+            <div class="path-pick">
+              <input type="text" id="tags-target" placeholder="Choose a folder or a .dcm file…" />
+              <button class="btn ghost" data-pick="tags-target" data-pick-mode="folder">Browse…</button>
+              <button class="btn ghost" data-pick="tags-target" data-pick-mode="file">File…</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Filter <span class="dim">(keyword, tag or value; /regex/ allowed)</span><input type="text" id="tags-filter" placeholder="e.g. Patient" /></label>
+          <label class="grow">Has value<input type="text" id="tags-value" placeholder="e.g. DOE^JANE" /></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="tags-private" /> Private / unrecognised tags only</label>
+          <label><input type="checkbox" id="tags-all" /> Every file (default: one per series)</label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Dump tags</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="tags-result" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
+      </section>
+
+      <!-- EDIT -->
+      <section class="view" id="view-edit">
+        <header class="view-head">
+          <h1>Edit tags</h1>
+          <p>Change or remove tags and write the result to a new folder. The source is never touched from here.</p>
+        </header>
+        <div class="form-row">
+          <label class="grow">Source file or folder
+            <div class="path-pick">
+              <input type="text" id="edit-target" placeholder="Choose the source…" />
+              <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Browse…</button>
+              <button class="btn ghost" data-pick="edit-target" data-pick-mode="file">File…</button>
+            </div>
+          </label>
+        </div>
+        <div class="kv-block">
+          <div class="kv-label">Set tags <span class="dim">(Keyword or (gggg,eeee) = value)</span></div>
+          <div id="edit-sets" class="kv-rows"></div>
+          <button class="btn ghost small" id="edit-addset">+ Set a tag</button>
+        </div>
+        <div class="kv-block">
+          <div class="kv-label">Remove tags</div>
+          <div id="edit-removes" class="kv-rows"></div>
+          <button class="btn ghost small" id="edit-addremove">+ Remove a tag</button>
+        </div>
+        <div class="form-row">
+          <label class="grow">Write copies to
+            <div class="path-pick">
+              <input type="text" id="edit-out" placeholder="Destination folder…" />
+              <button class="btn ghost" data-pick="edit-out" data-pick-mode="create">Browse…</button>
+              <button class="btn ghost" data-reveal="edit-out">Open</button>
+            </div>
+          </label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="edit-dryrun" checked /> Dry run (show what would change, write nothing)</label>
+          <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(--force; can split a study)</span></label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run edit</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- ANON -->
+      <section class="view" id="view-anon">
+        <header class="view-head">
+          <h1>De-identify a folder</h1>
+          <p>Copy a folder with identifiers removed and UIDs remapped. The source is never modified.</p>
+        </header>
+        <div class="caution">
+          <strong>Best-effort, not certified.</strong> It does not read pixel data, so burned-in
+          annotations survive, and identifiers inside nested sequences (SR, presentation states) can
+          survive. Always inspect a sample before sharing anything this produces.
+        </div>
+        <div class="form-row">
+          <label class="grow">Folder to de-identify
+            <div class="path-pick">
+              <input type="text" id="anon-folder" placeholder="Choose the source folder…" />
+              <button class="btn ghost" data-pick="anon-folder" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Write the de-identified copy to
+            <div class="path-pick">
+              <input type="text" id="anon-out" placeholder="Destination folder (must be outside the source)…" />
+              <button class="btn ghost" data-pick="anon-out" data-pick-mode="create">Browse…</button>
+              <button class="btn ghost" data-reveal="anon-out">Open</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label>Pseudonym prefix<input type="text" id="anon-prefix" placeholder="ANON" /></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="anon-keepdesc" /> Keep study/series descriptions</label>
+          <label><input type="checkbox" id="anon-keepprivate" /> Keep private tags</label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>De-identify</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
