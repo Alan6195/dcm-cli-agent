@@ -92,6 +92,10 @@ function isInteractive() {
  * @returns {Promise<number>} Exit code.
  */
 async function main(argv) {
+  // A reader that closes the pipe early (`dcm info | head`, quitting a pager)
+  // must not end in an EPIPE stack trace. Installed before any output.
+  log.installStreamGuards();
+
   const parsed = tokenize(argv);
   const { flags, positionals } = parsed;
 

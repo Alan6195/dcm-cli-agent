@@ -107,11 +107,17 @@ function readUserPath() {
   // are interpolated instead. `DoNotExpandEnvironmentNames` matters too: without
   // it, an existing `%USERPROFILE%` style entry would be read back expanded and
   // then written out hard-coded.
+  // A user profile that has never had a user PATH has no Path value under
+  // HKCU\Environment at all. GetValueKind throws on a missing value rather
+  // than reporting its absence, so a bare `GetValueKind('Path')` would crash
+  // the install on exactly the clean machine this is most likely to run on.
+  // Treat "no value" as an empty String-kind PATH, which is what we then
+  // create.
   const script = `
     $ErrorActionPreference = 'Stop'
     $key = Get-Item -Path 'HKCU:\\Environment'
     $value = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-    $kind = $key.GetValueKind('Path')
+    try { $kind = $key.GetValueKind('Path') } catch { $kind = 'String' }
     [Console]::Out.Write("$kind\`n$value")
   `;
   const out = execFileSync(

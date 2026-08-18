@@ -108,7 +108,11 @@ try {
         # setx is deliberately avoided: it truncates at 1024 characters, which
         # is a well-known way to destroy someone's PATH.
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-        $kind = $key.GetValueKind('Path')
+        # A profile that has never had a user PATH has no Path value at all, and
+        # GetValueKind throws on a missing value rather than reporting it. Treat
+        # that as an empty String-kind PATH — the clean-machine case this is most
+        # likely to run on.
+        try { $kind = $key.GetValueKind('Path') } catch { $kind = 'String' }
         $current = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
 
         $entries = @($current -split ';' | Where-Object { $_.Trim() -ne '' })

@@ -65,6 +65,39 @@ function isVerbose() {
   return level >= LEVELS.debug;
 }
 
+/**
+ * Stops a closed output pipe from crashing the process.
+ *
+ * When output is piped into a reader that quits early — `dcm info | head`,
+ * `dcm tags | more` then `q`, a scrolled-and-closed pager — the OS tears the
+ * pipe down and the next write to it raises EPIPE. Node turns an unhandled
+ * write error on a stream into a thrown 'error' event, so a perfectly ordinary
+ * "I've seen enough" ends in a stack trace that looks like the tool broke.
+ *
+ * A broken downstream pipe is not this tool's failure and there is nothing to
+ * report to a reader that has already gone away, so EPIPE (and the related
+ * ERR_STREAM_DESTROYED / EBADF) is swallowed and the process exits quietly.
+ * Any other stream error is re-thrown so genuine problems still surface.
+ *
+ * Idempotent: safe to call more than once.
+ */
+let guardsInstalled = false;
+function installStreamGuards() {
+  if (guardsInstalled) return;
+  guardsInstalled = true;
+
+  const quietPipeErrors = new Set(['EPIPE', 'ERR_STREAM_DESTROYED', 'EBADF']);
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', (err) => {
+      if (quietPipeErrors.has(err?.code)) {
+        // The reader is gone. Nothing left to say; leave quietly.
+        process.exit(process.exitCode ?? 0);
+      }
+      throw err;
+    });
+  }
+}
+
 /** Report output. Goes to stdout because it is the product of the command. */
 function out(msg = '') {
   process.stdout.write(`${msg}\n`);
@@ -160,6 +193,7 @@ function attachLibraryLogger(dimseLog) {
 
 module.exports = {
   configure,
+  installStreamGuards,
   isVerbose,
   out,
   info,
