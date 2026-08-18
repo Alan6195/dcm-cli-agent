@@ -47,6 +47,11 @@
         <span class="nav-ico">⦸</span> De-identify
       </button>
 
+      <div class="nav-group-label">Assistant</div>
+      <button class="nav-item" data-view="mcp">
+        <span class="nav-ico">✦</span> Connect to Claude
+      </button>
+
       <div class="sidebar-footer">
         <div id="engine-version">engine …</div>
         <div class="sidebar-hint">Every action runs the real <code>dcm</code> command.</div>
@@ -320,6 +325,52 @@
           <span class="status-chip" data-status hidden></span>
         </div>
         <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- MCP / CONNECT TO CLAUDE -->
+      <section class="view" id="view-mcp">
+        <header class="view-head">
+          <h1>Connect to Claude</h1>
+          <p>Let Claude (or any MCP client) drive these DICOM operations as tools, using the same engine this app runs.</p>
+        </header>
+
+        <div class="mcp-status" id="mcp-status">
+          <span class="dot"></span><span id="mcp-status-text">Checking whether <code>dcm</code> is on your PATH…</span>
+        </div>
+
+        <div class="section-title">Claude Code (terminal)</div>
+        <p class="mcp-note">Run this once. It registers the server so Claude Code can call it.</p>
+        <div class="copy-box" data-copy="claude mcp add dcm-dicom -- dcm mcp">
+          <code>claude mcp add dcm-dicom -- dcm mcp</code>
+          <button class="btn ghost small">Copy</button>
+        </div>
+
+        <div class="section-title">Claude Desktop</div>
+        <p class="mcp-note">Add this to your <code>claude_desktop_config.json</code> (Settings → Developer → Edit Config), then restart Claude.</p>
+        <div class="copy-box block" data-copy='{
+  "mcpServers": {
+    "dcm-dicom": { "command": "dcm", "args": ["mcp"] }
+  }
+}'>
+          <pre>{
+  "mcpServers": {
+    "dcm-dicom": { "command": "dcm", "args": ["mcp"] }
+  }
+}</pre>
+          <button class="btn ghost small">Copy</button>
+        </div>
+
+        <div class="section-title">What Claude can then do</div>
+        <div class="tool-grid">
+          <div class="tool-card"><b>dcm_echo</b> Test a peer connection (C-ECHO).</div>
+          <div class="tool-card"><b>dcm_inventory</b> Inventory a folder — studies, series, sizes.</div>
+          <div class="tool-card"><b>dcm_query</b> Query a peer (C-FIND).</div>
+          <div class="tool-card"><b>dcm_tags</b> Inspect DICOM tags.</div>
+          <div class="tool-card"><b>dcm_send</b> Send a study (C-STORE), with found/sent/acknowledged accounting.</div>
+          <div class="tool-card"><b>dcm_anon</b> De-identify a folder.</div>
+          <div class="tool-card"><b>dcm_edit</b> Change or remove tags into a new folder.</div>
+        </div>
+        <p class="mcp-note dim">Requires <code>dcm</code> installed and on your PATH (the same command this app uses). If <code>claude mcp add</code> isn't found, install Claude Code first.</p>
       </section>
 
     </main>

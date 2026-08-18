@@ -727,6 +727,72 @@ function wirePickers() {
 }
 
 // --------------------------------------------------------------------------
+// Copy affordances + MCP screen
+// --------------------------------------------------------------------------
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flash(el, cls = 'copied') {
+  el.classList.add(cls);
+  setTimeout(() => el.classList.remove(cls), 1100);
+}
+
+function wireCopy() {
+  // Click a command preview to copy the command.
+  document.addEventListener('click', async (e) => {
+    const cmd = e.target.closest('.cmd-preview');
+    if (cmd && cmd.textContent.trim()) {
+      if (await copyText(cmd.textContent.replace(/^\$\s*/, ''))) flash(cmd);
+      return;
+    }
+    const box = e.target.closest('.copy-box');
+    if (box) {
+      const text = box.getAttribute('data-copy') || '';
+      if (await copyText(text)) {
+        const btn = box.querySelector('.btn');
+        if (btn) { const t = btn.textContent; btn.textContent = 'Copied'; flash(btn); setTimeout(() => (btn.textContent = t), 1100); }
+      }
+    }
+  });
+}
+
+async function checkMcpStatus() {
+  // Probe whether `dcm mcp` is runnable from PATH by asking the engine (which we
+  // already run) for its version; if that works, the same command backs `dcm mcp`.
+  const el = $('#mcp-status');
+  const txt = $('#mcp-status-text');
+  try {
+    if (state.info && state.info.version) {
+      el.className = 'mcp-status ok';
+      txt.innerHTML = `Ready — this app runs engine <code>v${esc(state.info.version)}</code>. Once <code>dcm</code> is on your PATH, the commands below connect Claude to it.`;
+    } else {
+      el.className = 'mcp-status bad';
+      txt.textContent = 'Engine not detected.';
+    }
+  } catch {
+    el.className = 'mcp-status bad';
+    txt.textContent = 'Engine not detected.';
+  }
+}
+
+/** Ctrl/Cmd+Enter runs the active view's primary action. */
+function wireKeyboard() {
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const active = $('.view.active');
+      const run = active && active.querySelector('[data-run]:not([disabled])');
+      if (run) { run.click(); e.preventDefault(); }
+    }
+  });
+}
+
+// --------------------------------------------------------------------------
 // Boot
 // --------------------------------------------------------------------------
 async function boot() {
@@ -747,6 +813,9 @@ async function boot() {
   wireEdit();
   wireAnon();
   wirePickers();
+  wireCopy();
+  wireKeyboard();
+  checkMcpStatus();
 
   updateAllPreviews();
 }

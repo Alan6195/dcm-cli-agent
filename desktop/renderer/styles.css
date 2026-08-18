@@ -308,3 +308,39 @@ td.mono, th.mono { font-family: var(--mono); }
 
 .raw-toggle { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 4px 0; margin-bottom: 8px; }
 .empty-note { color: var(--text-dim); padding: 12px 0; }
+
+/* ---------------- MCP / Connect ---------------- */
+.mcp-status {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 9px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px;
+}
+.mcp-status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); flex: none; }
+.mcp-status.ok .dot { background: var(--green); box-shadow: 0 0 10px var(--green); }
+.mcp-status.bad .dot { background: var(--amber); }
+.mcp-note { color: var(--text-dim); margin: 0 0 10px; font-size: 12.5px; line-height: 1.5; }
+.mcp-note code, .mcp-status code { color: var(--text); background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
+
+.copy-box {
+  display: flex; align-items: center; gap: 10px; justify-content: space-between;
+  background: #0a0f18; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 7px; padding: 10px 12px; margin-bottom: 18px;
+}
+.copy-box code, .copy-box pre { font-family: var(--mono); font-size: 12.5px; color: var(--accent); margin: 0; user-select: text; white-space: pre; overflow-x: auto; }
+.copy-box.block { align-items: flex-start; }
+.copy-box .btn { flex: none; }
+
+.tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+.tool-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 11px 14px; font-size: 12.5px; color: var(--text-dim); line-height: 1.45;
+}
+.tool-card b { color: var(--accent); font-family: var(--mono); font-size: 12px; display: block; margin-bottom: 2px; }
+
+/* Click-to-copy affordance on command previews */
+.cmd-preview { cursor: pointer; position: relative; }
+.cmd-preview.copied::after {
+  content: "copied"; position: absolute; right: 10px; top: 8px;
+  color: var(--green); font-size: 11px; font-family: var(--sans);
+}
+.btn.copied { color: var(--green) !important; border-color: var(--green) !important; }

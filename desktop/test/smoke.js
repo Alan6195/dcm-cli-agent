@@ -12,7 +12,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const VIEWS = ['echo', 'send', 'receive', 'query', 'inventory', 'tags', 'edit', 'anon'];
+const VIEWS = ['echo', 'send', 'receive', 'query', 'inventory', 'tags', 'edit', 'anon', 'mcp'];
 
 function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
