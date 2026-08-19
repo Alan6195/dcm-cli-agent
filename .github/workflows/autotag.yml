@@ -1,0 +1,74 @@
+name: Auto-tag
+
+# Pushing a version bump to master IS the release action. This workflow tags
+# that commit vX.Y.Z and starts the release builds, so cutting a release is:
+# bump both package.json versions (plus both lockfiles), update the CHANGELOG,
+# commit, push. No manual tagging step to forget.
+#
+# Two deliberate details:
+# - Tags pushed with the default GITHUB_TOKEN do not trigger other workflows
+#   (GitHub's recursion guard), so this workflow starts release.yml and
+#   desktop.yml itself via workflow_dispatch at the new tag — the documented
+#   exception to that guard.
+# - The old manual flow (`git tag vX.Y.Z && git push origin vX.Y.Z`) still
+#   works exactly as before; when the tag already exists this workflow stands
+#   down.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: autotag
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch the release workflows
+
+jobs:
+  tag:
+    name: tag on version bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether this push is a release
+        id: decide
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          DESKTOP="$(node -p "require('./desktop/package.json').version")"
+          # The CLI and the desktop app release together under one tag, and
+          # the desktop version feeds latest.yml — the update feed. Refusing
+          # to tag a half-bumped tree here means the mistake is caught before
+          # anything is published, not after.
+          if [ "$VERSION" != "$DESKTOP" ]; then
+            echo "::error::package.json says $VERSION but desktop/package.json says $DESKTOP. Bump both (and both lockfiles) before releasing."
+            exit 1
+          fi
+          if git ls-remote --tags --exit-code origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION is already tagged; this push is not a release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag the release
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          TAG="v${{ steps.decide.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tagged $TAG at $(git rev-parse --short HEAD)"
+
+      - name: Start the release builds
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.decide.outputs.version }}"
+          gh workflow run release.yml --repo "${{ github.repository }}" --ref "$TAG" -f tag="$TAG"
+          gh workflow run desktop.yml --repo "${{ github.repository }}" --ref "$TAG"
+          echo "dispatched release.yml and desktop.yml at $TAG"

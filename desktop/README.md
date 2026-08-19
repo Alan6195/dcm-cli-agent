@@ -61,7 +61,9 @@ npm run dist:linux   # Linux: AppImage (x64)
 Output lands in `release/`. Builds are per-OS: Windows installers must be built
 on Windows, macOS on macOS. The included GitHub Actions workflow
 (`.github/workflows/desktop.yml`) builds all three on a tag and attaches them to
-the release.
+the release. The tag itself is cut by CI: when a version bump lands on master,
+`.github/workflows/autotag.yml` tags it and starts the release builds, so a
+release is just "bump versions, update CHANGELOG, push".
 
 Like the CLI binaries, the installers are **not code-signed**. Windows
 SmartScreen will warn on first run (*More info → Run anyway*); macOS will need

@@ -50,6 +50,12 @@ The desktop app updates itself, announces itself properly, and got a face.
   profiles, which live in the app's user-data folder, not the install folder.
 - Fixed a corrupted `--text-faint` color value in the app stylesheet that
   made the declaration invalid CSS.
+- **Releases are cut by CI.** Pushing a version bump to master now tags the
+  commit and starts the release builds — the tag step that was easy to forget
+  (and once produced binaries reporting the wrong version) no longer exists
+  as a manual step. The auto-tagger refuses a half-bumped tree where the CLI
+  and desktop versions disagree, and stands down when the tag already exists,
+  so the old manual `git tag` flow still works.
 - Note for this release only: v0.6.0 is the first build that carries the
   updater, so it has to be installed by hand once. Every release after it
   arrives through the app.
