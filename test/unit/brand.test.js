@@ -41,7 +41,7 @@ test('the banner degrades to plain text when output is not a terminal', () => {
   // A banner full of escape sequences in a redirected log helps nobody.
   const plain = brand.banner('0.2.0');
   assert.equal(plain, strip(plain), 'must contain no ANSI escapes');
-  assert.match(plain, /NewLumen/);
+  assert.match(plain, /Asteris/);
   assert.match(plain, /0\.2\.0/);
 });
 

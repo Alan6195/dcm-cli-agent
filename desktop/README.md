@@ -1,4 +1,4 @@
-# NewLumen DICOM — desktop app
+# Asteris DICOM — desktop app
 
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,

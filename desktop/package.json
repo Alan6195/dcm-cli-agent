@@ -1,10 +1,10 @@
 {
-  "name": "newlumen-dcm-desktop",
-  "productName": "NewLumen DICOM",
+  "name": "asteris-dcm-desktop",
+  "productName": "Asteris DICOM",
   "version": "0.4.0",
   "private": true,
-  "description": "Desktop app for the NewLumen DICOM CLI Agent — echo, inventory, send, receive, query, tags, edit and de-identify, with a live transfer report.",
-  "author": "NewLumen",
+  "description": "Desktop app for the Asteris DICOM CLI Agent \u2014 echo, inventory, send, receive, worklist, tags, edit and de-identify, with a live transfer report.",
+  "author": "Asteris",
   "license": "MIT",
   "repository": "https://github.com/Alan6195/dcm-cli-agent",
   "main": "main.js",
@@ -37,10 +37,13 @@
     "electron-builder": "^25.1.8"
   },
   "build": {
-    "appId": "com.newlumen.dcm.desktop",
-    "productName": "NewLumen DICOM",
-    "copyright": "Copyright © NewLumen",
-    "asar": false,
+    "appId": "com.asteris.dcm.desktop",
+    "productName": "Asteris DICOM",
+    "copyright": "Copyright \u00a9 Asteris",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/dcmjs-codecs/build/*.wasm"
+    ],
     "files": [
       "main.js",
       "preload.js",
@@ -59,10 +62,20 @@
     },
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
-      "artifactName": "NewLumen-DICOM-${version}-${arch}-setup.${ext}"
+      "artifactName": "Asteris-DICOM-${version}-${arch}-setup.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -70,24 +83,35 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "NewLumen DICOM"
+      "shortcutName": "Asteris DICOM"
     },
     "portable": {
-      "artifactName": "NewLumen-DICOM-${version}-${arch}-portable.${ext}"
+      "artifactName": "Asteris-DICOM-${version}-${arch}-portable.${ext}"
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ],
       "category": "public.app-category.medical",
-      "artifactName": "NewLumen-DICOM-${version}-${arch}.${ext}"
+      "artifactName": "Asteris-DICOM-${version}-${arch}.${ext}"
     },
     "linux": {
       "target": [
-        { "target": "AppImage", "arch": ["x64"] }
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "category": "Science",
-      "artifactName": "NewLumen-DICOM-${version}-${arch}.${ext}"
+      "artifactName": "Asteris-DICOM-${version}-${arch}.${ext}"
     }
   }
 }

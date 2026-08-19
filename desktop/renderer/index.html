@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
-  <title>NewLumen DICOM</title>
+  <title>Asteris DICOM</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -14,7 +14,7 @@
       <div class="brand">
         <div class="brand-mark">◈</div>
         <div class="brand-text">
-          <div class="brand-name">NEWLUMEN</div>
+          <div class="brand-name">ASTERIS</div>
           <div class="brand-sub">DICOM</div>
         </div>
       </div>
@@ -31,6 +31,9 @@
       </button>
       <button class="nav-item" data-view="query">
         <span class="nav-ico">⌕</span> Query a peer
+      </button>
+      <button class="nav-item" data-view="worklist">
+        <span class="nav-ico">▦</span> Worklist (MWL)
       </button>
 
       <div class="nav-group-label">Local files</div>
@@ -176,6 +179,45 @@
         </div>
         <div class="result-table" data-result hidden></div>
         <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- WORKLIST (MWL) -->
+      <section class="view" id="view-worklist">
+        <header class="view-head">
+          <h1>Modality Worklist</h1>
+          <p>Test an MWL SCP the way a modality would: ask it what's scheduled. Sends a C-FIND at worklist level; changes nothing.</p>
+        </header>
+        <div class="conn-host" data-conn></div>
+
+        <div class="section-title">Scheduled for</div>
+        <div class="chip-row" id="mwl-when">
+          <button class="chip active" data-when="today">Today</button>
+          <button class="chip" data-when="tomorrow">Tomorrow</button>
+          <button class="chip" data-when="week">Next 7 days</button>
+          <button class="chip" data-when="any">Any date</button>
+          <button class="chip" data-when="custom">Custom…</button>
+          <input type="text" id="mwl-date" class="chip-input" placeholder="YYYYMMDD or YYYYMMDD-YYYYMMDD" hidden />
+        </div>
+
+        <div class="form-row triple">
+          <label>Modality<input type="text" id="mwl-modality" placeholder="any — e.g. CT, DX, US" maxlength="16" /></label>
+          <label>Scheduled station AE<input type="text" id="mwl-station" placeholder="any — e.g. CT01" maxlength="16" /></label>
+          <label>Limit<input type="number" id="mwl-limit" placeholder="all" min="1" /></label>
+        </div>
+        <div class="form-row triple">
+          <label>Patient name<input type="text" id="mwl-patientname" placeholder="any — DOE^JANE, wildcards ok" /></label>
+          <label>Patient ID<input type="text" id="mwl-patientid" placeholder="any" /></label>
+          <label>Accession<input type="text" id="mwl-accession" placeholder="any" /></label>
+        </div>
+
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Fetch worklist</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="result-table" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
+        <p class="mcp-note dim">Scheduling fields are sent inside the Scheduled Procedure Step Sequence, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty.</p>
       </section>
 
       <!-- INVENTORY -->

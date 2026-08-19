@@ -309,6 +309,20 @@ td.mono, th.mono { font-family: var(--mono); }
 .raw-toggle { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 4px 0; margin-bottom: 8px; }
 .empty-note { color: var(--text-dim); padding: 12px 0; }
 
+/* ---------------- Chips (worklist date presets) ---------------- */
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+.chip {
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 20px; padding: 7px 15px; cursor: pointer; font-size: 12.5px;
+  transition: all 0.12s;
+}
+.chip:hover { color: var(--text); border-color: var(--border-2); }
+.chip.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.chip-input { width: 250px; }
+
+/* Worklist result emphasis */
+td.when { color: var(--accent); font-family: var(--mono); white-space: nowrap; }
+
 /* ---------------- MCP / Connect ---------------- */
 .mcp-status {
   display: flex; align-items: center; gap: 10px;

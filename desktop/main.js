@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * NewLumen DICOM — Electron main process.
+ * Asteris DICOM — Electron main process.
  *
  * The whole point of this app is to put a friendly face on the existing CLI
  * engine without forking it. Every action the UI takes runs the exact same
@@ -87,7 +87,7 @@ function createWindow() {
     minWidth: 940,
     minHeight: 620,
     backgroundColor: '#0e1420',
-    title: 'NewLumen DICOM',
+    title: 'Asteris DICOM',
     icon: process.platform === 'linux'
       ? path.join(__dirname, 'build', 'icon.png')
       : undefined,
@@ -224,10 +224,23 @@ app.whenReady().then(() => {
 
   // Headless verification. Guarded by env; a normal launch never enters here.
   if (process.env.DCM_SMOKE_DIR && mainWindow) {
-    mainWindow.webContents.once('did-finish-load', () => {
-      const { runSmoke } = require('./test/smoke');
-      runSmoke(mainWindow, app);
-    });
+    const startSmoke = () => {
+      try {
+        require('./test/smoke').runSmoke(mainWindow, app);
+      } catch (err) {
+        // The harness is not shipped in packaged builds. Say so loudly rather
+        // than leaving the process alive and looking like a hang.
+        process.stderr.write(`smoke harness unavailable: ${err.message}\n`);
+        app.exit(3);
+      }
+    };
+    // A packaged app can finish loading from the asar archive before this
+    // listener is attached, so waiting on did-finish-load alone would hang.
+    if (mainWindow.webContents.isLoadingMainFrame()) {
+      mainWindow.webContents.once('did-finish-load', startSmoke);
+    } else {
+      startSmoke();
+    }
   }
 
   app.on('activate', () => {

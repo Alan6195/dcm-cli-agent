@@ -43,6 +43,15 @@ Examples:
   dcm find --host pacs.example.org --port 11112 --called-ae ARCHIVE --study StudyDate=20260101-20260131
   dcm find --host pacs.example.org --port 11112 --called-ae ARCHIVE --series StudyInstanceUID=1.2.840...
   dcm find --host pacs.example.org --port 11112 --called-ae WORKLIST --mwl Modality=CT
+  dcm find --host pacs.example.org --port 11112 --called-ae WORKLIST --mwl ScheduledStationAETitle=CT01 ScheduledProcedureStepStartDate=20260819
+
+Modality Worklist:
+  Modality, ScheduledStationAETitle, ScheduledProcedureStepStartDate/Time,
+  ScheduledProcedureStepDescription/ID/Status and ScheduledPerformingPhysicianName
+  belong inside the Scheduled Procedure Step Sequence, not at the top level.
+  Give them as ordinary key=value pairs and they are placed there for you, and
+  the scheduling fields in the answer are flattened back out for reading. This
+  is the usual reason a hand-built worklist query returns nothing at all.
 
 Note: a peer that accepted your images may still return zero matches for them.
 Storing and indexing are different operations, and store-and-forward receivers
@@ -66,18 +75,41 @@ const DEFAULT_KEYS = {
     'SOPClassUID', 'InstanceNumber',
   ],
   mwl: [
-    'PatientName', 'PatientID', 'AccessionNumber', 'Modality',
-    'ScheduledProcedureStepStartDate', 'ScheduledProcedureStepStartTime',
-    'ScheduledStationAETitle', 'RequestedProcedureDescription',
+    'PatientName', 'PatientID', 'PatientBirthDate', 'PatientSex',
+    'AccessionNumber', 'StudyInstanceUID',
+    'RequestedProcedureDescription', 'RequestedProcedureID',
   ],
 };
+
+/**
+ * Worklist keys that live inside the Scheduled Procedure Step Sequence.
+ *
+ * This is the part of a Modality Worklist query people most often get wrong.
+ * Modality, the scheduled station and the scheduled start date/time are not
+ * top-level attributes — they are inside ScheduledProcedureStepSequence
+ * (0040,0100). Some SCPs are lenient and answer a flat query anyway; a
+ * conformant one either ignores the matching (returning the whole worklist) or
+ * returns nothing at all, which looks like "the worklist is empty" rather than
+ * "the query was malformed". So the sequence is built properly, and a matching
+ * key naming one of these is routed into it automatically.
+ */
+const MWL_SPS_KEYS = [
+  'Modality',
+  'ScheduledStationAETitle',
+  'ScheduledProcedureStepStartDate',
+  'ScheduledProcedureStepStartTime',
+  'ScheduledProcedureStepDescription',
+  'ScheduledPerformingPhysicianName',
+  'ScheduledProcedureStepID',
+  'ScheduledProcedureStepStatus',
+];
 
 /** Columns printed per level, in order. */
 const COLUMNS = {
   study: ['PatientName', 'PatientID', 'StudyDate', 'ModalitiesInStudy', 'NumberOfStudyRelatedInstances', 'StudyDescription', 'StudyInstanceUID'],
   series: ['SeriesNumber', 'Modality', 'NumberOfSeriesRelatedInstances', 'SeriesDescription', 'SeriesInstanceUID'],
   image: ['InstanceNumber', 'SOPInstanceUID'],
-  mwl: ['PatientName', 'PatientID', 'Modality', 'ScheduledProcedureStepStartDate', 'ScheduledProcedureStepStartTime', 'RequestedProcedureDescription'],
+  mwl: ['PatientName', 'PatientID', 'AccessionNumber', 'Modality', 'ScheduledProcedureStepStartDate', 'ScheduledProcedureStepStartTime', 'ScheduledStationAETitle', 'RequestedProcedureDescription'],
 };
 
 /**
@@ -91,8 +123,51 @@ const COLUMNS = {
 function buildIdentifier(level, pairs) {
   const elements = {};
   for (const key of DEFAULT_KEYS[level]) elements[key] = '';
+
+  if (level === 'mwl') {
+    // Request the whole Scheduled Procedure Step Sequence, with each key
+    // present but empty so the peer returns it.
+    const sps = {};
+    for (const key of MWL_SPS_KEYS) sps[key] = '';
+    for (const [key, value] of pairs) {
+      if (MWL_SPS_KEYS.includes(key)) sps[key] = value;
+      else elements[key] = value;
+    }
+    elements.ScheduledProcedureStepSequence = [sps];
+    return elements;
+  }
+
   for (const [key, value] of pairs) elements[key] = value;
   return elements;
+}
+
+/**
+ * Lifts Scheduled Procedure Step fields to the top level of a worklist match.
+ *
+ * The scheduling information a person actually wants to read — modality, when,
+ * which station — arrives nested one level down. Flattening it here keeps the
+ * table and the JSON flat, which is what every consumer of this output wants.
+ * Top-level values already present are never overwritten.
+ *
+ * @param {Record<string, unknown>} elements
+ * @returns {Record<string, unknown>}
+ */
+function flattenWorklistMatch(elements) {
+  const sequence = elements.ScheduledProcedureStepSequence;
+  if (!Array.isArray(sequence) || sequence.length === 0) return elements;
+
+  const flattened = { ...elements };
+  delete flattened.ScheduledProcedureStepSequence;
+
+  // A step can legitimately appear more than once. The first is the scheduled
+  // one in practice; anything beyond it is kept so nothing is silently lost.
+  const [first, ...rest] = sequence;
+  for (const [key, value] of Object.entries(first || {})) {
+    if (key.startsWith('_')) continue;
+    if (flattened[key] === undefined || flattened[key] === '') flattened[key] = value;
+  }
+  if (rest.length) flattened.AdditionalScheduledSteps = String(rest.length);
+  return flattened;
 }
 
 /**
@@ -194,7 +269,7 @@ async function run(parsed) {
     if (statusLib.classify(status) === statusLib.Class.PENDING) {
       if (!response.hasDataset()) return;
       const elements = response.getDataset().getElements();
-      matches.push(elements);
+      matches.push(level === 'mwl' ? flattenWorklistMatch(elements) : elements);
 
       if (limit && matches.length >= limit && !cancelled) {
         cancelled = true;
@@ -278,4 +353,4 @@ async function run(parsed) {
   return 0;
 }
 
-module.exports = { run, USAGE, buildIdentifier, display };
+module.exports = { run, USAGE, buildIdentifier, display, flattenWorklistMatch, MWL_SPS_KEYS };

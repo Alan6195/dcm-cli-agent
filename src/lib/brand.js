@@ -16,7 +16,7 @@ const log = require('./log');
  * sequences in a log file helps nobody.
  */
 
-const PRODUCT = 'NewLumen';
+const PRODUCT = 'Asteris';
 const TOOL = 'DICOM CLI Agent';
 const TAGLINE = 'DICOM network operations for folders of DICOM files';
 
@@ -48,7 +48,7 @@ function banner(version) {
   // Padding must be measured on the plain text. Colouring first and then
   // padding counts the ANSI escape bytes as visible characters, which is why
   // hand-tuned banner widths drift the moment the version string changes.
-  const wordmark = '  ◈ N E W L U M E N';
+  const wordmark = '  ◈ A S T E R I S';
   const subtitle = `  ${TOOL} · v${version}`;
 
   const row = (plain, paint) =>

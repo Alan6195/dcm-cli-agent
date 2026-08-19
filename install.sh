@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Installs the NewLumen DICOM CLI Agent (dcm) for the current user.
+# Installs the Asteris DICOM CLI Agent (dcm) for the current user.
 #
 # Downloads the latest release binary for this platform, verifies it against the
 # published SHA256SUMS.txt, and installs it to ~/.local/bin. Nothing is written
@@ -20,7 +20,7 @@ step() { printf '\033[36m  %s\033[0m\n' "$1"; }
 die()  { printf '\033[31m  error: %s\033[0m\n' "$1" >&2; exit 1; }
 
 echo
-cyan "  NewLumen DICOM CLI Agent - installer"
+cyan "  Asteris DICOM CLI Agent - installer"
 echo
 
 # --- Which binary does this machine need? ------------------------------------

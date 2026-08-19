@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * NewLumen DICOM — renderer.
+ * Asteris DICOM — renderer.
  *
  * No Node here. Everything goes through window.dcm (see preload.js). Each view
  * builds the exact `dcm` argument vector a person would type, shows it, and
@@ -505,6 +505,122 @@ function wireQuery() {
 }
 
 // --------------------------------------------------------------------------
+// View: WORKLIST (MWL)
+// --------------------------------------------------------------------------
+/** Local YYYYMMDD, offset by whole days. DICOM dates are local, not UTC. */
+function dicomDate(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+}
+
+/** The date-matching value for the selected preset, or '' for any. */
+function mwlDateValue() {
+  const active = $('#mwl-when .chip.active');
+  const when = active ? active.dataset.when : 'today';
+  if (when === 'today') return dicomDate(0);
+  if (when === 'tomorrow') return dicomDate(1);
+  // A DICOM date range is inclusive on both ends.
+  if (when === 'week') return `${dicomDate(0)}-${dicomDate(7)}`;
+  if (when === 'custom') return $('#mwl-date').value.trim();
+  return '';
+}
+
+BUILDERS.worklist = () => {
+  const argv = ['find', ...connArgs(), '--mwl'];
+  const limit = $('#mwl-limit').value.trim();
+  if (limit) argv.push('--limit', limit);
+
+  // Scheduling keys go in as ordinary pairs; the engine routes them into the
+  // Scheduled Procedure Step Sequence where a conformant SCP expects them.
+  const date = mwlDateValue();
+  if (date) argv.push(`ScheduledProcedureStepStartDate=${date}`);
+  const pairs = [
+    ['Modality', $('#mwl-modality').value.trim()],
+    ['ScheduledStationAETitle', $('#mwl-station').value.trim()],
+    ['PatientName', $('#mwl-patientname').value.trim()],
+    ['PatientID', $('#mwl-patientid').value.trim()],
+    ['AccessionNumber', $('#mwl-accession').value.trim()],
+  ];
+  for (const [k, v] of pairs) if (v) argv.push(`${k}=${v}`);
+  return argv;
+};
+
+/** Renders worklist matches as a scheduling table. */
+function renderWorklist(json) {
+  const box = $('#view-worklist [data-result]');
+  const matches = Array.isArray(json?.matches) ? json.matches : [];
+  box.hidden = false;
+
+  if (!matches.length) {
+    box.innerHTML =
+      '<div class="empty-note">No scheduled procedures matched.<br>' +
+      'That can be a genuinely empty worklist, a date with nothing scheduled, ' +
+      'or an AE Title the SCP does not answer for. Try <b>Any date</b> with no ' +
+      'other filters to see whether the SCP returns anything at all.</div>';
+    return;
+  }
+
+  const fmtTime = (t) => {
+    const s = String(t || '').replace(/[^0-9]/g, '');
+    if (s.length < 4) return s || '';
+    return `${s.slice(0, 2)}:${s.slice(2, 4)}`;
+  };
+  const fmtDate = (d) => {
+    const s = String(d || '');
+    return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
+  };
+
+  const rows = matches.map((m) => `<tr>
+      <td class="when">${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
+      <td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>
+      <td>${esc(m.PatientName || '')}</td>
+      <td class="mono">${esc(m.PatientID || '')}</td>
+      <td class="mono">${esc(m.AccessionNumber || '')}</td>
+      <td>${esc(m.ScheduledStationAETitle || '')}</td>
+      <td>${esc(m.RequestedProcedureDescription || m.ScheduledProcedureStepDescription || '')}</td>
+    </tr>`).join('');
+
+  box.innerHTML =
+    `<div class="section-title">${matches.length} scheduled procedure(s)</div>` +
+    '<table><thead><tr><th>Scheduled</th><th>Modality</th><th>Patient</th><th>Patient ID</th>' +
+    '<th>Accession</th><th>Station AE</th><th>Procedure</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+function wireWorklist() {
+  for (const chip of $$('#mwl-when .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#mwl-when .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      $('#mwl-date').hidden = chip.dataset.when !== 'custom';
+      updateAllPreviews();
+    });
+  }
+  ['mwl-date', 'mwl-modality', 'mwl-station', 'mwl-limit', 'mwl-patientname', 'mwl-patientid', 'mwl-accession']
+    .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+
+  $('#view-worklist [data-run]').addEventListener('click', async () => {
+    const miss = connMissing();
+    $('#view-worklist [data-result]').hidden = true;
+    const c = consoleEl('worklist'); c.hidden = true; c.textContent = '';
+    if (miss.length) {
+      appendConsole('worklist', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr');
+      return;
+    }
+    setStatus('worklist', 'running', 'Fetching…');
+    const { code, stdout, stderr } = await runCapture('worklist', [...BUILDERS.worklist(), '--json']);
+    setStatus('worklist', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
+    try {
+      renderWorklist(JSON.parse(stdout));
+    } catch {
+      appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+    }
+  });
+}
+
+// --------------------------------------------------------------------------
 // View: INVENTORY (info)
 // --------------------------------------------------------------------------
 BUILDERS.inventory = () => {
@@ -808,6 +924,7 @@ async function boot() {
   wireSend();
   wireReceive();
   wireQuery();
+  wireWorklist();
   wireInventory();
   wireTags();
   wireEdit();
