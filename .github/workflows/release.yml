@@ -16,6 +16,7 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -114,6 +115,7 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -183,6 +185,7 @@ jobs:
     name: publish to npm
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # `npm publish --provenance` signs the package with a build attestation so
     # anyone can verify it came from this repository and this workflow. That
     # needs an OIDC token, and job-level permissions replace the workflow-level

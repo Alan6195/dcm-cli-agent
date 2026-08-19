@@ -17,6 +17,9 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    # A full build takes ~10 minutes; a v0.6.0 release run sat for 45+ on a
+    # hung apt mirror. Fail fast instead — a re-run costs minutes.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -57,8 +60,11 @@ jobs:
           fi
 
       # Linux needs a couple of libraries for electron-builder's AppImage step.
+      # This installs in seconds; the step timeout is for the apt mirror hang
+      # that once held a release hostage for the better part of an hour.
       - name: Linux build deps
         if: runner.os == 'Linux'
+        timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools
 
       - name: Install desktop dependencies
@@ -102,6 +108,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/') || inputs.publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
