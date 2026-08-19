@@ -203,9 +203,6 @@ function createWindow(opts = {}) {
     show: !withSplash,
     backgroundColor: '#0e1420',
     title: 'Asteris DICOM App',
-    icon: process.platform === 'linux'
-      ? path.join(__dirname, 'build', 'icon.png')
-      : undefined,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -325,10 +322,10 @@ function cancelRun(_event, runId) {
 //
 // Two tiers, because not every build of this app can replace itself:
 //
-//  - The installed Windows app (NSIS) and the Linux AppImage self-update via
-//    electron-updater against the GitHub release feed: check on launch,
-//    download in the background, swap on "Restart & update" — or silently on
-//    the next normal quit if the button is never clicked.
+//  - The installed Windows app (NSIS) self-updates via electron-updater
+//    against the GitHub release feed: check on launch, download in the
+//    background, swap on "Restart & update" — or silently on the next normal
+//    quit if the button is never clicked.
 //  - The Windows portable exe has no install to replace, and the unsigned
 //    macOS build cannot swap itself (Squirrel.Mac requires a code signature).
 //    Those get a notify-only check against the GitHub API and a button that
@@ -355,10 +352,8 @@ function setUpdateState(next) {
 function selfUpdateSupported() {
   if (!app.isPackaged) return false;
   // The portable launcher sets this; a portable exe has no install to update.
-  if (process.platform === 'win32') return !process.env.PORTABLE_EXECUTABLE_DIR;
-  // AppImage sets this; an unpacked Linux build has nothing to swap.
-  if (process.platform === 'linux') return !!process.env.APPIMAGE;
-  return false;
+  // macOS (unsigned) can't swap itself, and there is no Linux build.
+  return process.platform === 'win32' && !process.env.PORTABLE_EXECUTABLE_DIR;
 }
 
 function isNewerVersion(remote, local) {

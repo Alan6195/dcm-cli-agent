@@ -11,7 +11,6 @@ command-line tool. Every asset below is labelled with which one it belongs to.
   it never updates itself.
 - **macOS:** pick the `.dmg` for your chip — `arm64` for Apple Silicon, `x64`
   for Intel.
-- **Linux:** the `.AppImage`. Mark it executable and run it.
 
 The `latest*.yml` and `*.blockmap` files are metadata the app's auto-updater
 reads. They have to stay attached to the release, but you never need to

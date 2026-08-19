@@ -28,8 +28,6 @@ jobs:
             label: windows
           - os: macos-latest
             label: macos
-          - os: ubuntu-latest
-            label: linux
 
     steps:
       - uses: actions/checkout@v4
@@ -59,14 +57,6 @@ jobs:
             exit 1
           fi
 
-      # Linux needs a couple of libraries for electron-builder's AppImage step.
-      # This installs in seconds; the step timeout is for the apt mirror hang
-      # that once held a release hostage for the better part of an hour.
-      - name: Linux build deps
-        if: runner.os == 'Linux'
-        timeout-minutes: 5
-        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
-
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm install
@@ -93,7 +83,7 @@ jobs:
           # glob is for the updater feed (latest*.yml); builder-debug.yml is an
           # electron-builder internal dump that must not reach the release page.
           find release -maxdepth 1 -type f ! -name 'builder-debug.yml' \
-            \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.blockmap' -o -name '*.yml' \) \
+            \( -name '*.exe' -o -name '*.dmg' -o -name '*.blockmap' -o -name '*.yml' \) \
             -exec cp {} out/ \; || true
           ls -la out
 
@@ -145,7 +135,6 @@ jobs:
               *-portable.exe)         echo "App — Windows portable, no install ($1)" ;;
               *arm64*.dmg)            echo "App — macOS Apple Silicon ($1)" ;;
               *x64*.dmg)              echo "App — macOS Intel ($1)" ;;
-              *.AppImage)             echo "App — Linux AppImage ($1)" ;;
               latest*.yml|*.blockmap) echo "App auto-update metadata — leave attached ($1)" ;;
               *)                      echo "" ;;
             esac

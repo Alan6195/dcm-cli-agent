@@ -18,8 +18,6 @@
     "dist:win": "electron-builder --win",
     "predist:mac": "node copy-engine.js",
     "dist:mac": "electron-builder --mac",
-    "predist:linux": "node copy-engine.js",
-    "dist:linux": "electron-builder --linux",
     "prepack": "node copy-engine.js",
     "pack": "electron-builder --dir"
   },
@@ -107,18 +105,6 @@
         }
       ],
       "category": "public.app-category.medical",
-      "artifactName": "Asteris-DICOM-App-${version}-${arch}.${ext}"
-    },
-    "linux": {
-      "target": [
-        {
-          "target": "AppImage",
-          "arch": [
-            "x64"
-          ]
-        }
-      ],
-      "category": "Science",
       "artifactName": "Asteris-DICOM-App-${version}-${arch}.${ext}"
     }
   }

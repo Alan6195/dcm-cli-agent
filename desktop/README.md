@@ -55,12 +55,11 @@ DIMSE code and the one WebAssembly codec module come along automatically.
 npm run dist         # build for the current OS
 npm run dist:win     # Windows: NSIS installer + portable .exe (x64)
 npm run dist:mac     # macOS: .dmg (arm64 + x64)
-npm run dist:linux   # Linux: AppImage (x64)
 ```
 
 Output lands in `release/`. Builds are per-OS: Windows installers must be built
 on Windows, macOS on macOS. The included GitHub Actions workflow
-(`.github/workflows/desktop.yml`) builds all three on a tag and attaches them to
+(`.github/workflows/desktop.yml`) builds both on a tag and attaches them to
 the release. The tag itself is cut by CI: when a version bump lands on master,
 `.github/workflows/autotag.yml` tags it and starts the release builds, so a
 release is just "bump versions, update CHANGELOG, push".
@@ -72,7 +71,7 @@ later step if this goes past the support team.
 
 ## Updates
 
-The installed Windows app and the Linux AppImage keep themselves current.
+The installed Windows app keeps itself current.
 On launch (and every few hours after) the app checks the GitHub release feed,
 downloads a newer version in the background, and shows **Restart & update** in
 the sidebar. Clicking it installs silently and relaunches. If you never click

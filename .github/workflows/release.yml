@@ -155,7 +155,6 @@ jobs:
               *-portable.exe)         echo "App — Windows portable, no install ($1)" ;;
               *arm64*.dmg)            echo "App — macOS Apple Silicon ($1)" ;;
               *x64*.dmg)              echo "App — macOS Intel ($1)" ;;
-              *.AppImage)             echo "App — Linux AppImage ($1)" ;;
               latest*.yml|*.blockmap) echo "App auto-update metadata — leave attached ($1)" ;;
               *)                      echo "" ;;
             esac

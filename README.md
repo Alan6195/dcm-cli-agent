@@ -96,10 +96,10 @@ people on the team who won't touch a terminal. Every screen builds the real
 does can never drift apart. Download the installer for your platform from
 [releases](https://github.com/Alan6195/dcm-cli-agent/releases/latest) (assets
 are labeled "App — …" to tell them apart from the CLI binaries). The
-installed Windows app and the Linux AppImage keep themselves up to date from
-the same releases page; the macOS and portable builds tell you when a new
-version is out and take you there instead — unsigned apps can't swap
-themselves. Details in [desktop/README.md](desktop/README.md).
+installed Windows app keeps itself up to date from the same releases page;
+the macOS and portable builds tell you when a new version is out and take
+you there instead — unsigned apps can't swap themselves. Details in
+[desktop/README.md](desktop/README.md).
 
 ## Not sure where to start?
 
