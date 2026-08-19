@@ -1,9 +1,23 @@
-# Asteris DICOM — desktop app
+# Asteris DICOM App
 
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,
 shows it, and runs it. Echo, Send (with a live transfer report), a Receiver you
 can start and stop, Query, Inventory, Tag inspector, Tag editor and De-identify.
+
+The product name is deliberately "Asteris DICOM App" — typing "asteris" into
+the Windows Start menu finds it, and the trailing "App" separates it from the
+`dcm` CLI when both are installed.
+
+Launch behavior worth knowing, all deliberate:
+
+- a splash appears immediately on launch, so a slow first start never looks
+  like a failed one; the main window takes over as soon as it has painted;
+- only one instance runs — launching it again fronts the existing window
+  instead of racing the first instance for profiles and receiver ports;
+- window size, position and maximized state are remembered across launches
+  (and reset if the monitor they were on is gone);
+- saved connection profiles survive updates and the v0.5 → v0.6 rename.
 
 ## Why it's built this way
 
@@ -54,11 +68,48 @@ SmartScreen will warn on first run (*More info → Run anyway*); macOS will need
 `xattr -d com.apple.quarantine` on the .app or a right-click → Open. Signing is a
 later step if this goes past the support team.
 
+## Updates
+
+The installed Windows app and the Linux AppImage keep themselves current.
+On launch (and every few hours after) the app checks the GitHub release feed,
+downloads a newer version in the background, and shows **Restart & update** in
+the sidebar. Clicking it installs silently and relaunches. If you never click
+it, the downloaded update is applied on the next normal quit instead — either
+way you don't visit the releases page again.
+
+There's a **Check for updates** link under the engine version for when you
+don't want to wait out the timer, and after any update the next launch shows a
+one-time "Updated to vX.Y.Z" notice with a link to that release's notes — so a
+silent on-quit update never leaves you wondering which version you're on.
+
+The check and download happen through `electron-updater` against the
+`latest*.yml` metadata that the release workflow attaches next to the
+installers, and the download is verified against the SHA-512 recorded there
+before it is applied. That is the integrity check a code signature would
+otherwise provide.
+
+Two builds can't replace themselves, so they notify instead of updating:
+
+- the **portable exe** — there is no install to swap, so it shows the new
+  version with a button that opens the releases page;
+- **macOS** — Squirrel.Mac refuses to swap an unsigned app, so same behavior.
+  If the app is ever signed, flipping macOS to full self-update is only a
+  matter of removing the platform guard in `main.js`.
+
+Installing a newer setup exe by hand always works too: the NSIS installer
+uninstalls the previous version and installs over it. Connection profiles
+survive — they live in the per-user app-data folder, not the install folder.
+
+Dev runs (`npm start`) never check for updates; the updater only arms in a
+packaged app.
+
 ## Layout
 
 ```
-main.js            Electron main process: window, IPC, engine spawning, profiles
+main.js            Electron main process: window, IPC, engine spawning, profiles, updates
 preload.js         The only bridge the renderer gets (contextIsolation on)
 renderer/          The UI — index.html, styles.css, app.js (no framework, no build)
+renderer/splash.html  The launch splash (static HTML/CSS, no scripts)
+build/icon.png     App icon; electron-builder derives the .ico and .icns from it
 test/smoke.js      Headless screenshot/verification driver (env-guarded)
 ```

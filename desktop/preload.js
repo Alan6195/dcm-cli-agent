@@ -56,4 +56,22 @@ contextBridge.exposeInMainWorld('dcm', {
 
   /** Stop a running child by its runId. */
   cancel: (runId) => ipcRenderer.invoke('dcm:cancel', runId),
+
+  update: {
+    /** Current update state, for renderers that boot after an event fired. */
+    state: () => ipcRenderer.invoke('update:state'),
+    /** Trigger an immediate check; resolves {update, error?}. */
+    check: () => ipcRenderer.invoke('update:check'),
+    /** Quit and apply a downloaded update (self-updating builds only). */
+    install: () => ipcRenderer.invoke('update:install'),
+    /** Open the releases page, or a specific version's release notes. */
+    openReleases: (version) => ipcRenderer.invoke('update:open-releases', version),
+    /** The "you were just updated" notice, or null. */
+    whatsnew: () => ipcRenderer.invoke('update:whatsnew'),
+    whatsnewAck: () => ipcRenderer.invoke('update:whatsnew-ack'),
+    /** Subscribe to update state changes. */
+    onStatus: (cb) => {
+      ipcRenderer.on('update:status', (_event, state) => cb(state));
+    },
+  },
 });

@@ -1,9 +1,9 @@
 {
   "name": "asteris-dcm-desktop",
-  "productName": "Asteris DICOM",
-  "version": "0.5.0",
+  "productName": "Asteris DICOM App",
+  "version": "0.6.0",
   "private": true,
-  "description": "Desktop app for the Asteris DICOM CLI Agent \u2014 echo, inventory, send, receive, worklist, tags, edit and de-identify, with a live transfer report.",
+  "description": "Desktop app for the Asteris DICOM CLI Agent — echo, inventory, send, receive, worklist, tags, edit and de-identify, with a live transfer report.",
   "author": "Asteris",
   "license": "MIT",
   "repository": "https://github.com/Alan6195/dcm-cli-agent",
@@ -27,7 +27,8 @@
     "@anthropic-ai/sdk": "^0.115.0",
     "dcmjs": "^0.50.3",
     "dcmjs-codecs": "^0.0.8",
-    "dcmjs-dimse": "^0.3.3"
+    "dcmjs-dimse": "^0.3.3",
+    "electron-updater": "^6.8.9"
   },
   "overrides": {
     "adm-zip": "^0.6.0"
@@ -38,8 +39,15 @@
   },
   "build": {
     "appId": "com.asteris.dcm.desktop",
-    "productName": "Asteris DICOM",
-    "copyright": "Copyright \u00a9 Asteris",
+    "productName": "Asteris DICOM App",
+    "copyright": "Copyright © Asteris",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Alan6195",
+        "repo": "dcm-cli-agent"
+      }
+    ],
     "asar": true,
     "asarUnpack": [
       "node_modules/dcmjs-codecs/build/*.wasm"
@@ -75,7 +83,7 @@
           ]
         }
       ],
-      "artifactName": "Asteris-DICOM-${version}-${arch}-setup.${ext}"
+      "artifactName": "Asteris-DICOM-App-${version}-${arch}-setup.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -83,10 +91,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Asteris DICOM"
+      "shortcutName": "Asteris DICOM App"
     },
     "portable": {
-      "artifactName": "Asteris-DICOM-${version}-${arch}-portable.${ext}"
+      "artifactName": "Asteris-DICOM-App-${version}-${arch}-portable.${ext}"
     },
     "mac": {
       "target": [
@@ -99,7 +107,7 @@
         }
       ],
       "category": "public.app-category.medical",
-      "artifactName": "Asteris-DICOM-${version}-${arch}.${ext}"
+      "artifactName": "Asteris-DICOM-App-${version}-${arch}.${ext}"
     },
     "linux": {
       "target": [
@@ -111,7 +119,7 @@
         }
       ],
       "category": "Science",
-      "artifactName": "Asteris-DICOM-${version}-${arch}.${ext}"
+      "artifactName": "Asteris-DICOM-App-${version}-${arch}.${ext}"
     }
   }
 }

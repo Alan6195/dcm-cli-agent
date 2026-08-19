@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.6.0
+
+The desktop app updates itself, announces itself properly, and got a face.
+
+- **Desktop: in-app updates.** The installed Windows app and the Linux
+  AppImage check the GitHub release feed on launch, download a new version in
+  the background, and show a "Restart & update" button in the sidebar; the
+  install is silent and the app relaunches. If the button is never clicked,
+  the downloaded update is applied on the next normal quit, so simply using
+  the app keeps it current. The update is verified against the SHA-512 in the
+  release's `latest.yml` before it is applied — the integrity check the
+  missing code signature would otherwise give. A "Check for updates" link
+  skips the four-hour timer, and the first launch after any update shows a
+  one-time "Updated to vX.Y.Z" notice, so a silent on-quit update never
+  leaves you wondering which version you're on.
+- Builds that cannot replace themselves are told, not left behind: the
+  portable exe has no install to swap and the unsigned macOS build can't
+  self-update (Squirrel.Mac requires a signature), so those check the GitHub
+  API and show a button that opens the releases page instead.
+- **Renamed to "Asteris DICOM App".** Typing "asteris" in the Windows Start
+  menu now finds it, and the name distinguishes it from the `dcm` CLI. Saved
+  connection profiles are migrated from the old name's data folder
+  automatically.
+- **An actual icon.** Builds previously shipped the default Electron icon,
+  which made the app look anonymous exactly where the new name is supposed to
+  help — the Start menu. The ◈ mark, drawn as geometry at 1024px;
+  electron-builder derives the Windows and macOS formats from it.
+- **A splash screen on launch.** A packaged app pays for asar extraction and
+  first paint before anything appears, and that silent gap reads exactly like
+  "it didn't work". The splash appears immediately and hands over to the main
+  window when it has painted, with an 8-second fallback so a wedged renderer
+  still produces a window rather than an eternal splash.
+- **Single instance.** Launching the app twice now fronts the existing window
+  instead of starting a second copy that races the first for profile writes
+  and receiver ports.
+- Window size, position and maximized state are remembered across launches,
+  and forgotten if the display they were on is no longer connected.
+- Fixed the echo screen's missing status chip — every other screen showed
+  running/OK/failed next to its Run button; C-ECHO only ever showed console
+  text.
+- **Release assets are labeled.** The releases page now says which file is
+  the CLI and which is the App, per platform, instead of a bare filename
+  list — and the release body opens with a short "which file do I want"
+  guide. Both release workflows apply identical labels, so it holds no matter
+  which one creates the release.
+- Installing a newer setup exe by hand over an existing install keeps working
+  as before — the NSIS installer removes the previous version and preserves
+  profiles, which live in the app's user-data folder, not the install folder.
+- Fixed a corrupted `--text-faint` color value in the app stylesheet that
+  made the declaration invalid CSS.
+- Note for this release only: v0.6.0 is the first build that carries the
+  updater, so it has to be installed by hand once. Every release after it
+  arrives through the app.
+
 ## v0.5.0
 
 Transfer-syntax conversion, parallel sending, and a speed test.

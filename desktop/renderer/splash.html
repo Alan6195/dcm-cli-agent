@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!-- Static HTML + CSS only. No scripts, so script-src can be 'none'. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline';" />
+  <title>Asteris DICOM App</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0e1420;
+      color: #dce6f2;
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+      user-select: none;
+      cursor: default;
+      overflow: hidden;
+    }
+    .wrap {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      border: 1px solid #24344a;
+      box-sizing: border-box;
+    }
+    .mark {
+      font-size: 44px;
+      color: #22d3ee;
+      line-height: 1;
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.55; transform: scale(0.94); }
+    }
+    .name { font-size: 17px; font-weight: 650; letter-spacing: 0.16em; }
+    .name .dim { color: #8ba0ba; font-weight: 500; }
+    .bar {
+      width: 200px;
+      height: 3px;
+      border-radius: 2px;
+      background: #182436;
+      overflow: hidden;
+      position: relative;
+    }
+    .bar::after {
+      content: "";
+      position: absolute;
+      top: 0; left: -40%;
+      width: 40%; height: 100%;
+      border-radius: 2px;
+      background: #22d3ee;
+      animation: slide 1.2s ease-in-out infinite;
+    }
+    @keyframes slide {
+      0% { left: -40%; }
+      100% { left: 100%; }
+    }
+    .hint { font-size: 11.5px; color: #8ba0ba; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="mark">◈</div>
+    <div class="name">ASTERIS <span class="dim">DICOM APP</span></div>
+    <div class="bar"></div>
+    <div class="hint">Starting…</div>
+  </div>
+</body>
+</html>

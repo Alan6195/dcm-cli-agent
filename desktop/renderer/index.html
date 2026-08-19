@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
-  <title>Asteris DICOM</title>
+  <title>Asteris DICOM App</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -59,7 +59,19 @@
       </button>
 
       <div class="sidebar-footer">
+        <div id="update-banner" class="update-banner" hidden>
+          <div id="update-text"></div>
+          <button class="btn primary update-btn" id="update-action" hidden></button>
+        </div>
+        <div id="whatsnew-banner" class="update-banner" hidden>
+          <div id="whatsnew-text"></div>
+          <div class="banner-row">
+            <button class="btn ghost" id="whatsnew-open">What's new</button>
+            <button class="btn ghost" id="whatsnew-dismiss">Dismiss</button>
+          </div>
+        </div>
         <div id="engine-version">engine …</div>
+        <button class="linklike" id="update-check" hidden>Check for updates</button>
         <div class="sidebar-hint">Every action runs the real <code>dcm</code> command.</div>
       </div>
     </nav>
@@ -80,6 +92,7 @@
         <div class="cmd-preview" data-cmd></div>
         <div class="actions">
           <button class="btn primary" data-run>Run C-ECHO</button>
+          <span class="status-chip" data-status hidden></span>
         </div>
         <div class="console-wrap"><pre class="console" data-console></pre></div>
       </section>

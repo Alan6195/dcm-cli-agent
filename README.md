@@ -88,6 +88,19 @@ A few things worth knowing:
 - **macOS quarantines downloads.** The install script clears that for you. If
   you downloaded by hand, run `xattr -d com.apple.quarantine ./dcm`.
 
+## Prefer a window?
+
+The same engine ships as a desktop app — **Asteris DICOM App** — for the
+people on the team who won't touch a terminal. Every screen builds the real
+`dcm` command, shows it, and runs it, so what the app does and what the CLI
+does can never drift apart. Download the installer for your platform from
+[releases](https://github.com/Alan6195/dcm-cli-agent/releases/latest) (assets
+are labeled "App — …" to tell them apart from the CLI binaries). The
+installed Windows app and the Linux AppImage keep themselves up to date from
+the same releases page; the macOS and portable builds tell you when a new
+version is out and take you there instead — unsigned apps can't swap
+themselves. Details in [desktop/README.md](desktop/README.md).
+
 ## Not sure where to start?
 
 Just run `dcm` with no arguments. You get a menu that asks for what it needs and

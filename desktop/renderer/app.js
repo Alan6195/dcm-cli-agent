@@ -1311,6 +1311,98 @@ function wireKeyboard() {
 }
 
 // --------------------------------------------------------------------------
+// Updates
+// --------------------------------------------------------------------------
+/**
+ * Renders the update banner in the sidebar footer. Self-updating builds go
+ * idle -> downloading -> ready ("Restart & update"); builds that cannot swap
+ * themselves (portable exe, unsigned macOS) go idle -> available ("Download",
+ * which opens the releases page). Errors stay silent — a failed background
+ * check is not worth a banner.
+ */
+/** True on packaged builds, where the manual check link makes sense. */
+let updateCheckEligible = false;
+
+function renderUpdateState(s) {
+  const banner = $('#update-banner');
+  const text = $('#update-text');
+  const action = $('#update-action');
+  if (!banner || !s) return;
+
+  const label = s.version ? `v${s.version}` : 'update';
+  let visible = true;
+  if (s.status === 'downloading') {
+    action.hidden = true;
+    text.textContent = `Downloading ${label}… ${s.percent || 0}%`;
+  } else if (s.status === 'ready') {
+    text.textContent = `Update ${label} is ready.`;
+    action.textContent = 'Restart & update';
+    action.hidden = false;
+    action.onclick = () => window.dcm.update.install();
+  } else if (s.status === 'available') {
+    text.textContent = `${label} is available.`;
+    action.textContent = 'Download';
+    action.hidden = false;
+    action.onclick = () => window.dcm.update.openReleases();
+  } else {
+    visible = false;
+  }
+  banner.hidden = !visible;
+
+  // The check link and the banner are alternatives: the link hides while the
+  // banner is up and comes back reset whenever the banner goes away (say, a
+  // download failed), so there is always a live way to re-trigger a check.
+  const check = $('#update-check');
+  if (check && updateCheckEligible) {
+    check.hidden = visible;
+    if (!visible) {
+      check.disabled = false;
+      check.textContent = 'Check for updates';
+    }
+  }
+}
+
+async function wireUpdates() {
+  updateCheckEligible = Boolean(state.info.packaged);
+  window.dcm.update.onStatus(renderUpdateState);
+  renderUpdateState(await window.dcm.update.state());
+
+  // Manual "check now", so nobody has to wait out the 4-hour timer to know.
+  // Dev runs have no update source, so the link only appears when packaged.
+  const check = $('#update-check');
+  if (updateCheckEligible && check) {
+    check.addEventListener('click', async () => {
+      check.disabled = true;
+      check.textContent = 'Checking…';
+      const r = await window.dcm.update.check();
+      if (r && r.update) {
+        // The status events take over: the banner appears and
+        // renderUpdateState hides and resets this link.
+        return;
+      }
+      check.textContent = r && r.error ? 'Check failed — will retry later' : 'Up to date';
+      setTimeout(() => {
+        check.textContent = 'Check for updates';
+        check.disabled = false;
+      }, 4000);
+    });
+  }
+
+  // One-time "you were just updated" notice after a version change.
+  const wn = await window.dcm.update.whatsnew();
+  if (wn && wn.to) {
+    const banner = $('#whatsnew-banner');
+    $('#whatsnew-text').textContent = `Updated to v${wn.to}.`;
+    banner.hidden = false;
+    $('#whatsnew-open').addEventListener('click', () => window.dcm.update.openReleases(wn.to));
+    $('#whatsnew-dismiss').addEventListener('click', () => {
+      banner.hidden = true;
+      window.dcm.update.whatsnewAck();
+    });
+  }
+}
+
+// --------------------------------------------------------------------------
 // Boot
 // --------------------------------------------------------------------------
 async function boot() {
@@ -1335,6 +1427,7 @@ async function boot() {
   wirePickers();
   wireCopy();
   wireKeyboard();
+  wireUpdates();
   checkMcpStatus();
 
   updateAllPreviews();

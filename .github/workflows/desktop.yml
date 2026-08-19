@@ -37,6 +37,25 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      # The desktop version is load-bearing: it becomes the version in
+      # latest.yml, which is the sole input to the installed app's update decision. A tag on
+      # a commit where desktop/package.json was forgotten at the old number
+      # would publish a feed that says "no update" forever — with a green
+      # pipeline. The CLI release has this exact guard because it fired once.
+      - name: The app's version must match the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          EXPECTED="${TAG#desktop-}"
+          EXPECTED="${EXPECTED#v}"
+          ACTUAL="$(node -p "require('./desktop/package.json').version")"
+          echo "tag=$TAG expected=$EXPECTED actual=$ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Tag $TAG expects version $EXPECTED but desktop/package.json says $ACTUAL. The tag is probably on a commit older than the version bump. Shipping this would attach a latest.yml that tells every installed app there is no update."
+            exit 1
+          fi
+
       # Linux needs a couple of libraries for electron-builder's AppImage step.
       - name: Linux build deps
         if: runner.os == 'Linux'
@@ -48,7 +67,12 @@ jobs:
 
       - name: Build installers
         working-directory: desktop
-        run: npm run dist
+        # --publish never: with a publish block in package.json, electron-builder
+        # would otherwise try to upload to GitHub itself on a tag build and fail
+        # on the missing token. The update metadata (latest*.yml, blockmaps) is
+        # still written to release/ and attached by the release job below —
+        # that's the feed the in-app updater reads.
+        run: npm run dist -- --publish never
         env:
           # Never try to sign; there is no certificate and CSC_* being unset is
           # enough on macOS, but make the intent explicit.
@@ -59,8 +83,10 @@ jobs:
         working-directory: desktop
         run: |
           mkdir -p out
-          # Copy the distributable installers, not the unpacked tree.
-          find release -maxdepth 1 -type f \
+          # Copy the distributable installers, not the unpacked tree. The *.yml
+          # glob is for the updater feed (latest*.yml); builder-debug.yml is an
+          # electron-builder internal dump that must not reach the release page.
+          find release -maxdepth 1 -type f ! -name 'builder-debug.yml' \
             \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.blockmap' -o -name '*.yml' \) \
             -exec cp {} out/ \; || true
           ls -la out
@@ -79,6 +105,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The release body comes from a file in the repo, so the repo has to be
+      # checked out here. Checkout goes first: it cleans the workspace, which
+      # would wipe the downloaded artifacts if it ran after them.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -91,8 +122,44 @@ jobs:
         run: |
           cd artifacts
           ls -la
-          gh release create "$TAG" * \
+          # The release page shows an asset's label INSTEAD of its filename,
+          # so every label repeats the real filename in parentheses. gh takes
+          # 'path#label' on both create and upload. The mapping covers the
+          # CLI binaries too, so both workflows label identically no matter
+          # which one wins the race to create the release.
+          label_for() {
+            case "$1" in
+              dcm-windows-x64.exe)    echo "CLI — Windows x64 ($1)" ;;
+              dcm-macos-arm64)        echo "CLI — macOS Apple Silicon ($1)" ;;
+              dcm-macos-x64)          echo "CLI — macOS Intel ($1)" ;;
+              dcm-linux-x64)          echo "CLI — Linux x64 ($1)" ;;
+              SHA256SUMS.txt)         echo "Checksums for the CLI binaries ($1)" ;;
+              *-setup.exe)            echo "App — Windows installer, auto-updates ($1)" ;;
+              *-portable.exe)         echo "App — Windows portable, no install ($1)" ;;
+              *arm64*.dmg)            echo "App — macOS Apple Silicon ($1)" ;;
+              *x64*.dmg)              echo "App — macOS Intel ($1)" ;;
+              *.AppImage)             echo "App — Linux AppImage ($1)" ;;
+              latest*.yml|*.blockmap) echo "App auto-update metadata — leave attached ($1)" ;;
+              *)                      echo "" ;;
+            esac
+          }
+
+          assets=()
+          for f in *; do
+            label="$(label_for "$f")"
+            if [ -n "$label" ]; then
+              assets+=("$f#$label")
+            else
+              assets+=("$f")
+            fi
+          done
+
+          # --notes-file supplies the "which file do I want" guide as the
+          # body; --generate-notes then appends the generated changelog after
+          # it (the API prepends a supplied body to generated notes).
+          gh release create "$TAG" "${assets[@]}" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --generate-notes \
-            || gh release upload "$TAG" * --repo "${{ github.repository }}" --clobber
+            --notes-file "$GITHUB_WORKSPACE/.github/RELEASE_NOTES_HEADER.md" \
+            || gh release upload "$TAG" "${assets[@]}" --repo "${{ github.repository }}" --clobber

@@ -137,11 +137,47 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          gh release create "$TAG" artifacts/* \
+          # The release page shows an asset's label INSTEAD of its filename,
+          # so every label repeats the real filename in parentheses. gh takes
+          # 'path#label' on both create and upload. The mapping covers the
+          # desktop installers too, so both workflows label identically no
+          # matter which one wins the race to create the release.
+          label_for() {
+            case "$1" in
+              dcm-windows-x64.exe)    echo "CLI — Windows x64 ($1)" ;;
+              dcm-macos-arm64)        echo "CLI — macOS Apple Silicon ($1)" ;;
+              dcm-macos-x64)          echo "CLI — macOS Intel ($1)" ;;
+              dcm-linux-x64)          echo "CLI — Linux x64 ($1)" ;;
+              SHA256SUMS.txt)         echo "Checksums for the CLI binaries ($1)" ;;
+              *-setup.exe)            echo "App — Windows installer, auto-updates ($1)" ;;
+              *-portable.exe)         echo "App — Windows portable, no install ($1)" ;;
+              *arm64*.dmg)            echo "App — macOS Apple Silicon ($1)" ;;
+              *x64*.dmg)              echo "App — macOS Intel ($1)" ;;
+              *.AppImage)             echo "App — Linux AppImage ($1)" ;;
+              latest*.yml|*.blockmap) echo "App auto-update metadata — leave attached ($1)" ;;
+              *)                      echo "" ;;
+            esac
+          }
+
+          assets=()
+          for f in artifacts/*; do
+            label="$(label_for "$(basename "$f")")"
+            if [ -n "$label" ]; then
+              assets+=("$f#$label")
+            else
+              assets+=("$f")
+            fi
+          done
+
+          # --notes-file supplies the "which file do I want" guide as the
+          # body; --generate-notes then appends the generated changelog after
+          # it (the API prepends a supplied body to generated notes).
+          gh release create "$TAG" "${assets[@]}" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --generate-notes \
-            || gh release upload "$TAG" artifacts/* --repo "${{ github.repository }}" --clobber
+            --notes-file .github/RELEASE_NOTES_HEADER.md \
+            || gh release upload "$TAG" "${assets[@]}" --repo "${{ github.repository }}" --clobber
 
   npm:
     name: publish to npm
