@@ -12,7 +12,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const VIEWS = ['echo', 'send', 'receive', 'query', 'worklist', 'inventory', 'tags', 'edit', 'anon', 'mcp'];
+const VIEWS = ['echo', 'send', 'receive', 'query', 'worklist', 'speed', 'inventory', 'tags', 'edit', 'anon', 'mcp'];
 
 function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -82,6 +82,53 @@ async function runSmoke(win, app) {
       );
       fs.writeFileSync(path.join(outDir, 'send-console.txt'), consoleText || '');
       process.stdout.write(`send console bytes: ${(consoleText || '').length}\n`);
+    }
+
+    // Live speed test against a receiver started by the harness caller.
+    if (process.env.DCM_SMOKE_PEER_PORT && fixtures) {
+      const port = process.env.DCM_SMOKE_PEER_PORT;
+      await win.webContents.executeJavaScript(`
+        showView('speed');
+        document.querySelector('#speed-folder').value = ${JSON.stringify(fixtures)};
+        state.conn = { host: '127.0.0.1', port: '${port}', calledAe: 'SMOKE', callingAe: '' };
+        syncConnInputs();
+        document.querySelectorAll('.ts-opt')[1].checked = true;
+        document.querySelector('#view-speed [data-run]').click();
+        true
+      `);
+      await wait(20000);
+      await shot(win, outDir, 'speed-result');
+      const rows = await win.webContents.executeJavaScript(
+        `document.querySelectorAll('#view-speed [data-result] tbody tr').length`
+      );
+      process.stdout.write(`speed rows: ${rows}\n`);
+    }
+
+    // Live tag load + edit preview.
+    if (fixtures) {
+      await win.webContents.executeJavaScript(`
+        showView('edit');
+        document.querySelector('#edit-target').value = ${JSON.stringify(fixtures)};
+        document.querySelector('#edit-load').click();
+        true
+      `);
+      await wait(4000);
+      const tagCount = await win.webContents.executeJavaScript(
+        `document.querySelectorAll('#edit-grid .tag-row[data-kw]').length`
+      );
+      process.stdout.write(`editor tags: ${tagCount}\n`);
+      await win.webContents.executeJavaScript(`
+        const row = document.querySelector('.tag-row[data-kw="PatientID"] .tag-val');
+        row.value = 'TEST-999';
+        row.dispatchEvent(new Event('input', {bubbles:true}));
+        true
+      `);
+      await wait(400);
+      await shot(win, outDir, 'edit-loaded');
+      const cmd = await win.webContents.executeJavaScript(
+        `document.querySelector('#view-edit [data-cmd]').textContent`
+      );
+      process.stdout.write(`edit cmd: ${cmd}\n`);
     }
 
     process.stdout.write('smoke: OK\n');

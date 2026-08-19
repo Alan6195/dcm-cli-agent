@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.5.0
+
+Transfer-syntax conversion, parallel sending, and a speed test.
+
+- **`dcm send --transfer-syntax <ts>`** converts each instance to the requested
+  transfer syntax *before* it is sent, rather than only proposing it. This is
+  the distinction that matters: the library offers one presentation context of
+  [Implicit, Explicit, ...additional], so merely adding a syntax there gets the
+  study transcoded straight back to whatever the receiver picks first, and
+  nothing changes on the wire. Converting the dataset instead means the library
+  proposes a dedicated context for the converted syntax, and a peer that accepts
+  it receives exactly what was asked for. Measured on a 36-instance study: 98.6
+  KB on the wire as stored, 68.2 KB as RLE, 39.0 KB as JPEG 2000 — and the
+  receiver stores it in that syntax. Names or UIDs are accepted.
+- **`dcm send --parallel <n>`** runs up to 16 associations at once. C-STORE is
+  sequential inside one association, so concurrent associations are the only
+  honest way to make a transfer faster. Measured 4x on 160 instances (23.5s to
+  6.0s) with the accounting still exact. Default stays 1.
+- **`dcm send --json`** reports the outcome plus elapsed time, throughput, bytes
+  on disk, bytes on the wire and the negotiated syntaxes. `--label` tags a run.
+- Throughput is now printed under the ordinary transfer report too. It is
+  measured against bytes on disk rather than bytes on the wire, so compressing a
+  study does not flatter the number.
+- **`dcm scp`** now accepts the transfer syntax the sender proposed first — its
+  stated preference — instead of always forcing uncompressed. Forcing it made
+  the loopback receiver silently undo a deliberate conversion, which made
+  testing compressed transfer impossible. `--prefer-syntax` and
+  `--prefer-uncompressed` restore explicit control.
+- **Desktop: Speed test screen.** Compare transfer syntaxes, chunk sizes,
+  association counts, or just repeat a run. Every run gets its own calling AE
+  Title so the peer's ingress log can be read run by run.
+- **Desktop: rebuilt tag editor.** Load a study or a single file, edit values in
+  an inline grid, tick tags to remove, choose whether it applies to every
+  instance or just the loaded file, and preview before writing.
+- Byte statistics are captured after the socket closes rather than at
+  association release, where they were still zero.
+
 ## v0.4.0
 
 An MCP server, a desktop app, and two robustness fixes.

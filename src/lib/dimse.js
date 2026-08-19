@@ -39,6 +39,12 @@ const { constants } = dcmjsDimse;
  */
 
 /** Default watchdog timings, in milliseconds. */
+/**
+ * How long to wait after an association release for the socket to close, so
+ * that byte statistics are final before they are reported.
+ */
+const RELEASE_CLOSE_GRACE_MS = 400;
+
 const DEFAULT_TIMEOUTS = Object.freeze({
   /** TCP connect. Short: an unreachable host should fail fast. */
   connect: 15000,
@@ -117,6 +123,8 @@ function runAssociation(params) {
     let association;
     let client;
     let watchdog;
+    let releaseOutcome;
+    let releaseTimer;
     let lastActivity = Date.now();
 
     /**
@@ -127,6 +135,7 @@ function runAssociation(params) {
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
+      clearTimeout(releaseTimer);
       let statistics;
       try {
         statistics = client?.getStatistics?.();
@@ -190,13 +199,19 @@ function runAssociation(params) {
 
       client.on('associationReleased', () => {
         touch();
-        settle({
+        releaseOutcome = {
           kind: 'completed',
           label: 'Association completed',
           headline: 'The association was released normally.',
           retryable: false,
           raw: 'A-RELEASE-RP',
-        });
+        };
+        // Byte statistics are only final once the socket actually closes, and
+        // the close follows a release immediately. Waiting for it makes the
+        // throughput figures real instead of zero. A peer that holds the
+        // socket open must never stall the run, so this is a short grace
+        // period, not a dependency.
+        releaseTimer = setTimeout(() => settle(releaseOutcome), RELEASE_CLOSE_GRACE_MS);
       });
 
       client.on('networkError', (err) => {
@@ -218,6 +233,13 @@ function runAssociation(params) {
 
       // The library exposes both; either can be the last thing we hear.
       const onClosed = () => {
+        // The ordinary path: released, then closed. Settle with the completion
+        // recorded at release, now that the statistics are final.
+        if (releaseOutcome) {
+          settle(releaseOutcome);
+          return;
+        }
+
         // Reaching here unsettled means the socket closed without a release,
         // a rejection, an abort or an error. Treat it as a failure rather than
         // a completion: a silent close during a transfer is exactly how a

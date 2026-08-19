@@ -322,6 +322,10 @@ BUILDERS.send = () => {
   if (chunk) argv.push('--chunk', chunk);
   if (retry) argv.push('--retry', retry);
   if (timeout) argv.push('--timeout', timeout);
+  const syntax = $('#send-syntax').value;
+  if (syntax) argv.push('--transfer-syntax', syntax);
+  const parallel = $('#send-parallel').value.trim();
+  if (parallel && parallel !== '1') argv.push('--parallel', parallel);
   if ($('#send-dryrun').checked) argv.push('--dry-run');
   if ($('#send-norecurse').checked) argv.push('--no-recurse');
   if ($('#send-rewrite').checked) argv.push('--rewrite-series-uid');
@@ -355,8 +359,9 @@ function showTotals(t, ok) {
 }
 
 function wireSend() {
-  ['send-folder', 'send-chunk', 'send-retry', 'send-timeout'].forEach((id) =>
+  ['send-folder', 'send-chunk', 'send-retry', 'send-timeout', 'send-parallel'].forEach((id) =>
     $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#send-syntax').addEventListener('change', updateAllPreviews);
   ['send-dryrun', 'send-norecurse', 'send-rewrite'].forEach((id) =>
     $(`#${id}`).addEventListener('change', updateAllPreviews));
 
@@ -621,6 +626,240 @@ function wireWorklist() {
 }
 
 // --------------------------------------------------------------------------
+// View: SPEED TEST
+// --------------------------------------------------------------------------
+/** Which comparison the speed screen is set to run. */
+function speedMode() {
+  const active = $('#speed-mode .chip.active');
+  return active ? active.dataset.mode : 'syntax';
+}
+
+/**
+ * Builds the list of runs to perform.
+ *
+ * Each run carries its own calling AE Title so the peer's ingress log can be
+ * read per run rather than showing one indistinguishable stream. AE Titles are
+ * capped at 16 characters by DICOM, so the label is trimmed to fit rather than
+ * being silently truncated by the receiver.
+ */
+function speedRuns() {
+  const prefix = ($('#speed-aeprefix').value.trim() || 'AST').toUpperCase();
+  const baseChunk = $('#speed-chunk').value.trim();
+  const mode = speedMode();
+  const runs = [];
+
+  const ae = (tag, n) => {
+    const suffix = `-${String(n).padStart(2, '0')}`;
+    const room = 16 - prefix.length - suffix.length - 1;
+    const mid = room > 0 ? `-${tag.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, room)}` : '';
+    return `${prefix}${mid}${suffix}`.slice(0, 16);
+  };
+
+  if (mode === 'syntax') {
+    const chosen = $$('.ts-opt').filter((c) => c.checked);
+    chosen.forEach((c, i) => {
+      const label = c.value || 'as-stored';
+      runs.push({
+        label,
+        title: c.parentElement.textContent.trim(),
+        transferSyntax: c.value || null,
+        chunk: baseChunk,
+        callingAe: ae(c.value || 'STORED', i + 1),
+      });
+    });
+  } else if (mode === 'chunk') {
+    const sizes = $('#speed-chunks').value.split(',').map((s) => s.trim()).filter(Boolean);
+    sizes.forEach((size, i) => {
+      runs.push({
+        label: `chunk ${size}`,
+        title: `Chunk ${size}`,
+        transferSyntax: null,
+        chunk: size,
+        callingAe: ae(`C${size}`, i + 1),
+      });
+    });
+  } else if (mode === 'parallel') {
+    const counts = $('#speed-parallels').value.split(',').map((x) => x.trim()).filter(Boolean);
+    counts.forEach((n, i) => {
+      runs.push({
+        label: `parallel ${n}`,
+        title: `${n} association${n === '1' ? '' : 's'}`,
+        transferSyntax: null,
+        chunk: baseChunk,
+        parallel: n,
+        callingAe: ae(`P${n}`, i + 1),
+      });
+    });
+  } else {
+    const n = Math.max(1, Number($('#speed-repeats').value) || 3);
+    for (let i = 0; i < n; i++) {
+      runs.push({
+        label: `run ${i + 1}`,
+        title: `Run ${i + 1}`,
+        transferSyntax: null,
+        chunk: baseChunk,
+        callingAe: ae('RUN', i + 1),
+      });
+    }
+  }
+  return runs;
+}
+
+/** argv for a single speed run. */
+function speedArgv(run) {
+  const folder = $('#speed-folder').value.trim();
+  const argv = ['send'];
+  if (folder) argv.push(folder);
+  if (state.conn.host) argv.push('--host', state.conn.host);
+  if (state.conn.port) argv.push('--port', String(state.conn.port));
+  if (state.conn.calledAe) argv.push('--called-ae', state.conn.calledAe);
+  argv.push('--calling-ae', run.callingAe);
+  if (run.chunk) argv.push('--chunk', run.chunk);
+  if (run.transferSyntax) argv.push('--transfer-syntax', run.transferSyntax);
+  if (run.parallel && run.parallel !== '1') argv.push('--parallel', run.parallel);
+  argv.push('--label', run.label, '--json');
+  return argv;
+}
+
+BUILDERS.speed = () => {
+  const runs = speedRuns();
+  return runs.length ? speedArgv(runs[0]) : ['send'];
+};
+
+/** Renders the comparison table once runs have results. */
+function renderSpeedResults(results) {
+  const box = $('#view-speed [data-result]');
+  box.hidden = false;
+  const ok = results.filter((r) => r.data && r.data.ok);
+
+  if (!ok.length) {
+    box.innerHTML = '<div class="empty-note">No run completed successfully. The output below says why.</div>';
+    return;
+  }
+
+  const best = Math.max(...ok.map((r) => r.data.megabytesPerSecond || 0));
+  const rows = results.map((r) => {
+    if (!r.data) {
+      return `<tr><td>${esc(r.run.title)}</td><td colspan="6" class="dim">failed — see output</td></tr>`;
+    }
+    const d = r.data;
+    const isBest = (d.megabytesPerSecond || 0) === best && d.ok;
+    const negotiated = (d.negotiatedTransferSyntaxes || []).map((t) => t.name).join(', ') || '—';
+    return `<tr class="${isBest ? 'best' : ''}">
+      <td>${esc(r.run.title)}${isBest ? '<span class="badge-best">FASTEST</span>' : ''}</td>
+      <td class="mono">${esc(r.run.callingAe)}</td>
+      <td>${esc(negotiated)}</td>
+      <td class="num">${(d.elapsedMs / 1000).toFixed(2)}s</td>
+      <td class="num">${d.megabytesPerSecond}</td>
+      <td class="num">${d.instancesPerSecond}</td>
+      <td class="num">${humanBytes(d.bytesSent)}</td>
+      <td class="num">${d.acknowledged}/${d.found}</td>
+    </tr>`;
+  }).join('');
+
+  box.innerHTML =
+    '<div class="section-title">Comparison</div>' +
+    '<table><thead><tr><th>Run</th><th>Calling AE</th><th>Negotiated syntax</th>' +
+    '<th class="num">Elapsed</th><th class="num">MB/s</th><th class="num">Inst/s</th>' +
+    '<th class="num">On the wire</th><th class="num">Ack</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+function wireSpeed() {
+  for (const chip of $$('#speed-mode .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#speed-mode .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      const mode = chip.dataset.mode;
+      $('#speed-syntax-opts').hidden = mode !== 'syntax';
+      $('#speed-chunk-opts').hidden = mode !== 'chunk';
+      $('#speed-parallel-opts').hidden = mode !== 'parallel';
+      $('#speed-repeat-opts').hidden = mode !== 'repeat';
+      updateAllPreviews();
+    });
+  }
+  ['speed-folder', 'speed-aeprefix', 'speed-chunk', 'speed-chunks', 'speed-repeats', 'speed-parallels']
+    .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $$('.ts-opt').forEach((c) => c.addEventListener('change', updateAllPreviews));
+
+  $('#view-speed [data-cancel]').addEventListener('click', () => {
+    speedCancelled = true;
+    const id = state.activeRuns.speed;
+    if (id) window.dcm.cancel(id);
+  });
+
+  $('#view-speed [data-run]').addEventListener('click', runSpeedTest);
+}
+
+let speedCancelled = false;
+
+async function runSpeedTest() {
+  const folder = $('#speed-folder').value.trim();
+  const progress = $('#speed-progress');
+  const box = $('#view-speed [data-result]');
+  const c = consoleEl('speed');
+  box.hidden = true;
+  c.hidden = true;
+  c.textContent = '';
+
+  if (!folder) {
+    appendConsole('speed', 'Choose a study folder to send.\n', 'stderr');
+    return;
+  }
+  const miss = connMissing();
+  if (miss.length) {
+    appendConsole('speed', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr');
+    return;
+  }
+
+  const runs = speedRuns();
+  if (!runs.length) {
+    appendConsole('speed', 'Pick at least one thing to compare.\n', 'stderr');
+    return;
+  }
+
+  speedCancelled = false;
+  $('#view-speed [data-run]').disabled = true;
+  $('#view-speed [data-cancel]').hidden = false;
+  setStatus('speed', 'running', `Running 1/${runs.length}…`);
+  progress.hidden = false;
+  progress.innerHTML = runs
+    .map((r, i) => `<div class="run-line" id="speed-line-${i}"><span>${esc(r.title)} · ${esc(r.callingAe)}</span><span class="rate">waiting…</span></div>`)
+    .join('');
+
+  const results = [];
+  for (let i = 0; i < runs.length; i++) {
+    if (speedCancelled) break;
+    setStatus('speed', 'running', `Running ${i + 1}/${runs.length}…`);
+    const line = $(`#speed-line-${i} .rate`);
+    if (line) line.textContent = 'sending…';
+
+    const { code, stdout, stderr } = await runCapture('speed', speedArgv(runs[i]));
+    let data = null;
+    try {
+      data = JSON.parse(stdout);
+    } catch {
+      appendConsole('speed', `\n--- ${runs[i].title} ---\n${stdout || stderr}\n`, 'stderr');
+    }
+    results.push({ run: runs[i], data, code });
+
+    if (line) {
+      line.textContent = data
+        ? `${data.megabytesPerSecond} MB/s · ${(data.elapsedMs / 1000).toFixed(2)}s`
+        : `failed (exit ${code})`;
+    }
+    const parent = $(`#speed-line-${i}`);
+    if (parent) parent.classList.add('done');
+  }
+
+  $('#view-speed [data-run]').disabled = false;
+  $('#view-speed [data-cancel]').hidden = true;
+  const anyOk = results.some((r) => r.data && r.data.ok);
+  setStatus('speed', anyOk ? 'ok' : 'fail', speedCancelled ? 'Stopped' : (anyOk ? 'Done' : 'Failed'));
+  renderSpeedResults(results);
+}
+
+// --------------------------------------------------------------------------
 // View: INVENTORY (info)
 // --------------------------------------------------------------------------
 BUILDERS.inventory = () => {
@@ -744,44 +983,207 @@ function wireTags() {
 }
 
 // --------------------------------------------------------------------------
-// View: EDIT
+// View: EDIT (load tags, edit in place, write a copy)
 // --------------------------------------------------------------------------
+/** Tags loaded from the chosen study/file, plus the user's pending changes. */
+const editState = {
+  tags: [],          // [{tag, vr, keyword, value}]
+  changes: new Map(), // keyword -> new value
+  removals: new Set(),// keyword
+  loadedPath: '',
+  scope: 'study',
+};
+
+/** UIDs are structural; changing them is gated behind --force for good reason. */
+const UID_KEYWORDS = new Set([
+  'StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID',
+  'FrameOfReferenceUID', 'MediaStorageSOPInstanceUID',
+]);
+
+function editScope() {
+  const active = $('#edit-scope-row .chip.active');
+  return active ? active.dataset.scope : 'study';
+}
+
 BUILDERS.edit = () => {
   const argv = ['edit'];
-  const t = $('#edit-target').value.trim();
-  if (t) argv.push(t);
-  for (const row of $$('#edit-sets .kv-row')) {
-    const k = $('.kv-k', row).value.trim();
-    const v = $('.kv-v', row).value.trim();
-    if (k) argv.push('--set', `${k}=${v}`);
-  }
-  for (const row of $$('#edit-removes .kv-row')) {
-    const k = $('.kv-k', row).value.trim();
-    if (k) argv.push('--remove', k);
-  }
+  const target = $('#edit-target').value.trim();
+  if (target) argv.push(target);
+  for (const [keyword, value] of editState.changes) argv.push('--set', `${keyword}=${value}`);
+  for (const keyword of editState.removals) argv.push('--remove', keyword);
   const out = $('#edit-out').value.trim();
   if (out) argv.push('--out', out);
+  if (editScope() === 'one') argv.push('--no-recurse');
   if ($('#edit-dryrun').checked) argv.push('--dry-run');
   if ($('#edit-force').checked) argv.push('--force');
   return argv;
 };
 
+/** Draws the editable grid from editState.tags, filtered by the search box. */
+function renderTagEditor() {
+  const grid = $('#edit-grid');
+  const needle = $('#edit-filter').value.trim().toLowerCase();
+
+  const visible = editState.tags.filter((t) => {
+    if (!needle) return true;
+    return (
+      (t.keyword || '').toLowerCase().includes(needle) ||
+      (t.tag || '').toLowerCase().includes(needle) ||
+      String(t.value ?? '').toLowerCase().includes(needle)
+    );
+  });
+
+  const head =
+    '<div class="tag-row head"><div>Tag</div><div>Keyword</div><div>Value</div><div>Remove</div></div>';
+
+  const rows = visible.map((t) => {
+    const kw = t.keyword;
+    const changed = editState.changes.has(kw);
+    const removing = editState.removals.has(kw);
+    const value = changed ? editState.changes.get(kw) : (t.value ?? '');
+    const isUid = UID_KEYWORDS.has(kw);
+    return `<div class="tag-row ${changed ? 'changed' : ''} ${removing ? 'removing' : ''}" data-kw="${esc(kw)}">
+      <div class="tg">${esc(t.tag)}</div>
+      <div class="kw">${esc(kw)}${isUid ? ' <span class="pill">UID</span>' : ''}</div>
+      <div><input type="text" class="tag-val" value="${esc(value)}" ${removing ? 'disabled' : ''} /></div>
+      <div><label class="rm"><input type="checkbox" class="tag-rm" ${removing ? 'checked' : ''} /> remove</label></div>
+    </div>`;
+  }).join('');
+
+  grid.innerHTML = head + (rows || '<div class="empty-note" style="padding:14px">No tags match that filter.</div>');
+
+  for (const row of $$('.tag-row[data-kw]', grid)) {
+    const kw = row.dataset.kw;
+    const original = editState.tags.find((t) => t.keyword === kw);
+
+    $('.tag-val', row).addEventListener('input', (e) => {
+      const v = e.target.value;
+      // Only record a change when it actually differs from what was loaded —
+      // otherwise every field touched would be rewritten needlessly.
+      if (v === String(original?.value ?? '')) editState.changes.delete(kw);
+      else editState.changes.set(kw, v);
+      row.classList.toggle('changed', editState.changes.has(kw));
+      renderPending();
+      updateAllPreviews();
+    });
+
+    $('.tag-rm', row).addEventListener('change', (e) => {
+      if (e.target.checked) {
+        editState.removals.add(kw);
+        editState.changes.delete(kw);
+      } else {
+        editState.removals.delete(kw);
+      }
+      renderTagEditor();
+      renderPending();
+      updateAllPreviews();
+    });
+  }
+}
+
+/** One-line summary of what will happen, so nothing is applied blind. */
+function renderPending() {
+  const box = $('#edit-pending');
+  const n = editState.changes.size;
+  const r = editState.removals.size;
+  if (!n && !r) { box.hidden = true; return; }
+
+  const scopeText = editScope() === 'one'
+    ? 'the loaded file only'
+    : 'every instance in the study';
+  const bits = [];
+  if (n) bits.push(`<b>${n}</b> tag${n === 1 ? '' : 's'} changed`);
+  if (r) bits.push(`<b>${r}</b> removed`);
+  box.hidden = false;
+  box.innerHTML = `${bits.join(' · ')} — will apply to ${scopeText}.`;
+}
+
+async function loadTagsForEditing() {
+  const target = $('#edit-target').value.trim();
+  clearConsole('edit');
+  if (!target) {
+    appendConsole('edit', 'Choose a study folder or a .dcm file first.\n', 'stderr');
+    return;
+  }
+
+  setStatus('edit', 'running', 'Loading…');
+  // One representative file is what we edit against: a study shares its tag
+  // structure, and dumping every instance would be slow and unreadable.
+  const { code, stdout, stderr } = await runCapture('edit', ['tags', target, '--json']);
+  setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Loaded' : 'Failed');
+
+  if (code !== 0) {
+    appendConsole('edit', stdout || stderr || 'Could not read tags.\n', 'stderr');
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    appendConsole('edit', stdout || 'Unexpected output.\n', 'stderr');
+    return;
+  }
+
+  const first = (parsed.results || [])[0];
+  if (!first) {
+    appendConsole('edit', 'No DICOM instances found there.\n', 'stderr');
+    return;
+  }
+
+  // Only tags with a real keyword can be addressed by name on the command line.
+  editState.tags = (first.tags || []).filter((t) => t.keyword && !/^\(/.test(t.keyword));
+  editState.changes.clear();
+  editState.removals.clear();
+  editState.loadedPath = first.path || target;
+
+  $('#edit-scope-row').hidden = false;
+  $('#edit-loaded').hidden = false;
+  $('#edit-filter').value = '';
+  renderTagEditor();
+  renderPending();
+  updateAllPreviews();
+
+  appendConsole('edit', `Loaded ${editState.tags.length} tags from ${editState.loadedPath}\n`, 'stdout');
+}
+
 function wireEdit() {
-  $('#edit-addset').addEventListener('click', () => { addKvRow($('#edit-sets'), { keyPh: 'Keyword or (gggg,eeee)', valPh: 'new value' }); updateAllPreviews(); });
-  $('#edit-addremove').addEventListener('click', () => { addKvRow($('#edit-removes'), { withVal: false, keyPh: 'Keyword to remove' }); updateAllPreviews(); });
+  $('#edit-load').addEventListener('click', loadTagsForEditing);
+  $('#edit-filter').addEventListener('input', renderTagEditor);
   ['edit-target', 'edit-out'].forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
   ['edit-dryrun', 'edit-force'].forEach((id) => $(`#${id}`).addEventListener('change', updateAllPreviews));
-  addKvRow($('#edit-sets'), { keyPh: 'Keyword or (gggg,eeee)', valPh: 'new value' });
+
+  for (const chip of $$('#edit-scope-row .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#edit-scope-row .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderPending();
+      updateAllPreviews();
+    });
+  }
 
   $('#view-edit [data-run]').addEventListener('click', async () => {
     clearConsole('edit');
-    const t = $('#edit-target').value.trim();
+    const target = $('#edit-target').value.trim();
     const out = $('#edit-out').value.trim();
-    const hasChange = $$('#edit-sets .kv-row .kv-k').some((i) => i.value.trim()) ||
-                      $$('#edit-removes .kv-row .kv-k').some((i) => i.value.trim());
-    if (!t) { appendConsole('edit', 'Choose a source file or folder.\n', 'stderr'); return; }
-    if (!hasChange) { appendConsole('edit', 'Add at least one tag to set or remove.\n', 'stderr'); return; }
-    if (!out) { appendConsole('edit', 'Choose an output folder (writes copies; the source is untouched).\n', 'stderr'); return; }
+
+    if (!target) { appendConsole('edit', 'Choose a source folder or file.\n', 'stderr'); return; }
+    if (!editState.changes.size && !editState.removals.size) {
+      appendConsole('edit', 'Nothing to apply — change a value or tick a tag to remove.\n', 'stderr');
+      return;
+    }
+    if (!out) { appendConsole('edit', 'Choose where to write the edited copy.\n', 'stderr'); return; }
+
+    const touchingUid = [...editState.changes.keys(), ...editState.removals]
+      .some((kw) => UID_KEYWORDS.has(kw));
+    if (touchingUid && !$('#edit-force').checked) {
+      appendConsole('edit',
+        'That includes a UID, which is refused unless you tick "Allow editing UIDs".\n' +
+        'Rewriting UIDs on some instances and not others splits a study. To get fresh\n' +
+        'UIDs across a whole study consistently, use De-identify instead.\n', 'stderr');
+      return;
+    }
+
     setStatus('edit', 'running', $('#edit-dryrun').checked ? 'Previewing…' : 'Writing…');
     const { code } = await runStreaming('edit', BUILDERS.edit());
     setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
@@ -925,6 +1327,7 @@ async function boot() {
   wireReceive();
   wireQuery();
   wireWorklist();
+  wireSpeed();
   wireInventory();
   wireTags();
   wireEdit();

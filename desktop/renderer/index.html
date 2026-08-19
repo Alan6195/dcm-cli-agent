@@ -35,6 +35,9 @@
       <button class="nav-item" data-view="worklist">
         <span class="nav-ico">▦</span> Worklist (MWL)
       </button>
+      <button class="nav-item" data-view="speed">
+        <span class="nav-ico">⏱</span> Speed test
+      </button>
 
       <div class="nav-group-label">Local files</div>
       <button class="nav-item" data-view="inventory">
@@ -100,6 +103,25 @@
           <label>Chunk size<input type="number" id="send-chunk" placeholder="200" min="1" /></label>
           <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
           <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="form-row triple">
+          <label>Convert to transfer syntax <span class="dim">(before sending)</span>
+            <select id="send-syntax">
+              <option value="">Send as stored (no conversion)</option>
+              <option value="implicit">Implicit VR Little Endian</option>
+              <option value="explicit">Explicit VR Little Endian</option>
+              <option value="deflated">Deflated Explicit VR LE</option>
+              <option value="rle">RLE Lossless</option>
+              <option value="jpeg-lossless">JPEG Lossless</option>
+              <option value="jpeg-ls">JPEG-LS Lossless</option>
+              <option value="jpeg2000">JPEG 2000 Lossless</option>
+              <option value="jpeg2000-lossy">JPEG 2000 Lossy</option>
+              <option value="jpeg-baseline">JPEG Baseline (lossy)</option>
+            </select>
+          </label>
+          <label>Parallel associations <span class="dim">(1–16)</span>
+            <input type="number" id="send-parallel" placeholder="1" min="1" max="16" />
+          </label>
         </div>
         <div class="checks">
           <label><input type="checkbox" id="send-dryrun" checked /> Dry run first (scan &amp; plan, no connection)</label>
@@ -220,6 +242,86 @@
         <p class="mcp-note dim">Scheduling fields are sent inside the Scheduled Procedure Step Sequence, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty.</p>
       </section>
 
+
+      <!-- SPEED TEST -->
+      <section class="view" id="view-speed">
+        <header class="view-head">
+          <h1>Speed test</h1>
+          <p>Send the same study repeatedly and compare. Each run uses its own calling AE Title, so you can pick it out of the peer's ingress logs.</p>
+        </header>
+
+        <div class="form-row">
+          <label class="grow">Study folder to send
+            <div class="path-pick">
+              <input type="text" id="speed-folder" placeholder="Choose a folder of DICOM files…" />
+              <button class="btn ghost" data-pick="speed-folder" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+
+        <div class="conn-host" data-conn></div>
+
+        <div class="section-title">What to compare</div>
+        <div class="chip-row" id="speed-mode">
+          <button class="chip active" data-mode="syntax">Transfer syntaxes</button>
+          <button class="chip" data-mode="chunk">Chunk sizes</button>
+          <button class="chip" data-mode="parallel">Parallel associations</button>
+          <button class="chip" data-mode="repeat">Repeat the same run</button>
+        </div>
+
+        <div id="speed-syntax-opts">
+          <div class="checks inline-checks">
+            <label><input type="checkbox" class="ts-opt" value="" checked /> As stored (no request)</label>
+            <label><input type="checkbox" class="ts-opt" value="implicit" /> Implicit VR LE</label>
+            <label><input type="checkbox" class="ts-opt" value="explicit" /> Explicit VR LE</label>
+            <label><input type="checkbox" class="ts-opt" value="rle" /> RLE Lossless</label>
+            <label><input type="checkbox" class="ts-opt" value="jpeg-lossless" /> JPEG Lossless</label>
+            <label><input type="checkbox" class="ts-opt" value="jpeg2000" /> JPEG 2000 Lossless</label>
+          </div>
+        </div>
+
+        <div id="speed-chunk-opts" hidden>
+          <div class="form-row">
+            <label class="grow">Chunk sizes to try <span class="dim">(instances per association, comma separated)</span>
+              <input type="text" id="speed-chunks" value="50, 200, 500" />
+            </label>
+          </div>
+        </div>
+
+        <div id="speed-parallel-opts" hidden>
+          <div class="form-row">
+            <label class="grow">Association counts to try <span class="dim">(comma separated — check what the peer allows)</span>
+              <input type="text" id="speed-parallels" value="1, 2, 4" />
+            </label>
+          </div>
+        </div>
+
+        <div id="speed-repeat-opts" hidden>
+          <div class="form-row">
+            <label>How many runs<input type="number" id="speed-repeats" value="3" min="1" max="20" /></label>
+          </div>
+        </div>
+
+        <div class="form-row triple">
+          <label>Calling AE prefix <span class="dim">(a run number is appended)</span>
+            <input type="text" id="speed-aeprefix" value="AST" maxlength="10" />
+          </label>
+          <label>Chunk size<input type="number" id="speed-chunk" placeholder="200" min="1" /></label>
+        </div>
+
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run speed test</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+
+        <div class="speed-progress" id="speed-progress" hidden></div>
+        <div class="result-table" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
+        <p class="mcp-note dim">Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for.</p>
+      </section>
+
       <!-- INVENTORY -->
       <section class="view" id="view-inventory">
         <header class="view-head">
@@ -284,29 +386,36 @@
       <section class="view" id="view-edit">
         <header class="view-head">
           <h1>Edit tags</h1>
-          <p>Change or remove tags and write the result to a new folder. The source is never touched from here.</p>
+          <p>Load a study or a single file, change values in place, then write the result to a new folder. The source is never modified.</p>
         </header>
+
         <div class="form-row">
-          <label class="grow">Source file or folder
+          <label class="grow">Study folder or single file
             <div class="path-pick">
-              <input type="text" id="edit-target" placeholder="Choose the source…" />
-              <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Browse…</button>
+              <input type="text" id="edit-target" placeholder="Choose a study folder or one .dcm file…" />
+              <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Folder…</button>
               <button class="btn ghost" data-pick="edit-target" data-pick-mode="file">File…</button>
+              <button class="btn primary" id="edit-load">Load tags</button>
             </div>
           </label>
         </div>
-        <div class="kv-block">
-          <div class="kv-label">Set tags <span class="dim">(Keyword or (gggg,eeee) = value)</span></div>
-          <div id="edit-sets" class="kv-rows"></div>
-          <button class="btn ghost small" id="edit-addset">+ Set a tag</button>
+
+        <div id="edit-scope-row" class="chip-row" hidden>
+          <span class="level-label">Apply changes to</span>
+          <button class="chip active" data-scope="study">Every instance</button>
+          <button class="chip" data-scope="one">Only the loaded file</button>
         </div>
-        <div class="kv-block">
-          <div class="kv-label">Remove tags</div>
-          <div id="edit-removes" class="kv-rows"></div>
-          <button class="btn ghost small" id="edit-addremove">+ Remove a tag</button>
+
+        <div id="edit-loaded" hidden>
+          <div class="form-row">
+            <label class="grow">Filter tags<input type="text" id="edit-filter" placeholder="Type to narrow the list — e.g. Patient" /></label>
+          </div>
+          <div class="tag-editor" id="edit-grid"></div>
+          <div class="pending-summary" id="edit-pending" hidden></div>
         </div>
+
         <div class="form-row">
-          <label class="grow">Write copies to
+          <label class="grow">Write the edited copy to
             <div class="path-pick">
               <input type="text" id="edit-out" placeholder="Destination folder…" />
               <button class="btn ghost" data-pick="edit-out" data-pick-mode="create">Browse…</button>
@@ -315,12 +424,13 @@
           </label>
         </div>
         <div class="checks">
-          <label><input type="checkbox" id="edit-dryrun" checked /> Dry run (show what would change, write nothing)</label>
-          <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(--force; can split a study)</span></label>
+          <label><input type="checkbox" id="edit-dryrun" checked /> Preview only (show what would change, write nothing)</label>
+          <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(can split a study)</span></label>
         </div>
+
         <div class="cmd-preview" data-cmd></div>
         <div class="actions">
-          <button class="btn primary" data-run>Run edit</button>
+          <button class="btn primary" data-run>Apply changes</button>
           <span class="status-chip" data-status hidden></span>
         </div>
         <div class="console-wrap"><pre class="console" data-console></pre></div>

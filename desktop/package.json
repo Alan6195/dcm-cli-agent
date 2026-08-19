@@ -1,7 +1,7 @@
 {
   "name": "asteris-dcm-desktop",
   "productName": "Asteris DICOM",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Desktop app for the Asteris DICOM CLI Agent \u2014 echo, inventory, send, receive, worklist, tags, edit and de-identify, with a live transfer report.",
   "author": "Asteris",

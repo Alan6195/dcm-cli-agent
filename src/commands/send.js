@@ -14,13 +14,60 @@ const { formatOutcome } = require('../lib/reject');
 const { report } = require('../lib/report');
 
 const { Dataset, Transcoding } = dcmjsDimse;
+const { TransferSyntax } = dcmjsDimse.constants;
 const { CStoreRequest } = dcmjsDimse.requests;
 
 const FLAGS = [
   'host', 'port', 'called-ae', 'calling-ae', 'chunk', 'dry-run', 'recurse',
   'retry', 'timeout', 'connect-timeout', 'association-timeout',
-  'rewrite-series-uid', 'no-recurse',
+  'rewrite-series-uid', 'no-recurse', 'transfer-syntax', 'label', 'parallel',
 ];
+
+/**
+ * Transfer syntaxes that can be asked for by name.
+ *
+ * The UIDs are what actually goes on the wire, but nobody remembers them and a
+ * typo in one is a silent negotiation failure. Names are accepted alongside.
+ */
+const TRANSFER_SYNTAX_ALIASES = Object.freeze({
+  'implicit': TransferSyntax.ImplicitVRLittleEndian,
+  'implicit-vr-le': TransferSyntax.ImplicitVRLittleEndian,
+  'explicit': TransferSyntax.ExplicitVRLittleEndian,
+  'explicit-vr-le': TransferSyntax.ExplicitVRLittleEndian,
+  'deflated': TransferSyntax.DeflatedExplicitVRLittleEndian,
+  'rle': TransferSyntax.RleLossless,
+  'jpeg-lossless': TransferSyntax.JpegLossless,
+  'jpeg-baseline': TransferSyntax.JpegBaseline,
+  'jpeg-ls': TransferSyntax.JpegLsLossless,
+  'jpeg-ls-lossy': TransferSyntax.JpegLsLossy,
+  'jpeg2000': TransferSyntax.Jpeg2000Lossless,
+  'jpeg2000-lossy': TransferSyntax.Jpeg2000Lossy,
+});
+
+/** Human label for a transfer syntax UID, for reports. */
+const TRANSFER_SYNTAX_NAMES = Object.freeze(
+  Object.fromEntries(Object.entries(TransferSyntax).map(([name, uid]) => [uid, name]))
+);
+
+/**
+ * Resolves --transfer-syntax to a UID.
+ *
+ * @param {string|undefined} value
+ * @returns {string|undefined}
+ */
+function resolveTransferSyntax(value) {
+  if (!value) return undefined;
+  const key = String(value).trim();
+  if (/^[0-9.]+$/.test(key)) return key;
+  const uid = TRANSFER_SYNTAX_ALIASES[key.toLowerCase()];
+  if (!uid) {
+    const known = Object.keys(TRANSFER_SYNTAX_ALIASES).join(', ');
+    throw new args.UsageError(
+      `--transfer-syntax "${value}" is not a name I know. Use a UID, or one of: ${known}.`
+    );
+  }
+  return uid;
+}
 
 const USAGE = `
 dcm send — send a folder of DICOM files to a peer (C-STORE)
@@ -47,6 +94,21 @@ Options:
   --dry-run               Scan and report what would be sent. Opens no connection.
   --no-recurse            Only look at files directly in the folder.
   --timeout <ms>          Silence allowed before giving up. Default: 60000.
+  --transfer-syntax <ts>  Convert each instance to this transfer syntax before
+                          sending it, by name or UID. Names: implicit, explicit,
+                          deflated, rle, jpeg-lossless, jpeg-baseline, jpeg-ls,
+                          jpeg2000, jpeg2000-lossy. This is a real conversion,
+                          not just a proposal — the bytes on the wire are in the
+                          syntax you asked for. Needs the codecs module for
+                          compressed syntaxes, and holds datasets in memory, so
+                          the chunk size is reduced automatically.
+  --parallel <n>          Run n associations at once (1-16, default 1). C-STORE is
+                          sequential inside one association, so this is the only
+                          real way to go faster. Check what the receiver allows:
+                          exceeding its limit gets associations rejected rather
+                          than speeding anything up.
+  --label <text>          Tag this run in --json output, for comparing runs.
+  --json                  Emit the result and timing as JSON.
   --rewrite-series-uid    Replace each Series Instance UID with a deterministic
                           2.25.<hash> value. MODIFIES DATA — see below.
   --verbose               Log the full association negotiation.
@@ -98,12 +160,31 @@ function isRetryableStatus(status) {
  * @returns {object} A CStoreRequest.
  */
 function buildRequest(entry, meta, opts) {
-  if (!opts.rewriteSeriesUid) {
+  // The fast path: nothing about the instance needs changing, so the file is
+  // streamed straight from disk and its pixel data never enters memory.
+  if (!opts.rewriteSeriesUid && !opts.transferSyntax) {
     return new CStoreRequest(entry.path);
   }
 
-  const dataset = Dataset.fromFile(entry.path);
+  let dataset = Dataset.fromFile(entry.path);
   if (!dataset) throw new Error('parser returned no dataset');
+
+  // Convert before it goes out, rather than only proposing the syntax and
+  // letting the peer decide. Asking for a syntax and actually sending it are
+  // different things: a peer that also accepts the original will usually just
+  // take the original, so proposing alone is not a conversion.
+  if (opts.transferSyntax) {
+    const source = dataset.getTransferSyntaxUid();
+    if (source !== opts.transferSyntax) {
+      dataset = Transcoding.transcodeDataset(dataset, opts.transferSyntax);
+      entry.transcodedFrom = source;
+    }
+    entry.transferSyntax = dataset.getTransferSyntaxUid();
+  }
+
+  if (!opts.rewriteSeriesUid) {
+    return new CStoreRequest(dataset);
+  }
 
   const sourceSeries = dataset.getElement('SeriesInstanceUID');
   const studyUid = dataset.getElement('StudyInstanceUID');
@@ -123,6 +204,93 @@ function buildRequest(entry, meta, opts) {
   entry.rewrittenSeriesUid = replacement;
 
   return new CStoreRequest(dataset);
+}
+
+/*
+ * A note on why the conversion above is the whole mechanism, and why the
+ * request is deliberately left alone afterwards.
+ *
+ * It is tempting to also call setAdditionalTransferSyntaxes() with the target.
+ * That backfires. The library builds one presentation context offering
+ * [Implicit, Explicit, ...additional], and a receiver that takes the first
+ * entry then picks Implicit — so the dataset is transcoded straight back and
+ * nothing was gained. Leaving the request alone means the dataset's (now
+ * converted) syntax is not in that context, so the library proposes a second
+ * context offering only the converted syntax. A peer that accepts it receives
+ * exactly what was asked for; a peer that refuses it falls back to the
+ * uncompressed context, which the report then shows as the negotiated syntax.
+ */
+
+
+/**
+ * Derives the throughput figures a speed comparison needs.
+ *
+ * Two different byte counts matter and conflating them is misleading. Bytes on
+ * disk is how much study you moved; bytes on the wire is what the network
+ * actually carried, which is far smaller for a compressed syntax. Throughput is
+ * reported against bytes on disk, because that is the work done — otherwise
+ * compressing looks slower for moving the same study.
+ *
+ * @param {object} result   Reconciled ledger result.
+ * @param {object} metrics
+ */
+function summariseThroughput(result, metrics) {
+  const seconds = Math.max(metrics.elapsedMs, 1) / 1000;
+  const bytesOnDisk = metrics.bytesOnDisk || 0;
+  const acknowledged = result.totals ? result.totals.acknowledged : 0;
+
+  return {
+    bytesOnDisk,
+    negotiated: [...metrics.acceptedSyntaxes].map((uid) => ({
+      uid,
+      name: TRANSFER_SYNTAX_NAMES[uid] || uid,
+    })),
+    instancesPerSecond: Number((acknowledged / seconds).toFixed(2)),
+    megabytesPerSecond: Number((bytesOnDisk / 1048576 / seconds).toFixed(2)),
+    wireMegabytes: Number((metrics.bytesSent / 1048576).toFixed(2)),
+  };
+}
+
+/** Prints the timing block under the transfer report. */
+function reportThroughput(throughput, metrics, requestedSyntax) {
+  const seconds = (metrics.elapsedMs / 1000).toFixed(2);
+  log.out('');
+  log.out(`elapsed           ${seconds}s`);
+  log.out(`throughput        ${throughput.instancesPerSecond} instance/s · ${throughput.megabytesPerSecond} MB/s`);
+  log.out(`sent on the wire  ${throughput.wireMegabytes} MB in ${metrics.associations} association(s)`);
+  if (metrics.parallel > 1) {
+    log.out(`parallelism       ${metrics.parallel} concurrent association(s)`);
+  }
+
+  if (requestedSyntax) {
+    const name = TRANSFER_SYNTAX_NAMES[requestedSyntax] || requestedSyntax;
+    log.out(`requested syntax  ${name}`);
+  }
+  if (throughput.negotiated.length) {
+    log.out(`negotiated        ${throughput.negotiated.map((t) => t.name).join(', ')}`);
+    if (requestedSyntax && !throughput.negotiated.some((t) => t.uid === requestedSyntax)) {
+      log.out(log.color.yellow(
+        '  the peer did not accept the requested syntax and fell back — the timing above is for what it did accept'
+      ));
+    }
+  }
+}
+
+/**
+ * Notes which transfer syntaxes the peer accepted for this association.
+ *
+ * @param {object} association
+ * @param {{acceptedSyntaxes: Set<string>}} metrics
+ */
+function recordAcceptedSyntaxes(association, metrics) {
+  try {
+    for (const { context } of association.getPresentationContexts()) {
+      const uid = context.getAcceptedTransferSyntaxUid();
+      if (uid) metrics.acceptedSyntaxes.add(uid);
+    }
+  } catch {
+    // Not every peer/stack populates this; it is reporting, not correctness.
+  }
 }
 
 /**
@@ -191,19 +359,35 @@ async function sendChunk(params) {
   }
 
   let accepted = false;
-  const { outcome } = await runAssociation({
+  const { outcome, statistics } = await runAssociation({
     host: connection.host,
     port: connection.port,
     callingAe: connection.callingAe,
     calledAe: connection.calledAe,
     requests,
     timeouts,
-    onAccepted: () => {
+    onAccepted: (assoc) => {
       accepted = true;
       // Only now can these be called sent: before acceptance nothing went out.
       for (const entry of built) entry.dispatched = true;
+      // Record what the peer actually agreed to carry. Proposing a transfer
+      // syntax and getting it are different things, and a speed comparison is
+      // meaningless without knowing which one was really used.
+      if (options && options.metrics) recordAcceptedSyntaxes(assoc, options.metrics);
     },
   });
+
+  // Bytes actually put on the wire, which is the number that matters when
+  // comparing transfer syntaxes: a compressed one sends far fewer.
+  if (options && options.metrics && statistics) {
+    try {
+      options.metrics.bytesSent += statistics.getBytesSent() || 0;
+      options.metrics.bytesReceived += statistics.getBytesReceived() || 0;
+    } catch {
+      /* statistics are decorative; never fail a transfer over them */
+    }
+    options.metrics.associations += 1;
+  }
 
   if (outcome && outcome.kind !== 'completed') {
     studyLedger.addEvent({
@@ -317,6 +501,19 @@ async function run(parsed) {
   const rewriteSeriesUid = args.resolve(flags, {
     name: 'rewrite-series-uid', type: 'boolean', fallback: false,
   });
+  const transferSyntax = resolveTransferSyntax(args.resolve(flags, { name: 'transfer-syntax' }));
+  const parallel = args.resolve(flags, { name: 'parallel', type: 'number', fallback: 1 });
+  if (!Number.isInteger(parallel) || parallel < 1 || parallel > 16) {
+    throw new args.UsageError(
+      `--parallel must be between 1 and 16, got "${parallel}". Most receivers cap ` +
+        'concurrent associations well below that, and exceeding their limit gets ' +
+        'associations rejected rather than making the transfer faster.'
+    );
+  }
+  // A free-text label carried into --json output, so a run can be tied back to
+  // whatever the caller was testing without the caller having to correlate.
+  const label = args.resolve(flags, { name: 'label' });
+  const asJson = flags.has('json');
 
   if (!Number.isInteger(chunkSizeRequested) || chunkSizeRequested < 1) {
     throw new args.UsageError(`--chunk must be a positive integer, got "${chunkSizeRequested}".`);
@@ -329,7 +526,10 @@ async function run(parsed) {
   // roughly the size of the study in memory. Shrink the chunk to compensate
   // unless the operator has chosen a size explicitly.
   let chunkSize = chunkSizeRequested;
-  if (rewriteSeriesUid && !flags.has('chunk') && chunkSize > 50) {
+  // Both rewriting and transcoding have to hold parsed datasets — pixel data
+  // included — in memory, so a chunk sized for streaming from disk is far too
+  // large. Shrink it unless a size was chosen explicitly.
+  if ((rewriteSeriesUid || transferSyntax) && !flags.has('chunk') && chunkSize > 50) {
     chunkSize = 50;
   }
 
@@ -444,7 +644,23 @@ async function run(parsed) {
   }
 
   // --- Send, study by study ---
-  const options = { rewriteSeriesUid };
+  // Bytes on disk across everything registered, so throughput can be expressed
+  // as study-moved-per-second rather than wire-bytes-per-second.
+  let bytesOnDisk = 0;
+  for (const studyLedger of ledger.studies.values()) {
+    for (const entry of studyLedger.entries) bytesOnDisk += entry.bytes || 0;
+  }
+
+  const metrics = {
+    parallel,
+    bytesOnDisk,
+    bytesSent: 0,
+    bytesReceived: 0,
+    associations: 0,
+    acceptedSyntaxes: new Set(),
+    startedAt: Date.now(),
+  };
+  const options = { rewriteSeriesUid, transferSyntax, metrics };
   let studyIndex = 0;
 
   for (const studyLedger of ledger.studies.values()) {
@@ -460,31 +676,83 @@ async function run(parsed) {
       `  ${entries.length} instance(s) in ${chunks.length} association(s) of up to ${chunkSize}`
     );
 
-    for (let i = 0; i < chunks.length; i++) {
-      const label = `study ${studyIndex} chunk ${i + 1}/${chunks.length}`;
-      log.info(`  ${label}: sending ${chunks[i].length} instance(s)`);
+    // Chunks are dispatched by a small pool of workers, each of which opens its
+    // own association. C-STORE is sequential within an association — the
+    // protocol has no way to interleave — so the only honest way to go faster
+    // is to run several associations at once. One worker reproduces exactly
+    // the previous behaviour, which is why that is still the default.
+    let nextChunk = 0;
+    const workerCount = Math.min(parallel, chunks.length);
 
-      await sendChunkWithRetry({
-        entries: chunks[i],
-        metaByPath,
-        studyLedger,
-        connection,
-        timeouts,
-        options,
-        retries,
-        label,
-      });
+    const worker = async (workerId) => {
+      for (;;) {
+        const i = nextChunk++;
+        if (i >= chunks.length) return;
 
-      const soFar = studyLedger.reconcile();
-      log.info(
-        `  ${label}: ${soFar.acknowledged}/${soFar.found} acknowledged so far`
-      );
-    }
+        const label = parallel > 1
+          ? `study ${studyIndex} chunk ${i + 1}/${chunks.length} [w${workerId}]`
+          : `study ${studyIndex} chunk ${i + 1}/${chunks.length}`;
+        log.info(`  ${label}: sending ${chunks[i].length} instance(s)`);
+
+        await sendChunkWithRetry({
+          entries: chunks[i],
+          metaByPath,
+          studyLedger,
+          connection,
+          timeouts,
+          options,
+          retries,
+          label,
+        });
+
+        const soFar = studyLedger.reconcile();
+        log.info(
+          `  ${label}: ${soFar.acknowledged}/${soFar.found} acknowledged so far`
+        );
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: workerCount }, (_, w) => worker(w + 1))
+    );
   }
 
   // --- Reconcile and report ---
+  metrics.elapsedMs = Date.now() - metrics.startedAt;
   const result = ledger.reconcile();
+
+  const throughput = summariseThroughput(result, metrics);
+
+  if (asJson) {
+    log.out(JSON.stringify({
+      ok: result.ok,
+      peer: { host: connection.host, port: connection.port, calledAe: connection.calledAe, callingAe: connection.callingAe },
+      label,
+      requestedTransferSyntax: transferSyntax
+        ? { uid: transferSyntax, name: TRANSFER_SYNTAX_NAMES[transferSyntax] || transferSyntax }
+        : null,
+      negotiatedTransferSyntaxes: throughput.negotiated,
+      found: result.totals.found,
+      sent: result.totals.sent,
+      acknowledged: result.totals.acknowledged,
+      failed: result.totals.failed,
+      warned: result.totals.warning,
+      shortfall: result.totals.shortfall,
+      chunkSize,
+      parallel,
+      associations: metrics.associations,
+      elapsedMs: metrics.elapsedMs,
+      bytesOnDisk: throughput.bytesOnDisk,
+      bytesSent: metrics.bytesSent,
+      bytesReceived: metrics.bytesReceived,
+      instancesPerSecond: throughput.instancesPerSecond,
+      megabytesPerSecond: throughput.megabytesPerSecond,
+    }, null, 2));
+    return result.ok ? 0 : 1;
+  }
+
   report.transfer({ result, connection, chunkSize, rewriteSeriesUid });
+  reportThroughput(throughput, metrics, transferSyntax);
 
   return result.ok ? 0 : 1;
 }

@@ -18,7 +18,8 @@ const {
   TransferSyntax,
 } = dcmjsDimse.constants;
 
-const FLAGS = ['port', 'ae', 'persist', 'accept-calling-ae', 'reject-after'];
+const FLAGS = ['port', 'ae', 'persist', 'accept-calling-ae', 'reject-after',
+  'prefer-syntax', 'prefer-uncompressed'];
 
 const USAGE = `
 dcm scp — a permissive DICOM receiver that logs everything
@@ -43,6 +44,10 @@ Options:
   --persist <dir>            Write received instances to disk, laid out as
                              <dir>/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm
                              Default: acknowledge and discard.
+  --prefer-syntax <ts>       Accept this transfer syntax when the sender offers
+                             it, by UID or dcmjs name. Default: take whatever
+                             the sender proposed first, which is its preference.
+  --prefer-uncompressed      Always pick an uncompressed syntax when offered.
   --reject-after <n>         Stop acknowledging after n instances in an
                              association, to simulate a receiver that goes
                              quiet mid-transfer. Testing aid.
@@ -123,10 +128,17 @@ function makeScpClass(config, stats) {
         return;
       }
 
-      // Permissive: accept every proposed abstract syntax. Prefer an
-      // uncompressed transfer syntax when one is offered, because those are
-      // always decodable; otherwise take what is on the table.
-      const preferred = [TransferSyntax.ExplicitVRLittleEndian, TransferSyntax.ImplicitVRLittleEndian];
+      // Permissive: accept every proposed abstract syntax.
+      //
+      // Transfer syntax is taken in the order the sender proposed it, which is
+      // the sender's stated preference. That matters for testing: forcing
+      // uncompressed here would silently undo a sender that deliberately
+      // converted a study to a compressed syntax, and the transfer would look
+      // like the conversion never happened. --prefer-syntax overrides, and
+      // --prefer-uncompressed restores the old always-decodable behaviour.
+      const preferred = config.preferUncompressed
+        ? [TransferSyntax.ExplicitVRLittleEndian, TransferSyntax.ImplicitVRLittleEndian]
+        : (config.preferSyntax ? [config.preferSyntax] : []);
 
       for (const { id } of association.getPresentationContexts()) {
         const context = association.getPresentationContext(id);
@@ -302,7 +314,20 @@ async function run(parsed) {
     finds: 0, refused: 0, aborts: 0, errors: 0,
   };
 
-  const config = { ae, acceptCallingAe, persist, rejectAfter };
+  const preferUncompressed = args.resolve(flags, {
+    name: 'prefer-uncompressed', type: 'boolean', fallback: false,
+  });
+  const preferSyntaxRaw = args.resolve(flags, { name: 'prefer-syntax' });
+  const preferSyntax = preferSyntaxRaw
+    ? (/^[0-9.]+$/.test(preferSyntaxRaw) ? preferSyntaxRaw : TransferSyntax[preferSyntaxRaw])
+    : undefined;
+  if (preferSyntaxRaw && !preferSyntax) {
+    throw new args.UsageError(
+      `--prefer-syntax "${preferSyntaxRaw}" is not a transfer syntax UID or a known name.`
+    );
+  }
+
+  const config = { ae, acceptCallingAe, persist, rejectAfter, preferUncompressed, preferSyntax };
   const server = new Server(makeScpClass(config, stats));
 
   server.on('networkError', (err) => {
