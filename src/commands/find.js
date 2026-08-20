@@ -9,6 +9,7 @@ const { formatOutcome } = require('../lib/reject');
 const { CFindRequest } = dcmjsDimse.requests;
 
 const FLAGS = [
+  'json-raw',
   'host', 'port', 'called-ae', 'calling-ae', 'study', 'series', 'image', 'mwl',
   'timeout', 'connect-timeout', 'association-timeout', 'limit',
 ];
@@ -35,7 +36,12 @@ Options:
   --called-ae <AE>       The peer's AE Title.              [env DCM_CALLED_AE]
   --calling-ae <AE>      Our AE Title. Default: DCM-CLI    [env DCM_CALLING_AE]
   --limit <n>            Stop after n matches.
-  --json                 Emit matches as JSON.
+  --json                 Emit matches as JSON, values rendered for reading.
+  --json-raw             Emit matches as JSON with values exactly as they came
+                         off the wire — sequences stay arrays, Person Names stay
+                         objects. This is the form to feed to 'dcm mpps', which
+                         needs the correlation keys intact; --json flattens a
+                         sequence to a string and cannot carry them.
   --verbose              Log the full association negotiation.
 
 Examples:
@@ -224,6 +230,10 @@ async function run(parsed) {
   );
   const limit = args.resolve(flags, { name: 'limit', type: 'number' });
   const asJson = flags.has('json');
+  const asRawJson = flags.has('json-raw');
+  if (asJson && asRawJson) {
+    throw new args.UsageError('--json and --json-raw ask for two different shapes; choose one.');
+  }
 
   const timeouts = resolveTimeouts({
     timeout: args.resolve(flags, { name: 'timeout', type: 'number' }),
@@ -303,6 +313,19 @@ async function run(parsed) {
     return 1;
   }
 
+  if (asRawJson) {
+    // Values exactly as the peer sent them. `display()` is for a person
+    // reading a table; it turns a sequence into a string and an empty
+    // sequence into '', which silently destroys the very attributes an MPPS
+    // N-CREATE must echo back for the RIS to correlate the step.
+    log.out(JSON.stringify({
+      level, host, port, calledAe, raw: true,
+      count: matches.length,
+      matches: matches.map(stripPrivateKeys),
+    }, null, 2));
+    return matches.length > 0 ? 0 : 1;
+  }
+
   if (asJson) {
     const plain = matches.map((m) => {
       const row = {};
@@ -353,4 +376,25 @@ async function run(parsed) {
   return 0;
 }
 
-module.exports = { run, USAGE, buildIdentifier, display, flattenWorklistMatch, MWL_SPS_KEYS };
+/**
+ * Strips dcmjs bookkeeping keys (_vrMap and friends) at every level, including
+ * inside sequence items, leaving a plain JSON-safe structure.
+ *
+ * @param {*} value
+ * @returns {*}
+ */
+function stripPrivateKeys(value) {
+  if (Array.isArray(value)) return value.map(stripPrivateKeys);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k.startsWith('_')) continue;
+      out[k] = stripPrivateKeys(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+module.exports = {
+  stripPrivateKeys, run, USAGE, buildIdentifier, display, flattenWorklistMatch, MWL_SPS_KEYS };

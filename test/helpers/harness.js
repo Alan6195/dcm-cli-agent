@@ -42,6 +42,8 @@ async function startScp(config = {}) {
   const stats = {
     associations: 0, rejected: 0, echoes: 0, stored: 0,
     finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
+    mppsCreated: 0, mppsCompleted: 0, mppsDiscontinued: 0, mppsRefused: 0,
+    worklistWithheld: 0,
   };
 
   const full = {
@@ -52,6 +54,9 @@ async function startScp(config = {}) {
     // { file, items } from src/lib/worklist.loadWorklistFile, or undefined for
     // the default receiver that answers every C-FIND with zero matches.
     worklist: config.worklist,
+    // Keep a worklist item answering queries after its performed procedure step
+    // has finished. The receiver defaults to withholding it, as `dcm scp` does.
+    keepPerformed: config.keepPerformed ?? false,
   };
 
   const server = new Server(makeScpClass(full, stats));

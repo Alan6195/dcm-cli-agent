@@ -35,6 +35,9 @@
       <button class="nav-item" data-view="worklist">
         <span class="nav-ico">▦</span> Worklist (MWL)
       </button>
+      <button class="nav-item" data-view="mpps">
+        <span class="nav-ico">⊙</span> Perform a step (MPPS)
+      </button>
       <button class="nav-item" data-view="speed">
         <span class="nav-ico">⏱</span> Speed test
       </button>
@@ -264,9 +267,122 @@
           <button class="btn primary" data-run>Fetch worklist</button>
           <span class="status-chip" data-status hidden></span>
         </div>
+        <div class="correlation-note" id="mwl-correlation" hidden></div>
         <div class="result-table" data-result hidden></div>
+        <div class="pick-panel" id="mwl-selected" hidden>
+          <div class="pick-head">
+            <span class="pick-title">Perform this step</span>
+            <button class="btn ghost small" id="mwl-clearsel">Clear selection</button>
+          </div>
+          <div class="attr-grid" id="mwl-attrs"></div>
+          <p class="pick-note">
+            These are the values this row would assert in the N-CREATE. Selecting a row is
+            local to this app — nothing has been sent and nothing on the SCP has changed.
+          </p>
+          <button class="btn primary" id="mwl-perform">Add images and perform this step →</button>
+        </div>
         <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
         <p class="mcp-note dim">Scheduling fields are sent inside the Scheduled Procedure Step Sequence, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty.</p>
+        <p class="mcp-note dim">This table is only ever redrawn by a fresh query. Performing a step does not restyle a row here, because what the SCP did with the scheduled entry is not visible from this side.</p>
+      </section>
+
+      <!-- MPPS — PERFORM A STEP -->
+      <section class="view" id="view-mpps">
+        <header class="view-head">
+          <h1>Perform a step (MPPS)</h1>
+          <p>Open a Modality Performed Procedure Step, send this study's images, and close the step. One <code>dcm mpps perform</code> transaction: N-CREATE, C-STORE, N-SET.</p>
+        </header>
+
+        <div class="empty-note" id="mpps-nosel">
+          No worklist row is selected. Go to <b>Worklist (MWL)</b>, fetch a worklist and click
+          the patient you are imaging. Every attribute this step asserts comes from that row or
+          from the images themselves — this screen does not invent any of them.
+        </div>
+
+        <div id="mpps-body" hidden>
+          <div class="section-title">What this step will assert</div>
+          <div class="attr-grid" id="mpps-attrs"></div>
+          <p class="mcp-note dim" id="mpps-attr-note"></p>
+
+          <div class="form-row">
+            <label class="grow">Images produced for this step
+              <div class="path-pick">
+                <input type="text" id="mpps-folder" placeholder="Choose the folder holding this study's images…" />
+                <button class="btn ghost" data-pick="mpps-folder" data-pick-mode="folder">Browse…</button>
+              </div>
+            </label>
+          </div>
+
+          <div class="section-title">MPPS peer — where the procedure step goes</div>
+          <div class="conn-host" data-conn></div>
+
+          <div class="conn-panel">
+            <div class="conn-title"><span>Storage peer — where the images go</span></div>
+            <div class="checks">
+              <label><input type="checkbox" id="mpps-store-same" checked /> Same system as the MPPS peer</label>
+            </div>
+            <div class="conn-grid store">
+              <label>Host <input type="text" id="mpps-store-host" placeholder="pacs.example.org" /></label>
+              <label>Port <input type="number" id="mpps-store-port" placeholder="104" min="1" max="65535" /></label>
+              <label>Called AE — archive <input type="text" id="mpps-store-ae" maxlength="16" placeholder="ARCHIVE" /></label>
+            </div>
+            <div class="web-auth-hint">
+              The RIS that takes the procedure step and the archive that takes the images are
+              often different systems. Both are written out in full in the command below, even
+              when they are the same — a default you cannot see is a default nobody can check.
+            </div>
+          </div>
+
+          <div class="form-row triple">
+            <label>Performed step ID <span class="dim">(Type 1)</span><input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
+            <label>Performed station AE <span class="dim">(Type 1)</span><input type="text" id="mpps-stationae" maxlength="16" placeholder="our calling AE" /></label>
+            <label>Performed step description<input type="text" id="mpps-stepdesc" placeholder="optional" /></label>
+          </div>
+          <div class="form-row triple">
+            <label>Chunk size<input type="number" id="mpps-chunk" placeholder="200" min="1" /></label>
+            <label>Retries<input type="number" id="mpps-retry" placeholder="1" min="0" /></label>
+            <label>Retrieve AE <span class="dim">(blank = the archive's AE)</span><input type="text" id="mpps-retrieveae" maxlength="16" placeholder="ARCHIVE" /></label>
+          </div>
+          <div class="form-row">
+            <label class="grow">Step record <span class="dim">(writes the instances the archive acknowledged, so the step can be reopened or audited)</span>
+              <div class="path-pick">
+                <input type="text" id="mpps-record" placeholder="Optional — e.g. step.json" />
+                <button class="btn ghost" data-pick="mpps-record" data-pick-mode="create">Browse…</button>
+              </div>
+            </label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="mpps-dryrun" checked /> Dry run (scan the folder and print the N-CREATE; opens no connection, creates no step, sends nothing)</label>
+            <label><input type="checkbox" id="mpps-norecurse" /> Don't recurse into subfolders</label>
+          </div>
+
+          <div class="cmd-preview" data-cmd></div>
+          <div class="actions">
+            <button class="btn primary" data-run>Dry run</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+
+          <div class="outcome" id="mpps-outcome" hidden></div>
+          <div class="totals" data-totals hidden></div>
+          <div class="console-wrap tall"><pre class="console" data-console></pre></div>
+
+          <div class="actions" id="mpps-after" hidden>
+            <button class="btn ghost" id="mpps-requery">Re-query the worklist</button>
+            <span class="dim">A fresh query is the only thing that can change the worklist table.</span>
+          </div>
+
+          <p class="mcp-note dim">
+            <b>COMPLETED means every instance found on disk was acknowledged by the archive.</b>
+            There is no override. If any instance is unaccounted for, the engine marks the step
+            DISCONTINUED and exits non-zero, and this screen reports that as a failure.
+          </p>
+          <p class="mcp-note dim">
+            PerformedSeriesSequence is built only from instances the archive positively
+            acknowledged, never from a folder listing. What the MPPS SCP then does with the
+            scheduled worklist entry is not visible from here.
+          </p>
+        </div>
       </section>
 
 

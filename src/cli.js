@@ -29,11 +29,13 @@ const COMMANDS = {
   tags: () => require('./commands/tags'),
   edit: () => require('./commands/edit'),
   anon: () => require('./commands/anon'),
+  mpps: () => require('./commands/mpps'),
   web: () => require('./commands/web'),
   explain: () => require('./commands/explain'),
   mcp: () => require('./commands/mcp'),
   install: () => require('./commands/install'),
   uninstall: () => ({ run: require('./commands/install').uninstall }),
+  update: () => require('./commands/update'),
 };
 
 const USAGE = `
@@ -51,11 +53,13 @@ Commands:
   tags      Dump the DICOM tags in a file or folder
   edit      Change or remove tags and write the result
   anon      De-identify a folder into a new directory
+  mpps      Modality Performed Procedure Step: start, perform, complete a step
   web       DICOMweb: ping, send (STOW), query (QIDO), retrieve (WADO), serve
   explain   Explain a failed transfer log using the Anthropic API (optional)
   mcp       Run an MCP server so an assistant can drive these operations
   install   Put this executable on your PATH so you can type 'dcm' anywhere
   uninstall Undo install
+  update    Replace this executable with the latest published release
 
 Global options:
   --verbose      Log the full association negotiation — contexts, transfer

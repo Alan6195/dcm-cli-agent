@@ -1,5 +1,96 @@
 # Changelog
 
+## v0.9.0
+
+MPPS: the worklist can now be answered, not just read. Plus a CLI that
+replaces itself.
+
+- **`dcm mpps`** — Modality Performed Procedure Step, the other half of a
+  worklist. A worklist says what is scheduled; MPPS says what happened, and a
+  RIS reconciles the two on Study Instance UID to close the order. Verbs:
+  `start` (N-CREATE, IN PROGRESS), `complete` / `discontinue` (N-SET), and
+  **`perform`**, which is the whole transaction — open the step, send the
+  folder, close the step — in one command.
+- **A step is only marked COMPLETED when every instance was acknowledged.**
+  There is no `--force`. A shortfall marks it DISCONTINUED and exits non-zero,
+  saying so in numbers: *"6 of 10 instances were acknowledged. The step was
+  marked DISCONTINUED, not COMPLETED, because 4 instances are unaccounted
+  for."* This is the same rule the transfer report has always applied, but it
+  matters more here: `send` reporting a shortfall is a number on your screen,
+  while an MPPS marked COMPLETED is a claim in someone else's database that a
+  technologist will believe.
+- **PerformedSeriesSequence is built from the ledger, never from a folder.**
+  Only instances the peer actually acknowledged are referenced, so the record
+  cannot list a SOP Instance UID the archive does not hold. The report prints
+  *referenced in MPPS* next to *found* and *acknowledged*, so any gap is on
+  screen. `complete --series-from <folder>` exists for the standalone case and
+  says plainly, in yellow, that it is asserting what is on your disk rather
+  than what the archive confirmed.
+- **Type 1 attributes are validated before anything is sent**, naming each
+  missing one and the flag that supplies it. Many SCPs accept an N-CREATE with
+  an empty Type 1 and then silently fail to reconcile it — success status,
+  useless result.
+- **A peer that accepts the association but refuses the MPPS presentation
+  context is named as such** ("this peer does not support MPPS") in about a
+  second, instead of looking like a 60-second timeout.
+- **`dcm scp` speaks MPPS too**, so the whole loop is testable locally: it
+  accepts N-CREATE/N-SET, enforces the legal status transitions, refuses a
+  duplicate step or a missing Type 1 the way a conformant SCP does, and
+  correlates a finished step back to the worklist item by Study Instance UID —
+  after which that item stops being returned by MWL queries, which is what a
+  real RIS does. `--keep-performed` keeps them coming back.
+- **`dcm find --mwl --json-raw`** emits worklist matches with values exactly as
+  they came off the wire — sequences stay arrays, Person Names stay objects.
+  The existing `--json` renders values for reading, which turns a sequence into
+  a string and loses precisely the correlation keys MPPS needs. `dcm mpps
+  perform --from-worklist <file>` reads the raw form, so a worklist match
+  reaches an N-CREATE without anyone retyping a UID.
+- **Desktop: a Perform a step (MPPS) screen.** Pick a worklist row, attach the
+  images, perform. It shows *what this step will assert* attribute by
+  attribute, marks anything the SCP did not return rather than inventing it,
+  and writes both peers into the command in full even when they are the same
+  system — a default you cannot see is a default nobody can check. It never
+  re-colours a worklist row from local state: only a fresh query may change
+  that table, and the result is worded as correlation, not proof.
+- **MCP: `dcm_mpps_start`, `dcm_mpps_complete`, `dcm_mpps_discontinue`,
+  `dcm_mpps_perform`**, with the same rules stated in their descriptions.
+- `dcm-cli-agent` was never published to npm, so the release workflow no
+  longer pretends: the npm job is gone and the install instructions no longer
+  offer a package that does not exist.
+
+### The binary can also replace itself now
+
+- **`dcm update`** — checks GitHub Releases, downloads the build for this
+  platform, verifies it against the `SHA256SUMS.txt` published with it, runs it
+  once to confirm it reports the version it should, and only then puts it in
+  place. The download is written to a temp file in the install directory, so
+  the swap is a rename on one volume and a checksum that does not match costs a
+  deleted temp file and nothing else — the working binary is untouched until
+  the new one has passed every check. There is deliberately no flag to skip the
+  checksum: the binaries are not code-signed, so it is the only thing standing
+  in for a signature. `--check` reports without changing anything and exits 0
+  either way, because it answered the question; `--check --json` gives a script
+  `updateAvailable` to read instead of an exit code. `--dry-run`, `--force`,
+  `--version <tag>` and `--dir` are there too.
+- **Windows self-replacement is handled properly.** A running `.exe` cannot be
+  overwritten, but it can be renamed: the old binary is moved aside, the new
+  one takes its name, and the rename is deleted on the next update once nothing
+  is running it. A leftover `dcm.exe.old-*` is reported on stderr and does not
+  change the exit code — it is inert, and training people to ignore exit 1
+  would cost more than the file does. If the second rename fails, the first is
+  undone immediately, so a failed update can never leave you with no `dcm` on
+  your PATH. The downloaded-from-the-internet mark is cleared the way
+  `dcm install` already does it, so SmartScreen stays quiet.
+- **It refuses where self-replacement is the wrong answer** rather than
+  half-doing it: from a source checkout it says `git pull`, and from an
+  `npm install -g` copy it says to let npm replace it. `--check` still reports
+  in both.
+- **Nothing phones home.** A version check happens when you ask for one, never
+  on an ordinary invocation. `dcm update --check` in a login script is the
+  supported way to be told.
+- New `src/lib/version.js` orders versions properly, including prereleases —
+  `0.9.0-rc.1` now sorts below `0.9.0` rather than comparing equal to it.
+
 ## v0.8.0
 
 The MCP server grows up: everything the engine does, reachable by an assistant.

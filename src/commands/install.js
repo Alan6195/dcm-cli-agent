@@ -236,8 +236,6 @@ async function run(parsed) {
     log.error('Build the executable first, then install that:');
     log.error('  npm run build');
     log.error('  .\\dist\\dcm.exe install');
-    log.error('');
-    log.error('Or use npm directly:  npm install -g dcm-cli-agent');
     return 1;
   }
 

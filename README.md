@@ -5,9 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A single-binary DICOM CLI for pushing folders of DICOM around. C-ECHO, C-STORE,
-C-FIND, a receiver that logs everything, plus inventory and de-identification.
-No runtime to install on the box you're running it from. Windows, macOS and
-Linux.
+C-FIND, a receiver that logs everything, worklists and MPPS, DICOMweb
+(STOW/QIDO/WADO), plus inventory and de-identification. No runtime to install
+on the box you're running it from. Windows, macOS and Linux.
 
 I wrote this because every DICOM transfer tool I've used answers the wrong
 question. They tell you the association succeeded. What I need to know is
@@ -59,13 +59,8 @@ chmod +x dcm-macos-arm64 && ./dcm-macos-arm64 install
 ```
 
 `dcm install --dry-run` shows exactly what it would do first. `dcm uninstall`
-reverses it.
-
-Or with Node 22+, skip the binary entirely:
-
-```bash
-npm install -g dcm-cli-agent
-```
+reverses it, and `dcm update` replaces the installed binary with the latest
+release.
 
 </details>
 
@@ -87,6 +82,39 @@ A few things worth knowing:
   would otherwise give you.
 - **macOS quarantines downloads.** The install script clears that for you. If
   you downloaded by hand, run `xattr -d com.apple.quarantine ./dcm`.
+
+### dcm update
+
+The CLI counterpart to the desktop app's in-app updates. It replaces the
+binary you're running with the latest published release.
+
+```bash
+dcm update --check    # is there a newer one? changes nothing
+dcm update            # fetch it, verify it, install it
+dcm update --dry-run  # everything except the replacement
+```
+
+It fetches the release for your platform from GitHub, checks it against the
+`SHA256SUMS.txt` published alongside it, runs it once to confirm it reports the
+version it should, and only then puts it in place. The download goes to a temp
+file in the install directory, so a checksum that doesn't match costs you a
+deleted temp file and nothing else — your working binary is never touched until
+the new one has passed. There's no flag to skip the checksum: the binaries
+aren't code-signed, so it's the only thing standing in for a signature.
+
+`--check` exits 0 either way — it answered the question. Read
+`updateAvailable` from `--check --json`, not the exit code. Exit 1 means the
+installed binary is not the version you asked for.
+
+On Windows a running `.exe` can't be overwritten, so the old one is renamed
+aside and the new one takes its name. That rename can't be deleted while it's
+still being run, so it's swept on the next update; a leftover `dcm.exe.old-*`
+is not a failure. Either way the new version takes effect the next time you
+run `dcm`, not in the process that did the update.
+
+Self-replacement only makes sense for the standalone binary. Run from a
+checkout, it tells you to `git pull` instead of handing you a copy of Node.
+It never phones home on its own — a check happens when you ask for one.
 
 ## Prefer a window?
 
@@ -400,6 +428,81 @@ dcm find --host pacs.example.org --port 11112 --called-ae ARCHIVE PatientID=1234
 ```
 
 Zero matches does not mean your transfer failed. See below.
+
+### dcm mpps
+
+A worklist says what is *scheduled*. MPPS — Modality Performed Procedure Step —
+says what *happened*, and the RIS reconciles the two on Study Instance UID to
+close the order. This is the half that lets a study actually be completed
+rather than just looked up.
+
+The whole transaction in one command: open the step, send the images, close the
+step.
+
+```bash
+dcm find --mwl --host ris.example.org --port 11112 --called-ae WORKLIST \
+  --json-raw Modality=CT > worklist.json
+
+dcm mpps perform ./acquired --from-worklist worklist.json \
+  --host ris.example.org --port 11112 --called-ae RIS-MPPS --calling-ae CT01
+```
+
+```
+N-CREATE: opening the step as IN PROGRESS
+  step 2.25.9030360608524058115956103740651924 is IN PROGRESS
+
+C-STORE: sending 412 instance(s) to ARCHIVE
+N-SET: closing the step as COMPLETED
+
+  found                412
+  acknowledged         412
+  referenced in MPPS   412
+  step status            COMPLETED
+```
+
+**A step is marked COMPLETED only when every instance was acknowledged.** There
+is no flag to override that. If two instances are unaccounted for, the step is
+marked DISCONTINUED and the command exits non-zero:
+
+```
+410 of 412 instances were acknowledged. The step was marked DISCONTINUED, not
+COMPLETED, because two instances are unaccounted for.
+```
+
+That's the same rule the transfer report has always followed, and it matters
+more here. A shortfall in `dcm send` is a number on your screen. An MPPS marked
+COMPLETED is a claim in someone else's database, which a technologist will read
+and believe. For the same reason, the Performed Series Sequence is built from
+the instances the peer acknowledged — never from a scan of your folder — so the
+record cannot reference an image the archive doesn't hold.
+
+Use `--from-worklist` rather than retyping UIDs: `--json-raw` keeps values as
+they came off the wire, while plain `--json` renders them for reading and turns
+sequences into strings, losing the correlation keys MPPS needs.
+
+The individual steps exist too, for a workflow that spans processes:
+
+```bash
+dcm mpps start --from-worklist worklist.json ...        # prints the MPPS UID
+dcm mpps complete <mpps-uid> --acknowledged sent.json ...
+dcm mpps discontinue <mpps-uid> --reason-code 110501^DCM^"Equipment failure" ...
+```
+
+The MPPS peer and the archive are often different systems, so `--store-host`,
+`--store-port` and `--store-called-ae` are separate; they default to the MPPS
+peer and the command prints both in full either way.
+
+**Testing it locally.** `dcm scp` speaks MPPS as well, so you can exercise the
+whole loop without a RIS:
+
+```bash
+dcm scp --port 11112 --ae WLSCP --worklist ./worklist.json --persist ./received
+```
+
+It enforces the legal status transitions, refuses a duplicate step or a missing
+Type 1 attribute the way a conformant SCP does, and when a step finishes it
+correlates back to the worklist item on Study Instance UID and stops returning
+it — which is what a real RIS does. `--keep-performed` leaves them in.
 
 ### dcm info
 
@@ -838,6 +941,11 @@ xattr -d com.apple.quarantine ./dcm
 
 The 0/1 split is deliberately strict. 823 found and 822 acknowledged exits 1.
 It's meant to be safe to drop into a cron job.
+
+Two things that look like failures and aren't: `dcm update --check` exits 0
+whether or not an update exists, because it answered the question; and a
+`dcm.exe.old-*` file left behind by an update exits 0, because the new binary
+is installed and the leftover is swept on the next run.
 
 ## Building from source
 

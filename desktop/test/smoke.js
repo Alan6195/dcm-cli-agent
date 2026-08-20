@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const VIEWS = [
-  'echo', 'send', 'receive', 'query', 'worklist', 'speed',
+  'echo', 'send', 'receive', 'query', 'worklist', 'mpps', 'speed',
   'webping', 'websend', 'webquery', 'webhub',
   'inventory', 'tags', 'edit', 'anon', 'mcp',
 ];
@@ -86,6 +86,55 @@ async function runSmoke(win, app) {
       );
       fs.writeFileSync(path.join(outDir, 'send-console.txt'), consoleText || '');
       process.stdout.write(`send console bytes: ${(consoleText || '').length}\n`);
+    }
+
+    // Worklist row -> "perform this step" hand-off. No MWL SCP is needed: the
+    // renderer is fed one match in the shape `dcm find --mwl --json` emits, the
+    // row is clicked, and the MPPS command preview is captured. That is the
+    // whole contract of the screen — the selection carries the row's attributes
+    // into a command, and both peers appear in it in full.
+    {
+      const folder = fixtures || '/tmp/study';
+      await win.webContents.executeJavaScript(`
+        showView('worklist');
+        state.conn = { host: '127.0.0.1', port: '11112', calledAe: 'RISMPPS', callingAe: 'CT01' };
+        syncConnInputs();
+        renderWorklist({ matches: [{
+          PatientName: 'DOE^JANE', PatientID: 'P-1001', AccessionNumber: 'ACC-77',
+          StudyInstanceUID: '1.2.826.0.1.3680043.8.498.10101', Modality: 'CT',
+          ScheduledProcedureStepID: 'SPS-1', ScheduledProcedureStepStartDate: '20260820',
+          ScheduledProcedureStepStartTime: '0930', ScheduledStationAETitle: 'CT01',
+          RequestedProcedureDescription: 'CT Abdomen', RequestedProcedureID: 'RP-5',
+        }] });
+        document.querySelector('#view-worklist [data-result] tr.pick-row').click();
+        true
+      `);
+      await wait(250);
+      await shot(win, outDir, 'worklist-selected');
+
+      await win.webContents.executeJavaScript(`
+        showView('mpps');
+        document.querySelector('#mpps-store-same').checked = false;
+        document.querySelector('#mpps-store-host').value = 'pacs.example.org';
+        document.querySelector('#mpps-store-port').value = '104';
+        document.querySelector('#mpps-store-ae').value = 'ARCHIVE';
+        document.querySelector('#mpps-folder').value = ${JSON.stringify(folder)};
+        document.querySelector('#mpps-folder').dispatchEvent(new Event('input', {bubbles:true}));
+        true
+      `);
+      await wait(250);
+      await shot(win, outDir, 'mpps-selected');
+
+      const mppsCmd = await win.webContents.executeJavaScript(
+        `document.querySelector('#view-mpps [data-cmd]').textContent`
+      );
+      fs.writeFileSync(path.join(outDir, 'mpps-cmd.txt'), mppsCmd || '');
+      process.stdout.write(`mpps cmd: ${mppsCmd}\n`);
+      for (const needed of ['mpps perform', '--store-host', '--store-called-ae', '--study-uid']) {
+        if (!String(mppsCmd).includes(needed)) {
+          throw new Error(`mpps command preview is missing ${needed}: ${mppsCmd}`);
+        }
+      }
     }
 
     // Live speed test against a receiver started by the harness caller.

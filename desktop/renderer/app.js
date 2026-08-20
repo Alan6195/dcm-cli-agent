@@ -52,6 +52,14 @@ const state = {
   profiles: [],
   info: { home: '', platform: '', version: '' },
   activeRuns: {}, // view -> runId (for cancel/stop)
+
+  // The worklist as the SCP last returned it, plus which row the operator
+  // picked. `matches` is replaced wholesale by a fetch and by nothing else.
+  mwl: { matches: [], selectedIdx: null },
+
+  // The last `mpps perform` this app ran. Kept separately from the selection so
+  // the outcome keeps naming its own study after a re-query clears the picker.
+  mpps: { lastRun: null },
 };
 
 // --------------------------------------------------------------------------
@@ -656,6 +664,12 @@ function renderWorklist(json) {
   const matches = Array.isArray(json?.matches) ? json.matches : [];
   box.hidden = false;
 
+  // A fetch replaces the list, so any previous pick is gone with it. Carrying a
+  // selection across queries would mean showing attributes the SCP did not just
+  // return, which is exactly the kind of stale local state this screen avoids.
+  state.mwl.matches = matches;
+  clearWorklistSelection();
+
   if (!matches.length) {
     box.innerHTML =
       '<div class="empty-note">No scheduled procedures matched.<br>' +
@@ -675,7 +689,8 @@ function renderWorklist(json) {
     return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
   };
 
-  const rows = matches.map((m) => `<tr>
+  const rows = matches.map((m, i) => `<tr class="pick-row" data-idx="${i}" tabindex="0" role="button" aria-pressed="false">
+      <td class="pick-cell"><span class="pick-dot"></span></td>
       <td class="when">${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
       <td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>
       <td>${esc(m.PatientName || '')}</td>
@@ -686,10 +701,132 @@ function renderWorklist(json) {
     </tr>`).join('');
 
   box.innerHTML =
-    `<div class="section-title">${matches.length} scheduled procedure(s)</div>` +
-    '<table><thead><tr><th>Scheduled</th><th>Modality</th><th>Patient</th><th>Patient ID</th>' +
+    `<div class="section-title">${matches.length} scheduled procedure(s) — click one to perform it</div>` +
+    '<table><thead><tr><th class="pick-cell"></th><th>Scheduled</th><th>Modality</th><th>Patient</th><th>Patient ID</th>' +
     '<th>Accession</th><th>Station AE</th><th>Procedure</th></tr></thead>' +
     `<tbody>${rows}</tbody></table>`;
+}
+
+// --------------------------------------------------------------------------
+// Worklist selection — the hand-off into `dcm mpps perform`
+// --------------------------------------------------------------------------
+/** The worklist item the operator picked, or null. */
+function selectedWorklistItem() {
+  const i = state.mwl.selectedIdx;
+  return i == null ? null : (state.mwl.matches[i] ?? null);
+}
+
+/** First non-empty value among the given keys of a worklist match. */
+function attrOf(item, ...keys) {
+  for (const k of keys) {
+    const v = item ? item[k] : '';
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
+
+/**
+ * The attributes a selected row hands to `dcm mpps perform`.
+ *
+ * Everything here came off the wire in the C-FIND response. Nothing is
+ * defaulted or guessed: a key the SCP did not return stays empty, and the
+ * screen says so rather than filling it in.
+ */
+function worklistAttrs(item) {
+  if (!item) return null;
+  return {
+    studyInstanceUid: attrOf(item, 'StudyInstanceUID'),
+    accessionNumber: attrOf(item, 'AccessionNumber'),
+    patientId: attrOf(item, 'PatientID'),
+    patientName: attrOf(item, 'PatientName'),
+    patientBirthDate: attrOf(item, 'PatientBirthDate'),
+    patientSex: attrOf(item, 'PatientSex'),
+    modality: attrOf(item, 'Modality'),
+    scheduledStepId: attrOf(item, 'ScheduledProcedureStepID'),
+    scheduledStepDescription: attrOf(item, 'ScheduledProcedureStepDescription'),
+    requestedProcedureId: attrOf(item, 'RequestedProcedureID'),
+    requestedProcedureDescription: attrOf(item, 'RequestedProcedureDescription'),
+    scheduledStationAe: attrOf(item, 'ScheduledStationAETitle'),
+  };
+}
+
+/** One "key / value" cell, amber when the SCP returned nothing for it. */
+function attrCell(label, value, missingLabel = 'not returned by the SCP') {
+  const has = value !== '';
+  return `<div class="attr ${has ? '' : 'missing'}">` +
+    `<div class="attr-k">${esc(label)}</div>` +
+    `<div class="attr-v">${esc(has ? value : `— ${missingLabel} —`)}</div></div>`;
+}
+
+function selectWorklistRow(idx) {
+  const item = state.mwl.matches[idx];
+  if (!item) return;
+  state.mwl.selectedIdx = idx;
+
+  for (const tr of $$('#view-worklist [data-result] tr.pick-row')) {
+    const on = Number(tr.dataset.idx) === idx;
+    tr.classList.toggle('row-selected', on);
+    tr.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  const a = worklistAttrs(item);
+  $('#mwl-attrs').innerHTML =
+    attrCell('Patient', a.patientName) +
+    attrCell('Patient ID', a.patientId) +
+    attrCell('Accession', a.accessionNumber) +
+    attrCell('Modality', a.modality) +
+    attrCell('Scheduled step ID', a.scheduledStepId) +
+    attrCell('Study Instance UID', a.studyInstanceUid);
+  $('#mwl-selected').hidden = false;
+
+  // Seed the two Type 1 fields the operator is allowed to correct. Re-seeding
+  // on every selection is right: they describe the row that is now picked.
+  const stepId = $('#mpps-stepid');
+  stepId.value = a.scheduledStepId;
+  delete stepId.dataset.touched;
+  const desc = $('#mpps-stepdesc');
+  desc.value = a.scheduledStepDescription || a.requestedProcedureDescription;
+  delete desc.dataset.touched;
+
+  renderMppsPanel();
+  updateAllPreviews();
+}
+
+function clearWorklistSelection() {
+  state.mwl.selectedIdx = null;
+  for (const tr of $$('#view-worklist [data-result] tr.pick-row')) {
+    tr.classList.remove('row-selected');
+    tr.setAttribute('aria-pressed', 'false');
+  }
+  $('#mwl-selected').hidden = true;
+  renderMppsPanel();
+  updateAllPreviews();
+}
+
+/**
+ * Says whether the study we performed is still returned by this query.
+ *
+ * Deliberately worded as correlation. A worklist item can leave a query's
+ * results for reasons that have nothing to do with our MPPS — the date filter,
+ * the station AE, the SCP's own rules — and it can stay in them even after a
+ * performed step was accepted. Either way, all that has been re-read is this
+ * query.
+ */
+function renderMwlCorrelation() {
+  const el = $('#mwl-correlation');
+  const last = state.mpps.lastRun;
+  if (!last || !last.studyInstanceUid) { el.hidden = true; return; }
+
+  const uid = last.studyInstanceUid;
+  const present = state.mwl.matches.some((m) => attrOf(m, 'StudyInstanceUID') === uid);
+  el.hidden = false;
+  el.innerHTML = present
+    ? `The study you performed (<code>${esc(uid)}</code>) <b>still matches this query.</b> ` +
+      'That is not evidence the SCP refused anything: some SCPs keep a scheduled step visible ' +
+      'after a performed step is reported, and this app cannot see the SCP\'s worklist rules.'
+    : `The study you performed (<code>${esc(uid)}</code>) <b>no longer matches this query.</b> ` +
+      'That is a correlation, not proof. An item can drop out of a query because of the date ' +
+      'filter, the station AE or the SCP\'s own rules; all that has been re-read here is the query.';
 }
 
 function wireWorklist() {
@@ -704,6 +841,23 @@ function wireWorklist() {
   ['mwl-date', 'mwl-modality', 'mwl-station', 'mwl-limit', 'mwl-patientname', 'mwl-patientid', 'mwl-accession']
     .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
 
+  // Delegated, because the table's innerHTML is replaced on every fetch.
+  const results = $('#view-worklist [data-result]');
+  results.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr.pick-row');
+    if (tr) selectWorklistRow(Number(tr.dataset.idx));
+  });
+  results.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const tr = e.target.closest('tr.pick-row');
+    if (!tr) return;
+    e.preventDefault();
+    selectWorklistRow(Number(tr.dataset.idx));
+  });
+
+  $('#mwl-clearsel').addEventListener('click', clearWorklistSelection);
+  $('#mwl-perform').addEventListener('click', () => showView('mpps'));
+
   $('#view-worklist [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
     $('#view-worklist [data-result]').hidden = true;
@@ -717,10 +871,347 @@ function wireWorklist() {
     setStatus('worklist', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
     try {
       renderWorklist(JSON.parse(stdout));
+      renderMwlCorrelation();
     } catch {
+      // No parseable answer means nothing was re-read, so the correlation note
+      // from an earlier query would be stale. Take it down.
+      $('#mwl-correlation').hidden = true;
       appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
     }
   });
+}
+
+// --------------------------------------------------------------------------
+// View: MPPS — perform the selected step
+// --------------------------------------------------------------------------
+/** The storage peer as the three fields currently read. */
+function mppsStore() {
+  return {
+    host: $('#mpps-store-host').value.trim(),
+    port: $('#mpps-store-port').value.trim(),
+    calledAe: $('#mpps-store-ae').value.trim(),
+  };
+}
+
+/**
+ * Keeps the mirrored fields honest.
+ *
+ * "Same system as the MPPS peer" copies the real values into the storage
+ * fields rather than leaving them blank, so the command preview can name both
+ * peers in full. The same goes for the Performed Station AE Title, which is
+ * Type 1 and would otherwise be an invisible engine default.
+ */
+function syncMppsMirrors() {
+  const same = $('#mpps-store-same').checked;
+  for (const [id, val] of [
+    ['mpps-store-host', state.conn.host],
+    ['mpps-store-port', state.conn.port],
+    ['mpps-store-ae', state.conn.calledAe],
+  ]) {
+    const el = $(`#${id}`);
+    el.readOnly = same;
+    el.classList.toggle('mirrored', same);
+    if (same) el.value = val;
+  }
+
+  const station = $('#mpps-stationae');
+  if (!station.dataset.touched) station.value = state.conn.callingAe || 'DCM-CLI';
+}
+
+BUILDERS.mpps = () => {
+  // Builders run on every keystroke anywhere, which makes this the one hook
+  // that catches a change to the shared connection panel too.
+  syncMppsMirrors();
+
+  const argv = ['mpps', 'perform'];
+  const folder = $('#mpps-folder').value.trim();
+  if (folder) argv.push(folder);
+
+  argv.push(...connArgs());
+
+  // Both peers, always written out. `dcm mpps perform` defaults each --store-*
+  // to the MPPS peer, but a default you cannot see is a default nobody can
+  // check — and sending images to the RIS by accident is the exact mistake
+  // this screen exists to prevent.
+  const store = mppsStore();
+  if (store.host) argv.push('--store-host', store.host);
+  if (store.port) argv.push('--store-port', store.port);
+  if (store.calledAe) argv.push('--store-called-ae', store.calledAe);
+
+  const a = worklistAttrs(selectedWorklistItem());
+  if (a) {
+    const push = (flag, value) => { if (value) argv.push(flag, value); };
+    push('--study-uid', a.studyInstanceUid);
+    push('--accession', a.accessionNumber);
+    push('--patient-id', a.patientId);
+    push('--patient-name', a.patientName);
+    push('--patient-birth-date', a.patientBirthDate);
+    push('--patient-sex', a.patientSex);
+    push('--modality', a.modality);
+    push('--scheduled-step-id', a.scheduledStepId);
+    push('--requested-procedure-id', a.requestedProcedureId);
+    push('--requested-procedure-description', a.requestedProcedureDescription);
+  }
+
+  const stepId = $('#mpps-stepid').value.trim();
+  if (stepId) argv.push('--step-id', stepId);
+  const stationAe = $('#mpps-stationae').value.trim();
+  if (stationAe) argv.push('--station-ae', stationAe);
+  const stepDesc = $('#mpps-stepdesc').value.trim();
+  if (stepDesc) argv.push('--step-description', stepDesc);
+
+  const chunk = $('#mpps-chunk').value.trim();
+  if (chunk) argv.push('--chunk', chunk);
+  const retry = $('#mpps-retry').value.trim();
+  if (retry) argv.push('--retry', retry);
+  const retrieveAe = $('#mpps-retrieveae').value.trim();
+  if (retrieveAe) argv.push('--retrieve-ae', retrieveAe);
+  const record = $('#mpps-record').value.trim();
+  if (record) argv.push('--write-acknowledged', record);
+
+  if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
+  if ($('#mpps-dryrun').checked) argv.push('--dry-run');
+  return argv;
+};
+
+/** Shows either the "pick a row first" note or the form, and fills the form. */
+function renderMppsPanel() {
+  const a = worklistAttrs(selectedWorklistItem());
+  $('#mpps-nosel').hidden = Boolean(a);
+  $('#mpps-body').hidden = !a;
+  if (!a) return;
+
+  $('#mpps-attrs').innerHTML =
+    attrCell('Patient', a.patientName) +
+    attrCell('Patient ID', a.patientId) +
+    attrCell('Patient birth date', a.patientBirthDate) +
+    attrCell('Patient sex', a.patientSex) +
+    attrCell('Accession', a.accessionNumber) +
+    attrCell('Modality', a.modality) +
+    attrCell('Scheduled step ID', a.scheduledStepId) +
+    attrCell('Requested procedure ID', a.requestedProcedureId) +
+    attrCell('Procedure', a.requestedProcedureDescription || a.scheduledStepDescription) +
+    attrCell('Scheduled station AE', a.scheduledStationAe) +
+    attrCell('Study Instance UID', a.studyInstanceUid);
+
+  // Say what the engine will do about anything the SCP left out, rather than
+  // quietly filling it in here.
+  const notes = [];
+  if (!a.studyInstanceUid) {
+    notes.push('This row carries no <b>Study Instance UID</b>. It is Type 1 inside ' +
+      'ScheduledStepAttributesSequence, and the engine will take it from the folder only if ' +
+      'that folder holds exactly one study.');
+  }
+  if (!a.modality) {
+    notes.push('This row carries no <b>Modality</b>. It is Type 1, and the engine will take it ' +
+      'from the folder only if the folder holds exactly one.');
+  }
+  if (!$('#mpps-stepid').value.trim()) {
+    notes.push('<b>Performed step ID</b> is Type 1 and there is no scheduled step ID to fall ' +
+      'back on. The engine refuses the N-CREATE until it is filled in above.');
+  }
+  const note = $('#mpps-attr-note');
+  note.innerHTML = notes.length
+    ? notes.join(' ')
+    : 'Every value above came back from the SCP in this query. Attributes not shown ' +
+      '(start date and time) are taken at the moment the step is created.';
+}
+
+/**
+ * Reads the engine's own report.
+ *
+ * Deliberately reads the printed report rather than re-deriving anything: the
+ * counts and the status sentence shown here are the engine's words, so the app
+ * cannot claim more than the transaction did.
+ */
+function parseMppsReport(text) {
+  const t = stripAnsi(text);
+  const num = (label) => {
+    const m = new RegExp(`^ {2}${label} +(\\d+)`, 'm').exec(t);
+    return m ? Number(m[1]) : null;
+  };
+  const statusMatch = /^step status +(\S+)/m.exec(t);
+  const shortfall = /^\d+ of \d+ instances were acknowledged\.[\s\S]*?unaccounted for\./m.exec(t);
+  return {
+    status: statusMatch ? statusMatch[1] : null,
+    found: num('found'),
+    sent: num('sent'),
+    acknowledged: num('acknowledged'),
+    referenced: num('referenced in MPPS'),
+    shortfall: shortfall ? shortfall[0].replace(/\s+/g, ' ') : null,
+    stillInProgress: /the step is still IN PROGRESS/.test(t),
+    neverOpened: /the procedure step was never opened/.test(t),
+  };
+}
+
+function renderMppsTotals(r) {
+  const box = $('#view-mpps [data-totals]');
+  if (r.found == null) { box.hidden = true; box.classList.remove('show'); return; }
+  const cell = (n, lbl, cls = '') =>
+    `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
+  const complete = r.acknowledged != null && r.acknowledged === r.found;
+  box.innerHTML =
+    cell(r.found, 'found') +
+    cell(r.sent, 'sent') +
+    cell(r.acknowledged, 'acknowledged', complete ? 'ok' : 'fail') +
+    cell(r.referenced, 'referenced in MPPS', complete ? 'ok' : 'fail');
+  box.hidden = false;
+  box.classList.add('show');
+}
+
+/**
+ * Turns the run into one verdict.
+ *
+ * DISCONTINUED is a failure here, not a qualified success. The engine already
+ * exits non-zero for it; the screen has to say the same thing, because a step
+ * that says DISCONTINUED means the study is not fully accounted for in the
+ * archive and somebody has to act on that.
+ */
+function renderMppsOutcome({ code, report, dryRun }) {
+  const box = $('#mpps-outcome');
+  box.hidden = false;
+
+  if (dryRun) {
+    box.className = 'outcome';
+    box.innerHTML = '<span class="outcome-head">Dry run — nothing was sent.</span>' +
+      'No connection was opened, no procedure step was created and no images left this machine. ' +
+      'PerformedSeriesSequence cannot be previewed: it is built from what the archive ' +
+      'acknowledges, and nothing has been acknowledged.';
+    setStatus('mpps', code === 0 ? 'ok' : 'fail', code === 0 ? 'Plan ready' : 'Scan failed');
+    return;
+  }
+
+  if (report.status === 'COMPLETED' && code === 0) {
+    box.className = 'outcome ok';
+    box.innerHTML = '<span class="outcome-head">Step COMPLETED.</span>' +
+      'Every instance found on disk was acknowledged by the archive and is referenced in the ' +
+      'MPPS. <b>What the MPPS SCP does with the scheduled worklist entry is not visible from ' +
+      'here</b> — re-query the worklist if you need to see whether it still matches.';
+    setStatus('mpps', 'ok', 'COMPLETED');
+    return;
+  }
+
+  box.className = 'outcome bad';
+  let head = 'The step was not completed.';
+  let body;
+  if (report.status === 'DISCONTINUED') {
+    head = 'Step DISCONTINUED — this is a failure.';
+    body = (report.shortfall ? `${esc(report.shortfall)} ` : '') +
+      'There is no override for this. COMPLETED asserts the work is fully accounted for, and ' +
+      'the performed series above name only what the archive actually took. Resend the ' +
+      'outstanding instances and open a new step, or find out why the archive refused them.';
+  } else if (report.neverOpened) {
+    head = 'N-CREATE failed — the step was never opened.';
+    body = 'Nothing was sent. The images are untouched; the output above says why the MPPS peer ' +
+      'refused. Fix the peer and run this again.';
+  } else if (report.stillInProgress) {
+    head = 'N-SET failed — the step is still IN PROGRESS on the peer.';
+    body = 'The images were sent, but the closing N-SET did not land, so the step is open on the ' +
+      'MPPS peer. Close it by hand with <b>dcm mpps complete</b> or <b>discontinue</b> once the ' +
+      'peer is reachable — the command in the output above is the one to run.';
+  } else {
+    body = 'The engine exited ' + esc(String(code)) + ' without reporting a closed step. The ' +
+      'output above is the whole story; nothing here is inferred beyond it.';
+  }
+  box.innerHTML = `<span class="outcome-head">${esc(head)}</span>${body}`;
+  setStatus('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
+}
+
+function wireMpps() {
+  const ids = [
+    'mpps-folder', 'mpps-store-host', 'mpps-store-port', 'mpps-store-ae',
+    'mpps-stepid', 'mpps-stationae', 'mpps-stepdesc',
+    'mpps-chunk', 'mpps-retry', 'mpps-retrieveae', 'mpps-record',
+  ];
+  ids.forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+
+  // Once either Type 1 field is edited by hand, stop overwriting it.
+  ['mpps-stationae', 'mpps-stepid', 'mpps-stepdesc'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
+
+  // Filling in a missing Type 1 step ID should retire the warning about it.
+  $('#mpps-stepid').addEventListener('input', renderMppsPanel);
+
+  $('#mpps-store-same').addEventListener('change', updateAllPreviews);
+  $('#mpps-norecurse').addEventListener('change', updateAllPreviews);
+  $('#mpps-dryrun').addEventListener('change', () => {
+    $('#view-mpps [data-run]').textContent = $('#mpps-dryrun').checked ? 'Dry run' : 'Perform step';
+    updateAllPreviews();
+  });
+
+  $('#mpps-requery').addEventListener('click', () => {
+    showView('worklist');
+    $('#view-worklist [data-run]').click();
+  });
+
+  $('#view-mpps [data-cancel]').addEventListener('click', () => {
+    const id = state.activeRuns.mpps;
+    if (id) window.dcm.cancel(id);
+  });
+
+  $('#view-mpps [data-run]').addEventListener('click', async () => {
+    const item = selectedWorklistItem();
+    clearConsole('mpps');
+    $('#mpps-outcome').hidden = true;
+    $('#view-mpps [data-totals]').hidden = true;
+    $('#mpps-after').hidden = true;
+
+    if (!item) {
+      appendConsole('mpps', 'Select a worklist row first.\n', 'stderr');
+      return;
+    }
+    const folder = $('#mpps-folder').value.trim();
+    if (!folder) {
+      appendConsole('mpps', 'Choose the folder holding this study\'s images.\n', 'stderr');
+      return;
+    }
+
+    const dryRun = $('#mpps-dryrun').checked;
+    if (!dryRun) {
+      const miss = connMissing();
+      if (miss.length) {
+        appendConsole('mpps', `Fill in the MPPS peer: ${miss.join(', ')}.\n`, 'stderr');
+        return;
+      }
+      const store = mppsStore();
+      const storeMiss = [
+        ['host', store.host], ['port', store.port], ['called AE', store.calledAe],
+      ].filter(([, v]) => !v).map(([label]) => label);
+      if (storeMiss.length) {
+        appendConsole('mpps',
+          `Fill in the storage peer: ${storeMiss.join(', ')}. Both peers are named in full in ` +
+          'the command, so neither can be left to a hidden default.\n', 'stderr');
+        return;
+      }
+    }
+
+    const argv = BUILDERS.mpps();
+    const attrs = worklistAttrs(item);
+    setStatus('mpps', 'running', dryRun ? 'Scanning…' : 'Performing…');
+    $('#view-mpps [data-run]').disabled = true;
+    if (!dryRun) $('#view-mpps [data-cancel]').hidden = false;
+
+    const { code, stdout } = await runStreaming('mpps', argv);
+
+    $('#view-mpps [data-run]').disabled = false;
+    $('#view-mpps [data-cancel]').hidden = true;
+
+    const report = parseMppsReport(stdout);
+    if (!dryRun) {
+      renderMppsTotals(report);
+      // Recorded so the re-query can name the study it is looking for, even
+      // after a fresh fetch clears the selection.
+      state.mpps.lastRun = {
+        studyInstanceUid: attrs.studyInstanceUid,
+        status: report.status,
+        code,
+      };
+      $('#mpps-after').hidden = false;
+    }
+    renderMppsOutcome({ code, report, dryRun });
+  });
+
+  renderMppsPanel();
 }
 
 // --------------------------------------------------------------------------
@@ -1719,6 +2210,7 @@ async function boot() {
   wireReceive();
   wireQuery();
   wireWorklist();
+  wireMpps();
   wireSpeed();
   wireWebping();
   wireWebsend();

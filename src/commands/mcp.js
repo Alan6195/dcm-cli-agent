@@ -32,6 +32,8 @@ dcm mcp — run a Model Context Protocol (MCP) server over stdio
 Exposes the DICOM operations as MCP tools so an assistant can drive them:
   DIMSE     dcm_echo, dcm_inventory, dcm_query, dcm_worklist, dcm_tags,
             dcm_send, dcm_anon, dcm_edit
+  MPPS      dcm_mpps_start, dcm_mpps_perform, dcm_mpps_complete,
+            dcm_mpps_discontinue
   DICOMweb  dcm_web_ping, dcm_web_send, dcm_web_query, dcm_web_retrieve
 
 It speaks JSON-RPC on stdin/stdout and is meant to be launched by an MCP client,

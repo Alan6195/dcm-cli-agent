@@ -2,7 +2,8 @@
 
 /**
  * MCP tools that drive DIMSE and local-file commands: connectivity, query,
- * worklist, inventory, tag inspection, transfer and mutation.
+ * worklist, inventory, tag inspection, transfer, mutation, and the Modality
+ * Performed Procedure Step verbs that close the worklist loop.
  *
  * Each tool builds the argument vector the CLI command takes and runs that
  * command through the runtime — the descriptions say what a result does and
@@ -29,6 +30,43 @@ const EXTRA_MWL_KEYS =
   'ScheduledProcedureStepStatus, ScheduledProcedureStepID, ' +
   'ScheduledPerformingPhysicianName, RequestedProcedureDescription, ' +
   'RequestedProcedureID, PatientBirthDate, PatientSex';
+
+/**
+ * How a dcm_worklist row becomes a dcm_mpps_perform call.
+ *
+ * The CLI hands a worklist item to MPPS through a file: `dcm find --mwl
+ * --json-raw > wl.json`, then `dcm mpps perform --from-worklist wl.json`.
+ * Across the MCP boundary there is no file — dcm_worklist's answer lands in the
+ * conversation, and nothing here writes it to disk — so the handoff is made of
+ * named parameters instead, one per row key, and this table is the mapping. It
+ * is emitted once per worklist result rather than once per row: the values are
+ * already in `matches`, and copying them a second time would be a second thing
+ * to keep in step with the first.
+ *
+ * ScheduledStationAETitle is deliberately absent. It names the station the work
+ * was BOOKED on; PerformedStationAETitle names the AE the images actually
+ * arrive under, and defaulting the second to the first would break the match
+ * the archive makes between the images and the step whenever this tool is not
+ * running on that station.
+ */
+const MPPS_HANDOFF = {
+  tool: 'dcm_mpps_perform',
+  // In the order an MPPS SCP tries them: the first key that matches anything
+  // decides, so a correct Study Instance UID is worth more than the rest.
+  correlationKeys: ['StudyInstanceUID', 'AccessionNumber', 'ScheduledProcedureStepID'],
+  parameters: {
+    StudyInstanceUID: 'studyUid',
+    AccessionNumber: 'accessionNumber',
+    ScheduledProcedureStepID: 'scheduledStepId',
+    Modality: 'modality',
+    PatientID: 'patientId',
+    PatientName: 'patientName',
+    PatientBirthDate: 'patientBirthDate',
+    PatientSex: 'patientSex',
+    RequestedProcedureID: 'requestedProcedureId',
+    RequestedProcedureDescription: 'requestedProcedureDescription',
+  },
+};
 
 /**
  * Today's date in DICOM DA form, offset by whole days.
@@ -160,7 +198,7 @@ function register(server, z, rt) {
     {
       title: 'Modality Worklist (C-FIND MWL)',
       description:
-        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all.',
+        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all. Each row carries the keys the MPPS tools need — StudyInstanceUID above all — and structuredContent.mppsHandoff names which parameter of dcm_mpps_perform each one goes to, so going from a scheduled row to a performed step needs no guessing.',
       inputSchema: {
         ...peerSchema(),
         modality: z.string().optional().describe('Modality the procedure is scheduled on, e.g. CT, MR, CR, US.'),
@@ -244,11 +282,22 @@ function register(server, z, rt) {
       ? '\n\nNo scheduled procedures matched. That is a legitimate answer — nothing may be ' +
         'booked for this date, station or modality. Re-run with scheduledDate "any" and no ' +
         'other filters before concluding the worklist SCP is at fault.'
-      : '';
+      : '\n\nTo report what was performed against one of these rows, pass its keys to ' +
+        'dcm_mpps_perform as named parameters: StudyInstanceUID as studyUid, ' +
+        'AccessionNumber as accessionNumber, ScheduledProcedureStepID as scheduledStepId, ' +
+        'Modality as modality, and the patient keys likewise. The full mapping is in ' +
+        'structuredContent.mppsHandoff. Do not write these rows to a file and pass them as ' +
+        'fromWorklist: this JSON is rendered for reading, and the MPPS commands refuse it ' +
+        'by name.';
+
+    // Additive: `count` and `matches` keep the shape every existing consumer
+    // reads. The handoff table rides along so the mapping is machine-readable
+    // and not only prose in the note above.
+    const structured = parsed.count === 0 ? parsed : { ...parsed, mppsHandoff: MPPS_HANDOFF };
 
     return {
-      content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) + note }],
-      structuredContent: parsed,
+      content: [{ type: 'text', text: JSON.stringify(structured, null, 2) + note }],
+      structuredContent: structured,
     };
   }
 
@@ -400,6 +449,341 @@ function register(server, z, rt) {
       return textResult(await runCommand('edit', argv));
     }
   );
+
+  // ---- Modality Performed Procedure Step ---------------------------------
+
+  // `dcm mpps` is not in the runtime's default command table. The table is the
+  // set the first tool modules needed, not a closed list, so a module that
+  // drives a command missing from it registers that command here rather than
+  // reaching around runCommand and opening a second output capture. Guarded
+  // because register() is called once per server and several times per test
+  // run.
+  if (!rt.COMMANDS.mpps) rt.COMMANDS.mpps = () => require('../mpps');
+
+  /**
+   * The step attributes dcm_mpps_start and dcm_mpps_perform share.
+   *
+   * Named after the dcm_worklist row keys they come from, so the handoff is a
+   * rename and not a translation. See MPPS_HANDOFF for why this is parameters
+   * rather than a file.
+   *
+   * @returns {Record<string, object>}
+   */
+  const stepSchema = () => ({
+    studyUid: z.string().optional().describe(
+      'Study Instance UID — StudyInstanceUID from the dcm_worklist row. Type 1 inside ScheduledStepAttributesSequence, and THE correlation key: the RIS ties the step to the order and to the images on this and little else. dcm_mpps_perform takes it from the folder when the folder holds exactly one study and this is not given, and refuses if the two disagree.'),
+    accessionNumber: z.string().optional().describe('AccessionNumber from the worklist row. The second correlation key an SCP tries.'),
+    scheduledStepId: z.string().optional().describe('ScheduledProcedureStepID from the worklist row. The third correlation key, and what stepId defaults to.'),
+    modality: z.string().optional().describe('Modality of the performed step, e.g. CT. Type 1. dcm_mpps_perform reads it from the folder when the folder holds exactly one modality, and refuses to guess when it holds several.'),
+    stepId: z.string().optional().describe('Performed Procedure Step ID. Type 1. Defaults to scheduledStepId. With neither, the call is refused locally before anything is sent.'),
+    stationAe: z.string().optional().describe('Performed Station AE Title. Type 1. Defaults to callingAe, which is the AE the images arrive under, so the archive matches the two by default. Setting it to the SCHEDULED station AE instead breaks that match unless the images really are sent from there.'),
+    stationName: z.string().optional().describe('Performed Station Name (free text, not an AE Title).'),
+    location: z.string().optional().describe('Performed Location.'),
+    stepDescription: z.string().optional().describe('Performed Procedure Step Description — what was actually done.'),
+    patientId: z.string().optional(),
+    patientName: z.string().optional().describe('DICOM person name, e.g. "DOE^JANE".'),
+    patientBirthDate: z.string().optional().describe('YYYYMMDD.'),
+    patientSex: z.string().optional().describe('M, F or O.'),
+    requestedProcedureId: z.string().optional(),
+    requestedProcedureDescription: z.string().optional(),
+    startDate: z.string().optional().describe('YYYYMMDD the step started. Default: today, local time on this machine.'),
+    startTime: z.string().optional().describe('HHMMSS the step started. Default: now, local time on this machine.'),
+    mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. The generated one is returned, and it is the only handle on the step.'),
+    fromWorklist: z.string().optional().describe(
+      'Path to a JSON file of worklist attributes, as written by `dcm find --mwl --json-raw`. It is NOT the output of dcm_worklist or `dcm find --mwl --json`: that form is rendered for people to read, which turns sequences into strings, and it is refused by name rather than sent malformed. Over MCP prefer the named parameters above — they carry the same values with no file involved. Named parameters win over anything in the file.'),
+  });
+
+  /**
+   * Builds the attribute half of an mpps argument vector.
+   *
+   * @param {object} a  Tool arguments.
+   * @returns {string[]}
+   */
+  const stepArgv = (a) => {
+    const argv = [];
+    // First, so the explicit parameters below override what the file carries —
+    // the same precedence the CLI has.
+    opt(argv, '--from-worklist', a.fromWorklist);
+    opt(argv, '--study-uid', a.studyUid);
+    opt(argv, '--accession', a.accessionNumber);
+    opt(argv, '--scheduled-step-id', a.scheduledStepId);
+    opt(argv, '--modality', a.modality);
+    opt(argv, '--step-id', a.stepId);
+    opt(argv, '--station-ae', a.stationAe);
+    opt(argv, '--station-name', a.stationName);
+    opt(argv, '--location', a.location);
+    opt(argv, '--step-description', a.stepDescription);
+    opt(argv, '--patient-id', a.patientId);
+    opt(argv, '--patient-name', a.patientName);
+    opt(argv, '--patient-birth-date', a.patientBirthDate);
+    opt(argv, '--patient-sex', a.patientSex);
+    opt(argv, '--requested-procedure-id', a.requestedProcedureId);
+    opt(argv, '--requested-procedure-description', a.requestedProcedureDescription);
+    opt(argv, '--start-date', a.startDate);
+    opt(argv, '--start-time', a.startTime);
+    opt(argv, '--mpps-uid', a.mppsUid);
+    return argv;
+  };
+
+  /**
+   * The sentences an MPPS result has to end with, assembled from the fields the
+   * command emitted rather than restated here.
+   *
+   * The rule this enforces is the fourth honesty rule: nothing in an MPPS
+   * result may imply the worklist changed on the far end. The step status is
+   * what the SCP answered about the step; what it then does with the scheduled
+   * procedure step is invisible from this side of the association, so the note
+   * says so every time the round trip succeeded.
+   *
+   * @param {object} p  The parsed JSON document the mpps verb printed.
+   * @returns {string}
+   */
+  function mppsNote(p) {
+    const notes = [];
+
+    if (p.dryRun) {
+      notes.push(
+        '--dry-run: no connection was opened, no step was created and nothing was sent. ' +
+          'The dataset above is what would go on the wire.' +
+          (p.found === undefined
+            ? ''
+            : ' PerformedSeriesSequence cannot be previewed — it is built from what the ' +
+              'archive acknowledges, and nothing has been acknowledged.')
+      );
+    }
+
+    if (p.explanation) {
+      notes.push(
+        `${p.explanation}\n\nThere is no override for this. COMPLETED asserts the work is ` +
+          'fully accounted for, and PerformedSeriesSequence names only what the archive ' +
+          'actually took, so a COMPLETED here would be a claim nothing supports. Resend the ' +
+          'outstanding instances and open a new step, or find out why the archive refused them.'
+      );
+    }
+
+    if (p.stage === 'n-create') {
+      notes.push('The N-CREATE failed, so no step was opened and nothing was sent. The instances on disk are untouched.');
+    } else if (p.stage === 'n-set') {
+      notes.push(
+        'The images were sent and the acknowledged count above is real, but the closing N-SET ' +
+          `failed, so the step is still IN PROGRESS on the peer. Close it with dcm_mpps_${p.intendedStatus === 'DISCONTINUED' ? 'discontinue' : 'complete'} ` +
+          `{ mppsUid: "${p.mppsSopInstanceUid}" }` +
+          (p.stepRecord ? `, passing acknowledged: "${p.stepRecord}" so the performed series survive.` : '. Pass writeAcknowledged next time so the acknowledged instances survive a failure like this.')
+      );
+    } else if (!p.ok && p.message) {
+      notes.push(p.message);
+    }
+
+    if (p.assertedFromDisk) {
+      notes.push(
+        'The performed series above were built by scanning a local folder. Nothing here ' +
+          'confirms the archive holds those instances — they were not sent by this call and ' +
+          'nobody acknowledged them. The MPPS now asserts they exist.'
+      );
+    }
+
+    if (p.reasonRecordedLocally && !p.reasonSent) {
+      notes.push(
+        `The reason "${p.reasonRecordedLocally}" was recorded in this result and NOT sent. A ` +
+          'discontinuation reason is a coded attribute whose CodeValue, CodingSchemeDesignator ' +
+          'and CodeMeaning are all Type 1, so free text has nowhere legal to go in it. Use ' +
+          'reasonCode "CODE^SCHEME^MEANING" to send a real one.'
+      );
+    }
+
+    // Guarded on dryRun as well as ok: a dry run reports ok:true having spoken
+    // to nobody, and saying the SCP answered would be exactly the kind of
+    // invented reassurance these tools exist to avoid.
+    if (p.ok && !p.dryRun) {
+      notes.push(
+        'The SCP answered success. What it does next with the scheduled procedure step — ' +
+          'whether the worklist entry disappears, changes status or stays put — happens on its ' +
+          'side and is not visible from here. If a later dcm_worklist no longer returns the ' +
+          'item, that is the SCP correlating the two, not proof this call changed the order.'
+      );
+    }
+
+    return notes.join('\n\n');
+  }
+
+  /**
+   * Presents an mpps verb's `--json` document.
+   *
+   * Unlike jsonResult, a failure still carries structuredContent. The shortfall
+   * path IS the interesting one — found, sent and acknowledged side by side are
+   * the whole point of it — and dropping the numbers because the exit code was
+   * non-zero would leave an assistant with nothing to reason about at exactly
+   * the moment it needs them.
+   *
+   * @param {{code:number, out:string, err:string}} result  From runCommand.
+   * @returns {object}  MCP tool result.
+   */
+  function mppsResult(result) {
+    let parsed;
+    try {
+      parsed = JSON.parse(result.out);
+    } catch {
+      // A usage error is refused before anything is sent and never prints a
+      // document; its message is the whole answer.
+      return textResult(result);
+    }
+
+    const note = mppsNote(parsed);
+    return {
+      content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) + (note ? `\n\n${note}` : '') }],
+      structuredContent: parsed,
+      isError: parsed.ok !== true,
+    };
+  }
+
+  server.registerTool(
+    'dcm_mpps_perform',
+    {
+      title: 'Perform a study (MPPS N-CREATE, C-STORE, N-SET)',
+      description:
+        'Report a study as performed, end to end: open a Modality Performed Procedure Step (N-CREATE, IN PROGRESS), C-STORE the folder to the archive, then close the step (N-SET). This is the verb that closes the worklist loop — dcm_worklist says what is scheduled, this says what happened, and a RIS reconciles the two on Study Instance UID. ' +
+        'THE STEP IS MARKED COMPLETED ONLY IF EVERY INSTANCE FOUND ON DISK WAS ACKNOWLEDGED BY THE ARCHIVE. There is no override. If even one is unaccounted for the step is marked DISCONTINUED and this tool returns an error result saying how many are missing — a partial transfer is never reported as a completed procedure. ' +
+        'PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing, because naming a SOP Instance UID the archive does not hold is a fabricated clinical record that everything downstream believes. Instances stored with a warning status are referenced (the archive holds them) but do not count as acknowledged, so a run with warnings still ends DISCONTINUED. ' +
+        'What this tool reports is what the MPPS SCP answered. It cannot see the worklist: if the item stops appearing in dcm_worklist afterwards, that is the SCP correlating the step to the order, not proof that this call changed anything. ' +
+        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting.',
+      inputSchema: {
+        folder: z.string().describe('Folder of DICOM files that were produced. Must hold exactly one study: a performed procedure step describes one study, and Study Instance UID is what the RIS reconciles on.'),
+        ...peerSchema(),
+        storeHost: z.string().optional().describe('Archive hostname. Default: host. MPPS and storage are frequently different systems — a RIS or broker takes the step, an archive takes the images — and the result says which peer took what.'),
+        storePort: z.number().int().optional().describe('Archive DIMSE port. Default: port.'),
+        storeCalledAe: z.string().optional().describe("The archive's AE Title. Default: calledAe."),
+        ...stepSchema(),
+        chunk: z.number().int().optional().describe('Instances per storage association (default 200).'),
+        retry: z.number().int().optional().describe('Retries for a chunk that came back with fewer acknowledgements than it sent (default 1).'),
+        retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — where the images can be fetched from. Default: the archive AE they were sent to.'),
+        writeAcknowledged: z.string().optional().describe('Path to write a step record: the step, and the instances the archive acknowledged. Pass it if the closing N-SET might fail — it is what lets dcm_mpps_complete rebuild an honest performed-series list later.'),
+        endDate: z.string().optional().describe('YYYYMMDD the step ended. Default: now, local time.'),
+        endTime: z.string().optional().describe('HHMMSS the step ended. Default: now, local time.'),
+        dryRun: z.boolean().optional().describe('Scan the folder and print the N-CREATE that would be sent. Opens no connection, creates no step and sends no images.'),
+        recurse: z.boolean().optional().describe('Recurse into subfolders (default true).'),
+      },
+    },
+    async (a) => {
+      const argv = ['perform', a.folder, ...peerArgv(a), ...stepArgv(a)];
+      opt(argv, '--store-host', a.storeHost);
+      opt(argv, '--store-port', a.storePort);
+      opt(argv, '--store-called-ae', a.storeCalledAe);
+      opt(argv, '--chunk', a.chunk);
+      opt(argv, '--retry', a.retry);
+      opt(argv, '--retrieve-ae', a.retrieveAe);
+      opt(argv, '--write-acknowledged', a.writeAcknowledged);
+      opt(argv, '--end-date', a.endDate);
+      opt(argv, '--end-time', a.endTime);
+      if (a.dryRun) argv.push('--dry-run');
+      if (a.recurse === false) argv.push('--no-recurse');
+      argv.push('--json');
+      return mppsResult(await runCommand('mpps', argv));
+    }
+  );
+
+  server.registerTool(
+    'dcm_mpps_start',
+    {
+      title: 'Open a procedure step (MPPS N-CREATE)',
+      description:
+        'Tell an MPPS SCP that work has begun on a scheduled study: N-CREATE with status IN PROGRESS. Returns the MPPS SOP Instance UID it generated, which is the ONLY handle on the step — dcm_mpps_complete cannot close it without one, so keep it. ' +
+        'Use this only when the images are sent by something else, or when the step has to stay open while other work happens; dcm_mpps_perform does start, store and close as one transaction and is the usual choice. ' +
+        'Every Type 1 attribute is checked here before anything goes on the wire, and a missing one is refused by name. That is not belt and braces: many SCPs accept an N-CREATE carrying an empty Type 1, answer success, and then never reconcile the step against the order, so from this end it looks like it worked and days later the order is still open. ' +
+        'Opening a step says nothing about the worklist entry — whether the SCP moves the scheduled step to ARRIVED or STARTED is its business and is not visible from here.',
+      inputSchema: {
+        ...peerSchema(),
+        ...stepSchema(),
+        out: z.string().optional().describe('Path to write a step record carrying the step UID, so dcm_mpps_complete can be given it later instead of the UID by hand.'),
+        dryRun: z.boolean().optional().describe('Build and return the N-CREATE dataset without connecting.'),
+      },
+    },
+    async (a) => {
+      const argv = ['start', ...peerArgv(a), ...stepArgv(a)];
+      opt(argv, '--out', a.out);
+      if (a.dryRun) argv.push('--dry-run');
+      argv.push('--json');
+      return mppsResult(await runCommand('mpps', argv));
+    }
+  );
+
+  /**
+   * Parameters shared by complete and discontinue, which differ only in the
+   * terminal status they set and in whether a reason applies.
+   *
+   * @returns {Record<string, object>}
+   */
+  const finishSchema = () => ({
+    mppsUid: z.string().optional().describe('The MPPS SOP Instance UID returned by dcm_mpps_start. May be omitted when acknowledged names a step record that carries it; giving both a UID and a record that disagree is refused rather than closing the wrong step.'),
+    ...peerSchema(),
+    acknowledged: z.string().optional().describe('Path to a step record written by dcm_mpps_start (out) or dcm_mpps_perform (writeAcknowledged). PerformedSeriesSequence is built from the instances in it, which are exactly the ones the archive acknowledged. This is the honest source; prefer it wherever it exists.'),
+    seriesFrom: z.string().optional().describe('Build PerformedSeriesSequence by scanning this folder instead. IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record. It exists for the case where some other tool did the transfer, and the result says plainly that the sequence was asserted from disk. Mutually exclusive with acknowledged.'),
+    retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — the AE the images can be fetched from.'),
+    endDate: z.string().optional().describe('YYYYMMDD. Default: today, local time.'),
+    endTime: z.string().optional().describe('HHMMSS. Default: now, local time.'),
+    dryRun: z.boolean().optional().describe('Build and return the N-SET dataset without connecting.'),
+    recurse: z.boolean().optional().describe('With seriesFrom, recurse into subfolders (default true).'),
+  });
+
+  /**
+   * Builds the argument vector for complete and discontinue.
+   *
+   * @param {string} verb
+   * @param {object} a
+   * @returns {string[]}
+   */
+  const finishArgv = (verb, a) => {
+    const argv = [verb];
+    // The UID is positional and must precede the flags the tokenizer reads.
+    if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+    argv.push(...peerArgv(a));
+    opt(argv, '--acknowledged', a.acknowledged);
+    opt(argv, '--series-from', a.seriesFrom);
+    opt(argv, '--retrieve-ae', a.retrieveAe);
+    opt(argv, '--end-date', a.endDate);
+    opt(argv, '--end-time', a.endTime);
+    if (a.dryRun) argv.push('--dry-run');
+    if (a.recurse === false) argv.push('--no-recurse');
+    return argv;
+  };
+
+  server.registerTool(
+    'dcm_mpps_complete',
+    {
+      title: 'Close a procedure step as COMPLETED (MPPS N-SET)',
+      description:
+        'Close a step opened by dcm_mpps_start: N-SET to COMPLETED. ' +
+        'COMPLETED asserts that the work finished and is fully accounted for, so the performed series it carries must be real: pass acknowledged, a step record naming the instances the archive positively acknowledged. seriesFrom scans a folder instead and therefore asserts what is on your disk rather than what the archive holds — the result labels that plainly, and the two sources cannot be combined. Completing with neither is legal DICOM and warns, because it claims the work finished and names no images at all. ' +
+        'Note that this tool does not re-check the transfer: it sets the status you asked for. dcm_mpps_perform is the verb that refuses to say COMPLETED when instances are unaccounted for, because it is the one that did the sending and knows. ' +
+        'Closing the step here says nothing about the worklist entry. Whether the SCP or a RIS behind it then retires the scheduled step is its own business; query dcm_worklist if you need to know, and read the disappearance as correlation rather than as proof.',
+      inputSchema: { ...finishSchema() },
+    },
+    async (a) => mppsResult(await runCommand('mpps', [...finishArgv('complete', a), '--json']))
+  );
+
+  server.registerTool(
+    'dcm_mpps_discontinue',
+    {
+      title: 'Close a procedure step as DISCONTINUED (MPPS N-SET)',
+      description:
+        'Close a step that did not finish: N-SET to DISCONTINUED. This is the honest ending for an abandoned or partial acquisition, and it is what dcm_mpps_perform sets by itself when the archive did not acknowledge every instance. Any performed series it carries are still built only from acknowledged instances — a step that stopped early still may not claim images the archive does not hold. ' +
+        'reason is free text: it is recorded in the result and NOT sent. A discontinuation reason is a coded attribute whose CodeValue, CodingSchemeDesignator and CodeMeaning are all Type 1, so carrying free text there means inventing a code value that means nothing to the receiver — the same fabrication as naming instances that do not exist. reasonCode sends a real one. The result says which of the two happened. ' +
+        'As with every verb here, what the SCP then does with the scheduled step is not visible from this end.',
+      inputSchema: {
+        ...finishSchema(),
+        reason: z.string().optional().describe('Free-text reason. Recorded in this result and NOT sent — there is no legal place for free text in a coded reason. Use reasonCode to send one.'),
+        reasonCode: z.string().optional().describe('The coded reason, actually sent, as "CODE^SCHEME^MEANING", e.g. "110513^DCM^Discontinued for equipment failure".'),
+      },
+    },
+    async (a) => {
+      const argv = finishArgv('discontinue', a);
+      // Attached form: a free-text reason shaped like `dose=high` would be read
+      // as a matching key by the tokenizer, leaving --reason valueless.
+      if (a.reason !== undefined && a.reason !== '') argv.push(`--reason=${a.reason}`);
+      if (a.reasonCode !== undefined && a.reasonCode !== '') argv.push(`--reason-code=${a.reasonCode}`);
+      argv.push('--json');
+      return mppsResult(await runCommand('mpps', argv));
+    }
+  );
 }
 
-module.exports = { register, dicomDate, resolveScheduledDate };
+module.exports = { register, dicomDate, resolveScheduledDate, MPPS_HANDOFF };

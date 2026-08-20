@@ -64,8 +64,21 @@ test('tools-dimse registers exactly the DIMSE and local-file tools', () => {
   toolsDimse.register(server, z, rt);
   assert.deepEqual(
     server.tools.map((t) => t.name),
-    ['dcm_echo', 'dcm_query', 'dcm_worklist', 'dcm_inventory', 'dcm_tags', 'dcm_send', 'dcm_anon', 'dcm_edit']
+    [
+      'dcm_echo', 'dcm_query', 'dcm_worklist', 'dcm_inventory', 'dcm_tags',
+      'dcm_send', 'dcm_anon', 'dcm_edit',
+      'dcm_mpps_perform', 'dcm_mpps_start', 'dcm_mpps_complete', 'dcm_mpps_discontinue',
+    ]
   );
+});
+
+test('tools-dimse registers the mpps command it drives with the runtime', () => {
+  // `dcm mpps` is not in the runtime's default table; the module that needs it
+  // adds it. If that ever stops happening, every MPPS tool fails at call time
+  // rather than at load time, which is a much worse place to find out.
+  toolsDimse.register(fakeServer(), z, rt);
+  assert.equal(typeof rt.COMMANDS.mpps, 'function');
+  assert.equal(typeof rt.COMMANDS.mpps().run, 'function');
 });
 
 test('tools-web registers exactly the DICOMweb tools', () => {

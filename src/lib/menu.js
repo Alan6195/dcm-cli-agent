@@ -266,6 +266,40 @@ const ACTIONS = [
       return { command: 'web', argv: ['ping', '--url', url] };
     },
   },
+  {
+    key: '11',
+    label: 'Check for a newer version',
+    detail: 'Ask GitHub what the latest release is. Reports only, unless you ask it to install.',
+    async build(rl) {
+      // Defaulting to "no" matters: this is the one entry on the list that can
+      // replace the file the menu is running from, and nobody should arrive
+      // there by pressing Enter twice.
+      const apply = await confirm(rl, 'Install it if there is a newer one?', false);
+      return { command: 'update', argv: apply ? [] : ['--check'] };
+    },
+  },
+  {
+    key: '12',
+    label: 'Perform a scheduled step (MPPS)',
+    detail: 'Open the step, send the images, close it — and only mark it COMPLETED if every instance was acknowledged.',
+    async build(rl) {
+      const folder = await ask(rl, 'folder', 'Folder of images that were acquired', { required: true });
+      const connection = await askConnection(rl);
+      const studyUid = await ask(rl, 'mppsStudyUid', 'Study Instance UID from the worklist', { required: true });
+      const modality = await ask(rl, 'mppsModality', 'Modality', { fallback: 'CT', required: true });
+      const accession = await ask(rl, 'mppsAccession', 'Accession number (blank to skip)', {});
+      const patientId = await ask(rl, 'mppsPatientId', 'Patient ID (blank to skip)', {});
+
+      const argv = ['perform', folder, ...connection, '--study-uid', studyUid, '--modality', modality];
+      if (accession) argv.push('--accession', accession);
+      if (patientId) argv.push('--patient-id', patientId);
+      log.out('');
+      log.out(log.color.dim('  Tip: `dcm find --mwl --json-raw` writes a worklist file that'));
+      log.out(log.color.dim('  `dcm mpps perform --from-worklist` reads, which carries every'));
+      log.out(log.color.dim('  correlation key rather than the few asked for here.'));
+      return { command: 'mpps', argv };
+    },
+  },
 ];
 
 /**
