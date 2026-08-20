@@ -333,6 +333,42 @@ dcm scp --port 11112 --accept-calling-ae ALLOWED-AE
 dcm scp --port 11112 --reject-after 20
 ```
 
+
+**Serving a worklist.** By default this receiver stores but does not index, so
+every C-FIND against it returns zero matches. Give it `--worklist` and it
+answers Modality Worklist queries from a JSON file, which is what you want when
+you're testing whether a modality's worklist query is shaped right:
+
+```bash
+dcm scp --port 11112 --ae WORKLIST --worklist ./worklist.json
+```
+
+```jsonc
+[
+  {
+    "PatientName": "DOE^JANE",
+    "PatientID": "12345",
+    "AccessionNumber": "A1",
+    "Modality": "CT",
+    "ScheduledStationAETitle": "CT01",
+    "ScheduledProcedureStepStartDate": "20260820",
+    "ScheduledProcedureStepStartTime": "090000",
+    "RequestedProcedureDescription": "CHEST"
+  }
+]
+```
+
+Write the scheduled-step keys flat; they're nested into
+`ScheduledProcedureStepSequence` in the answer, which is where an MWL SCU reads
+them. It matches on Modality, ScheduledStationAETitle, the scheduled start date
+(a single date or a `YYYYMMDD-YYYYMMDD` range, either side open), PatientID,
+PatientName and AccessionNumber, with `*` and `?` wildcards. A matching key it
+doesn't support is named in a warning and ignored rather than quietly treated as
+a match — results are never narrower than they look.
+
+It's a test fixture, not a RIS: the file is read once at startup, nothing is
+written back, and there are no procedure-step status transitions or MPPS.
+
 ### dcm find
 
 Query a peer. Matching keys are bare `Keyword=value` pairs.
@@ -577,10 +613,6 @@ Claude Desktop, or anything else that speaks MCP — can drive these operations 
 tools. It is the same engine, not a second implementation: each tool builds the
 argument vector the command takes and runs it, capturing the output.
 
-Tools exposed: `dcm_echo`, `dcm_inventory`, `dcm_query`, `dcm_tags`, `dcm_send`,
-`dcm_anon`, `dcm_edit`. Connection details (host, port, AE Titles) are arguments
-to the individual tools.
-
 ```bash
 # Claude Code
 claude mcp add dcm-dicom -- dcm mcp
@@ -595,10 +627,46 @@ claude mcp add dcm-dicom -- dcm mcp
 }
 ```
 
+**Tools.** Everything the CLI does, minus the parts that make no sense to an
+assistant (`explain` — it *is* the assistant; `install` — it manages its own
+PATH):
+
+| | |
+|---|---|
+| DIMSE | `dcm_echo`, `dcm_query`, `dcm_worklist`, `dcm_send` |
+| DICOMweb | `dcm_web_ping`, `dcm_web_query`, `dcm_web_send`, `dcm_web_retrieve` |
+| Local files | `dcm_inventory`, `dcm_tags`, `dcm_edit`, `dcm_anon` |
+| Servers | `dcm_receiver_start`, `dcm_web_hub_start`, `dcm_servers_list`, `dcm_server_status`, `dcm_server_stop` |
+
+`dcm_worklist` is a Modality Worklist query in its own right rather than a
+level of `dcm_query`, because worklist matching uses a different vocabulary —
+`Modality`, `ScheduledStationAETitle`, scheduled dates — and an empty worklist
+is a legitimate answer rather than a failure. It takes `scheduledDate: "today"`
+as well as an explicit date or range.
+
+The server tools are what let an assistant check its own work: start a
+receiver or a DICOMweb hub on this machine, send to it, read back what arrived,
+and stop it. They run as separate child processes so their logging can never
+touch the JSON-RPC channel, they pick a free port if you don't name one, and
+they are killed when the server exits. Stop them when you're done.
+
+**Resources.** `dcm://usage/<command>` serves each command's own `--help` text,
+read from the installed code so it cannot drift, and `dcm://troubleshooting`
+carries the failure modes that actually cost time — the calling-AE allowlist
+trap, `0x0122` arriving *after* a successful store, a peer that stores happily
+and still answers zero queries, a DICOMweb 404 that is really a missing
+`/dicom-web` prefix.
+
+**Prompts.** `verify-a-peer`, `diagnose-a-failed-transfer` and `mirror-a-study`
+encode the orderings that work, rather than leaving them to be rediscovered.
+
 It reads and writes JSON-RPC on stdin/stdout and is meant to be launched by the
 client, not run by hand. `dcm_send` reports the same found/sent/acknowledged
 accounting as the CLI and flags a shortfall as an error; pass `dryRun` to plan
-without connecting.
+without connecting. DICOMweb credentials are read from the environment the
+server was launched with (`DCM_WEB_TOKEN`, or `DCM_WEB_USER`/`DCM_WEB_PASS`) and
+are deliberately not tool arguments, so a token never travels through the
+conversation.
 
 ## Why it behaves the way it does
 

@@ -11,18 +11,27 @@
  * Because the server speaks JSON-RPC over stdout, command output must never
  * reach the real stdout. log.beginCapture()/endCapture() redirect it into a
  * string for the duration of each call, and calls are serialised so two
- * commands never capture at once.
+ * commands never capture at once. That plumbing lives in ./mcp/runtime.js,
+ * the only module that touches capture.
+ *
+ * This file owns the wiring and nothing else: it builds the server, hands it to
+ * each register(server, z, rt) module, and connects the transport. The tools
+ * themselves live in ./mcp/tools-*.js so they can grow independently.
  */
 
 const log = require('../lib/log');
-const { tokenize } = require('../lib/args');
+const rt = require('./mcp/runtime');
+const toolsDimse = require('./mcp/tools-dimse');
+const toolsWeb = require('./mcp/tools-web');
+const toolsServers = require('./mcp/tools-servers');
+const resources = require('./mcp/resources');
 
 const USAGE = `
 dcm mcp — run a Model Context Protocol (MCP) server over stdio
 
 Exposes the DICOM operations as MCP tools so an assistant can drive them:
-  DIMSE     dcm_echo, dcm_inventory, dcm_query, dcm_tags, dcm_send, dcm_anon,
-            dcm_edit
+  DIMSE     dcm_echo, dcm_inventory, dcm_query, dcm_worklist, dcm_tags,
+            dcm_send, dcm_anon, dcm_edit
   DICOMweb  dcm_web_ping, dcm_web_send, dcm_web_query, dcm_web_retrieve
 
 It speaks JSON-RPC on stdin/stdout and is meant to be launched by an MCP client,
@@ -49,79 +58,6 @@ DCM_WEB_USER and DCM_WEB_PASS, from the environment this server was launched
 with. They are deliberately not tool arguments, so a token never travels
 through the assistant's conversation.
 `.trimStart();
-
-/** The command modules each tool drives, loaded lazily. */
-const COMMANDS = {
-  echo: () => require('./echo'),
-  info: () => require('./info'),
-  find: () => require('./find'),
-  tags: () => require('./tags'),
-  send: () => require('./send'),
-  anon: () => require('./anon'),
-  edit: () => require('./edit'),
-  web: () => require('./web'),
-};
-
-/** Serialise tool executions so output capture never overlaps. */
-let chain = Promise.resolve();
-function serialize(fn) {
-  const result = chain.then(fn, fn);
-  chain = result.then(() => {}, () => {});
-  return result;
-}
-
-/**
- * Runs a command in-process with its output captured.
- *
- * @param {string} name  Command module key.
- * @param {string[]} argv  Argument vector for that command (without the name).
- * @returns {Promise<{code:number, out:string, err:string}>}
- */
-function runCommand(name, argv) {
-  return serialize(async () => {
-    const mod = COMMANDS[name]();
-    const sink = log.beginCapture();
-    let code = 0;
-    try {
-      code = await mod.run(tokenize(argv));
-    } catch (err) {
-      log.error(err && err.message ? err.message : String(err));
-      code = 1;
-    } finally {
-      log.endCapture();
-    }
-    return { code, out: sink.out, err: sink.err };
-  });
-}
-
-/** Build a text tool result, marking non-zero exits as errors. */
-function textResult({ code, out, err }, { successText } = {}) {
-  const body = [out, err].filter((s) => s && s.trim()).join('\n').trim();
-  const text = body || (code === 0 ? (successText || 'Done.') : `Exited with code ${code}.`);
-  return { content: [{ type: 'text', text }], isError: code !== 0 };
-}
-
-/** For --json tools: return parsed JSON as pretty text plus structured content. */
-function jsonResult({ code, out, err }) {
-  if (code !== 0) {
-    return { content: [{ type: 'text', text: (err || out || `Exited with code ${code}.`).trim() }], isError: true };
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(out);
-  } catch {
-    return { content: [{ type: 'text', text: out.trim() || '(no output)' }] };
-  }
-  return {
-    content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
-    structuredContent: parsed,
-  };
-}
-
-/** Push flag/value pairs only when the value is set. */
-function opt(argv, flag, value) {
-  if (value !== undefined && value !== null && value !== '') argv.push(flag, String(value));
-}
 
 /**
  * @param {{flags: Map}} parsed
@@ -153,280 +89,10 @@ async function run(parsed) {
   const { version } = require('../../package.json');
   const server = new McpServer({ name: 'dcm-dicom', version });
 
-  // ---- Connectivity ------------------------------------------------------
-  server.registerTool(
-    'dcm_echo',
-    {
-      title: 'DICOM C-ECHO',
-      description:
-        'Verify connectivity to a DICOM peer (C-ECHO). Confirms the peer answers and accepts your calling AE Title. Sends no images.',
-      inputSchema: {
-        host: z.string().describe('Peer hostname or IP.'),
-        port: z.number().int().describe('Peer DIMSE port, e.g. 11112.'),
-        calledAe: z.string().describe("The peer's AE Title."),
-        callingAe: z.string().optional().describe('Our AE Title (default DCM-CLI).'),
-        timeout: z.number().int().optional().describe('Milliseconds of silence to tolerate.'),
-      },
-    },
-    async (a) => {
-      const argv = ['--host', a.host, '--port', String(a.port), '--called-ae', a.calledAe];
-      opt(argv, '--calling-ae', a.callingAe);
-      opt(argv, '--timeout', a.timeout);
-      return textResult(await runCommand('echo', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_query',
-    {
-      title: 'DICOM C-FIND',
-      description:
-        'Query a peer (C-FIND). Note: a peer can accept images and still return zero matches — storing and indexing are separate.',
-      inputSchema: {
-        host: z.string(),
-        port: z.number().int(),
-        calledAe: z.string(),
-        callingAe: z.string().optional(),
-        level: z.enum(['study', 'series', 'image', 'mwl']).optional().describe('Query level (default study).'),
-        keys: z.record(z.string(), z.string()).optional().describe('Matching keys as DICOM keyword→value, e.g. {"PatientID":"12345"}.'),
-        limit: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      const argv = ['--host', a.host, '--port', String(a.port), '--called-ae', a.calledAe];
-      opt(argv, '--calling-ae', a.callingAe);
-      if (a.level && a.level !== 'study') argv.push(`--${a.level}`);
-      opt(argv, '--limit', a.limit);
-      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
-      argv.push('--json');
-      return jsonResult(await runCommand('find', argv));
-    }
-  );
-
-  // ---- DICOMweb ----------------------------------------------------------
-  // Credentials are read from the environment the MCP server was launched
-  // with (DCM_WEB_TOKEN, or DCM_WEB_USER/DCM_WEB_PASS) — deliberately not
-  // tool arguments, so a token never transits the assistant conversation.
-  server.registerTool(
-    'dcm_web_ping',
-    {
-      title: 'DICOMweb connectivity check',
-      description:
-        'Verify a DICOMweb base URL answers and the credentials in the server environment work. Does not prove the server will accept images — storage is a separate grant on many servers.',
-      inputSchema: {
-        url: z.string().describe('Base URL including any path prefix, e.g. https://pacs.example.org/dicom-web.'),
-        timeout: z.number().int().optional().describe('Milliseconds to tolerate.'),
-      },
-    },
-    async (a) => {
-      const argv = ['ping', '--url', a.url];
-      opt(argv, '--timeout', a.timeout);
-      return textResult(await runCommand('web', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_web_send',
-    {
-      title: 'DICOMweb store (STOW-RS)',
-      description:
-        'Send a folder of DICOM files to a DICOMweb server (STOW-RS), reporting files found / sent / acknowledged exactly like dcm_send. A partial transfer is an error, not a success.',
-      inputSchema: {
-        url: z.string().describe('Base DICOMweb URL.'),
-        folder: z.string().describe('Absolute path of the folder to send.'),
-        chunk: z.number().int().optional().describe('Instances per STOW request (default 50).'),
-        dryRun: z.boolean().optional().describe('Scan and plan without connecting.'),
-        timeout: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      const argv = ['send', a.folder, '--url', a.url];
-      opt(argv, '--chunk', a.chunk);
-      opt(argv, '--timeout', a.timeout);
-      if (a.dryRun) argv.push('--dry-run');
-      return textResult(await runCommand('web', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_web_query',
-    {
-      title: 'DICOMweb query (QIDO-RS)',
-      description:
-        'Query a DICOMweb server (QIDO-RS). Zero matches is not proof a transfer failed — storing and indexing are separate on many systems.',
-      inputSchema: {
-        url: z.string().describe('Base DICOMweb URL.'),
-        level: z.enum(['studies', 'series', 'instances']).optional().describe('Query level (default studies).'),
-        keys: z.record(z.string(), z.string()).optional().describe('Matching keys as DICOM keyword→value, e.g. {"PatientID":"12345"}.'),
-        limit: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      // Matching keys go in before the level switch: a bare switch immediately
-      // followed by a key=value token is the one ordering where the tokenizer
-      // has to decide whether the key is the switch's value.
-      const argv = ['query', '--url', a.url];
-      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
-      opt(argv, '--limit', a.limit);
-      if (a.level && a.level !== 'studies') argv.push(`--${a.level}`);
-      argv.push('--json');
-      return jsonResult(await runCommand('web', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_web_retrieve',
-    {
-      title: 'DICOMweb retrieve (WADO-RS)',
-      description:
-        'Retrieve a study (or one series/instance) from a DICOMweb server into a local folder, reporting how many instances were received and written.',
-      inputSchema: {
-        url: z.string().describe('Base DICOMweb URL.'),
-        studyUid: z.string().describe('StudyInstanceUID to retrieve.'),
-        seriesUid: z.string().optional(),
-        instanceUid: z.string().optional(),
-        outDir: z.string().describe('Absolute path of the folder to write into.'),
-        timeout: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      const argv = ['retrieve', '--url', a.url, '--study', a.studyUid, '--out', a.outDir];
-      opt(argv, '--series', a.seriesUid);
-      opt(argv, '--instance', a.instanceUid);
-      opt(argv, '--timeout', a.timeout);
-      argv.push('--json');
-      return jsonResult(await runCommand('web', argv));
-    }
-  );
-
-  // ---- Local files -------------------------------------------------------
-  server.registerTool(
-    'dcm_inventory',
-    {
-      title: 'Inventory a DICOM folder',
-      description:
-        'Inventory a folder or file: studies, series, modalities, counts, sizes and transfer syntaxes. Reads metadata only; sends nothing.',
-      inputSchema: {
-        path: z.string().describe('Folder or .dcm file to inspect.'),
-        series: z.boolean().optional().describe('Break down per series and flag colliding Series UIDs.'),
-        recurse: z.boolean().optional().describe('Recurse into subfolders (default true).'),
-      },
-    },
-    async (a) => {
-      const argv = [a.path];
-      if (a.series) argv.push('--series');
-      if (a.recurse === false) argv.push('--no-recurse');
-      argv.push('--json');
-      return jsonResult(await runCommand('info', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_tags',
-    {
-      title: 'Inspect DICOM tags',
-      description: 'Dump the DICOM tags in a file or folder. Reads metadata only and never returns pixel data.',
-      inputSchema: {
-        path: z.string(),
-        filter: z.string().optional().describe('Substring on keyword/tag/value, or /regex/.'),
-        value: z.string().optional().describe('Only tags whose value matches — useful for finding lingering identifiers.'),
-        privateOnly: z.boolean().optional().describe('Only private/unrecognised tags.'),
-        all: z.boolean().optional().describe('Every file, not one representative per series.'),
-        limit: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      const argv = [a.path];
-      opt(argv, '--filter', a.filter);
-      opt(argv, '--value', a.value);
-      if (a.privateOnly) argv.push('--private');
-      if (a.all) argv.push('--all');
-      opt(argv, '--limit', a.limit);
-      argv.push('--json');
-      return jsonResult(await runCommand('tags', argv));
-    }
-  );
-
-  // ---- Transfer / mutation ----------------------------------------------
-  server.registerTool(
-    'dcm_send',
-    {
-      title: 'Send a study (C-STORE)',
-      description:
-        'Send a folder to a peer (C-STORE), grouped by study and chunked. Reports files found, sent and acknowledged; a shortfall is a failure (isError). Use dryRun to plan without connecting.',
-      inputSchema: {
-        path: z.string().describe('Folder of DICOM files to send.'),
-        host: z.string(),
-        port: z.number().int(),
-        calledAe: z.string(),
-        callingAe: z.string().optional(),
-        chunk: z.number().int().optional().describe('Instances per association (default 200).'),
-        retry: z.number().int().optional().describe('Retries for an under-acknowledged chunk (default 1).'),
-        dryRun: z.boolean().optional().describe('Scan and report the plan without opening a connection.'),
-        rewriteSeriesUid: z.boolean().optional().describe('Replace Series Instance UIDs (changes the data sent).'),
-        timeout: z.number().int().optional(),
-      },
-    },
-    async (a) => {
-      const argv = [a.path, '--host', a.host, '--port', String(a.port), '--called-ae', a.calledAe];
-      opt(argv, '--calling-ae', a.callingAe);
-      opt(argv, '--chunk', a.chunk);
-      opt(argv, '--retry', a.retry);
-      opt(argv, '--timeout', a.timeout);
-      if (a.dryRun) argv.push('--dry-run');
-      if (a.rewriteSeriesUid) argv.push('--rewrite-series-uid');
-      return textResult(await runCommand('send', argv));
-    }
-  );
-
-  server.registerTool(
-    'dcm_anon',
-    {
-      title: 'De-identify a folder',
-      description:
-        'Copy a folder with patient identifiers removed and UIDs remapped (best-effort, not certified — does not touch pixel data). The source is never modified.',
-      inputSchema: {
-        path: z.string().describe('Source folder.'),
-        out: z.string().describe('Destination folder (must be outside the source).'),
-        prefix: z.string().optional().describe('Pseudonym prefix (default ANON).'),
-        keepDescriptions: z.boolean().optional(),
-        keepPrivate: z.boolean().optional(),
-      },
-    },
-    async (a) => {
-      const argv = [a.path, '--out', a.out];
-      opt(argv, '--prefix', a.prefix);
-      if (a.keepDescriptions) argv.push('--keep-descriptions');
-      if (a.keepPrivate) argv.push('--keep-private');
-      return textResult(await runCommand('anon', argv), { successText: 'De-identified.' });
-    }
-  );
-
-  server.registerTool(
-    'dcm_edit',
-    {
-      title: 'Edit DICOM tags',
-      description:
-        'Change or remove tags and write copies to a new folder (the source is untouched). Editing UIDs requires force. Use dryRun to preview.',
-      inputSchema: {
-        path: z.string().describe('Source file or folder.'),
-        out: z.string().describe('Destination folder for the edited copies.'),
-        set: z.record(z.string(), z.string()).optional().describe('Tags to set, keyword or (gggg,eeee) → value.'),
-        remove: z.array(z.string()).optional().describe('Tag keywords/numbers to remove.'),
-        dryRun: z.boolean().optional(),
-        force: z.boolean().optional().describe('Allow editing UIDs and structural identifiers.'),
-      },
-    },
-    async (a) => {
-      const argv = [a.path];
-      for (const [k, v] of Object.entries(a.set || {})) argv.push('--set', `${k}=${v}`);
-      for (const k of a.remove || []) argv.push('--remove', k);
-      argv.push('--out', a.out);
-      if (a.dryRun) argv.push('--dry-run');
-      if (a.force) argv.push('--force');
-      return textResult(await runCommand('edit', argv));
-    }
-  );
+  toolsDimse.register(server, z, rt);
+  toolsWeb.register(server, z, rt);
+  toolsServers.register(server, z, rt);
+  resources.register(server, z, rt);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

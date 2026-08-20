@@ -41,7 +41,7 @@ async function startScp(config = {}) {
   const port = await freePort();
   const stats = {
     associations: 0, rejected: 0, echoes: 0, stored: 0,
-    finds: 0, refused: 0, aborts: 0, errors: 0,
+    finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
   };
 
   const full = {
@@ -49,6 +49,9 @@ async function startScp(config = {}) {
     acceptCallingAe: config.acceptCallingAe ?? [],
     persist: config.persist,
     rejectAfter: config.rejectAfter ?? 0,
+    // { file, items } from src/lib/worklist.loadWorklistFile, or undefined for
+    // the default receiver that answers every C-FIND with zero matches.
+    worklist: config.worklist,
   };
 
   const server = new Server(makeScpClass(full, stats));

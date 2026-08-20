@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.8.0
+
+The MCP server grows up: everything the engine does, reachable by an assistant.
+
+- **`dcm_worklist`** — Modality Worklist is now a tool in its own right rather
+  than a level of `dcm_query`. Worklist matching uses a different vocabulary
+  (`Modality`, `ScheduledStationAETitle`, scheduled dates) and an empty
+  worklist is a legitimate answer, not a failure, so it needed its own shape.
+  `scheduledDate` takes `today`/`tomorrow`/`week`, a date, or a range, and
+  resolves the words against the local calendar — a UTC-derived "today" asks
+  the wrong day either side of midnight and returns an empty worklist that
+  looks like nothing is scheduled.
+- **`dcm scp --worklist <file>`** — the receiver can now serve a Modality
+  Worklist from a JSON file, so a worklist integration can be exercised
+  locally: point a modality (or `dcm find --mwl`, or `dcm_worklist`) at
+  something that actually answers, and see which query returns the item you
+  expect. Matching covers Modality, ScheduledStationAETitle, the scheduled
+  start date including open-ended ranges, PatientID, PatientName and
+  AccessionNumber, with wildcards; a matching key it does not support is named
+  in a warning and ignored rather than silently treated as a match, so results
+  are never narrower than they look. This closes the last "we can query it but
+  not serve it" gap — and it is a test fixture, not a scheduling system: no
+  MPPS, no status transitions, nothing written back.
+- **Server tools**: `dcm_receiver_start`, `dcm_web_hub_start`,
+  `dcm_servers_list`, `dcm_server_status`, `dcm_server_stop`. An assistant can
+  now start a receiver or a DICOMweb hub, send to it, read back what arrived
+  and stop it — check its own work end to end, which nothing in the MCP
+  surface could do before. They run as child processes so their logging can
+  never reach the JSON-RPC channel, pick a free port when none is given, and
+  are killed when the server exits.
+- **Every engine option an assistant can use is now exposed.** Each tool's
+  schema was diffed against its command's actual flag list: `dcm_send` gained
+  `transferSyntax` (the v0.5 conversion, previously unreachable), `parallel`,
+  `label` and `chunk`; the DICOMweb tools gained `insecure`, `retry`,
+  `include`, `offset` and optional `url` so `DCM_WEB_URL` works; `dcm_tags`,
+  `dcm_edit`, `dcm_anon` and `dcm_inventory` gained their missing switches.
+  Tools that write files say so in the first words of their description.
+- **Resources**: `dcm://usage/<command>` serves each command's own help text,
+  read from the installed module so it cannot drift from the code, plus
+  `dcm://troubleshooting` — the failure modes that actually cost time,
+  compiled from this README and changelog rather than invented.
+- **Prompts**: `verify-a-peer`, `diagnose-a-failed-transfer` and
+  `mirror-a-study` encode orderings that work instead of leaving them to be
+  rediscovered.
+- **Fixed a shutdown leak.** A running child kept `dcm mcp` alive after the
+  client disconnected, so the SDK's close path waited two seconds and then
+  hard-killed it, orphaning the servers it had started. Disconnect now cleans
+  up in about 30 ms with no survivors.
+- `src/commands/mcp.js` was 444 lines and doing everything; the tools now live
+  in `mcp/tools-{dimse,web,servers}.js` and `mcp/resources.js`, with capture
+  and serialisation in `mcp/runtime.js` — the one place allowed to touch the
+  log chokepoint.
+
 ## v0.7.0
 
 DICOMweb: the HTTP face of DICOM, with the same accounting spine.
