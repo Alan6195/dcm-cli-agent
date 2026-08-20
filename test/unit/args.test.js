@@ -130,3 +130,19 @@ test('global flags are always accepted', () => {
   const { flags } = tokenize(['--verbose', '--json', '--help']);
   assert.doesNotThrow(() => rejectUnknown(flags, ['host']));
 });
+
+test('a hex-tag matching key is not swallowed by the flag in front of it', () => {
+  // `dcm web query --series 00100020=12345` must ask about PatientID, not
+  // hand the key to --series. The keyword spelling was already guarded; the
+  // 8-hex-digit spelling of the same key has to be too.
+  const { flags, pairs } = tokenize(['--series', '00100020=12345']);
+  assert.equal(flags.get('series'), true, '--series must stay a bare switch');
+  assert.deepEqual(pairs, [['00100020', '12345']]);
+});
+
+test('a base64 token keeps its padding instead of looking like a matching key', () => {
+  // Padding makes `abc123==` pair-shaped by accident; without --require-token
+  // being declared pair-valued the hub refuses to start.
+  const { flags } = tokenize(['--require-token', 'abc123==']);
+  assert.equal(flags.get('require-token'), 'abc123==');
+});

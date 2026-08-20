@@ -21,7 +21,9 @@ const USAGE = `
 dcm mcp — run a Model Context Protocol (MCP) server over stdio
 
 Exposes the DICOM operations as MCP tools so an assistant can drive them:
-  dcm_echo, dcm_inventory, dcm_query, dcm_tags, dcm_send, dcm_anon, dcm_edit
+  DIMSE     dcm_echo, dcm_inventory, dcm_query, dcm_tags, dcm_send, dcm_anon,
+            dcm_edit
+  DICOMweb  dcm_web_ping, dcm_web_send, dcm_web_query, dcm_web_retrieve
 
 It speaks JSON-RPC on stdin/stdout and is meant to be launched by an MCP client,
 not run by hand. Connect it, for example:
@@ -39,8 +41,13 @@ not run by hand. Connect it, for example:
 Usage:
   dcm mcp
 
-There are no options. Connection details (host, port, AE Titles) are arguments
-to the individual tools, not to this command.
+There are no options. Connection details (host, port, AE Titles, DICOMweb base
+URL) are arguments to the individual tools, not to this command.
+
+DICOMweb credentials are the exception: the web tools read DCM_WEB_TOKEN, or
+DCM_WEB_USER and DCM_WEB_PASS, from the environment this server was launched
+with. They are deliberately not tool arguments, so a token never travels
+through the assistant's conversation.
 `.trimStart();
 
 /** The command modules each tool drives, loaded lazily. */
@@ -52,6 +59,7 @@ const COMMANDS = {
   send: () => require('./send'),
   anon: () => require('./anon'),
   edit: () => require('./edit'),
+  web: () => require('./web'),
 };
 
 /** Serialise tool executions so output capture never overlaps. */
@@ -192,6 +200,102 @@ async function run(parsed) {
       for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
       argv.push('--json');
       return jsonResult(await runCommand('find', argv));
+    }
+  );
+
+  // ---- DICOMweb ----------------------------------------------------------
+  // Credentials are read from the environment the MCP server was launched
+  // with (DCM_WEB_TOKEN, or DCM_WEB_USER/DCM_WEB_PASS) — deliberately not
+  // tool arguments, so a token never transits the assistant conversation.
+  server.registerTool(
+    'dcm_web_ping',
+    {
+      title: 'DICOMweb connectivity check',
+      description:
+        'Verify a DICOMweb base URL answers and the credentials in the server environment work. Does not prove the server will accept images — storage is a separate grant on many servers.',
+      inputSchema: {
+        url: z.string().describe('Base URL including any path prefix, e.g. https://pacs.example.org/dicom-web.'),
+        timeout: z.number().int().optional().describe('Milliseconds to tolerate.'),
+      },
+    },
+    async (a) => {
+      const argv = ['ping', '--url', a.url];
+      opt(argv, '--timeout', a.timeout);
+      return textResult(await runCommand('web', argv));
+    }
+  );
+
+  server.registerTool(
+    'dcm_web_send',
+    {
+      title: 'DICOMweb store (STOW-RS)',
+      description:
+        'Send a folder of DICOM files to a DICOMweb server (STOW-RS), reporting files found / sent / acknowledged exactly like dcm_send. A partial transfer is an error, not a success.',
+      inputSchema: {
+        url: z.string().describe('Base DICOMweb URL.'),
+        folder: z.string().describe('Absolute path of the folder to send.'),
+        chunk: z.number().int().optional().describe('Instances per STOW request (default 50).'),
+        dryRun: z.boolean().optional().describe('Scan and plan without connecting.'),
+        timeout: z.number().int().optional(),
+      },
+    },
+    async (a) => {
+      const argv = ['send', a.folder, '--url', a.url];
+      opt(argv, '--chunk', a.chunk);
+      opt(argv, '--timeout', a.timeout);
+      if (a.dryRun) argv.push('--dry-run');
+      return textResult(await runCommand('web', argv));
+    }
+  );
+
+  server.registerTool(
+    'dcm_web_query',
+    {
+      title: 'DICOMweb query (QIDO-RS)',
+      description:
+        'Query a DICOMweb server (QIDO-RS). Zero matches is not proof a transfer failed — storing and indexing are separate on many systems.',
+      inputSchema: {
+        url: z.string().describe('Base DICOMweb URL.'),
+        level: z.enum(['studies', 'series', 'instances']).optional().describe('Query level (default studies).'),
+        keys: z.record(z.string(), z.string()).optional().describe('Matching keys as DICOM keyword→value, e.g. {"PatientID":"12345"}.'),
+        limit: z.number().int().optional(),
+      },
+    },
+    async (a) => {
+      // Matching keys go in before the level switch: a bare switch immediately
+      // followed by a key=value token is the one ordering where the tokenizer
+      // has to decide whether the key is the switch's value.
+      const argv = ['query', '--url', a.url];
+      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
+      opt(argv, '--limit', a.limit);
+      if (a.level && a.level !== 'studies') argv.push(`--${a.level}`);
+      argv.push('--json');
+      return jsonResult(await runCommand('web', argv));
+    }
+  );
+
+  server.registerTool(
+    'dcm_web_retrieve',
+    {
+      title: 'DICOMweb retrieve (WADO-RS)',
+      description:
+        'Retrieve a study (or one series/instance) from a DICOMweb server into a local folder, reporting how many instances were received and written.',
+      inputSchema: {
+        url: z.string().describe('Base DICOMweb URL.'),
+        studyUid: z.string().describe('StudyInstanceUID to retrieve.'),
+        seriesUid: z.string().optional(),
+        instanceUid: z.string().optional(),
+        outDir: z.string().describe('Absolute path of the folder to write into.'),
+        timeout: z.number().int().optional(),
+      },
+    },
+    async (a) => {
+      const argv = ['retrieve', '--url', a.url, '--study', a.studyUid, '--out', a.outDir];
+      opt(argv, '--series', a.seriesUid);
+      opt(argv, '--instance', a.instanceUid);
+      opt(argv, '--timeout', a.timeout);
+      argv.push('--json');
+      return jsonResult(await runCommand('web', argv));
     }
   );
 

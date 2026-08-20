@@ -5,6 +5,7 @@ const path = require('path');
 
 const log = require('../lib/log');
 const args = require('../lib/args');
+const { safeUidSegment } = require('../lib/uid');
 const { dcmjsDimse } = require('../lib/dimse');
 
 const { Server, Scp } = dcmjsDimse;
@@ -56,17 +57,6 @@ Options:
 Example:
   dcm scp --port 11112 --ae TEST-SCP --persist ./received
 `.trimStart();
-
-/** UIDs are digits and dots; anything else must not reach the filesystem. */
-function safeUidSegment(uid, fallback) {
-  if (typeof uid !== 'string' || uid.length === 0) return fallback;
-  const cleaned = uid.replace(/[^0-9.]/g, '');
-  // Reject traversal-ish and empty results outright rather than repairing them.
-  if (cleaned === '' || cleaned === '.' || cleaned === '..' || cleaned.length > 64) {
-    return fallback;
-  }
-  return cleaned;
-}
 
 /**
  * Builds the Scp subclass. The configuration is closed over rather than passed

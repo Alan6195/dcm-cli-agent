@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.7.0
+
+DICOMweb: the HTTP face of DICOM, with the same accounting spine.
+
+- **`dcm web`** — a new command family for servers that speak DICOMweb:
+  `ping` (is there a service at this URL, and do my credentials open it?),
+  `send` (STOW-RS), `query` (QIDO-RS), `retrieve` (WADO-RS) and `serve`
+  (a loopback hub). No new dependencies — HTTP and the multipart/related
+  encoding are done with Node's own modules, and STOW request bodies stream
+  file by file, so memory stays flat however large the study is.
+- **`web send` keeps the three-number rule.** It registers every file in the
+  same ledger DIMSE send uses and settles each one from the server's own
+  STOW response: `ReferencedSOPSequence` is acknowledged,
+  `FailedSOPSequence` is failed with the reason code translated, and an
+  instance the server didn't mention at all is *unanswered* — never silently
+  dropped. Shortfall exits non-zero. STOW failure reasons reuse DICOM's
+  storage codes, so the report reads the same as a DIMSE transfer.
+- **Credentials are environment-only** (`DCM_WEB_TOKEN`, or
+  `DCM_WEB_USER`/`DCM_WEB_PASS`), the same policy as `dcm explain`'s API
+  key: no flag, no config file, nothing to leak into shell history. A 401
+  names the variable to set, never a value. Cleartext `http://` to a
+  non-local host warns that credentials and PHI would travel unencrypted.
+- **`web serve`** is the web mirror of `dcm scp`: accepts STOW (persisting
+  *before* it acknowledges — a 200 means stored), answers QIDO over what it
+  holds, streams WADO back, logs every request in the receiver's style, and
+  binds 127.0.0.1 unless told otherwise. `--require-token` and
+  `--reject-after` reproduce auth failures and partial stores locally, which
+  is how the client's shortfall accounting is end-to-end tested.
+- Failures translate to plain English with the raw code kept in brackets,
+  same ethos as the DIMSE rejections: 404 suggests the missing `/dicom-web`
+  path prefix, connection-refused points out that DICOMweb lives on the HTTP
+  port rather than 11112, TLS failures explain `--insecure` and warn against
+  using it on anything real.
+- **Desktop: a DICOMweb group** — test connection, send, query and a local
+  hub screen, all building real `dcm web` commands like every other screen.
+  DICOMweb server URLs get their own saved profiles, kept separate from the
+  DIMSE ones.
+- **MCP: four new tools** — `dcm_web_ping`, `dcm_web_send`, `dcm_web_query`,
+  `dcm_web_retrieve` — same engine, credentials read from the server's
+  environment so a token never transits the assistant conversation.
+- The path-safety function that turns wire-supplied UIDs into directory names
+  is now shared (`src/lib/uid.js`) instead of restated per receiver.
+
 ## v0.6.0
 
 The desktop app updates itself, announces itself properly, and got a face.

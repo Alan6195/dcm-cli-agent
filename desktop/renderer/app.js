@@ -48,6 +48,7 @@ function humanBytes(n) {
 // --------------------------------------------------------------------------
 const state = {
   conn: { host: '', port: '', calledAe: '', callingAe: '' },
+  web: { url: '' },
   profiles: [],
   info: { home: '', platform: '', version: '' },
   activeRuns: {}, // view -> runId (for cancel/stop)
@@ -150,17 +151,30 @@ function profileName(c) {
   return `${c.calledAe || 'AE'} @ ${c.host || 'host'}:${c.port || '?'}`;
 }
 
+/** Entries without a `kind` predate DICOMweb support and are DIMSE peers. */
+function isWebProfile(p) {
+  return p.kind === 'dicomweb';
+}
+
 function refreshProfileSelects() {
+  const dimse = state.profiles.filter((p) => !isWebProfile(p));
   for (const sel of $$('[data-profile-select]')) {
     const current = sel.value;
     sel.innerHTML = '<option value="">— saved peers —</option>' +
-      state.profiles.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
-    if (state.profiles.some((p) => p.name === current)) sel.value = current;
+      dimse.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
+    if (dimse.some((p) => p.name === current)) sel.value = current;
+  }
+  const web = state.profiles.filter(isWebProfile);
+  for (const sel of $$('[data-webprofile-select]')) {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— saved servers —</option>' +
+      web.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
+    if (web.some((p) => p.name === current)) sel.value = current;
   }
 }
 
 function applyProfile(name) {
-  const p = state.profiles.find((x) => x.name === name);
+  const p = state.profiles.find((x) => !isWebProfile(x) && x.name === name);
   if (!p) return;
   state.conn = { host: p.host || '', port: p.port || '', calledAe: p.calledAe || '', callingAe: p.callingAe || '' };
   syncConnInputs();
@@ -171,7 +185,7 @@ async function saveCurrentProfile() {
   if (!state.conn.host && !state.conn.calledAe) return;
   const name = profileName(state.conn);
   const entry = { name, ...state.conn };
-  const idx = state.profiles.findIndex((p) => p.name === name);
+  const idx = state.profiles.findIndex((p) => !isWebProfile(p) && p.name === name);
   if (idx >= 0) state.profiles[idx] = entry;
   else state.profiles.push(entry);
   await persistProfiles();
@@ -183,7 +197,90 @@ async function deleteSelectedProfile() {
   const sel = $('[data-profile-select]');
   const name = sel ? sel.value : '';
   if (!name) return;
-  state.profiles = state.profiles.filter((p) => p.name !== name);
+  state.profiles = state.profiles.filter((p) => isWebProfile(p) || p.name !== name);
+  await persistProfiles();
+  refreshProfileSelects();
+}
+
+// --------------------------------------------------------------------------
+// DICOMweb server panel (shared across the Web: views)
+// --------------------------------------------------------------------------
+// Deliberately parallel to — not shared with — the DIMSE connection panel:
+// distinct data-* attributes keep the two global syncs from touching each
+// other. One base URL mirrors across every [data-webconn] host.
+const WEBCONN_HTML = `
+  <div class="conn-panel">
+    <div class="conn-title">
+      <span>DICOMweb server</span>
+      <div class="conn-profiles">
+        <select data-webprofile-select><option value="">— saved servers —</option></select>
+        <button class="btn ghost small" data-webprofile-save>Save server</button>
+        <button class="btn ghost small" data-webprofile-del>Delete</button>
+      </div>
+    </div>
+    <div class="conn-grid web">
+      <label>Base URL <input type="text" data-webconn-url placeholder="https://pacs.example.org/dicom-web" /></label>
+    </div>
+    <div class="web-auth-hint">Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</div>
+  </div>
+`;
+
+function mountWebPanels() {
+  for (const host of $$('[data-webconn]')) {
+    host.innerHTML = WEBCONN_HTML;
+    wireWebPanel(host);
+  }
+  syncWebInputs();
+  refreshProfileSelects();
+}
+
+function wireWebPanel(panel) {
+  const input = $('[data-webconn-url]', panel);
+  input.addEventListener('input', () => {
+    state.web.url = input.value.trim();
+    syncWebInputs(panel);
+    updateAllPreviews();
+  });
+  $('[data-webprofile-select]', panel).addEventListener('change', (e) => {
+    applyWebProfile(e.target.value);
+  });
+  $('[data-webprofile-save]', panel).addEventListener('click', saveCurrentWebProfile);
+  $('[data-webprofile-del]', panel).addEventListener('click', deleteSelectedWebProfile);
+}
+
+/** Push state.web into every DICOMweb panel's inputs (except the source). */
+function syncWebInputs(except) {
+  for (const panel of $$('[data-webconn]')) {
+    if (panel === except) continue;
+    $('[data-webconn-url]', panel).value = state.web.url;
+  }
+}
+
+function applyWebProfile(name) {
+  const p = state.profiles.find((x) => isWebProfile(x) && x.name === name);
+  if (!p) return;
+  state.web.url = p.url || '';
+  syncWebInputs();
+  updateAllPreviews();
+}
+
+async function saveCurrentWebProfile() {
+  const url = state.web.url;
+  if (!url) return;
+  const entry = { name: url, kind: 'dicomweb', url };
+  const idx = state.profiles.findIndex((p) => isWebProfile(p) && p.name === entry.name);
+  if (idx >= 0) state.profiles[idx] = entry;
+  else state.profiles.push(entry);
+  await persistProfiles();
+  refreshProfileSelects();
+  for (const sel of $$('[data-webprofile-select]')) sel.value = entry.name;
+}
+
+async function deleteSelectedWebProfile() {
+  const sel = $('[data-webprofile-select]');
+  const name = sel ? sel.value : '';
+  if (!name) return;
+  state.profiles = state.profiles.filter((p) => !(isWebProfile(p) && p.name === name));
   await persistProfiles();
   refreshProfileSelects();
 }
@@ -195,6 +292,7 @@ function showView(name) {
   $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
   syncConnInputs();
+  syncWebInputs();
   updateAllPreviews();
 }
 
@@ -860,6 +958,207 @@ async function runSpeedTest() {
 }
 
 // --------------------------------------------------------------------------
+// View: WEB PING (DICOMweb connectivity)
+// --------------------------------------------------------------------------
+BUILDERS.webping = () => {
+  const argv = ['web', 'ping'];
+  if (state.web.url) argv.push('--url', state.web.url);
+  const t = $('#webping-timeout').value.trim();
+  if (t) argv.push('--timeout', t);
+  return argv;
+};
+
+function wireWebping() {
+  $('#webping-timeout').addEventListener('input', updateAllPreviews);
+  $('#view-webping [data-run]').addEventListener('click', async () => {
+    clearConsole('webping');
+    if (!state.web.url) { appendConsole('webping', 'Fill in the server URL.\n', 'stderr'); return; }
+    setStatus('webping', 'running', 'Testing…');
+    const { code } = await runStreaming('webping', BUILDERS.webping());
+    setStatus('webping', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : 'Failed');
+  });
+}
+
+// --------------------------------------------------------------------------
+// View: WEB SEND (STOW-RS)
+// --------------------------------------------------------------------------
+BUILDERS.websend = () => {
+  const argv = ['web', 'send'];
+  const folder = $('#websend-folder').value.trim();
+  if (folder) argv.push(folder);
+  if (state.web.url) argv.push('--url', state.web.url);
+  const chunk = $('#websend-chunk').value.trim();
+  if (chunk) argv.push('--chunk', chunk);
+  const retry = $('#websend-retry').value.trim();
+  if (retry !== '') argv.push('--retry', retry);
+  const timeout = $('#websend-timeout').value.trim();
+  if (timeout) argv.push('--timeout', timeout);
+  if ($('#websend-dryrun').checked) argv.push('--dry-run');
+  return argv;
+};
+
+function wireWebsend() {
+  ['websend-folder', 'websend-chunk', 'websend-retry', 'websend-timeout'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#websend-dryrun').addEventListener('change', updateAllPreviews);
+
+  $('#view-websend [data-run]').addEventListener('click', async () => {
+    const folder = $('#websend-folder').value.trim();
+    clearConsole('websend');
+    if (!folder) { appendConsole('websend', 'Choose a folder to send.\n', 'stderr'); return; }
+    if (!state.web.url) { appendConsole('websend', 'Fill in the server URL.\n', 'stderr'); return; }
+    setStatus('websend', 'running', 'Sending…');
+    $('#view-websend [data-run]').disabled = true;
+    const { code } = await runStreaming('websend', BUILDERS.websend());
+    $('#view-websend [data-run]').disabled = false;
+    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? 'Complete' : 'Failed');
+  });
+}
+
+// --------------------------------------------------------------------------
+// View: WEB QUERY (QIDO-RS)
+// --------------------------------------------------------------------------
+function webQueryLevel() {
+  const active = $('#webquery-level .chip.active');
+  return active ? active.dataset.level : 'studies';
+}
+
+BUILDERS.webquery = () => {
+  const argv = ['web', 'query'];
+  const pairs = [
+    ['PatientID', $('#webquery-patientid').value.trim()],
+    ['PatientName', $('#webquery-patientname').value.trim()],
+    ['StudyDate', $('#webquery-studydate').value.trim()],
+    ['StudyInstanceUID', $('#webquery-studyuid').value.trim()],
+  ];
+  for (const [k, v] of pairs) if (v) argv.push(`${k}=${v}`);
+  if (state.web.url) argv.push('--url', state.web.url);
+  const level = webQueryLevel();
+  if (level === 'series') argv.push('--series');
+  else if (level === 'instances') argv.push('--instances');
+  const limit = $('#webquery-limit').value.trim();
+  if (limit) argv.push('--limit', limit);
+  return argv;
+};
+
+/** Union-of-keys table over QIDO matches, same shape as renderFindResults. */
+function renderWebQueryResults(json) {
+  const box = $('#view-webquery [data-result]');
+  const matches = Array.isArray(json?.matches) ? json.matches : [];
+  if (!matches.length) {
+    box.hidden = false;
+    box.innerHTML = '<div class="empty-note">0 matches. (Exit code 1 on zero matches is the CLI convention — the server answered; nothing matched.)</div>';
+    return;
+  }
+  const cols = [];
+  for (const m of matches) for (const k of Object.keys(m)) if (!cols.includes(k)) cols.push(k);
+  const head = cols.map((c) => `<th>${esc(c)}</th>`).join('');
+  const rows = matches.map((m) =>
+    `<tr>${cols.map((c) => `<td class="mono">${esc(m[c] ?? '')}</td>`).join('')}</tr>`).join('');
+  box.hidden = false;
+  box.innerHTML = `<div class="section-title">${matches.length} match(es)</div><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function wireWebquery() {
+  for (const chip of $$('#webquery-level .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#webquery-level .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      updateAllPreviews();
+    });
+  }
+  ['webquery-patientid', 'webquery-patientname', 'webquery-studydate', 'webquery-studyuid', 'webquery-limit']
+    .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+
+  $('#view-webquery [data-run]').addEventListener('click', async () => {
+    clearConsole('webquery');
+    $('#view-webquery [data-result]').hidden = true;
+    if (!state.web.url) { appendConsole('webquery', 'Fill in the server URL.\n', 'stderr'); return; }
+    setStatus('webquery', 'running', 'Querying…');
+    const { code, stdout, stderr } = await runCapture('webquery', [...BUILDERS.webquery(), '--json']);
+
+    let parsed = null;
+    try { parsed = JSON.parse(stdout); } catch { /* raw fallback below */ }
+    const matches = parsed && Array.isArray(parsed.matches) ? parsed.matches : null;
+
+    // Exit code 1 with count 0 is the CLI's "no matches" convention, not an
+    // app error — a reachable server that found nothing is still a good run.
+    const ok = code === 0 || (code === 1 && parsed && parsed.count === 0);
+    setStatus('webquery', ok ? 'ok' : 'fail', ok ? 'Done' : 'Failed');
+
+    if (matches) {
+      renderWebQueryResults(parsed);
+    } else {
+      const c = consoleEl('webquery'); c.hidden = false;
+      appendConsole('webquery', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+    }
+  });
+}
+
+// --------------------------------------------------------------------------
+// View: WEB HUB (serve)
+// --------------------------------------------------------------------------
+BUILDERS.webhub = () => {
+  const argv = ['web', 'serve'];
+  const port = $('#webhub-port').value.trim();
+  if (port) argv.push('--port', port);
+  const persist = $('#webhub-persist').value.trim();
+  if (persist) argv.push('--persist', persist);
+  const root = $('#webhub-root').value.trim();
+  if (root) argv.push('--root', root);
+  const token = $('#webhub-token').value.trim();
+  if (token) argv.push('--require-token', token);
+  const reject = $('#webhub-rejectafter').value.trim();
+  if (reject) argv.push('--reject-after', reject);
+  return argv;
+};
+
+function wireWebhub() {
+  // The hub IS the server, so it has no Base URL field — but the other Web
+  // screens need one. Show the address to point them at, built from the port
+  // as it is typed, and offer it as one click into the shared web panel.
+  const showBaseUrl = () => {
+    const port = $('#webhub-port').value.trim();
+    const hint = $('#webhub-baseurl');
+    if (!port) {
+      hint.textContent = 'Choose a port; the address to point clients at appears here.';
+      return;
+    }
+    const url = `http://127.0.0.1:${port}`;
+    hint.innerHTML = `Clients point at <code>${esc(url)}</code> — <button class="linklike" id="webhub-use">use it on the other Web screens</button>`;
+    $('#webhub-use').addEventListener('click', () => {
+      state.web.url = url;
+      syncWebInputs();
+      updateAllPreviews();
+    });
+  };
+
+  ['webhub-port', 'webhub-persist', 'webhub-root', 'webhub-token', 'webhub-rejectafter'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#webhub-port').addEventListener('input', showBaseUrl);
+  showBaseUrl();
+
+  $('#view-webhub [data-run]').addEventListener('click', async () => {
+    clearConsole('webhub');
+    const port = $('#webhub-port').value.trim();
+    if (!port) { appendConsole('webhub', 'Choose a port to listen on.\n', 'stderr'); return; }
+    setStatus('webhub', 'running', 'Listening');
+    $('#view-webhub [data-run]').disabled = true;
+    $('#view-webhub [data-cancel]').hidden = false;
+    const { code } = await runStreaming('webhub', BUILDERS.webhub());
+    // Only reached when the hub stops.
+    $('#view-webhub [data-run]').disabled = false;
+    $('#view-webhub [data-cancel]').hidden = true;
+    setStatus('webhub', code === 0 ? 'ok' : 'fail', 'Stopped');
+  });
+
+  $('#view-webhub [data-cancel]').addEventListener('click', () => {
+    const id = state.activeRuns.webhub;
+    if (id) window.dcm.cancel(id);
+  });
+}
+
+// --------------------------------------------------------------------------
 // View: INVENTORY (info)
 // --------------------------------------------------------------------------
 BUILDERS.inventory = () => {
@@ -1413,6 +1712,7 @@ async function boot() {
 
   await loadProfiles();
   mountConnectionPanels();
+  mountWebPanels();
 
   wireEcho();
   wireSend();
@@ -1420,6 +1720,10 @@ async function boot() {
   wireQuery();
   wireWorklist();
   wireSpeed();
+  wireWebping();
+  wireWebsend();
+  wireWebquery();
+  wireWebhub();
   wireInventory();
   wireTags();
   wireEdit();

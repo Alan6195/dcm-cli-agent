@@ -10,6 +10,7 @@ const { Server } = dcmjsDimse;
 
 const log = require('../../src/lib/log');
 const { makeScpClass } = require('../../src/commands/scp');
+const { createWebServer } = require('../../src/commands/web/serve');
 const { tokenize } = require('../../src/lib/args');
 
 // Keep the library quiet during tests; individual tests opt into verbosity.
@@ -74,6 +75,50 @@ async function startScp(config = {}) {
 }
 
 /**
+ * Starts the real DICOMweb hub in-process.
+ *
+ * Uses the same createWebServer factory the `dcm web serve` command uses, so
+ * the tests exercise shipped code rather than a stand-in — the web mirror of
+ * startScp above.
+ *
+ * @param {object} config { persistDir?, rootDir?, requireToken?, rejectAfter? } — see createWebServer.
+ * @returns {Promise<{port: number, stats: object, close: function}>}
+ */
+async function startWebServer(config = {}) {
+  // The same stats object `dcm web serve`'s run() hands the factory; the hub
+  // mutates it in place, so tests can read counters straight off it.
+  const stats = {
+    requests: 0, stored: 0, rejectedParts: 0, unauthorized: 0,
+    queries: 0, retrievedInstances: 0, notFound: 0, errors: 0,
+  };
+
+  const server = createWebServer(config, stats);
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const { port } = server.address();
+
+  return {
+    port,
+    stats,
+    close: () => {
+      try {
+        server.close();
+        // Client requests ride Node's keep-alive global agent, so idle
+        // sockets would otherwise hold the server (and the test process)
+        // open for the keep-alive timeout.
+        server.closeAllConnections?.();
+      } catch {
+        // Already closed.
+      }
+    },
+  };
+}
+
+/**
  * Runs a command module the way the CLI would, capturing everything it prints.
  *
  * @param {object} mod   A command module exposing run().
@@ -123,4 +168,4 @@ async function withTempDir(prefix, fn) {
   }
 }
 
-module.exports = { freePort, startScp, runCommand, withTempDir };
+module.exports = { freePort, startScp, startWebServer, runCommand, withTempDir };

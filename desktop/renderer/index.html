@@ -39,6 +39,20 @@
         <span class="nav-ico">⏱</span> Speed test
       </button>
 
+      <div class="nav-group-label">DICOMweb</div>
+      <button class="nav-item" data-view="webping">
+        <span class="nav-ico">⊚</span> Web: test connection
+      </button>
+      <button class="nav-item" data-view="websend">
+        <span class="nav-ico">⇧</span> Web: send a study
+      </button>
+      <button class="nav-item" data-view="webquery">
+        <span class="nav-ico">⌗</span> Web: query (QIDO)
+      </button>
+      <button class="nav-item" data-view="webhub">
+        <span class="nav-ico">⌂</span> Web: local hub
+      </button>
+
       <div class="nav-group-label">Local files</div>
       <button class="nav-item" data-view="inventory">
         <span class="nav-ico">▤</span> Inventory
@@ -333,6 +347,128 @@
         <div class="result-table" data-result hidden></div>
         <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
         <p class="mcp-note dim">Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for.</p>
+      </section>
+
+      <!-- WEB PING (DICOMweb) -->
+      <section class="view" id="view-webping">
+        <header class="view-head">
+          <h1>Web: test connection</h1>
+          <p>QIDO-RS — is there a DICOMweb service at this URL, and do your credentials open it? Nothing is sent.</p>
+        </header>
+        <div class="conn-host" data-webconn></div>
+        <div class="form-row">
+          <label>Timeout (ms)<input type="number" id="webping-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Test connection</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- WEB SEND (STOW-RS) -->
+      <section class="view" id="view-websend">
+        <header class="view-head">
+          <h1>Web: send a study</h1>
+          <p>STOW-RS — upload a folder of DICOM files to a DICOMweb server, with a live transfer report.</p>
+        </header>
+        <div class="form-row">
+          <label class="grow">Folder to send
+            <div class="path-pick">
+              <input type="text" id="websend-folder" placeholder="Choose a folder of DICOM files…" />
+              <button class="btn ghost" data-pick="websend-folder" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+        <div class="conn-host" data-webconn></div>
+        <div class="form-row triple">
+          <label>Chunk size<input type="number" id="websend-chunk" placeholder="50" min="1" /></label>
+          <label>Retries<input type="number" id="websend-retry" placeholder="1" min="0" /></label>
+          <label>Timeout (ms)<input type="number" id="websend-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="websend-dryrun" /> Dry run (scan &amp; plan, nothing uploaded)</label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Send (STOW-RS)</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- WEB QUERY (QIDO-RS) -->
+      <section class="view" id="view-webquery">
+        <header class="view-head">
+          <h1>Web: query (QIDO)</h1>
+          <p>QIDO-RS — search a DICOMweb server for studies, series or instances. Changes nothing.</p>
+        </header>
+        <div class="conn-host" data-webconn></div>
+        <div class="section-title">Search level</div>
+        <div class="chip-row" id="webquery-level">
+          <button class="chip active" data-level="studies">Studies</button>
+          <button class="chip" data-level="series">Series</button>
+          <button class="chip" data-level="instances">Instances</button>
+        </div>
+        <div class="form-row triple">
+          <label>Patient ID<input type="text" id="webquery-patientid" placeholder="any" /></label>
+          <label>Patient name<input type="text" id="webquery-patientname" placeholder="any — DOE^JANE, wildcards ok" /></label>
+          <label>Study date<input type="text" id="webquery-studydate" placeholder="any — YYYYMMDD or YYYYMMDD-YYYYMMDD" /></label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Study Instance UID<input type="text" id="webquery-studyuid" placeholder="any" /></label>
+          <label>Limit<input type="number" id="webquery-limit" placeholder="all" min="1" /></label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run QIDO query</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="result-table" data-result hidden></div>
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+      </section>
+
+      <!-- WEB HUB (serve) -->
+      <section class="view" id="view-webhub">
+        <header class="view-head">
+          <h1>Web: local hub (serve)</h1>
+          <p>Run a local DICOMweb server (STOW/QIDO) for testing. Point the other Web screens — or any DICOMweb client — at it.</p>
+        </header>
+        <div class="form-row triple">
+          <label>Port<input type="number" id="webhub-port" placeholder="10808" min="1" max="65535" /></label>
+          <label>Reject after (test)<input type="number" id="webhub-rejectafter" placeholder="off" min="1" /></label>
+        </div>
+        <div class="web-auth-hint" id="webhub-baseurl"></div>
+        <div class="form-row">
+          <label class="grow">Save arriving studies to
+            <div class="path-pick">
+              <input type="text" id="webhub-persist" placeholder="(optional) accept and discard if empty" />
+              <button class="btn ghost" data-pick="webhub-persist" data-pick-mode="create">Browse…</button>
+              <button class="btn ghost" data-reveal="webhub-persist">Open</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Pre-populate index from
+            <div class="path-pick">
+              <input type="text" id="webhub-root" placeholder="(optional) folder of DICOM files to serve at startup" />
+              <button class="btn ghost" data-pick="webhub-root" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Require token <span class="dim">(test only — clients without this Bearer token get 401s; for reproducing auth failures, not real security)</span>
+            <input type="text" id="webhub-token" placeholder="(optional) e.g. test-token-123" />
+          </label>
+        </div>
+        <div class="cmd-preview" data-cmd></div>
+        <div class="actions">
+          <button class="btn primary" data-run>Start hub</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="console-wrap tall"><pre class="console" data-console></pre></div>
       </section>
 
       <!-- INVENTORY -->

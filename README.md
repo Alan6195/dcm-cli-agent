@@ -497,6 +497,57 @@ States can survive. It is not a certified implementation of the PS3.15
 confidentiality profiles. Check a sample yourself before it leaves your network.
 Treat the output as best-effort, not provably anonymous.
 
+### dcm web
+
+The same operations over DICOMweb — the HTTP face of DICOM — for the servers
+that speak it (cloud PACS, VNAs, Orthanc's DICOMweb plugin). STOW-RS to send,
+QIDO-RS to query, WADO-RS to retrieve, and a loopback hub to test against.
+
+```bash
+export DCM_WEB_URL=https://pacs.example.org/dicom-web
+
+dcm web ping
+dcm web send ./study
+dcm web query PatientID=12345
+dcm web retrieve --study 1.2.840.113619.2.55.3.604688.1 --out ./pulled
+```
+
+The same three numbers, the same rule: `web send` reports files found, sent
+and acknowledged from the server's own STOW response — instances the server
+listed as failed, or didn't account for at all, exit non-zero. A partial
+transfer is a failure over HTTP too.
+
+Credentials come from the environment and nowhere else, same policy as
+`dcm explain`'s API key — no flag, no config file, so they can't land in your
+shell history:
+
+```bash
+export DCM_WEB_TOKEN=...            # Bearer, or:
+export DCM_WEB_USER=... DCM_WEB_PASS=...  # HTTP Basic
+```
+
+Two things worth knowing before you chase a "failure":
+
+- **Include the path prefix in the URL.** Most servers root DICOMweb under
+  something like `/dicom-web`; a 404 on ping usually means the base URL is
+  missing it, not that the server is down.
+- **A good ping is not a storage grant.** Like C-ECHO, `web ping` proves the
+  URL answers and your credentials open it. Whether STOW is permitted is a
+  separate server-side decision.
+
+And the loopback hub, the web mirror of `dcm scp`:
+
+```bash
+dcm web serve --port 10808 --persist ./received
+```
+
+It accepts STOW, answers QIDO over what it holds, and serves WADO back. Binds
+127.0.0.1 unless you say otherwise — it's a test target, not a PACS. The same
+failure-injection switches exist for reproducing problems locally:
+`--require-token <token>` (reproduces 401s — use a made-up value, never a real
+one) and `--reject-after <n>` (a server that accepts part of a request and
+refuses the rest, for testing the shortfall accounting).
+
 ### dcm explain (optional)
 
 Pipes a failed transfer log at the Anthropic API and gets back a plain-English

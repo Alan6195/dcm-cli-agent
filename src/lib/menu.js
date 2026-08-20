@@ -228,6 +228,44 @@ const ACTIONS = [
       return { command: 'install', argv: dry ? ['--dry-run'] : [] };
     },
   },
+  {
+    key: '10',
+    label: 'DICOMweb (HTTP): ping, send, query, retrieve, or serve',
+    detail: 'STOW/QIDO/WADO against a DICOMweb URL. Credentials come from DCM_WEB_TOKEN or DCM_WEB_USER/DCM_WEB_PASS in the environment, never from a prompt.',
+    async build(rl) {
+      const verb = (await ask(rl, 'webVerb', 'Which operation? (ping / send / query / retrieve / serve)', { fallback: 'ping' })).toLowerCase();
+      // Falling through to ping on a typo would run a different operation than
+      // the one that was asked for, silently. The CLI rejects unknown verbs;
+      // so does this.
+      if (!['ping', 'send', 'query', 'retrieve', 'serve'].includes(verb)) {
+        throw new Error(`"${verb}" is not one of: ping, send, query, retrieve, serve`);
+      }
+      if (verb === 'serve') {
+        const port = await ask(rl, 'webServePort', 'Port to listen on', { env: 'DCM_WEB_SERVE_PORT', required: true });
+        const persist = await ask(rl, 'webServePersist', 'Folder to store received instances (empty = discard)', {});
+        const argv = ['serve', '--port', port];
+        if (persist) argv.push('--persist', persist);
+        return { command: 'web', argv };
+      }
+      const url = await ask(rl, 'webUrl', 'Base URL (include any /dicom-web prefix)', { env: 'DCM_WEB_URL', required: true });
+      if (verb === 'send') {
+        const folder = await ask(rl, 'webSendFolder', 'Folder to send', { required: true });
+        return { command: 'web', argv: ['send', folder, '--url', url] };
+      }
+      if (verb === 'query') {
+        const patientId = await ask(rl, 'webQueryPatient', 'PatientID to match (empty = all studies)', {});
+        const argv = ['query', '--url', url];
+        if (patientId) argv.push(`PatientID=${patientId}`);
+        return { command: 'web', argv };
+      }
+      if (verb === 'retrieve') {
+        const study = await ask(rl, 'webRetrieveStudy', 'StudyInstanceUID to retrieve', { required: true });
+        const out = await ask(rl, 'webRetrieveOut', 'Folder to write into', { required: true });
+        return { command: 'web', argv: ['retrieve', '--url', url, '--study', study, '--out', out] };
+      }
+      return { command: 'web', argv: ['ping', '--url', url] };
+    },
+  },
 ];
 
 /**

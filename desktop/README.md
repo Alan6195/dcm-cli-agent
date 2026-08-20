@@ -3,7 +3,11 @@
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,
 shows it, and runs it. Echo, Send (with a live transfer report), a Receiver you
-can start and stop, Query, Inventory, Tag inspector, Tag editor and De-identify.
+can start and stop, Query, Inventory, Tag inspector, Tag editor and De-identify —
+plus a DICOMweb group: test a server URL, send over STOW-RS, query over QIDO-RS,
+and run a local DICOMweb hub for testing. DICOMweb credentials come from the
+environment the app was launched from (`DCM_WEB_TOKEN`, or
+`DCM_WEB_USER`/`DCM_WEB_PASS`) — there is deliberately no token field.
 
 The product name is deliberately "Asteris DICOM App" — typing "asteris" into
 the Windows Start menu finds it, and the trailing "App" separates it from the

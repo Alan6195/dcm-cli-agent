@@ -144,9 +144,16 @@ function transfer({ result, connection, chunkSize, rewriteSeriesUid }) {
   log.out(BAR);
   log.out('TRANSFER REPORT');
   log.out(BAR);
-  log.out(`Peer            ${connection.host}:${connection.port} (${connection.calledAe})`);
-  log.out(`Calling AE      ${connection.callingAe}`);
-  log.out(`Chunk size      ${chunkSize} instance(s) per association`);
+  // A DIMSE connection has a host/port/AE pair; a DICOMweb one is just a URL.
+  // The accounting below is identical either way — that is the point of the
+  // ledger — so only these header lines differ.
+  if (connection.url) {
+    log.out(`Server          ${connection.url} (STOW-RS)`);
+  } else {
+    log.out(`Peer            ${connection.host}:${connection.port} (${connection.calledAe})`);
+    log.out(`Calling AE      ${connection.callingAe}`);
+  }
+  log.out(`Chunk size      ${chunkSize} instance(s) per ${connection.url ? 'request' : 'association'}`);
   if (rewriteSeriesUid) {
     log.out(`Series UIDs     ${log.color.yellow('REWRITTEN — sent data differs from data on disk')}`);
   }
@@ -237,7 +244,7 @@ function transfer({ result, connection, chunkSize, rewriteSeriesUid }) {
     // Association-level events: rejections, aborts, timeouts.
     if (study.events.length) {
       log.out('');
-      log.out('    association events:');
+      log.out(`    ${connection.url ? 'request' : 'association'} events:`);
       for (const event of study.events) {
         log.out(`      ${event.message}`);
         if (event.detail?.hint) log.out(`        ${log.color.dim(event.detail.hint)}`);

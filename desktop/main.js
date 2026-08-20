@@ -47,9 +47,19 @@ function resolveEngine() {
 
 const ENGINE = resolveEngine();
 
+// The smoke harness is automated verification, not somebody launching the app:
+// it gets its own user-data directory so a test run can never write over real
+// saved profiles, and it skips the single-instance lock so it still runs when
+// the installed app happens to be open (otherwise CI is fine but a developer's
+// verification run silently exits).
+const SMOKE = !!process.env.DCM_SMOKE_DIR;
+if (SMOKE) {
+  app.setPath('userData', path.join(process.env.DCM_SMOKE_DIR, 'userData'));
+}
+
 // Two instances would race over profiles.json and fight over receiver ports.
 // A second launch just fronts the window that is already there.
-const gotInstanceLock = app.requestSingleInstanceLock();
+const gotInstanceLock = SMOKE || app.requestSingleInstanceLock();
 if (!gotInstanceLock) {
   // Say so on stderr: `npm start` while the installed app is open loses this
   // race too, and a silent exit code 0 there looks exactly like a bug.

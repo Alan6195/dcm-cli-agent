@@ -29,6 +29,7 @@ const COMMANDS = {
   tags: () => require('./commands/tags'),
   edit: () => require('./commands/edit'),
   anon: () => require('./commands/anon'),
+  web: () => require('./commands/web'),
   explain: () => require('./commands/explain'),
   mcp: () => require('./commands/mcp'),
   install: () => require('./commands/install'),
@@ -50,6 +51,7 @@ Commands:
   tags      Dump the DICOM tags in a file or folder
   edit      Change or remove tags and write the result
   anon      De-identify a folder into a new directory
+  web       DICOMweb: ping, send (STOW), query (QIDO), retrieve (WADO), serve
   explain   Explain a failed transfer log using the Anthropic API (optional)
   mcp       Run an MCP server so an assistant can drive these operations
   install   Put this executable on your PATH so you can type 'dcm' anywhere
@@ -68,6 +70,7 @@ Global options:
 Connection details come from flags or environment variables, never from a file
 on disk:
   DCM_HOST  DCM_PORT  DCM_CALLED_AE  DCM_CALLING_AE  DCM_SCP_PORT
+  DCM_WEB_URL  DCM_WEB_TOKEN  DCM_WEB_USER  DCM_WEB_PASS  DCM_WEB_SERVE_PORT
 
 Examples:
   dcm echo --host pacs.example.org --port 11112 --called-ae ARCHIVE

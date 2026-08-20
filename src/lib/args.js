@@ -83,14 +83,19 @@ function tokenize(argv) {
 }
 
 /**
- * True for a bare `Keyword=value` token — the form C-FIND matching keys take.
+ * True for a bare `Keyword=value` token — the form C-FIND and QIDO matching
+ * keys take.
  *
  * DICOM keywords are alphanumeric and start with a letter, which is specific
  * enough to distinguish a matching key from an ordinary flag value such as a
- * hostname or a path.
+ * hostname or a path. An 8-hex-digit tag (`00100020=12345`) is the other legal
+ * spelling of the same thing, and it has to be recognised here too: without
+ * it `dcm web query --series 00100020=12345` lets --series swallow the key,
+ * and the peer is asked a different question than the one that was typed —
+ * the exact failure the keyword form is guarded against above.
  */
 function looksLikePair(token) {
-  return /^[A-Za-z][A-Za-z0-9]*=/.test(token);
+  return /^([A-Za-z][A-Za-z0-9]*|[0-9A-Fa-f]{8})=/.test(token);
 }
 
 /**
@@ -101,8 +106,12 @@ function looksLikePair(token) {
  * silently loses it. `dcm edit --set PatientID=TEST001` needs the pair consumed
  * as the flag's value, or the edit silently does nothing. A general rule cannot
  * satisfy both, so the flags that take pair-shaped values are named here.
+ *
+ * `--require-token` is here for a subtler reason: a base64 token carries `=`
+ * padding, so `--require-token abc123==` is pair-shaped by accident and the
+ * hub would refuse to start with "expects a value".
  */
-const PAIR_VALUED_FLAGS = new Set(['set', 'remove', 'filter', 'value']);
+const PAIR_VALUED_FLAGS = new Set(['set', 'remove', 'filter', 'value', 'require-token']);
 
 /** Repeated flags accumulate into an array rather than clobbering. */
 function setFlag(flags, name, value) {
