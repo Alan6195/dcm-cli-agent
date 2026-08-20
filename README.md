@@ -484,13 +484,40 @@ The individual steps exist too, for a workflow that spans processes:
 
 ```bash
 dcm mpps start --from-worklist worklist.json ...        # prints the MPPS UID
-dcm mpps complete <mpps-uid> --acknowledged sent.json ...
+dcm mpps complete <mpps-uid> --series-from ./acquired ...
 dcm mpps discontinue <mpps-uid> --reason-code 110501^DCM^"Equipment failure" ...
 ```
+
+The tool keeps no records of any kind, which is why `perform` is the path worth
+using. Only the process that ran the C-STORE knows which instances the archive
+actually acknowledged, and nothing writes that down — so a standalone
+`complete` has two honest answers to "which images?": name none, or name what a
+folder scan found and say so. `--series-from` does the latter and prints a
+disclaimer, in yellow, every time.
 
 The MPPS peer and the archive are often different systems, so `--store-host`,
 `--store-port` and `--store-called-ae` are separate; they default to the MPPS
 peer and the command prints both in full either way.
+
+**Rehearsing with images you already have.** A worklist item invents its Study
+Instance UID before the images exist, so stock images never match it, and the
+tool refuses rather than sending a step and a set of images the archive can
+never reconcile. The fix is the one a real modality uses — it adopts the
+identity the RIS assigned:
+
+```bash
+dcm mpps perform ./stock-images --from-worklist worklist.json --adopt-worklist-identity ...
+```
+
+That sends a re-stamped **copy** carrying the worklist's study, patient and
+accession. **Your folder is not modified** — the copy goes to a staging
+directory whose path is printed. Series and SOP Instance UIDs are left alone,
+because those belong to the equipment rather than to the order. If you would
+rather send the images untouched and accept that nothing will reconcile,
+`--allow-study-mismatch` says so explicitly. One caveat worth knowing: the
+re-stamped copy is written by the same dataset writer `dcm edit` and `dcm anon`
+use, which does not carry private tags across — if a private tag is the thing
+you are testing, send as-is.
 
 **Testing it locally.** `dcm scp` speaks MPPS as well, so you can exercise the
 whole loop without a RIS:

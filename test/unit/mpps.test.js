@@ -504,56 +504,68 @@ test('a Person Name object from the wire becomes a plain string', () => {
   assert.equal(mpps.buildCreateDataset(attrs).PatientName, 'DOE^JANE');
 });
 
-// --- step record -----------------------------------------------------------
+/** Every USAGE a person can reach through `dcm mpps`. */
+const USAGES = [
+  ['start', require('../../src/commands/mpps/start').USAGE],
+  ['perform', perform.USAGE],
+  ['complete', finish.usageFor('complete')],
+  ['discontinue', finish.usageFor('discontinue')],
+  ['(dispatcher)', dispatcher.USAGE],
+];
 
-test('a step record holds only the instances that were acknowledged', () => {
-  const record = mpps.buildStepRecord({
-    mppsSopInstanceUid: '2.25.1',
-    status: mpps.Status.COMPLETED,
-    studyInstanceUid: '1.2.3',
-    peer: { host: 'h', port: 1, calledAe: 'A', callingAe: 'B' },
-    entries: [
-      entry(Disposition.ACKNOWLEDGED, '1.1', 'S1'),
-      entry(Disposition.WARNING, '1.2', 'S1'),
-      entry(Disposition.FAILED, '1.3', 'S1'),
-      entry(Disposition.UNANSWERED, '1.4', 'S1'),
-    ],
-  });
+// --- statelessness ----------------------------------------------------------
 
-  assert.equal(record.kind, mpps.STEP_FILE_KIND);
-  assert.deepEqual(record.instances.map((i) => i.sopInstanceUid), ['1.1', '1.2']);
+test('nothing in the library writes or reads a step record', () => {
+  // The owner's decision: MPPS is stateless about procedure steps. No records
+  // directory, no per-step files, no local database. These names existed in
+  // v0.9.0 and their absence is the feature, so it is asserted rather than
+  // left to be reintroduced by someone restoring "just a small one".
+  for (const gone of ['buildStepRecord', 'readStepRecord', 'STEP_FILE_KIND', 'STEP_FILE_VERSION']) {
+    assert.equal(mpps[gone], undefined, `src/lib/mpps.js must not export ${gone}`);
+  }
 });
 
-test('a step record round-trips and rebuilds the same performed series', () => {
-  const record = mpps.buildStepRecord({
-    mppsSopInstanceUid: '2.25.1',
-    status: mpps.Status.IN_PROGRESS,
-    studyInstanceUid: '1.2.3',
-    peer: {},
-    entries: [entry(Disposition.ACKNOWLEDGED, '1.1', 'S1'), entry(Disposition.ACKNOWLEDGED, '2.1', 'S2')],
-  });
+test('no mpps verb advertises a flag that would write or read a file of steps', () => {
+  // Two patterns rather than one: `dcm edit --out` is a legitimate mention of
+  // another command's flag inside perform's note about the dataset writer, so
+  // --out is banned only where a flag is being DEFINED — at the head of an
+  // option line — while the record-specific names are banned everywhere.
+  const byName = /--(record-dir|record|write-acknowledged|acknowledged)\b/;
+  const definesOut = /^\s+--out\b/m;
 
-  const { record: read } = mpps.readStepRecord(tempJson('step.json', record));
-  const built = mpps.buildPerformedSeriesSequence(read.instances);
-  assert.equal(built.items.length, 2);
-  assert.equal(built.referenced, 2);
+  for (const [verb, usage] of USAGES) {
+    const named = usage.match(byName);
+    assert.equal(named, null, `dcm mpps ${verb} still advertises ${named && named[0]}`);
+    assert.equal(definesOut.test(usage), false, `dcm mpps ${verb} still defines --out`);
+  }
 });
 
-test('a file that is not a step record is refused', () => {
-  assert.throws(() => mpps.readStepRecord(tempJson('x.json', { instances: [] })), UsageError);
-  assert.throws(() => mpps.readStepRecord(tempJson('x.json', { kind: mpps.STEP_FILE_KIND })), UsageError);
+test('every removed flag is refused by the parser, not merely undocumented', async () => {
+  // The check above catches documentation drift; this one catches a flag that
+  // still quietly works. rejectUnknown() runs before anything connects, so
+  // none of these open a socket.
+  const gone = [
+    ['start', '--out', 'step.json'],
+    ['start', '--record-dir', 'recs'],
+    ['perform', './x', '--write-acknowledged', 'step.json'],
+    ['perform', './x', '--record-dir', 'recs'],
+    ['complete', '2.25.1', '--acknowledged', 'step.json'],
+    ['complete', '2.25.1', '--record-dir', 'recs'],
+    ['discontinue', '2.25.1', '--acknowledged', 'step.json'],
+    ['discontinue', '2.25.1', '--record-dir', 'recs'],
+  ];
+  for (const argv of gone) {
+    await assert.rejects(
+      () => dispatcher.run(tokenize(argv)),
+      UsageError,
+      `dcm mpps ${argv.join(' ')} was not refused`
+    );
+  }
 });
 
-test('a step record edited to claim unacknowledged instances is refused', () => {
-  // The whole value of the file is that everything in it was acknowledged. If
-  // that stops being true it must fail loudly, not quietly build a false record.
-  const tampered = {
-    kind: mpps.STEP_FILE_KIND,
-    version: mpps.STEP_FILE_VERSION,
-    instances: [{ disposition: Disposition.FAILED, sopInstanceUid: '1.1', seriesInstanceUid: 'S1' }],
-  };
-  const err = throwsUsage(() => mpps.readStepRecord(tempJson('bad.json', tampered)));
-  assert.ok(err.message.includes('disposition'));
+test('there is no list verb, so there is no record directory to read', async () => {
+  assert.equal(dispatcher.VERBS.list, undefined);
+  await assert.rejects(() => dispatcher.run(tokenize(['list'])), UsageError);
 });
 
 // --- flag resolution -------------------------------------------------------
@@ -667,40 +679,31 @@ test('a bad storage port is refused', () => {
 
 // --- closing a step --------------------------------------------------------
 
-test('the UID may come from the argument or the step record, but not disagree', () => {
-  assert.equal(finish.resolveMppsUid('2.25.1', undefined), '2.25.1');
-  assert.equal(finish.resolveMppsUid(undefined, { mppsSopInstanceUid: '2.25.2' }), '2.25.2');
-  assert.equal(finish.resolveMppsUid('2.25.3', { mppsSopInstanceUid: '2.25.3' }), '2.25.3');
+test('the UID comes from the argument and from nowhere else', () => {
+  assert.equal(finish.resolveMppsUid('2.25.1'), '2.25.1');
 
-  const err = throwsUsage(() => finish.resolveMppsUid('2.25.1', { mppsSopInstanceUid: '2.25.2' }));
-  assert.ok(err.message.includes('different procedure step'));
-
-  assert.throws(() => finish.resolveMppsUid(undefined, undefined), UsageError);
+  // No file to read it out of and no query service to ask for it, so a missing
+  // argument has to say that rather than send a lookup somewhere.
+  const err = throwsUsage(() => finish.resolveMppsUid(undefined));
+  assert.ok(err.message.includes('only handle on the step'));
+  assert.ok(err.message.includes('keeps no record'));
+  assert.throws(() => finish.resolveMppsUid(''), UsageError);
 });
 
-test('--acknowledged and --series-from cannot both answer the same question', () => {
-  const err = throwsUsage(
-    () => finish.resolvePerformedSeries(flagsOf('--series-from ./x'), { instances: [] }, '')
-  );
-  assert.ok(err.message.includes('Pick one'));
-});
-
-test('with neither source the performed series is empty and says so', () => {
-  const { built, assertedFromDisk } = finish.resolvePerformedSeries(flagsOf(''), undefined, '');
+test('with no source the performed series is empty and says so', () => {
+  const { built, assertedFromDisk } = finish.resolvePerformedSeries(flagsOf(''), '');
   assert.deepEqual(built.items, []);
   assert.equal(assertedFromDisk, false);
 });
 
-test('a step record builds a performed series that is not asserted from disk', () => {
-  const { built, assertedFromDisk, sourceLabel } = finish.resolvePerformedSeries(
-    flagsOf(''),
-    { instances: [entry(Disposition.ACKNOWLEDGED, '1.1', 'S1')] },
-    'ARCHIVE'
-  );
-  assert.equal(built.referenced, 1);
-  assert.equal(built.items[0].RetrieveAETitle, 'ARCHIVE');
-  assert.equal(assertedFromDisk, false);
-  assert.equal(sourceLabel, 'acknowledged instances');
+test('--series-from is the only source a standalone close has, and is labelled as disk', () => {
+  // The judgement this removal forced: with no records, a standalone complete
+  // can only assert what a folder scan found. That is acceptable, and the flag
+  // it comes from must stay marked assertedFromDisk so the yellow disclaimer
+  // and the JSON field both keep firing.
+  assert.equal(finish.resolvePerformedSeries.length, 2);
+  assert.ok(finish.usageFor('complete').includes('ONLY source'));
+  assert.ok(finish.usageFor('complete').includes('asserts what is on YOUR DISK'));
 });
 
 // --- perform ---------------------------------------------------------------
@@ -851,8 +854,11 @@ test('the N-service status codes an MPPS SCP actually returns are translated', (
 
 // --- dispatcher ------------------------------------------------------------
 
-test('the dispatcher routes exactly the four verbs', () => {
-  assert.deepEqual(Object.keys(dispatcher.VERBS), ['start', 'complete', 'discontinue', 'perform']);
+test('the dispatcher routes exactly the verbs it offers', () => {
+  assert.deepEqual(
+    Object.keys(dispatcher.VERBS),
+    ['start', 'complete', 'discontinue', 'perform']
+  );
   for (const load of Object.values(dispatcher.VERBS)) {
     const mod = load();
     assert.equal(typeof mod.run, 'function');

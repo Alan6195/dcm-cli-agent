@@ -1,8 +1,5 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-
 const log = require('../../lib/log');
 const args = require('../../lib/args');
 const { validateUid } = require('../../lib/uid');
@@ -12,7 +9,7 @@ const common = require('./common');
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
   ...common.ATTRIBUTE_FLAGS,
-  'out', 'dry-run',
+  'dry-run',
 ];
 
 const USAGE = `
@@ -21,6 +18,11 @@ dcm mpps start — open a performed procedure step (N-CREATE, IN PROGRESS)
 Tells the MPPS SCP that work has begun on a scheduled study. Prints the MPPS
 SOP Instance UID it generated: that UID is the only handle on the step, and
 'dcm mpps complete' cannot close it without one.
+
+Nothing is written to disk. This command keeps no record of the step, and MPPS
+has no query service, so the printed UID cannot be recovered from anywhere —
+not from here, and not from the SCP. Copy it. --json puts it in
+"mppsSopInstanceUid" for a caller that would rather not scrape the text.
 
 Usage:
   dcm mpps start --host <host> --port <port> --called-ae <AE> --study-uid <uid> --modality <MOD> [options]
@@ -62,7 +64,6 @@ Patient:
 Other:
   --from-worklist <file.json>   Take the attributes above from a worklist item.
   --mpps-uid <uid>       Use this MPPS SOP Instance UID instead of generating one.
-  --out <file.json>      Write the step record for 'dcm mpps complete' to read.
   --dry-run              Build and print the N-CREATE without connecting.
   --json                 Emit the result as JSON.
   --verbose              Log the full association negotiation.
@@ -93,7 +94,7 @@ Examples:
   dcm find --mwl --json-raw --host ris.example.org --port 11112 --called-ae WORKLIST \\
     PatientID=12345 > wl.json
   dcm mpps start --host ris.example.org --port 11112 --called-ae MPPSSCP \\
-    --from-worklist wl.json --out step.json
+    --from-worklist wl.json
 `.trimStart();
 
 /**
@@ -214,20 +215,6 @@ async function run(parsed) {
     );
   }
 
-  let outFile;
-  if (verdict.ok) {
-    const outFlag = args.resolve(flags, { name: 'out' });
-    if (outFlag !== undefined) {
-      outFile = writeStepRecord(outFlag, {
-        mppsSopInstanceUid,
-        status: mpps.Status.IN_PROGRESS,
-        studyInstanceUid: attrs.studyInstanceUid,
-        peer: connection,
-        entries: [],
-      });
-    }
-  }
-
   if (asJson) {
     log.out(JSON.stringify({
       ok: verdict.ok,
@@ -239,7 +226,6 @@ async function run(parsed) {
       peer: connection,
       status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
       message: verdict.lines.join(' '),
-      stepRecord: outFile ?? null,
     }, null, 2));
     return verdict.ok ? 0 : 1;
   }
@@ -257,7 +243,6 @@ async function run(parsed) {
   log.out(`  performed step ID      ${attrs.performedProcedureStepId}`);
   log.out(`  station AE             ${attrs.performedStationAeTitle}`);
   log.out(`  started                ${attrs.startDate} ${attrs.startTime}`);
-  if (outFile) log.out(`  step record            ${outFile}`);
   log.out('');
   log.out(
     log.color.dim(
@@ -273,26 +258,4 @@ async function run(parsed) {
   return 0;
 }
 
-/**
- * Writes the step record for a later `mpps complete`.
- *
- * @param {string} file
- * @param {object} params See mpps.buildStepRecord().
- * @returns {string} Resolved path.
- */
-function writeStepRecord(file, params) {
-  const resolved = path.resolve(file);
-  const record = mpps.buildStepRecord(params);
-  try {
-    fs.writeFileSync(resolved, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
-  } catch (err) {
-    // The step is already open on the SCP at this point, so failing to write
-    // the convenience file must not read as the step having failed.
-    log.warn(`could not write --out "${resolved}": ${err.message}`);
-    log.warn(`the step is open regardless; its UID is ${params.mppsSopInstanceUid}`);
-    return undefined;
-  }
-  return resolved;
-}
-
-module.exports = { run, USAGE, writeStepRecord };
+module.exports = { run, USAGE };

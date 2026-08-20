@@ -17,7 +17,7 @@ const common = require('./common');
 /** Flags both verbs accept. `reason` and `reason-code` are ignored by complete. */
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
-  'acknowledged', 'series-from', 'no-recurse', 'retrieve-ae',
+  'series-from', 'no-recurse', 'retrieve-ae',
   'end-date', 'end-time', 'dry-run', 'reason', 'reason-code',
 ];
 
@@ -50,8 +50,9 @@ dcm mpps ${verb} — close a performed procedure step (N-SET, ${status})
 Usage:
   dcm mpps ${verb} <mpps-uid> --host <host> --port <port> --called-ae <AE> [options]
 
-<mpps-uid> is the MPPS SOP Instance UID printed by 'dcm mpps start'. It may be
-omitted when --acknowledged names a step record that carries it.
+<mpps-uid> is the MPPS SOP Instance UID printed by 'dcm mpps start'. It is
+required. It is the only handle on the step: this command writes no records and
+MPPS has no query service, so there is nowhere to look a lost UID up.
 
 Connection:
   --host <host>          MPPS peer hostname.                    [env DCM_HOST]
@@ -61,12 +62,10 @@ Connection:
   --timeout <ms>         Silence allowed before giving up. Default: 60000.
 
 What was performed:
-  --acknowledged <file.json>  A step record written by 'dcm mpps start --out' or
-                         'dcm mpps perform --write-acknowledged'. Performed
-                         series are built from the instances in it, which are
-                         exactly the ones the archive acknowledged.
-  --series-from <folder> Build the performed series by scanning a folder.
-                         READ THE NOTE BELOW before using this.
+  --series-from <folder> Build the performed series by scanning a folder. This
+                         is the ONLY source this verb has, and it asserts what
+                         is on your disk. READ THE NOTE BELOW before using it.
+                         Given nothing, the step is closed naming no images.
   --no-recurse           With --series-from, do not descend into subfolders.
   --retrieve-ae <AE>     Retrieve AE Title recorded against each performed
                          series — the AE the images can be fetched from.
@@ -85,10 +84,16 @@ Note: --series-from asserts what is on YOUR DISK, not what the archive holds.
   include instances the archive refused, never received, or rejected as
   duplicates. Naming one of those in an MPPS is a fabricated record.
 
-  Use --acknowledged wherever there is a choice. --series-from exists for the
-  case where some other tool did the transfer and the step still has to be
-  closed, and this command says plainly, in its output, that the sequence was
-  asserted from disk.
+  There is no better source here, and that is deliberate. Only the process that
+  did the C-STORE knows which instances the archive positively acknowledged,
+  and that knowledge is written nowhere — this tool keeps no records of any
+  kind. So a standalone 'dcm mpps ${verb}' has exactly two honest answers to
+  "which images?": name none, or name what a folder scan found and say plainly
+  that it came from disk. It does say so, in yellow, every time it does it.
+
+  When the performed series matters, use 'dcm mpps perform'. It does the
+  N-CREATE, the C-STORE and the N-SET in one process, so the acknowledgement
+  ledger never has to survive anything.
 
 Note: closing the step here says nothing about the worklist entry.
   This command reports what the MPPS SCP answered. Whether that SCP, or a RIS
@@ -98,72 +103,51 @@ Note: closing the step here says nothing about the worklist entry.
 
 Example:
   dcm mpps ${verb} 2.25.31415926535897932384626433832795028841 \\
-    --host ris.example.org --port 11112 --called-ae MPPSSCP \\
-    --acknowledged step.json
+    --host ris.example.org --port 11112 --called-ae MPPSSCP
 `.trimStart();
 }
 
 /**
  * Resolves which MPPS SOP Instance UID is being closed.
  *
+ * One source, and deliberately no other: the argument. Nothing is written to
+ * disk, so there is no file to read it out of, and MPPS has no query service,
+ * so the peer cannot be asked which steps it is holding either.
+ *
  * @param {string|undefined} positional
- * @param {object|undefined} record
  * @returns {string}
  */
-function resolveMppsUid(positional, record) {
-  const fromRecord = record?.mppsSopInstanceUid;
-
-  if (positional && fromRecord && positional !== fromRecord) {
-    throw new args.UsageError(
-      `The UID on the command line (${positional}) is not the one in the step record ` +
-        `(${fromRecord}). One of them names a different procedure step, and closing ` +
-        'the wrong one is worse than closing none. Drop the positional argument to use ' +
-        'the record, or drop --acknowledged to use the argument.'
-    );
-  }
-
-  const uid = positional ?? fromRecord;
-  if (!uid) {
+function resolveMppsUid(positional) {
+  if (!positional) {
     throw new args.UsageError(
       'Missing the MPPS SOP Instance UID. It is the value `dcm mpps start` printed as ' +
         '"MPPS SOP Instance UID", and it is the only handle on the step:\n' +
         '  dcm mpps complete <mpps-uid> --host ... --port ... --called-ae ...\n' +
-        'Or pass --acknowledged <file.json>, which carries it.'
+        'This tool keeps no record of the steps it opened, and MPPS has no query service, ' +
+        'so a lost UID cannot be recovered from here or from the peer.'
     );
   }
 
-  return mpps.requireUid(uid, positional ? '<mpps-uid>' : 'the step record');
+  return mpps.requireUid(positional, '<mpps-uid>');
 }
 
 /**
- * Builds PerformedSeriesSequence from whichever source was named.
+ * Builds PerformedSeriesSequence from the one source this verb has.
+ *
+ * A folder scan, or nothing at all. The acknowledged-instance ledger belongs to
+ * the process that did the C-STORE and is not written down anywhere, so a
+ * standalone close cannot have it. `dcm mpps perform` is the verb that does.
  *
  * @param {Map} flags
- * @param {object|undefined} record
  * @param {string} retrieveAeTitle
  * @returns {{built: object, sourceLabel: string, assertedFromDisk: boolean}}
  */
-function resolvePerformedSeries(flags, record, retrieveAeTitle) {
+function resolvePerformedSeries(flags, retrieveAeTitle) {
   const seriesFrom = args.resolve(flags, { name: 'series-from' });
-  const hasRecord = record !== undefined;
-
-  if (seriesFrom !== undefined && hasRecord) {
-    throw new args.UsageError(
-      '--acknowledged and --series-from both answer "which instances were performed?", ' +
-        'and they answer it differently: one lists what the archive acknowledged, the ' +
-        'other lists what is on this disk. Pick one. --acknowledged is the honest answer ' +
-        'wherever it is available.'
-    );
-  }
-
-  if (hasRecord) {
-    const built = mpps.buildPerformedSeriesSequence(record.instances, { retrieveAeTitle });
-    return { built, sourceLabel: 'acknowledged instances', assertedFromDisk: false };
-  }
 
   if (seriesFrom !== undefined) {
-    // Required lazily: a `complete` that uses --acknowledged should not pay for
-    // the scanner, and the scanner pulls in the DICOM parser.
+    // Required lazily: a close that names no folder should not pay for the
+    // scanner, and the scanner pulls in the DICOM parser.
     const { scan } = require('../../lib/scan');
     const scanned = scan(seriesFrom, { recurse: !flags.has('no-recurse') });
     const built = mpps.buildPerformedSeriesSequenceFromFolder(scanned.studies, {
@@ -215,17 +199,11 @@ async function finish(parsed, spec) {
   const dryRun = flags.has('dry-run');
   const asJson = flags.has('json');
 
-  const acknowledgedFlag = args.resolve(flags, { name: 'acknowledged' });
-  const loaded = acknowledgedFlag !== undefined
-    ? mpps.readStepRecord(acknowledgedFlag)
-    : undefined;
-  const record = loaded?.record;
+  const mppsSopInstanceUid = resolveMppsUid(positionals[0]);
 
-  const mppsSopInstanceUid = resolveMppsUid(positionals[0], record);
-
-  // With no record there is nothing local that says otherwise, so the step is
-  // assumed open — the SCP is the authority and will refuse if it is not.
-  const priorStatus = record?.status ?? mpps.Status.IN_PROGRESS;
+  // Nothing local says otherwise — no records are kept — so the step is assumed
+  // open. The SCP is the authority on that and will refuse if it is not.
+  const priorStatus = mpps.Status.IN_PROGRESS;
   mpps.assertLegalTransition(priorStatus, status);
 
   const now = new Date();
@@ -234,7 +212,7 @@ async function finish(parsed, spec) {
   const retrieveAeTitle = args.resolve(flags, { name: 'retrieve-ae' }) ?? '';
 
   const { built, sourceLabel, assertedFromDisk } =
-    resolvePerformedSeries(flags, record, retrieveAeTitle);
+    resolvePerformedSeries(flags, retrieveAeTitle);
 
   const reason = verb === 'discontinue' ? args.resolve(flags, { name: 'reason' }) : undefined;
   const reasonCode = verb === 'discontinue'
@@ -256,13 +234,9 @@ async function finish(parsed, spec) {
   // have different fixes.
   if (status === mpps.Status.COMPLETED && built.items.length === 0) {
     log.warn(
-      record
-        ? `this N-SET marks the step COMPLETED, but "${loaded.file}" records no ` +
-            'acknowledged instances, so PerformedSeriesSequence is empty — the step will ' +
-            'claim the work finished and name no images at all.'
-        : 'this N-SET marks the step COMPLETED with an empty PerformedSeriesSequence — ' +
-            'it claims the work finished and names no images at all. Pass --acknowledged ' +
-            '(or --series-from) unless that is really what you mean.'
+      'this N-SET marks the step COMPLETED with an empty PerformedSeriesSequence — ' +
+        'it claims the work finished and names no images at all. Pass --series-from ' +
+        'unless that is really what you mean.'
     );
   }
 
@@ -375,7 +349,8 @@ async function finish(parsed, spec) {
       log.color.dim(
         'Nothing here confirms the archive holds those instances — they were not sent by\n' +
           'this command and nobody acknowledged them. The MPPS now asserts they exist. If\n' +
-          'that is not certain, close the step with --acknowledged instead.'
+          'that is not certain, use `dcm mpps perform`, which sends the images itself and\n' +
+          'names only what the archive acknowledged.'
       )
     );
     log.out('');

@@ -38,6 +38,9 @@
       <button class="nav-item" data-view="mpps">
         <span class="nav-ico">⊙</span> Perform a step (MPPS)
       </button>
+      <button class="nav-item" data-view="steps">
+        <span class="nav-ico">≣</span> Steps this session
+      </button>
       <button class="nav-item" data-view="speed">
         <span class="nav-ico">⏱</span> Speed test
       </button>
@@ -279,7 +282,7 @@
             These are the values this row would assert in the N-CREATE. Selecting a row is
             local to this app — nothing has been sent and nothing on the SCP has changed.
           </p>
-          <button class="btn primary" id="mwl-perform">Add images and perform this step →</button>
+          <button class="btn primary" id="mwl-perform">Perform this step →</button>
         </div>
         <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
         <p class="mcp-note dim">Scheduling fields are sent inside the Scheduled Procedure Step Sequence, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty.</p>
@@ -290,70 +293,120 @@
       <section class="view" id="view-mpps">
         <header class="view-head">
           <h1>Perform a step (MPPS)</h1>
-          <p>Open a Modality Performed Procedure Step, send this study's images, and close the step. One <code>dcm mpps perform</code> transaction: N-CREATE, C-STORE, N-SET.</p>
+          <p>Three decisions: which scheduled step, which folder of images, go. One <code>dcm mpps perform</code> transaction — N-CREATE, C-STORE, N-SET. Everything else has a default you can read in the command below and change under Advanced.</p>
         </header>
 
         <div class="empty-note" id="mpps-nosel">
-          No worklist row is selected. Go to <b>Worklist (MWL)</b>, fetch a worklist and click
-          the patient you are imaging. Every attribute this step asserts comes from that row or
-          from the images themselves — this screen does not invent any of them.
+          No worklist row is selected. Go to <b>Worklist (MWL)</b>, fetch a worklist, click the
+          patient you are imaging and press <b>Perform this step</b>. Every attribute this step
+          asserts comes from that row or from the images themselves — this screen invents none
+          of them.
         </div>
 
         <div id="mpps-body" hidden>
-          <div class="section-title">What this step will assert</div>
-          <div class="attr-grid" id="mpps-attrs"></div>
-          <p class="mcp-note dim" id="mpps-attr-note"></p>
+          <!-- ---------- 1. the step ---------- -->
+          <div class="step-hero">
+            <div class="hero-top">
+              <span class="pick-title">1 · Scheduled step</span>
+              <button class="btn ghost small" id="mpps-changestep">Change step</button>
+            </div>
+            <div class="hero-line" id="mpps-hero"></div>
+            <details class="adv" id="mpps-assert">
+              <summary>What this step will assert <span class="adv-sum" id="mpps-assert-sum"></span></summary>
+              <div class="adv-body">
+                <div class="attr-grid" id="mpps-attrs"></div>
+                <p class="mcp-note dim" id="mpps-attr-note"></p>
+              </div>
+            </details>
+          </div>
 
+          <!-- ---------- 2. the images ---------- -->
+          <div class="section-title">2 · Images produced for it</div>
           <div class="form-row">
-            <label class="grow">Images produced for this step
+            <label class="grow">
               <div class="path-pick">
                 <input type="text" id="mpps-folder" placeholder="Choose the folder holding this study's images…" />
                 <button class="btn ghost" data-pick="mpps-folder" data-pick-mode="folder">Browse…</button>
               </div>
             </label>
           </div>
+          <div class="folder-check" id="mpps-folder-check" hidden></div>
 
-          <div class="section-title">MPPS peer — where the procedure step goes</div>
+          <!-- The stock-image case: the folder's study is not the worklist's study. -->
+          <div class="mismatch" id="mpps-mismatch" hidden>
+            <div class="mismatch-head" id="mpps-mismatch-head"></div>
+            <div class="uid-pair" id="mpps-mismatch-uids"></div>
+            <div class="mismatch-body" id="mpps-mismatch-body"></div>
+            <div class="choice-list" id="mpps-choices" hidden>
+              <label class="choice">
+                <input type="radio" name="mpps-fix" data-fix="adopt" checked />
+                <span class="choice-body">
+                  <span class="choice-head">Adopt the worklist identity <span class="rec">what a modality does</span></span>
+                  <span class="choice-why">Sends a re-stamped <b>copy</b> carrying the study, patient and accession the
+                    worklist named. A RIS invents the study identity before the patient is on the table and the modality
+                    stamps it onto whatever it acquires; this does the same thing. <b>The folder you chose is not
+                    modified</b> — the copy is written to a staging directory and its path is printed. Series and SOP
+                    Instance UIDs are left alone, because they belong to the equipment, not to the order.</span>
+                  <span class="choice-flag">adds <code>--adopt-worklist-identity</code></span>
+                </span>
+              </label>
+              <label class="choice">
+                <input type="radio" name="mpps-fix" data-fix="asis" />
+                <span class="choice-body">
+                  <span class="choice-head">Send the images exactly as they are</span>
+                  <span class="choice-why">The step names the worklist's study and the images keep their own.
+                    <b>Nothing reconciles afterwards:</b> the archive files the images under one study while the RIS
+                    closes a step naming another. Pick this only when that is the thing you are testing — or when a
+                    private tag matters, since the re-stamped copy is written by a dataset writer that does not carry
+                    private tags across.</span>
+                  <span class="choice-flag">adds <code>--allow-study-mismatch</code></span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- ---------- 3. the peer ---------- -->
+          <div class="section-title">3 · MPPS peer — where the procedure step goes</div>
           <div class="conn-host" data-conn></div>
 
-          <div class="conn-panel">
-            <div class="conn-title"><span>Storage peer — where the images go</span></div>
-            <div class="checks">
-              <label><input type="checkbox" id="mpps-store-same" checked /> Same system as the MPPS peer</label>
-            </div>
-            <div class="conn-grid store">
-              <label>Host <input type="text" id="mpps-store-host" placeholder="pacs.example.org" /></label>
-              <label>Port <input type="number" id="mpps-store-port" placeholder="104" min="1" max="65535" /></label>
-              <label>Called AE — archive <input type="text" id="mpps-store-ae" maxlength="16" placeholder="ARCHIVE" /></label>
-            </div>
-            <div class="web-auth-hint">
-              The RIS that takes the procedure step and the archive that takes the images are
-              often different systems. Both are written out in full in the command below, even
-              when they are the same — a default you cannot see is a default nobody can check.
-            </div>
-          </div>
-
-          <div class="form-row triple">
-            <label>Performed step ID <span class="dim">(Type 1)</span><input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
-            <label>Performed station AE <span class="dim">(Type 1)</span><input type="text" id="mpps-stationae" maxlength="16" placeholder="our calling AE" /></label>
-            <label>Performed step description<input type="text" id="mpps-stepdesc" placeholder="optional" /></label>
-          </div>
-          <div class="form-row triple">
-            <label>Chunk size<input type="number" id="mpps-chunk" placeholder="200" min="1" /></label>
-            <label>Retries<input type="number" id="mpps-retry" placeholder="1" min="0" /></label>
-            <label>Retrieve AE <span class="dim">(blank = the archive's AE)</span><input type="text" id="mpps-retrieveae" maxlength="16" placeholder="ARCHIVE" /></label>
-          </div>
-          <div class="form-row">
-            <label class="grow">Step record <span class="dim">(writes the instances the archive acknowledged, so the step can be reopened or audited)</span>
-              <div class="path-pick">
-                <input type="text" id="mpps-record" placeholder="Optional — e.g. step.json" />
-                <button class="btn ghost" data-pick="mpps-record" data-pick-mode="create">Browse…</button>
+          <details class="adv" id="mpps-adv">
+            <summary>Advanced <span class="adv-sum" id="mpps-adv-sum"></span></summary>
+            <div class="adv-body">
+              <div class="conn-panel">
+                <div class="conn-title"><span>Storage peer — where the images go</span></div>
+                <div class="checks">
+                  <label><input type="checkbox" id="mpps-store-same" checked /> Same system as the MPPS peer</label>
+                </div>
+                <div class="conn-grid store">
+                  <label>Host <input type="text" id="mpps-store-host" placeholder="pacs.example.org" /></label>
+                  <label>Port <input type="number" id="mpps-store-port" placeholder="104" min="1" max="65535" /></label>
+                  <label>Called AE — archive <input type="text" id="mpps-store-ae" maxlength="16" placeholder="ARCHIVE" /></label>
+                </div>
+                <div class="web-auth-hint">
+                  The RIS that takes the procedure step and the archive that takes the images are often different
+                  systems. Both are written out in full in the command below, even when they are the same — a default
+                  you cannot see is a default nobody can check.
+                </div>
               </div>
-            </label>
-          </div>
+
+              <div class="form-row triple">
+                <label>Performed step ID <span class="dim">(Type 1)</span><input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
+                <label>Performed station AE <span class="dim">(Type 1)</span><input type="text" id="mpps-stationae" maxlength="16" placeholder="our calling AE" /></label>
+                <label>Performed step description<input type="text" id="mpps-stepdesc" placeholder="optional" /></label>
+              </div>
+              <div class="form-row triple">
+                <label>Chunk size<input type="number" id="mpps-chunk" placeholder="200" min="1" /></label>
+                <label>Retries<input type="number" id="mpps-retry" placeholder="1" min="0" /></label>
+                <label>Retrieve AE <span class="dim">(blank = the archive's AE)</span><input type="text" id="mpps-retrieveae" maxlength="16" placeholder="ARCHIVE" /></label>
+              </div>
+              <div class="checks">
+                <label><input type="checkbox" id="mpps-norecurse" /> Don't recurse into subfolders</label>
+              </div>
+            </div>
+          </details>
+
           <div class="checks">
-            <label><input type="checkbox" id="mpps-dryrun" checked /> Dry run (scan the folder and print the N-CREATE; opens no connection, creates no step, sends nothing)</label>
-            <label><input type="checkbox" id="mpps-norecurse" /> Don't recurse into subfolders</label>
+            <label><input type="checkbox" id="mpps-dryrun" checked /> Dry run — scan the folder and print the N-CREATE. Opens no connection, creates no step, sends nothing.</label>
           </div>
 
           <div class="cmd-preview" data-cmd></div>
@@ -369,6 +422,7 @@
 
           <div class="actions" id="mpps-after" hidden>
             <button class="btn ghost" id="mpps-requery">Re-query the worklist</button>
+            <button class="btn ghost" id="mpps-goto-steps">Open Steps this session</button>
             <span class="dim">A fresh query is the only thing that can change the worklist table.</span>
           </div>
 
@@ -385,6 +439,66 @@
         </div>
       </section>
 
+      <!-- STEPS THIS SESSION — the app's own memory, held in the window only -->
+      <section class="view" id="view-steps">
+        <header class="view-head">
+          <h1>Steps this session</h1>
+          <p>Every step this app has performed since it was opened, so one that is still open can be picked and closed without a 64-character UID being retyped.</p>
+        </header>
+
+        <div class="local-note">
+          <b>This is what this app did since you opened it — held in this window, and nothing else.</b>
+          Nothing here is written to disk: close the app and the list is gone. It is also
+          <b>not what the server believes</b>. MPPS has no query service — there is no C-FIND for
+          performed procedure steps — so there is no way to ask an MPPS SCP which steps it holds.
+          Nothing below was asked of any peer, a step shown IN PROGRESS may already have been
+          closed by someone at the console, and a step this app did not perform never appears here
+          however many the peer is holding.
+        </div>
+
+        <div class="result-table" data-result></div>
+
+        <div class="pick-panel" id="steps-selected" hidden>
+          <div class="pick-head">
+            <span class="pick-title" id="steps-pick-title">Close this step</span>
+            <button class="btn ghost small" id="steps-clearsel">Clear selection</button>
+          </div>
+          <div class="attr-grid" id="steps-attrs"></div>
+          <p class="pick-note" id="steps-note"></p>
+
+          <!-- Only a step still open offers anything. A closed one is history:
+               these controls are taken down rather than disabled, so there is
+               no command on screen that cannot be run. -->
+          <div id="steps-close" hidden>
+            <div class="chip-row" id="steps-verb">
+              <button class="chip active" data-verb="complete">Complete</button>
+              <button class="chip" data-verb="discontinue">Discontinue</button>
+            </div>
+            <div class="form-row" id="steps-reason-row" hidden>
+              <label class="grow">Discontinuation reason code <span class="dim">(optional — <code>value^scheme^meaning</code>. Free text is refused: a coded reason has to be a real code, not one invented here.)</span>
+                <input type="text" id="steps-reasoncode" placeholder="110513^DCM^Discontinued for equipment failure" />
+              </label>
+            </div>
+            <div class="checks">
+              <label id="steps-series-row" hidden><input type="checkbox" id="steps-series" /> <span id="steps-series-label"></span></label>
+              <label><input type="checkbox" id="steps-dryrun" checked /> Dry run — build and print the N-SET without connecting.</label>
+            </div>
+            <div class="cmd-preview" id="steps-close-cmd"></div>
+            <div class="actions">
+              <button class="btn primary" id="steps-close-run">Dry run</button>
+              <span class="status-chip" data-status hidden></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="console-wrap"><pre class="console" data-console></pre></div>
+
+        <p class="mcp-note dim">
+          The step is closed on the peer it was opened on — the host, port and AE Title this app
+          used for the N-CREATE, not whatever the connection panel says now. A step opened
+          somewhere else cannot be closed from here, because this app never saw it.
+        </p>
+      </section>
 
       <!-- SPEED TEST -->
       <section class="view" id="view-speed">

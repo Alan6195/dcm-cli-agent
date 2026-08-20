@@ -471,7 +471,7 @@ function register(server, z, rt) {
    */
   const stepSchema = () => ({
     studyUid: z.string().optional().describe(
-      'Study Instance UID — StudyInstanceUID from the dcm_worklist row. Type 1 inside ScheduledStepAttributesSequence, and THE correlation key: the RIS ties the step to the order and to the images on this and little else. dcm_mpps_perform takes it from the folder when the folder holds exactly one study and this is not given, and refuses if the two disagree.'),
+      'Study Instance UID — StudyInstanceUID from the dcm_worklist row. Type 1 inside ScheduledStepAttributesSequence, and THE correlation key: the RIS ties the step to the order and to the images on this and little else. dcm_mpps_perform takes it from the folder when the folder holds exactly one study and this is not given. When it is given and the folder disagrees, the call is refused by default and the refusal names the two ways forward — adoptWorklistIdentity, which stamps this UID onto a copy of the images the way a modality does, and allowStudyMismatch, which sends them as they are and accepts that nothing will reconcile. Neither is chosen for you.'),
     accessionNumber: z.string().optional().describe('AccessionNumber from the worklist row. The second correlation key an SCP tries.'),
     scheduledStepId: z.string().optional().describe('ScheduledProcedureStepID from the worklist row. The third correlation key, and what stepId defaults to.'),
     modality: z.string().optional().describe('Modality of the performed step, e.g. CT. Type 1. dcm_mpps_perform reads it from the folder when the folder holds exactly one modality, and refuses to guess when it holds several.'),
@@ -488,7 +488,7 @@ function register(server, z, rt) {
     requestedProcedureDescription: z.string().optional(),
     startDate: z.string().optional().describe('YYYYMMDD the step started. Default: today, local time on this machine.'),
     startTime: z.string().optional().describe('HHMMSS the step started. Default: now, local time on this machine.'),
-    mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. The generated one is returned, and it is the only handle on the step.'),
+    mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. Either way the UID is returned, and it remains the only handle on the step: nothing here writes it down and MPPS has no query service, so keep it if the step will be closed by a later call.'),
     fromWorklist: z.string().optional().describe(
       'Path to a JSON file of worklist attributes, as written by `dcm find --mwl --json-raw`. It is NOT the output of dcm_worklist or `dcm find --mwl --json`: that form is rendered for people to read, which turns sequences into strings, and it is refused by name rather than sent malformed. Over MCP prefer the named parameters above — they carry the same values with no file involved. Named parameters win over anything in the file.'),
   });
@@ -567,11 +567,49 @@ function register(server, z, rt) {
       notes.push(
         'The images were sent and the acknowledged count above is real, but the closing N-SET ' +
           `failed, so the step is still IN PROGRESS on the peer. Close it with dcm_mpps_${p.intendedStatus === 'DISCONTINUED' ? 'discontinue' : 'complete'} ` +
-          `{ mppsUid: "${p.mppsSopInstanceUid}" }` +
-          (p.stepRecord ? `, passing acknowledged: "${p.stepRecord}" so the performed series survive.` : '. Pass writeAcknowledged next time so the acknowledged instances survive a failure like this.')
+          `{ mppsUid: "${p.mppsSopInstanceUid}" }. That call will carry no performed series: ` +
+          'the ledger of what the archive acknowledged lives in the process that did the ' +
+          'sending and is written nowhere, and seriesFrom would assert what is in the folder ' +
+          'rather than what the archive took. Re-running dcm_mpps_perform is the way to get ' +
+          'an honest performed series.'
       );
     } else if (!p.ok && p.message) {
       notes.push(p.message);
+    }
+
+    // The command says both of these on stderr, which is where a person reads
+    // them and is nowhere an assistant reads them: only the JSON document
+    // survives into a tool result. Without these two the difference between
+    // "the images were made to match the order" and "the images were sent under
+    // a study nothing will reconcile" is a pair of fields nobody reads.
+    if (p.restamp) {
+      notes.push(
+        (p.dryRun
+          ? `Would send a re-stamped COPY of the folder carrying ${p.restamp.attributes.join(', ')} `
+          : `The images sent were a re-stamped COPY of the folder carrying ${p.restamp.attributes.join(', ')} `) +
+          `from the order${p.restamp.stagingDir ? `, staged at ${p.restamp.stagingDir}` : ''}. ` +
+          `The source folder at ${p.restamp.source} is not modified, and ` +
+          `${p.restamp.unchangedByDesign.join(' and ')} are left exactly as the equipment minted ` +
+          'them — they belong to the acquisition rather than to the order.' +
+          (p.restamp.privateElementsNotCarried
+            ? ` The dataset writer did not carry ${p.restamp.privateElementsNotCarried} private ` +
+              'or unrecognised element(s) across, which is a property of that writer and not of ' +
+              'this step; standard attributes and pixel data are intact. If what you are testing ' +
+              'depends on a private tag, allowStudyMismatch is the path that sends the original bytes.'
+            : '')
+      );
+    }
+
+    if (p.studyUidMismatch && p.allowStudyMismatch) {
+      notes.push(
+        `${p.dryRun ? 'WOULD SEND' : 'SENT'} IMAGES UNDER A STUDY THE STEP DOES NOT NAME. The ` +
+          `step names ${p.studyUidMismatch.declared}; the images carry ` +
+          `${p.studyUidMismatch.onDisk}. An archive files images by the Study Instance UID inside ` +
+          'them and a RIS reconciles the step by the one in the step, so these two will very ' +
+          'likely never be reconciled: the step sits open against a study that has no images, ' +
+          'and the images land under a study that has no step. adoptWorklistIdentity is the ' +
+          'parameter that makes them agree; this run was asked not to.'
+      );
     }
 
     if (p.assertedFromDisk) {
@@ -645,9 +683,10 @@ function register(server, z, rt) {
         'THE STEP IS MARKED COMPLETED ONLY IF EVERY INSTANCE FOUND ON DISK WAS ACKNOWLEDGED BY THE ARCHIVE. There is no override. If even one is unaccounted for the step is marked DISCONTINUED and this tool returns an error result saying how many are missing — a partial transfer is never reported as a completed procedure. ' +
         'PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing, because naming a SOP Instance UID the archive does not hold is a fabricated clinical record that everything downstream believes. Instances stored with a warning status are referenced (the archive holds them) but do not count as acknowledged, so a run with warnings still ends DISCONTINUED. ' +
         'What this tool reports is what the MPPS SCP answered. It cannot see the worklist: if the item stops appearing in dcm_worklist afterwards, that is the SCP correlating the step to the order, not proof that this call changed anything. ' +
-        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting.',
+        'WHEN THE IMAGES DO NOT CARRY THE WORKLIST\'S STUDY INSTANCE UID this is refused by default, because the step would name one study and the images would belong to another and the archive would never reconcile them. That is the normal state of affairs when rehearsing a worklist against stock or phantom images, and adoptWorklistIdentity is the answer to it: it stamps the worklist\'s identity onto a COPY of the images, which is exactly what a real modality does with a UID the RIS invented before the patient was on the table. allowStudyMismatch is the other way past the refusal and means something quite different — send them as they are and accept that nothing reconciles. Neither is implied by any other parameter. ' +
+        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting, including the re-stamp that would be applied.',
       inputSchema: {
-        folder: z.string().describe('Folder of DICOM files that were produced. Must hold exactly one study: a performed procedure step describes one study, and Study Instance UID is what the RIS reconciles on.'),
+        folder: z.string().describe('Folder of DICOM files that were produced. Must hold exactly one study: a performed procedure step describes one study, and Study Instance UID is what the RIS reconciles on. adoptWorklistIdentity does not relax this — stamping one identity onto two studies would merge them into a study that never existed, so a folder holding several is refused and has to be split.'),
         ...peerSchema(),
         storeHost: z.string().optional().describe('Archive hostname. Default: host. MPPS and storage are frequently different systems — a RIS or broker takes the step, an archive takes the images — and the result says which peer took what.'),
         storePort: z.number().int().optional().describe('Archive DIMSE port. Default: port.'),
@@ -656,10 +695,19 @@ function register(server, z, rt) {
         chunk: z.number().int().optional().describe('Instances per storage association (default 200).'),
         retry: z.number().int().optional().describe('Retries for a chunk that came back with fewer acknowledgements than it sent (default 1).'),
         retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — where the images can be fetched from. Default: the archive AE they were sent to.'),
-        writeAcknowledged: z.string().optional().describe('Path to write a step record: the step, and the instances the archive acknowledged. Pass it if the closing N-SET might fail — it is what lets dcm_mpps_complete rebuild an honest performed-series list later.'),
+        adoptWorklistIdentity: z.boolean().optional().describe(
+          'Send a re-stamped COPY of the folder carrying the identity the order gave it: StudyInstanceUID, and unless studyUidOnly also PatientID, PatientName, PatientBirthDate, PatientSex, AccessionNumber and StudyID wherever the worklist supplies them. THIS IS WHAT A REAL MODALITY DOES. The RIS invents the Study Instance UID before the patient is on the table; the images cannot already carry it, and the modality stamps it onto everything it acquires. So this is not an override of the mismatch check — it is the normal behaviour the check was pointing at, and it is the right answer for rehearsing a worklist against stock or phantom images, because the step and the images then name the same study and the archive reconciles them, which is the thing being rehearsed. ' +
+          'THE SOURCE FOLDER IS NEVER MODIFIED: every file is opened read-only, the copy goes to a staging directory, and the staging path is reported so what went on the wire can be inspected. Attributes the worklist leaves blank are not stamped — a blank means the RIS did not say, and writing it over what the images carry would destroy information rather than adopt any. Series and SOP Instance UIDs are deliberately never re-stamped: they belong to the equipment that produced the images rather than to the order, and re-minting them would break the relationships the images already have and make a resend look like a second acquisition. ' +
+          'One real cost: the copy is written by the same dataset writer dcm_edit and dcm_anon use, and that writer does not carry private tags across — a Siemens MR instance measured here went from 216 elements to 119. Standard attributes and pixel data survive intact and the number of dropped elements is reported. If what you are testing depends on a private tag, allowStudyMismatch is the path that sends the original bytes. Nothing else turns this on.'),
+        studyUidOnly: z.boolean().optional().describe('With adoptWorklistIdentity, stamp only StudyInstanceUID and leave the images\' own patient attributes alone. For when the demographics on the images are the ones you want to keep and only the correlation key has to agree. Refused on its own: with nothing being stamped there is nothing for it to narrow.'),
+        staging: z.string().optional().describe('Where the re-stamped copy is written. A fresh subdirectory is created inside it for each run, so the cleanup afterwards can only remove what that run made. Default: the OS temp directory. Refused unless adoptWorklistIdentity is set, because otherwise no copy is made.'),
+        keepStaging: z.boolean().optional().describe('Keep the staged copy after a run that ended COMPLETED, to inspect the bytes that went on the wire. A copy from a run that ended any other way is kept regardless. Refused unless adoptWorklistIdentity is set.'),
+        allowStudyMismatch: z.boolean().optional().describe(
+          'Open the step against the worklist\'s study and send the images unchanged, under the different study they carry. THE ARCHIVE WILL VERY LIKELY NEVER RECONCILE THE STEP WITH THE IMAGES: an archive files images by the Study Instance UID inside them and a RIS reconciles the step by the one in the step, so the step sits open against a study that has no images while the images land under a study that has no step, and no later action joins them up. ' +
+          'This is the explicit "I know what I am doing" path. It exists because it is also the only one that sends the ORIGINAL BYTES, private tags and all, which re-stamping cannot. It is not implied by any other parameter, and it cannot be combined with adoptWorklistIdentity, which asks for the opposite. If the goal is a rehearsal that behaves like the real thing, adoptWorklistIdentity is the one you want.'),
         endDate: z.string().optional().describe('YYYYMMDD the step ended. Default: now, local time.'),
         endTime: z.string().optional().describe('HHMMSS the step ended. Default: now, local time.'),
-        dryRun: z.boolean().optional().describe('Scan the folder and print the N-CREATE that would be sent. Opens no connection, creates no step and sends no images.'),
+        dryRun: z.boolean().optional().describe('Scan the folder and return the N-CREATE that would be sent, along with the re-stamp that would be applied and any study-UID mismatch. Opens no connection, creates no step, sends no images and writes no copy.'),
         recurse: z.boolean().optional().describe('Recurse into subfolders (default true).'),
       },
     },
@@ -671,12 +719,25 @@ function register(server, z, rt) {
       opt(argv, '--chunk', a.chunk);
       opt(argv, '--retry', a.retry);
       opt(argv, '--retrieve-ae', a.retrieveAe);
-      opt(argv, '--write-acknowledged', a.writeAcknowledged);
+
+      // Passed straight through, never inferred from one another: the command
+      // refuses studyUidOnly, staging and keepStaging without
+      // adoptWorklistIdentity, and refuses adoptWorklistIdentity together with
+      // allowStudyMismatch, and those refusals are the point. Turning one on
+      // because another was set would decide, on the caller's behalf, whether
+      // the images or the order wins — which is the whole question.
+      if (a.adoptWorklistIdentity) argv.push('--adopt-worklist-identity');
+      if (a.studyUidOnly) argv.push('--study-uid-only');
+      opt(argv, '--staging', a.staging);
+      if (a.keepStaging) argv.push('--keep-staging');
+      if (a.allowStudyMismatch) argv.push('--allow-study-mismatch');
+
       opt(argv, '--end-date', a.endDate);
       opt(argv, '--end-time', a.endTime);
       if (a.dryRun) argv.push('--dry-run');
       if (a.recurse === false) argv.push('--no-recurse');
       argv.push('--json');
+
       return mppsResult(await runCommand('mpps', argv));
     }
   );
@@ -686,20 +747,18 @@ function register(server, z, rt) {
     {
       title: 'Open a procedure step (MPPS N-CREATE)',
       description:
-        'Tell an MPPS SCP that work has begun on a scheduled study: N-CREATE with status IN PROGRESS. Returns the MPPS SOP Instance UID it generated, which is the ONLY handle on the step — dcm_mpps_complete cannot close it without one, so keep it. ' +
+        'Tell an MPPS SCP that work has begun on a scheduled study: N-CREATE with status IN PROGRESS. Returns the MPPS SOP Instance UID it generated in mppsSopInstanceUid, which is the ONLY handle on the step. KEEP IT: nothing here writes it down — this tool holds no records of any kind — and MPPS has no query service, so a UID that is lost cannot be recovered from this tool or from the SCP, and the step can then never be closed. ' +
         'Use this only when the images are sent by something else, or when the step has to stay open while other work happens; dcm_mpps_perform does start, store and close as one transaction and is the usual choice. ' +
         'Every Type 1 attribute is checked here before anything goes on the wire, and a missing one is refused by name. That is not belt and braces: many SCPs accept an N-CREATE carrying an empty Type 1, answer success, and then never reconcile the step against the order, so from this end it looks like it worked and days later the order is still open. ' +
         'Opening a step says nothing about the worklist entry — whether the SCP moves the scheduled step to ARRIVED or STARTED is its business and is not visible from here.',
       inputSchema: {
         ...peerSchema(),
         ...stepSchema(),
-        out: z.string().optional().describe('Path to write a step record carrying the step UID, so dcm_mpps_complete can be given it later instead of the UID by hand.'),
         dryRun: z.boolean().optional().describe('Build and return the N-CREATE dataset without connecting.'),
       },
     },
     async (a) => {
       const argv = ['start', ...peerArgv(a), ...stepArgv(a)];
-      opt(argv, '--out', a.out);
       if (a.dryRun) argv.push('--dry-run');
       argv.push('--json');
       return mppsResult(await runCommand('mpps', argv));
@@ -713,10 +772,9 @@ function register(server, z, rt) {
    * @returns {Record<string, object>}
    */
   const finishSchema = () => ({
-    mppsUid: z.string().optional().describe('The MPPS SOP Instance UID returned by dcm_mpps_start. May be omitted when acknowledged names a step record that carries it; giving both a UID and a record that disagree is refused rather than closing the wrong step.'),
+    mppsUid: z.string().describe('The MPPS SOP Instance UID returned by dcm_mpps_start or dcm_mpps_perform. Required, and there is no way around it: this tool keeps no records, so there is no directory to pick a step out of, and MPPS has no query service, so the SCP cannot be asked what it is holding either.'),
     ...peerSchema(),
-    acknowledged: z.string().optional().describe('Path to a step record written by dcm_mpps_start (out) or dcm_mpps_perform (writeAcknowledged). PerformedSeriesSequence is built from the instances in it, which are exactly the ones the archive acknowledged. This is the honest source; prefer it wherever it exists.'),
-    seriesFrom: z.string().optional().describe('Build PerformedSeriesSequence by scanning this folder instead. IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record. It exists for the case where some other tool did the transfer, and the result says plainly that the sequence was asserted from disk. Mutually exclusive with acknowledged.'),
+    seriesFrom: z.string().optional().describe('Build PerformedSeriesSequence by scanning this folder. It is the ONLY source this tool has here, and IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record. The result says plainly that the sequence was asserted from disk. Only the process that did the C-STORE knows what the archive actually acknowledged and that is written nowhere, so when the performed series matters use dcm_mpps_perform, which sends the images and closes the step in one go. Omit this and the step is closed naming no images at all.'),
     retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — the AE the images can be fetched from.'),
     endDate: z.string().optional().describe('YYYYMMDD. Default: today, local time.'),
     endTime: z.string().optional().describe('HHMMSS. Default: now, local time.'),
@@ -736,7 +794,7 @@ function register(server, z, rt) {
     // The UID is positional and must precede the flags the tokenizer reads.
     if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
     argv.push(...peerArgv(a));
-    opt(argv, '--acknowledged', a.acknowledged);
+
     opt(argv, '--series-from', a.seriesFrom);
     opt(argv, '--retrieve-ae', a.retrieveAe);
     opt(argv, '--end-date', a.endDate);
@@ -751,13 +809,16 @@ function register(server, z, rt) {
     {
       title: 'Close a procedure step as COMPLETED (MPPS N-SET)',
       description:
-        'Close a step opened by dcm_mpps_start: N-SET to COMPLETED. ' +
-        'COMPLETED asserts that the work finished and is fully accounted for, so the performed series it carries must be real: pass acknowledged, a step record naming the instances the archive positively acknowledged. seriesFrom scans a folder instead and therefore asserts what is on your disk rather than what the archive holds — the result labels that plainly, and the two sources cannot be combined. Completing with neither is legal DICOM and warns, because it claims the work finished and names no images at all. ' +
+        'Close a step left open by dcm_mpps_start, or by a dcm_mpps_perform whose closing N-SET failed: N-SET to COMPLETED. ' +
+        'COMPLETED asserts that the work finished and is fully accounted for. The only performed-series source this tool has here is seriesFrom, which scans a folder and therefore asserts what is on your disk rather than what the archive holds — the result labels that plainly. Completing without it is legal DICOM and warns, because it claims the work finished and names no images at all. Only the process that did the C-STORE knows what the archive acknowledged, and that is written nowhere, so when the performed series matters use dcm_mpps_perform instead. ' +
+        'The step is named by its UID and by nothing else: no records are kept, so there is no listing to pick it out of. ' +
         'Note that this tool does not re-check the transfer: it sets the status you asked for. dcm_mpps_perform is the verb that refuses to say COMPLETED when instances are unaccounted for, because it is the one that did the sending and knows. ' +
         'Closing the step here says nothing about the worklist entry. Whether the SCP or a RIS behind it then retires the scheduled step is its own business; query dcm_worklist if you need to know, and read the disappearance as correlation rather than as proof.',
       inputSchema: { ...finishSchema() },
     },
-    async (a) => mppsResult(await runCommand('mpps', [...finishArgv('complete', a), '--json']))
+    async (a) => mppsResult(
+      await runCommand('mpps', [...finishArgv('complete', a), '--json'])
+    )
   );
 
   server.registerTool(
@@ -765,7 +826,7 @@ function register(server, z, rt) {
     {
       title: 'Close a procedure step as DISCONTINUED (MPPS N-SET)',
       description:
-        'Close a step that did not finish: N-SET to DISCONTINUED. This is the honest ending for an abandoned or partial acquisition, and it is what dcm_mpps_perform sets by itself when the archive did not acknowledge every instance. Any performed series it carries are still built only from acknowledged instances — a step that stopped early still may not claim images the archive does not hold. ' +
+        'Close a step that did not finish: N-SET to DISCONTINUED. This is the honest ending for an abandoned or partial acquisition, and it is what dcm_mpps_perform sets by itself when the archive did not acknowledge every instance. As with dcm_mpps_complete, the step is named by its UID and by nothing else, and seriesFrom is the only performed-series source — a folder scan, labelled as one. ' +
         'reason is free text: it is recorded in the result and NOT sent. A discontinuation reason is a coded attribute whose CodeValue, CodingSchemeDesignator and CodeMeaning are all Type 1, so carrying free text there means inventing a code value that means nothing to the receiver — the same fabrication as naming instances that do not exist. reasonCode sends a real one. The result says which of the two happened. ' +
         'As with every verb here, what the SCP then does with the scheduled step is not visible from this end.',
       inputSchema: {
@@ -781,6 +842,7 @@ function register(server, z, rt) {
       if (a.reason !== undefined && a.reason !== '') argv.push(`--reason=${a.reason}`);
       if (a.reasonCode !== undefined && a.reasonCode !== '') argv.push(`--reason-code=${a.reasonCode}`);
       argv.push('--json');
+
       return mppsResult(await runCommand('mpps', argv));
     }
   );

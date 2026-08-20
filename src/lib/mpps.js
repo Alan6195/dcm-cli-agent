@@ -860,6 +860,10 @@ function worklistToAttributes(item) {
     requestedProcedureDescription: t('RequestedProcedureDescription'),
     scheduledProcedureStepId: t('ScheduledProcedureStepID'),
     scheduledProcedureStepDescription: t('ScheduledProcedureStepDescription'),
+    // Not an MPPS attribute — StudyID is not sent in the N-CREATE. It is here
+    // because it is part of the identity the RIS assigns, and
+    // `mpps perform --adopt-worklist-identity` stamps it onto the images.
+    studyId: t('StudyID'),
     performedProcedureStepDescription: t('ScheduledProcedureStepDescription'),
     scheduledStationAeTitle: t('ScheduledStationAETitle'),
     referencedStudySequence: normaliseSequence(item?.ReferencedStudySequence),
@@ -867,102 +871,6 @@ function worklistToAttributes(item) {
     procedureCodeSequence: normaliseSequence(item?.ProcedureCodeSequence),
     referencedPatientSequence: normaliseSequence(item?.ReferencedPatientSequence),
   };
-}
-
-// --- Step-record handoff ---------------------------------------------------
-
-/** Schema marker, so a wrong file is refused rather than half-read. */
-const STEP_FILE_KIND = 'dcm-mpps-step';
-const STEP_FILE_VERSION = 1;
-
-/**
- * Serialises an open procedure step, and the instances the archive has
- * acknowledged for it so far.
- *
- * This is the honest bridge between one command and the next. `dcm mpps start`
- * writes it with an empty instance list; `dcm mpps perform` writes it holding
- * every instance the archive positively acknowledged, with the status code it
- * answered; `dcm mpps complete` reads it. A step closed minutes or hours later
- * therefore still references only instances that were really taken, and the
- * status recorded here is what the transition check is made against.
- *
- * @param {object} params
- * @returns {object}
- */
-function buildStepRecord(params) {
-  const { mppsSopInstanceUid, status, studyInstanceUid, peer, entries } = params;
-  return {
-    kind: STEP_FILE_KIND,
-    version: STEP_FILE_VERSION,
-    writtenAt: new Date().toISOString(),
-    mppsSopInstanceUid,
-    status,
-    studyInstanceUid,
-    peer,
-    instances: (entries ?? [])
-      .filter((e) => REFERENCEABLE.has(e.disposition))
-      .map((e) => ({
-        path: e.path,
-        disposition: e.disposition,
-        status: e.status,
-        sopInstanceUid: e.sopInstanceUid,
-        sopClassUid: e.sopClassUid,
-        seriesInstanceUid: e.seriesInstanceUid,
-      })),
-  };
-}
-
-/**
- * Reads a file written by {@link buildStepRecord}.
- *
- * @param {string} file
- * @returns {{file: string, record: object}}
- */
-function readStepRecord(file) {
-  const resolved = path.resolve(file);
-
-  let raw;
-  try {
-    raw = fs.readFileSync(resolved, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      throw new args.UsageError(`--acknowledged "${resolved}" does not exist.`);
-    }
-    throw new args.UsageError(`--acknowledged "${resolved}" could not be read: ${err.message}`);
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new args.UsageError(`--acknowledged "${resolved}" is not valid JSON: ${err.message}`);
-  }
-
-  if (!parsed || parsed.kind !== STEP_FILE_KIND) {
-    throw new args.UsageError(
-      `--acknowledged "${resolved}" is not a procedure-step record. Files of this kind ` +
-        `carry "kind": "${STEP_FILE_KIND}" and are written by ` +
-        '`dcm mpps start --out <file>` and `dcm mpps perform --write-acknowledged <file>`.\n' +
-        'It has to be one of those and not a folder listing, because the whole point of ' +
-        'the record is that every instance in it was acknowledged by the archive.'
-    );
-  }
-
-  if (!Array.isArray(parsed.instances)) {
-    throw new args.UsageError(`--acknowledged "${resolved}" has no "instances" array.`);
-  }
-
-  const bad = parsed.instances.filter((i) => !REFERENCEABLE.has(i?.disposition));
-  if (bad.length) {
-    throw new args.UsageError(
-      `--acknowledged "${resolved}" lists ${bad.length} instance(s) whose disposition is ` +
-        `not "${Disposition.ACKNOWLEDGED}" or "${Disposition.WARNING}". The file has been ` +
-        'edited, or was not written by this tool. Refusing to build a performed-series ' +
-        'record from it.'
-    );
-  }
-
-  return { file: resolved, record: parsed };
 }
 
 // --- The wire --------------------------------------------------------------
@@ -1110,8 +1018,6 @@ module.exports = {
   CREATE_TYPE_1,
   CREATE_TYPE_2,
   SCHEDULED_STEP_TYPE_2,
-  STEP_FILE_KIND,
-  STEP_FILE_VERSION,
 
   dicomDate,
   dicomTime,
@@ -1139,9 +1045,6 @@ module.exports = {
   stringifiedSequences,
   readWorklistFile,
   worklistToAttributes,
-
-  buildStepRecord,
-  readStepRecord,
 
   mppsContextAccepted,
   sendNRequest,

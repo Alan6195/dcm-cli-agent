@@ -42,6 +42,14 @@ The usual sequence is one command:
 start / complete are the same transaction taken apart, for when the images are
 sent by something else or the step has to stay open in between.
 
+This command writes nothing to disk and remembers nothing between runs:
+  There is no record directory and no local database of steps. 'perform' needs
+  none — it opens, stores and closes in one process, so the step never has to
+  outlive it. When the two halves really are separate, the MPPS SOP Instance
+  UID that 'start' prints is the ONLY handle on the step: keep it and pass it
+  to 'complete' or 'discontinue'. Nothing here can hand it back to you later,
+  and nothing can ask the SCP for it either — MPPS has no query service.
+
 Two rules this command does not bend:
 
   COMPLETED means every instance found on disk was acknowledged by the archive.

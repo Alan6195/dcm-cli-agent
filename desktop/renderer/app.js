@@ -57,9 +57,18 @@ const state = {
   // picked. `matches` is replaced wholesale by a fetch and by nothing else.
   mwl: { matches: [], selectedIdx: null },
 
-  // The last `mpps perform` this app ran. Kept separately from the selection so
-  // the outcome keeps naming its own study after a re-query clears the picker.
-  mpps: { lastRun: null },
+  // The last `mpps perform` this app ran, the UID the next one will carry, and
+  // what the chosen folder turned out to hold. `lastRun` is kept separately
+  // from the selection so the outcome keeps naming its own study after a
+  // re-query clears the picker.
+  mpps: { lastRun: null, nextUid: null, mismatch: null },
+
+  // The steps this app has performed since the window opened, newest first,
+  // and which one is picked. This lives here and nowhere else: nothing is
+  // written to disk, so quitting forgets it. It is a memory of what this app
+  // did, never a claim about the SCP — MPPS has no query service, so there is
+  // no way to ask a peer which steps it is holding.
+  steps: { entries: [], selectedUid: null },
 };
 
 // --------------------------------------------------------------------------
@@ -790,10 +799,17 @@ function selectWorklistRow(idx) {
 
   renderMppsPanel();
   updateAllPreviews();
+  // A different row is a different study, so whatever was concluded about the
+  // chosen folder no longer applies to it.
+  checkMppsFolder();
 }
 
 function clearWorklistSelection() {
   state.mwl.selectedIdx = null;
+  // Whatever was concluded about the folder was concluded against a row that
+  // is no longer picked, so it cannot go on adding a flag to the command.
+  state.mpps.mismatch = null;
+  renderMppsMismatch();
   for (const tr of $$('#view-worklist [data-result] tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
@@ -856,7 +872,17 @@ function wireWorklist() {
   });
 
   $('#mwl-clearsel').addEventListener('click', clearWorklistSelection);
-  $('#mwl-perform').addEventListener('click', () => showView('mpps'));
+
+  // The hand-off. The selection is already carried by state.mwl.selectedIdx,
+  // so this only has to put the operator in front of the one thing still
+  // missing — the folder. Nothing is sent: the MPPS screen still shows the
+  // exact command and still waits to be told to run it.
+  $('#mwl-perform').addEventListener('click', () => {
+    showView('mpps');
+    const folder = $('#mpps-folder');
+    if (!folder.value.trim()) folder.focus();
+    checkMppsFolder();
+  });
 
   $('#view-worklist [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
@@ -918,6 +944,207 @@ function syncMppsMirrors() {
   if (!station.dataset.touched) station.value = state.conn.callingAe || 'DCM-CLI';
 }
 
+// --------------------------------------------------------------------------
+// The step's own UID
+// --------------------------------------------------------------------------
+/**
+ * A fresh MPPS SOP Instance UID.
+ *
+ * The app mints this rather than letting the engine mint one so that the UID
+ * is known BEFORE the run: it appears in the command preview, where it can be
+ * read and copied, and it is the handle this session's step list is keyed on
+ * even when the run's output cannot be parsed. 2.25.<128-bit integer> is the
+ * UUID-derived form from PS3.5 B.2 — no registered root is needed, and the
+ * whole UID is written into the command where it can be read.
+ */
+function newMppsUid() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  if (n === 0n) n = 1n; // a UID component may not be empty
+  return `2.25.${n.toString()}`;
+}
+
+/** The UID the next run will use. Held so the preview and the run agree. */
+function mppsNextUid() {
+  if (!state.mpps.nextUid) state.mpps.nextUid = newMppsUid();
+  return state.mpps.nextUid;
+}
+
+// --------------------------------------------------------------------------
+// The stock-image case: the folder's study is not the worklist's study
+// --------------------------------------------------------------------------
+/**
+ * Which way past a study mismatch is selected, or null when there is none.
+ *
+ * Returns null unless a real single-study mismatch was detected, so neither
+ * flag can be added to a command that does not need one. --adopt-worklist-
+ * identity and --allow-study-mismatch are mutually exclusive in the engine.
+ */
+function mppsFix() {
+  const m = state.mpps.mismatch;
+  if (!m || m.kind !== 'one-study') return null;
+  const picked = $$('#mpps-choices input[data-fix]').find((r) => r.checked);
+  return picked ? picked.dataset.fix : 'adopt';
+}
+
+/** Serial number of the newest folder scan, so a stale one cannot land. */
+let mppsScanToken = 0;
+
+/**
+ * Reads the chosen folder and compares its study with the worklist row's.
+ *
+ * The engine refuses a mismatch, and that refusal is right: a step naming one
+ * study while the images belong to another never reconciles. But a refusal
+ * arriving as a wall of stderr after a run is a bad way to learn that, so the
+ * comparison happens here, before anything is sent, and the two ways forward
+ * are offered as a choice. `dcm info --json` is read-only.
+ */
+async function checkMppsFolder() {
+  const folder = $('#mpps-folder').value.trim();
+  const item = selectedWorklistItem();
+  const box = $('#mpps-folder-check');
+  const token = ++mppsScanToken;
+
+  state.mpps.mismatch = null;
+  if (!folder || !item) {
+    box.hidden = true;
+    renderMppsMismatch();
+    updateAllPreviews();
+    return;
+  }
+
+  box.hidden = false;
+  box.className = 'folder-check';
+  box.textContent = 'Reading the folder…';
+  renderMppsMismatch();
+
+  const { stdout } = await runCapture('mpps-scan', ['info', folder, '--json']);
+  if (token !== mppsScanToken) return; // a newer folder was chosen meanwhile
+
+  let scan = null;
+  try { scan = JSON.parse(stdout); } catch { scan = null; }
+
+  const studies = Array.isArray(scan?.studies) ? scan.studies : null;
+  if (!studies) {
+    box.className = 'folder-check warn';
+    box.textContent =
+      'This folder could not be read. Nothing is assumed about it here — the engine will ' +
+      'say exactly why when the step runs.';
+    renderMppsMismatch();
+    updateAllPreviews();
+    return;
+  }
+
+  if (studies.length === 0) {
+    box.className = 'folder-check warn';
+    box.textContent =
+      `No DICOM instances under this folder (${scan.filesExamined} file(s) examined). ` +
+      'A performed step has to describe images that exist.';
+    renderMppsMismatch();
+    updateAllPreviews();
+    return;
+  }
+
+  const instances = studies.reduce((n, s) => n + (s.instanceCount || 0), 0);
+
+  if (studies.length > 1) {
+    state.mpps.mismatch = { kind: 'many', studies };
+    box.className = 'folder-check warn';
+    box.textContent = `${studies.length} studies, ${instances} instances.`;
+    renderMppsMismatch();
+    updateAllPreviews();
+    return;
+  }
+
+  const study = studies[0];
+  const declared = worklistAttrs(item).studyInstanceUid;
+  box.className = 'folder-check ok';
+
+  if (!declared) {
+    box.textContent =
+      `1 study, ${instances} instance(s). The worklist row carries no Study Instance UID, so ` +
+      `the step adopts the one the images already have (${study.studyInstanceUid}). That ` +
+      'direction needs no flag and changes nothing on disk.';
+  } else if (declared === study.studyInstanceUid) {
+    box.textContent =
+      `1 study, ${instances} instance(s) — the Study Instance UID matches the worklist row.`;
+  } else {
+    box.className = 'folder-check warn';
+    box.textContent = `1 study, ${instances} instance(s).`;
+    state.mpps.mismatch = {
+      kind: 'one-study',
+      declared,
+      onDisk: study.studyInstanceUid,
+      instances,
+      description: study.studyDescription || '',
+      patientId: study.patientId || '',
+    };
+  }
+
+  renderMppsMismatch();
+  updateAllPreviews();
+}
+
+/** Draws the mismatch panel, or takes it down. */
+function renderMppsMismatch() {
+  const panel = $('#mpps-mismatch');
+  const m = state.mpps.mismatch;
+  const choices = $('#mpps-choices');
+
+  if (!m) {
+    panel.hidden = true;
+    choices.hidden = true;
+    delete panel.dataset.for;
+    return;
+  }
+
+  panel.hidden = false;
+
+  if (m.kind === 'many') {
+    panel.className = 'mismatch bad';
+    choices.hidden = true;
+    $('#mpps-mismatch-head').textContent =
+      `This folder holds ${m.studies.length} studies, and one performed step describes exactly one.`;
+    $('#mpps-mismatch-uids').innerHTML = m.studies.slice(0, 5).map((s) =>
+      `<div class="uid-line"><span class="uid-k">${esc(String(s.instanceCount))} instance(s)</span>` +
+      `<code>${esc(s.studyInstanceUid)}</code></div>`).join('') +
+      (m.studies.length > 5 ? `<div class="uid-line dim">… and ${m.studies.length - 5} more</div>` : '');
+    $('#mpps-mismatch-body').innerHTML =
+      'Study Instance UID is the key the RIS reconciles the step against, so sending two studies ' +
+      'under one step would attribute half these images to the wrong order. <b>Re-stamping cannot ' +
+      'fix this</b> — adopting the worklist identity gives one folder one identity, and doing it ' +
+      'here would merge these studies into a single study that never existed. Split the folder ' +
+      'and perform one step per study.';
+    return;
+  }
+
+  panel.className = 'mismatch';
+  choices.hidden = false;
+
+  // A new mismatch starts on the recommended choice again. Carrying "send
+  // as-is" over to a different folder would be a decision nobody made.
+  const key = `${m.declared}|${m.onDisk}`;
+  if (panel.dataset.for !== key) {
+    panel.dataset.for = key;
+    const adopt = $('#mpps-choices input[data-fix="adopt"]');
+    if (adopt) adopt.checked = true;
+  }
+
+  $('#mpps-mismatch-head').textContent =
+    'These images belong to a different study than the worklist item.';
+  $('#mpps-mismatch-uids').innerHTML =
+    `<div class="uid-line"><span class="uid-k">Worklist item</span><code>${esc(m.declared)}</code></div>` +
+    `<div class="uid-line"><span class="uid-k">This folder</span><code>${esc(m.onDisk)}</code>` +
+    `<span class="uid-x">${esc(m.description || `${m.instances} instance(s)`)}</span></div>`;
+  $('#mpps-mismatch-body').innerHTML =
+    'That is normal for stock images: the RIS invented its Study Instance UID before these ' +
+    'pictures existed, so nothing on disk could be carrying it. It still has to be resolved ' +
+    'before anything is sent, because a step naming one study while the images carry another ' +
+    'is a pair of records the archive can never reconcile.';
+}
+
 BUILDERS.mpps = () => {
   // Builders run on every keystroke anywhere, which makes this the one hook
   // that catches a change to the shared connection panel too.
@@ -960,19 +1187,61 @@ BUILDERS.mpps = () => {
   const stepDesc = $('#mpps-stepdesc').value.trim();
   if (stepDesc) argv.push('--step-description', stepDesc);
 
+  // The step's own UID, minted here so it is visible before the run rather
+  // than only afterwards in the report.
+  argv.push('--mpps-uid', mppsNextUid());
+
+  // Exactly one of these, and only when a mismatch was actually found.
+  const fix = mppsFix();
+  if (fix === 'adopt') argv.push('--adopt-worklist-identity');
+  else if (fix === 'asis') argv.push('--allow-study-mismatch');
+
   const chunk = $('#mpps-chunk').value.trim();
   if (chunk) argv.push('--chunk', chunk);
   const retry = $('#mpps-retry').value.trim();
   if (retry) argv.push('--retry', retry);
   const retrieveAe = $('#mpps-retrieveae').value.trim();
   if (retrieveAe) argv.push('--retrieve-ae', retrieveAe);
-  const record = $('#mpps-record').value.trim();
-  if (record) argv.push('--write-acknowledged', record);
 
   if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
   if ($('#mpps-dryrun').checked) argv.push('--dry-run');
   return argv;
 };
+
+/** One line naming everything folded away under Advanced that is not a default. */
+function renderMppsAdvSummary() {
+  const el = $('#mpps-adv-sum');
+  if (!el) return;
+  const parts = [];
+
+  const store = mppsStore();
+  if (!$('#mpps-store-same').checked) {
+    parts.push(`images → ${store.host || '?'}:${store.port || '?'} ${store.calledAe || '?'}`);
+  }
+
+  const a = worklistAttrs(selectedWorklistItem());
+  const stepId = $('#mpps-stepid').value.trim();
+  if (a && stepId && stepId !== a.scheduledStepId) parts.push(`step ID ${stepId}`);
+  const station = $('#mpps-stationae').value.trim();
+  if (station && station !== (state.conn.callingAe || 'DCM-CLI')) parts.push(`station AE ${station}`);
+  const desc = $('#mpps-stepdesc').value.trim();
+  const seeded = a ? (a.scheduledStepDescription || a.requestedProcedureDescription) : '';
+  if (desc && desc !== seeded) parts.push(`description "${desc}"`);
+
+  for (const [id, label] of [
+    ['mpps-chunk', 'chunk'], ['mpps-retry', 'retries'], ['mpps-retrieveae', 'retrieve AE'],
+  ]) {
+    const v = $(`#${id}`).value.trim();
+    if (v) parts.push(`${label} ${v}`);
+  }
+
+  if ($('#mpps-norecurse').checked) parts.push('no recursion');
+
+  el.textContent = parts.length
+    ? `— ${parts.join(' · ')}`
+    : '— all defaults: images to the MPPS peer, step ID and description from the worklist row';
+  el.classList.toggle('changed', parts.length > 0);
+}
 
 /** Shows either the "pick a row first" note or the form, and fills the form. */
 function renderMppsPanel() {
@@ -981,18 +1250,34 @@ function renderMppsPanel() {
   $('#mpps-body').hidden = !a;
   if (!a) return;
 
-  $('#mpps-attrs').innerHTML =
-    attrCell('Patient', a.patientName) +
-    attrCell('Patient ID', a.patientId) +
-    attrCell('Patient birth date', a.patientBirthDate) +
-    attrCell('Patient sex', a.patientSex) +
-    attrCell('Accession', a.accessionNumber) +
-    attrCell('Modality', a.modality) +
-    attrCell('Scheduled step ID', a.scheduledStepId) +
-    attrCell('Requested procedure ID', a.requestedProcedureId) +
-    attrCell('Procedure', a.requestedProcedureDescription || a.scheduledStepDescription) +
-    attrCell('Scheduled station AE', a.scheduledStationAe) +
-    attrCell('Study Instance UID', a.studyInstanceUid);
+  const chip = (value, missing) => (value
+    ? `<span>${esc(value)}</span>`
+    : `<span class="miss">— ${esc(missing)} —</span>`);
+
+  $('#mpps-hero').innerHTML =
+    `<div class="hero-main">${chip(a.patientName, 'no patient name')}` +
+    `<span class="hero-sep">·</span>${chip(a.modality, 'no modality')}` +
+    `<span class="hero-sep">·</span>` +
+    `${chip(a.requestedProcedureDescription || a.scheduledStepDescription, 'no procedure description')}</div>` +
+    `<div class="hero-sub">Accession ${chip(a.accessionNumber, 'none returned')}` +
+    `<span class="hero-sep">·</span>Patient ID ${chip(a.patientId, 'none returned')}` +
+    `<span class="hero-sep">·</span>Step ${chip(a.scheduledStepId, 'none returned')}</div>` +
+    `<div class="hero-uid">Study ${a.studyInstanceUid
+      ? `<code>${esc(a.studyInstanceUid)}</code>`
+      : '<span class="miss">— none returned by the SCP —</span>'}</div>`;
+
+  const cells = [
+    ['Patient', a.patientName], ['Patient ID', a.patientId],
+    ['Patient birth date', a.patientBirthDate], ['Patient sex', a.patientSex],
+    ['Accession', a.accessionNumber], ['Modality', a.modality],
+    ['Scheduled step ID', a.scheduledStepId], ['Requested procedure ID', a.requestedProcedureId],
+    ['Procedure', a.requestedProcedureDescription || a.scheduledStepDescription],
+    ['Scheduled station AE', a.scheduledStationAe], ['Study Instance UID', a.studyInstanceUid],
+  ];
+  $('#mpps-attrs').innerHTML = cells.map(([k, v]) => attrCell(k, v)).join('');
+  const filled = cells.filter(([, v]) => v !== '').length;
+  $('#mpps-assert-sum').textContent =
+    `— ${filled} of ${cells.length} attributes came back from the SCP`;
 
   // Say what the engine will do about anything the SCP left out, rather than
   // quietly filling it in here.
@@ -1008,13 +1293,15 @@ function renderMppsPanel() {
   }
   if (!$('#mpps-stepid').value.trim()) {
     notes.push('<b>Performed step ID</b> is Type 1 and there is no scheduled step ID to fall ' +
-      'back on. The engine refuses the N-CREATE until it is filled in above.');
+      'back on. Fill it in under Advanced; the engine refuses the N-CREATE without it.');
   }
   const note = $('#mpps-attr-note');
   note.innerHTML = notes.length
     ? notes.join(' ')
     : 'Every value above came back from the SCP in this query. Attributes not shown ' +
       '(start date and time) are taken at the moment the step is created.';
+
+  renderMppsAdvSummary();
 }
 
 /**
@@ -1023,24 +1310,38 @@ function renderMppsPanel() {
  * Deliberately reads the printed report rather than re-deriving anything: the
  * counts and the status sentence shown here are the engine's words, so the app
  * cannot claim more than the transaction did.
+ *
+ * Both streams are read, and that is not incidental. The counts and the final
+ * status are the product and go to stdout, but the two sentences that say a
+ * step was never opened or is still open are failures and go to stderr. This
+ * screen decides from those two whether a step exists on the peer at all, so
+ * reading only stdout would mean deciding it from silence.
+ *
+ * @param {string} text stdout
+ * @param {string} [errText] stderr
  */
-function parseMppsReport(text) {
+function parseMppsReport(text, errText = '') {
   const t = stripAnsi(text);
+  const both = `${t}\n${stripAnsi(errText)}`;
   const num = (label) => {
     const m = new RegExp(`^ {2}${label} +(\\d+)`, 'm').exec(t);
     return m ? Number(m[1]) : null;
   };
   const statusMatch = /^step status +(\S+)/m.exec(t);
+  const uidMatch = /^MPPS SOP Instance UID +(\S+)/m.exec(t);
   const shortfall = /^\d+ of \d+ instances were acknowledged\.[\s\S]*?unaccounted for\./m.exec(t);
   return {
     status: statusMatch ? statusMatch[1] : null,
+    // `step status` is only printed once the N-SET lands, so a run whose N-SET
+    // failed reports no status here — stillInProgress below is what says so.
+    mppsUid: uidMatch ? uidMatch[1] : null,
     found: num('found'),
     sent: num('sent'),
     acknowledged: num('acknowledged'),
     referenced: num('referenced in MPPS'),
     shortfall: shortfall ? shortfall[0].replace(/\s+/g, ' ') : null,
-    stillInProgress: /the step is still IN PROGRESS/.test(t),
-    neverOpened: /the procedure step was never opened/.test(t),
+    stillInProgress: /the step is still IN PROGRESS/.test(both),
+    neverOpened: /the procedure step was never opened/.test(both),
   };
 }
 
@@ -1107,8 +1408,9 @@ function renderMppsOutcome({ code, report, dryRun }) {
   } else if (report.stillInProgress) {
     head = 'N-SET failed — the step is still IN PROGRESS on the peer.';
     body = 'The images were sent, but the closing N-SET did not land, so the step is open on the ' +
-      'MPPS peer. Close it by hand with <b>dcm mpps complete</b> or <b>discontinue</b> once the ' +
-      'peer is reachable — the command in the output above is the one to run.';
+      'MPPS peer. It is in <b>Steps this session</b> — pick it there and close it once the peer ' +
+      'is reachable, or run the command the output above prints. Do that before quitting: this ' +
+      'app remembers the UID only until it closes.';
   } else {
     body = 'The engine exited ' + esc(String(code)) + ' without reporting a closed step. The ' +
       'output above is the whole story; nothing here is inferred beyond it.';
@@ -1119,11 +1421,14 @@ function renderMppsOutcome({ code, report, dryRun }) {
 
 function wireMpps() {
   const ids = [
-    'mpps-folder', 'mpps-store-host', 'mpps-store-port', 'mpps-store-ae',
+    'mpps-store-host', 'mpps-store-port', 'mpps-store-ae',
     'mpps-stepid', 'mpps-stationae', 'mpps-stepdesc',
-    'mpps-chunk', 'mpps-retry', 'mpps-retrieveae', 'mpps-record',
+    'mpps-chunk', 'mpps-retry', 'mpps-retrieveae',
   ];
-  ids.forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+  ids.forEach((id) => $(`#${id}`).addEventListener('input', () => {
+    renderMppsAdvSummary();
+    updateAllPreviews();
+  }));
 
   // Once either Type 1 field is edited by hand, stop overwriting it.
   ['mpps-stationae', 'mpps-stepid', 'mpps-stepdesc'].forEach((id) =>
@@ -1132,17 +1437,40 @@ function wireMpps() {
   // Filling in a missing Type 1 step ID should retire the warning about it.
   $('#mpps-stepid').addEventListener('input', renderMppsPanel);
 
-  $('#mpps-store-same').addEventListener('change', updateAllPreviews);
-  $('#mpps-norecurse').addEventListener('change', updateAllPreviews);
+  // A different folder is a different study, so re-read it. Debounced because
+  // this fires per keystroke when the path is typed rather than picked.
+  let folderTimer = null;
+  $('#mpps-folder').addEventListener('input', () => {
+    updateAllPreviews();
+    clearTimeout(folderTimer);
+    folderTimer = setTimeout(checkMppsFolder, 350);
+  });
+
+  for (const radio of $$('#mpps-choices input[data-fix]')) {
+    radio.addEventListener('change', updateAllPreviews);
+  }
+
+  $('#mpps-store-same').addEventListener('change', () => {
+    renderMppsAdvSummary();
+    updateAllPreviews();
+  });
+  $('#mpps-norecurse').addEventListener('change', () => {
+    renderMppsAdvSummary();
+    updateAllPreviews();
+  });
   $('#mpps-dryrun').addEventListener('change', () => {
     $('#view-mpps [data-run]').textContent = $('#mpps-dryrun').checked ? 'Dry run' : 'Perform step';
     updateAllPreviews();
   });
 
+  $('#mpps-changestep').addEventListener('click', () => showView('worklist'));
+
   $('#mpps-requery').addEventListener('click', () => {
     showView('worklist');
     $('#view-worklist [data-run]').click();
   });
+
+  $('#mpps-goto-steps').addEventListener('click', () => showView('steps'));
 
   $('#view-mpps [data-cancel]').addEventListener('click', () => {
     const id = state.activeRuns.mpps;
@@ -1179,24 +1507,43 @@ function wireMpps() {
       ].filter(([, v]) => !v).map(([label]) => label);
       if (storeMiss.length) {
         appendConsole('mpps',
-          `Fill in the storage peer: ${storeMiss.join(', ')}. Both peers are named in full in ` +
-          'the command, so neither can be left to a hidden default.\n', 'stderr');
+          `Fill in the storage peer under Advanced: ${storeMiss.join(', ')}. Both peers are named ` +
+          'in full in the command, so neither can be left to a hidden default.\n', 'stderr');
         return;
       }
     }
 
     const argv = BUILDERS.mpps();
     const attrs = worklistAttrs(item);
+    // Read before the run: the UID this command carries, and the peers it
+    // names, are what the session entry is built from afterwards.
+    const uid = mppsNextUid();
+    const storePeer = mppsStore();
     setStatus('mpps', 'running', dryRun ? 'Scanning…' : 'Performing…');
     $('#view-mpps [data-run]').disabled = true;
     if (!dryRun) $('#view-mpps [data-cancel]').hidden = false;
 
-    const { code, stdout } = await runStreaming('mpps', argv);
+    const { code, stdout, stderr } = await runStreaming('mpps', argv);
 
     $('#view-mpps [data-run]').disabled = false;
     $('#view-mpps [data-cancel]').hidden = true;
 
-    const report = parseMppsReport(stdout);
+    // The engine's own study-mismatch refusal, in case the folder changed
+    // between the scan above and the run. It is right to refuse; what it
+    // cannot do is offer the choice as a choice, so re-read and do that.
+    if (/would name one study/.test(stderr) && /--adopt-worklist-identity/.test(stderr)) {
+      await checkMppsFolder();
+      const box = $('#mpps-outcome');
+      box.hidden = false;
+      box.className = 'outcome bad';
+      box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different ' +
+        'study than the worklist item.</span>Nothing was sent and nothing on disk was touched. ' +
+        'The two ways forward are offered above the peer settings; pick one and run this again.';
+      setStatus('mpps', 'fail', 'Study mismatch');
+      return;
+    }
+
+    const report = parseMppsReport(stdout, stderr);
     if (!dryRun) {
       renderMppsTotals(report);
       // Recorded so the re-query can name the study it is looking for, even
@@ -1206,12 +1553,323 @@ function wireMpps() {
         status: report.status,
         code,
       };
+      const remembered = rememberStep({
+        report, attrs, uid, folder, peer: { ...state.conn }, store: storePeer,
+      });
       $('#mpps-after').hidden = false;
+      $('#mpps-goto-steps').hidden = !remembered;
+      // The UID is spent: a step is identified by it, and a second N-CREATE
+      // carrying the same one would be a different step claiming the same
+      // identity. Mint the next one now so the preview shows what will run.
+      state.mpps.nextUid = null;
+      updateAllPreviews();
     }
     renderMppsOutcome({ code, report, dryRun });
   });
 
   renderMppsPanel();
+}
+
+// --------------------------------------------------------------------------
+// View: STEPS THIS SESSION — what this app did since it was opened
+// --------------------------------------------------------------------------
+/**
+ * Adds a step this app just performed to the session list.
+ *
+ * Session memory on purpose. There is no records directory and no per-step
+ * file, so the only place a performed step is remembered is this window, and
+ * quitting forgets it. That is the honest shape for it: this list is a note of
+ * what THIS APP did, and a note cannot be mistaken for the peer's own state.
+ * It could not be that anyway — MPPS has no query service, so there is no way
+ * to ask an SCP which steps it is holding, and a file on disk claiming to know
+ * would only be a stale guess with a timestamp on it.
+ *
+ * A run that never opened a step is not remembered. If the N-CREATE failed
+ * there is no step on the peer, and an entry for one would name something that
+ * does not exist.
+ *
+ * @param {{report: object, attrs: object, uid: string, folder: string,
+ *          peer: object, store: object}} run
+ * @returns {boolean} Whether an entry was added.
+ */
+function rememberStep({ report, attrs, uid, folder, peer, store }) {
+  if (report.neverOpened) return false;
+
+  // The engine prints the UID it used. Prefer it over the one this app minted
+  // so the list names what actually went on the wire.
+  const mppsUid = report.mppsUid || uid;
+  const status = report.status || (report.stillInProgress ? 'IN PROGRESS' : '');
+  if (!mppsUid || !status) return false;
+
+  state.steps.entries.unshift({
+    mppsUid,
+    status,
+    patientName: attrs.patientName || '',
+    patientId: attrs.patientId || '',
+    studyInstanceUid: attrs.studyInstanceUid || '',
+    modality: attrs.modality || '',
+    at: new Date(),
+    folder,
+    peer: { ...peer },
+    store: { ...store },
+    counts: {
+      found: report.found, sent: report.sent,
+      acknowledged: report.acknowledged, referenced: report.referenced,
+    },
+  });
+  renderSteps();
+  return true;
+}
+
+/** complete or discontinue. */
+function stepsVerb() {
+  const active = $('#steps-verb .chip.active');
+  return active ? active.dataset.verb : 'complete';
+}
+
+function stepsSelected() {
+  const uid = state.steps.selectedUid;
+  return uid ? (state.steps.entries.find((e) => e.mppsUid === uid) || null) : null;
+}
+
+/** True when a folder scan and the acknowledged set are the same set. */
+function stepFullyAcknowledged(e) {
+  const c = e.counts || {};
+  return c.found != null && c.acknowledged != null && c.found === c.acknowledged;
+}
+
+/**
+ * The exact `dcm mpps complete|discontinue` this screen would run.
+ *
+ * The peer comes from the entry, not from the connection panel: the step lives
+ * on the system that took the N-CREATE, and closing it against whatever the
+ * panel happens to say now would be an N-SET aimed at a peer that never heard
+ * of this UID.
+ */
+function stepsCloseArgv() {
+  const e = stepsSelected();
+  const argv = ['mpps', stepsVerb()];
+  if (e) {
+    argv.push(e.mppsUid);
+    if (e.peer.host) argv.push('--host', e.peer.host);
+    if (e.peer.port) argv.push('--port', String(e.peer.port));
+    if (e.peer.calledAe) argv.push('--called-ae', e.peer.calledAe);
+    if (e.peer.callingAe) argv.push('--calling-ae', e.peer.callingAe);
+    if (e.folder && $('#steps-series').checked) argv.push('--series-from', e.folder);
+  }
+  if (stepsVerb() === 'discontinue') {
+    const code = $('#steps-reasoncode').value.trim();
+    if (code) argv.push('--reason-code', code);
+  }
+  if ($('#steps-dryrun').checked) argv.push('--dry-run');
+  return argv;
+}
+
+function renderStepsClose() {
+  const e = stepsSelected();
+  const closed = Boolean(e) && e.status !== 'IN PROGRESS';
+
+  // A closed step is history and offers nothing. Taking the controls down is
+  // the honest form of that: a disabled button beside a complete command still
+  // reads as something that could be made to work.
+  $('#steps-pick-title').textContent = closed ? 'This step is closed' : 'Close this step';
+  $('#steps-close').hidden = !e || closed;
+
+  $('#steps-reason-row').hidden = stepsVerb() !== 'discontinue';
+  const dry = $('#steps-dryrun').checked;
+  const btn = $('#steps-close-run');
+  btn.textContent = dry ? 'Dry run' : (stepsVerb() === 'complete' ? 'Complete step' : 'Discontinue step');
+  btn.disabled = !e || closed;
+
+  // The performed-series option only exists while there is a folder to scan
+  // and a step still open to close.
+  const row = $('#steps-series-row');
+  row.hidden = !e || closed || !e.folder;
+  if (!row.hidden) {
+    $('#steps-series-label').innerHTML =
+      `Name the images in <code>${esc(e.folder)}</code> as the performed series ` +
+      '<span class="dim">— adds <code>--series-from</code>, which asserts what is on this disk ' +
+      'rather than what the archive acknowledged.</span>';
+  }
+
+  const note = $('#steps-note');
+  if (!e) {
+    note.textContent = '';
+  } else if (closed) {
+    note.innerHTML =
+      `This app set this step to <b>${esc(e.status)}</b>, and COMPLETED and DISCONTINUED are ` +
+      'both final — a conformant SCP refuses an N-SET that moves out of either, including ' +
+      're-setting the same value. If the peer disagrees, the peer is the authority; nothing ' +
+      'here can ask it.';
+  } else {
+    const c = e.counts || {};
+    let series;
+    if (!e.folder) {
+      series = 'No folder is remembered for this step, so PerformedSeriesSequence will be empty ' +
+        'unless you add one on the command line: the N-SET will claim the work finished and name ' +
+        'no images.';
+    } else if (stepFullyAcknowledged(e)) {
+      series = `All ${c.found} instance(s) found in that folder were acknowledged by the ` +
+        'archive, so a scan of it and what the archive holds are the same set.';
+    } else if (c.found != null && c.acknowledged != null) {
+      series = `Only ${c.acknowledged} of ${c.found} instance(s) were acknowledged, so a scan ` +
+        'of that folder would name images the archive may not hold. Left off by default for ' +
+        'that reason.';
+    } else {
+      series = 'This run reported no counts, so there is nothing here that says a scan of that ' +
+        'folder matches what the archive took.';
+    }
+    note.innerHTML =
+      `This app opened this step on <b>${esc(e.peer.calledAe || '?')}</b> and has not closed it. ` +
+      'Whether it is still open there is not knowable from here — if someone else already ' +
+      `closed it, the peer refuses the N-SET below and says so. ${series}`;
+  }
+
+  $('#steps-close-cmd').textContent = 'dcm ' + stepsCloseArgv().map(quoteArg).join(' ');
+}
+
+function clearStepsSelection() {
+  state.steps.selectedUid = null;
+  for (const tr of $$('#view-steps [data-result] tr.pick-row')) {
+    tr.classList.remove('row-selected');
+    tr.setAttribute('aria-pressed', 'false');
+  }
+  $('#steps-selected').hidden = true;
+}
+
+function selectStepRow(uid) {
+  const e = state.steps.entries.find((x) => x.mppsUid === uid);
+  if (!e) return;
+  state.steps.selectedUid = uid;
+  for (const tr of $$('#view-steps [data-result] tr.pick-row')) {
+    const on = tr.dataset.uid === uid;
+    tr.classList.toggle('row-selected', on);
+    tr.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  const c = e.counts || {};
+  const peerLine = (p) => (p && p.host
+    ? `${p.calledAe || '?'} @ ${p.host}:${p.port || '?'}`
+    : '');
+  $('#steps-attrs').innerHTML =
+    attrCell('Status', e.status) +
+    attrCell('Patient', e.patientName || e.patientId || '', 'not named by the worklist row') +
+    attrCell('Modality', e.modality || '', 'not named by the worklist row') +
+    attrCell('Study Instance UID', e.studyInstanceUid || '', 'taken from the folder by the engine') +
+    attrCell('MPPS SOP Instance UID', e.mppsUid) +
+    attrCell('Acknowledged', c.acknowledged == null ? '' : `${c.acknowledged} of ${c.found} found`, 'no counts reported') +
+    attrCell('Performed at', formatStepWhen(e)) +
+    attrCell('MPPS peer', peerLine(e.peer), 'not known for this run') +
+    attrCell('Storage peer', peerLine(e.store), 'not known for this run') +
+    attrCell('Folder sent', e.folder || '', 'none');
+  $('#steps-selected').hidden = false;
+  // A fresh selection starts on the option that suits it, rather than
+  // inheriting a choice made about a different step.
+  $('#steps-series').checked = Boolean(e.folder) && stepFullyAcknowledged(e);
+  renderStepsClose();
+}
+
+function formatStepWhen(e) {
+  const d = e.at instanceof Date ? e.at : new Date(e.at);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
+
+/** Draws the session list. */
+function renderSteps() {
+  const box = $('#view-steps [data-result]');
+  const entries = state.steps.entries;
+  const keep = state.steps.selectedUid;
+
+  if (!entries.length) {
+    box.innerHTML =
+      '<div class="empty-note">Nothing performed yet in this session.<br>' +
+      'A step appears here the moment <b>Perform a step (MPPS)</b> opens one on a peer. ' +
+      'A dry run opens nothing, so it adds nothing, and a step performed before this app ' +
+      'was opened — or by anything else — is not known here.</div>';
+    clearStepsSelection();
+    return;
+  }
+
+  const statusClass = (s) => (s === 'COMPLETED' ? 'ok' : s === 'DISCONTINUED' ? 'bad' : 'warn');
+  const rows = entries.map((e) => {
+    const c = e.counts || {};
+    const patient = e.patientName || e.patientId || '';
+    return `<tr class="pick-row" data-uid="${esc(e.mppsUid)}" tabindex="0" role="button" aria-pressed="false">
+      <td class="pick-cell"><span class="pick-dot"></span></td>
+      <td><span class="pill ${statusClass(e.status)}">${esc(e.status)}</span></td>
+      <td>${patient ? esc(patient) : '<span class="miss">— not named by the row —</span>'}</td>
+      <td>${esc(e.modality || '')}</td>
+      <td class="mono uid-cell">${esc(e.studyInstanceUid || '')}</td>
+      <td class="mono">${c.acknowledged == null ? '—' : `${c.acknowledged}/${c.found}`}</td>
+      <td class="when">${esc(formatStepWhen(e))}</td>
+      <td>${esc(e.peer && e.peer.host ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}` : '')}</td>
+    </tr>`;
+  }).join('');
+
+  const open = entries.filter((e) => e.status === 'IN PROGRESS').length;
+  box.innerHTML =
+    `<div class="section-title">${entries.length} step(s) this session` +
+    `${open ? ` — ${open} still IN PROGRESS, click one to close it` : ''}</div>` +
+    '<table><thead><tr><th class="pick-cell"></th><th>Status</th><th>Patient</th><th>Modality</th>' +
+    '<th>Study Instance UID</th><th>Acknowledged</th><th>Performed at</th><th>MPPS peer</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table>`;
+
+  // Re-drawing must not silently drop a selection that still exists — a close
+  // that just landed re-renders this table under the operator's cursor.
+  if (keep && entries.some((e) => e.mppsUid === keep)) selectStepRow(keep);
+  else clearStepsSelection();
+}
+
+function wireSteps() {
+  for (const chip of $$('#steps-verb .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#steps-verb .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderStepsClose();
+    });
+  }
+  $('#steps-reasoncode').addEventListener('input', renderStepsClose);
+  $('#steps-dryrun').addEventListener('change', renderStepsClose);
+  $('#steps-series').addEventListener('change', renderStepsClose);
+  $('#steps-clearsel').addEventListener('click', clearStepsSelection);
+
+  const results = $('#view-steps [data-result]');
+  results.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr.pick-row');
+    if (tr) selectStepRow(tr.dataset.uid);
+  });
+  results.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const tr = e.target.closest('tr.pick-row');
+    if (!tr) return;
+    e.preventDefault();
+    selectStepRow(tr.dataset.uid);
+  });
+
+  $('#steps-close-run').addEventListener('click', async () => {
+    const e = stepsSelected();
+    clearConsole('steps');
+    if (!e) return;
+    const dry = $('#steps-dryrun').checked;
+    const verb = stepsVerb();
+    setStatus('steps', 'running', dry ? 'Building…' : 'Closing…');
+    $('#steps-close-run').disabled = true;
+    const { code } = await runStreaming('steps', stepsCloseArgv());
+    $('#steps-close-run').disabled = false;
+    setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Closed') : 'Failed');
+
+    // The entry moves only when a real N-SET was accepted. This is not the app
+    // repainting a row from what it hoped happened: the engine exits zero only
+    // when the SCP accepted the status it was sent, and that status is the one
+    // written here.
+    if (!dry && code === 0) {
+      e.status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
+      renderSteps();
+    }
+  });
+
+  renderSteps();
+  renderStepsClose();
 }
 
 // --------------------------------------------------------------------------
@@ -2211,6 +2869,7 @@ async function boot() {
   wireQuery();
   wireWorklist();
   wireMpps();
+  wireSteps();
   wireSpeed();
   wireWebping();
   wireWebsend();

@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.10.0
+
+Performing a step made simple, and usable with the images you already have.
+
+- **Rehearsing with stock images now works.** A worklist item's Study Instance
+  UID is invented by the RIS before the pictures exist, so images you already
+  have never carry it, and `mpps perform` refused — correctly, because a step
+  naming one study while the images carry another is a pair of records the
+  archive can never reconcile. The answer is the one a real modality uses:
+  **`--adopt-worklist-identity`** stamps the worklist's study, patient and
+  accession onto a re-stamped **copy** and sends that. The folder you chose is
+  never modified and the staging path is printed. Series and SOP Instance UIDs
+  are left alone — they belong to the equipment, not the order.
+  `--allow-study-mismatch` sends untouched for when a mismatch is the thing
+  being tested, and the refusal now names both ways forward instead of just
+  stopping.
+- **The Perform screen is three decisions**: which scheduled step, which folder
+  of images, go. The twelve other fields moved behind a closed "Advanced"
+  disclosure that summarises any non-default value it holds, so nothing is
+  hidden while nothing is in the way. A study-UID mismatch is now a plain
+  choice in the app — adopt the worklist identity, or send as-is — rather than
+  an engine error.
+- **"Steps this session"** lists what the app has performed since it opened:
+  status, patient, study, counts. Selecting one that is still IN PROGRESS
+  fills its UID into a Complete or Discontinue command, so nobody retypes a
+  64-character identifier. It closes the step on the peer it was opened on,
+  not whatever the connection panel says now.
+- **The tool keeps no records of any kind.** The step-record file
+  (`start --out`), `perform --write-acknowledged` and the `--acknowledged`
+  input that consumed them are gone, along with `dcm mpps list`. `perform`
+  does N-CREATE, C-STORE and N-SET in one process, so the acknowledgement
+  ledger never has to survive anything, and the list in the app is session
+  memory that says so. This is a deliberate removal of shipped surface: there
+  is no local database to go stale, and no file to explain.
+- A standalone `complete` therefore has exactly two honest answers to "which
+  images?" — name none, or `--series-from <folder>` and say plainly that it
+  came from a disk scan rather than from what the archive confirmed. It says
+  so in yellow, every time. Three tests guard the removal so it cannot creep
+  back.
+
 ## v0.9.0
 
 MPPS: the worklist can now be answered, not just read. Plus a CLI that
