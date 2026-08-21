@@ -5,7 +5,15 @@ implementation: every screen builds the exact `dcm` command a person would type,
 shows it, and runs it. Echo, Send (with a live transfer report), a Receiver you
 can start and stop, Query, Inventory, Tag inspector, Tag editor and De-identify —
 plus a DICOMweb group: test a server URL, send over STOW-RS, query over QIDO-RS,
-and run a local DICOMweb hub for testing. DICOMweb credentials come from the
+and run a local DICOMweb hub for testing.
+
+**Worklist & perform** is one screen because it is one job: query the worklist,
+click a scheduled step, point at the folder of images, perform it. The step's
+attributes, the peers and the ten rarely-touched flags are a disclosure away
+rather than on screen, and the longer explanations sit behind small ⓘ marks —
+visible when you want them, silent when you don't. What must never be quiet
+still isn't: a study-UID mismatch, a shortfall, or a step that could not be
+closed appears inline the moment it applies. DICOMweb credentials come from the
 environment the app was launched from (`DCM_WEB_TOKEN`, or
 `DCM_WEB_USER`/`DCM_WEB_PASS`) — there is deliberately no token field.
 

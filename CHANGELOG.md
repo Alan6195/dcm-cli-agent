@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.11.0
+
+One screen for one job.
+
+- **Worklist, Perform a step and Steps this session are now a single
+  "Worklist & perform" screen.** Query at the top, the scheduled steps as a
+  table, click a row and the action panel opens beneath it: folder, then go.
+  The steps you performed show as a badge on the row itself, so there is no
+  third screen to visit and nothing to navigate between to finish one task.
+- **The prose is gone from the resting state.** Those three screens carried
+  860 words of always-on explanation between them, plus 900 more injected at
+  runtime; the merged screen shows about 70 at rest. Nothing was deleted — the
+  reasoning moved behind small ⓘ marks, one click away. A GUI is not a man
+  page, and the explanations were being read once and then endured forever.
+- **What must stay loud stayed loud.** The study-UID mismatch still presents
+  its two real choices inline, with the flag each one adds, at the moment it
+  arises — it is a decision, not a footnote. A shortfall still reports as a
+  failure with its numbers. A step that cannot be closed still says so.
+- Dry run is a two-state toggle rather than a checkbox with an 18-word label,
+  so the posture is legible at a glance. The peer collapses to one line
+  (`RISMPPS @ 10.0.0.5:11112 ← CT01`) and expands to edit. The Advanced
+  disclosure summarises its own non-default values, so folding it away hides
+  nothing.
+- The row badge says what **this app** sent, never what the RIS believes, and
+  only a fresh query still changes the table. That distinction is the reason
+  the badge is allowed to exist at all.
+
 ## v0.10.0
 
 Performing a step made simple, and usable with the images you already have.

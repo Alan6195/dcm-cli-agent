@@ -314,10 +314,41 @@ function showView(name) {
 }
 
 // --------------------------------------------------------------------------
+// View parts
+// --------------------------------------------------------------------------
+/**
+ * Where a view's command preview, status chip and console actually live.
+ *
+ * Every other screen runs one command, so `#view-<name> [data-cmd]` is enough
+ * to find its preview. The merged worklist screen runs three — the C-FIND, the
+ * perform transaction and the closing N-SET — and they are three separate
+ * previews in one section, so those three view keys name their elements
+ * outright instead of taking whichever one the selector happened to reach
+ * first. The console is deliberately shared: one workspace, one output pane,
+ * showing the last thing that ran.
+ */
+const VIEW_PARTS = {
+  worklist: { cmd: '#mwl-cmd', status: '#mwl-status', console: '#wl-console' },
+  mpps: { cmd: '#mpps-cmd', status: '#mpps-status', console: '#wl-console' },
+  steps: { status: '#steps-status', console: '#wl-console' },
+};
+
+function viewPart(view, kind) {
+  const named = VIEW_PARTS[view] && VIEW_PARTS[view][kind];
+  return named ? $(named) : $(`#view-${view} [data-${kind}]`);
+}
+
+// --------------------------------------------------------------------------
 // Console output
 // --------------------------------------------------------------------------
 function consoleEl(view) {
-  return $(`#view-${view} [data-console]`);
+  return viewPart(view, 'console');
+}
+
+/** Opens the disclosure the shared console sits in, so a failure is not folded away. */
+function revealConsole() {
+  const box = $('#mwl-out');
+  if (box) box.open = true;
 }
 
 function clearConsole(view) {
@@ -338,7 +369,7 @@ function appendConsole(view, text, stream) {
 }
 
 function setStatus(view, kind, label) {
-  const chip = $(`#view-${view} [data-status]`);
+  const chip = viewPart(view, 'status');
   if (!chip) return;
   if (!kind) { chip.hidden = true; return; }
   chip.hidden = false;
@@ -389,7 +420,7 @@ function runCapture(view, argv) {
 // Command preview
 // --------------------------------------------------------------------------
 function setPreview(view, argv) {
-  const el = $(`#view-${view} [data-cmd]`);
+  const el = viewPart(view, 'cmd');
   if (el) el.textContent = 'dcm ' + argv.map(quoteArg).join(' ');
 }
 
@@ -399,6 +430,9 @@ function updateAllPreviews() {
   for (const [view, build] of Object.entries(BUILDERS)) {
     try { setPreview(view, build()); } catch { /* partial form */ }
   }
+  // The collapsed peer bar's summary is the reason four fields may be folded
+  // away, so it is refreshed by the same hook that catches every edit to them.
+  try { renderMwlPeerSummary(); } catch { /* before the DOM is wired */ }
 }
 
 // --------------------------------------------------------------------------
@@ -667,9 +701,35 @@ BUILDERS.worklist = () => {
   return argv;
 };
 
+/**
+ * The session badge for a worklist row, or null.
+ *
+ * Matched on Study Instance UID, and on the scheduled step ID as well whenever
+ * both sides name one. A partial match shows nothing rather than guessing: a
+ * badge that named the wrong row would be exactly the false claim about the
+ * far end that this table is built to avoid. A row the SCP returned with no
+ * Study Instance UID can never be badged, because there is nothing to key on.
+ */
+function sessionBadgeFor(item) {
+  const uid = attrOf(item, 'StudyInstanceUID');
+  if (!uid) return null;
+  const stepId = attrOf(item, 'ScheduledProcedureStepID');
+  // Newest first, so a re-performed study shows what happened most recently.
+  const hit = state.steps.entries.find((e) => e.studyInstanceUid === uid
+    && (!stepId || !e.scheduledStepId || e.scheduledStepId === stepId));
+  if (!hit) return null;
+
+  const c = hit.counts || {};
+  const counts = (c.acknowledged != null && c.found != null)
+    ? ` ${c.acknowledged}/${c.found}` : '';
+  if (hit.status === 'COMPLETED') return { cls: 'done', text: `completed here${counts}`, uid: hit.mppsUid };
+  if (hit.status === 'DISCONTINUED') return { cls: 'stopped', text: `discontinued here${counts}`, uid: hit.mppsUid };
+  return { cls: 'open', text: 'open — not closed', uid: hit.mppsUid };
+}
+
 /** Renders worklist matches as a scheduling table. */
 function renderWorklist(json) {
-  const box = $('#view-worklist [data-result]');
+  const box = $('#mwl-results');
   const matches = Array.isArray(json?.matches) ? json.matches : [];
   box.hidden = false;
 
@@ -681,10 +741,10 @@ function renderWorklist(json) {
 
   if (!matches.length) {
     box.innerHTML =
-      '<div class="empty-note">No scheduled procedures matched.<br>' +
-      'That can be a genuinely empty worklist, a date with nothing scheduled, ' +
-      'or an AE Title the SCP does not answer for. Try <b>Any date</b> with no ' +
-      'other filters to see whether the SCP returns anything at all.</div>';
+      '<div class="empty-note">No scheduled procedures matched. Try <b>Any date</b> with no ' +
+      'other filters to see whether this SCP answers for your AE Title at all.</div>';
+    $('#mwl-foot').hidden = true;
+    renderOpenAlert();
     return;
   }
 
@@ -698,22 +758,87 @@ function renderWorklist(json) {
     return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
   };
 
-  const rows = matches.map((m, i) => `<tr class="pick-row" data-idx="${i}" tabindex="0" role="button" aria-pressed="false">
+  // The date is printed per row only when the query spans more than one day.
+  // Today / Tomorrow already fix it, and repeating it on every row of a
+  // one-day query is ten wasted characters times N.
+  const active = $('#mwl-when .chip.active');
+  const when = active ? active.dataset.when : 'today';
+  const showDate = when !== 'today' && when !== 'tomorrow';
+
+  const rows = matches.map((m, i) => {
+    const badge = sessionBadgeFor(m);
+    const procedure = m.RequestedProcedureDescription || m.ScheduledProcedureStepDescription || '';
+    const patient = m.PatientName || '';
+    return `<tr class="pick-row" data-idx="${i}" tabindex="0" role="button" aria-pressed="false">
       <td class="pick-cell"><span class="pick-dot"></span></td>
-      <td class="when">${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
+      <td class="when">${showDate ? `${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ` : ''}${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
       <td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>
-      <td>${esc(m.PatientName || '')}</td>
+      <td title="${esc(patient)}">${esc(patient)}</td>
       <td class="mono">${esc(m.PatientID || '')}</td>
       <td class="mono">${esc(m.AccessionNumber || '')}</td>
-      <td>${esc(m.ScheduledStationAETitle || '')}</td>
-      <td>${esc(m.RequestedProcedureDescription || m.ScheduledProcedureStepDescription || '')}</td>
-    </tr>`).join('');
+      <td title="${esc(procedure)}">${esc(procedure)}</td>
+      <td class="session-cell">${badge
+        ? `<span class="pill session ${badge.cls}" data-step-uid="${esc(badge.uid)}" title="This app performed this step from this window, in this session. It is not a statement about what the RIS now shows.">${esc(badge.text)}</span>`
+        : ''}</td>
+    </tr>`;
+  }).join('');
 
   box.innerHTML =
-    `<div class="section-title">${matches.length} scheduled procedure(s) — click one to perform it</div>` +
-    '<table><thead><tr><th class="pick-cell"></th><th>Scheduled</th><th>Modality</th><th>Patient</th><th>Patient ID</th>' +
-    '<th>Accession</th><th>Station AE</th><th>Procedure</th></tr></thead>' +
-    `<tbody>${rows}</tbody></table>`;
+    `<div class="qbar-count">${matches.length} scheduled — click one to perform it</div>` +
+    '<div class="table-scroll"><table id="mwl-table">' +
+    // Widths sum to 720 of the ~857px column; Procedure takes the slack.
+    // Modality is sized for its own header, not its 2-3 character values.
+    '<colgroup><col style="width:26px"><col style="width:100px"><col style="width:80px">' +
+    '<col style="width:150px"><col style="width:96px"><col style="width:96px">' +
+    '<col><col style="width:130px"></colgroup>' +
+    '<thead><tr><th class="pick-cell"></th><th>Scheduled</th><th>Modality</th><th>Patient</th>' +
+    '<th>Patient ID</th><th>Accession</th><th>Procedure</th><th>This app</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table></div>`;
+  $('#mwl-foot').hidden = false;
+  renderOpenAlert();
+}
+
+/**
+ * Repaints just the badge column against the session list.
+ *
+ * Called after a run and after a close. It touches the last cell of each row
+ * and nothing else — no row is re-coloured, no other cell is rewritten, and
+ * the SCP's own data in the other columns is left exactly as it was returned.
+ */
+function refreshSessionBadges() {
+  for (const tr of $$('#mwl-table tr.pick-row')) {
+    const item = state.mwl.matches[Number(tr.dataset.idx)];
+    const cell = tr.querySelector('td.session-cell');
+    if (!item || !cell) continue;
+    const badge = sessionBadgeFor(item);
+    cell.innerHTML = badge
+      ? `<span class="pill session ${badge.cls}" data-step-uid="${esc(badge.uid)}" title="This app performed this step from this window, in this session. It is not a statement about what the RIS now shows.">${esc(badge.text)}</span>`
+      : '';
+  }
+  renderOpenAlert();
+}
+
+/**
+ * The step this app opened that no row in the current results accounts for.
+ *
+ * This is the case the merge would otherwise lose. A step left IN PROGRESS has
+ * to stay reachable even when the query that produced its row has been
+ * replaced, because the only place its UID is remembered is this window.
+ */
+function renderOpenAlert() {
+  const el = $('#mwl-open-alert');
+  if (!el) return;
+  const open = state.steps.entries.filter((e) => e.status === 'IN PROGRESS');
+  const shown = new Set($$('#mwl-table tr.pick-row')
+    .map((tr) => sessionBadgeFor(state.mwl.matches[Number(tr.dataset.idx)]))
+    .filter(Boolean).map((b) => b.uid));
+  const stranded = open.filter((e) => !shown.has(e.mppsUid));
+  if (!stranded.length) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML =
+    `<span><b>${stranded.length} step${stranded.length === 1 ? '' : 's'} this app opened ` +
+    `${stranded.length === 1 ? 'is' : 'are'} still IN PROGRESS and not in these results.</b></span>` +
+    `<button class="btn ghost small" data-show-step="${esc(stranded[0].mppsUid)}">Show it</button>`;
 }
 
 // --------------------------------------------------------------------------
@@ -767,26 +892,41 @@ function attrCell(label, value, missingLabel = 'not returned by the SCP') {
     `<div class="attr-v">${esc(has ? value : `— ${missingLabel} —`)}</div></div>`;
 }
 
+/**
+ * Puts the one action panel into perform mode or closing mode, or takes it down.
+ *
+ * The panel is one object with two jobs, because a scheduled step and a step
+ * this app already opened are two different things to be holding. Only one can
+ * be selected at a time, so picking either releases the other.
+ */
+function setPanelMode(mode) {
+  const body = $('#mwl-detail-body');
+  const empty = $('#mwl-detail-empty');
+  body.hidden = mode === null;
+  empty.hidden = mode !== null;
+  $('#mwl-perform-mode').hidden = mode !== 'perform';
+  $('#mwl-close-mode').hidden = mode !== 'close';
+  $('#mwl-detail').classList.toggle('open', mode !== null);
+  $('#mwl-detail-title').textContent = mode === 'close'
+    ? ($('#steps-close').hidden ? 'This step is closed' : 'Close this step')
+    : 'Perform this step';
+}
+
 function selectWorklistRow(idx) {
   const item = state.mwl.matches[idx];
   if (!item) return;
+  // One panel, one selection: picking a scheduled row releases any session step.
+  if (state.steps.selectedUid) clearStepsSelection();
   state.mwl.selectedIdx = idx;
 
-  for (const tr of $$('#view-worklist [data-result] tr.pick-row')) {
+  for (const tr of $$('#mwl-table tr.pick-row')) {
     const on = Number(tr.dataset.idx) === idx;
     tr.classList.toggle('row-selected', on);
     tr.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (on) tr.scrollIntoView({ block: 'nearest' });
   }
 
   const a = worklistAttrs(item);
-  $('#mwl-attrs').innerHTML =
-    attrCell('Patient', a.patientName) +
-    attrCell('Patient ID', a.patientId) +
-    attrCell('Accession', a.accessionNumber) +
-    attrCell('Modality', a.modality) +
-    attrCell('Scheduled step ID', a.scheduledStepId) +
-    attrCell('Study Instance UID', a.studyInstanceUid);
-  $('#mwl-selected').hidden = false;
 
   // Seed the two Type 1 fields the operator is allowed to correct. Re-seeding
   // on every selection is right: they describe the row that is now picked.
@@ -797,11 +937,18 @@ function selectWorklistRow(idx) {
   desc.value = a.scheduledStepDescription || a.requestedProcedureDescription;
   delete desc.dataset.touched;
 
+  setPanelMode('perform');
   renderMppsPanel();
   updateAllPreviews();
   // A different row is a different study, so whatever was concluded about the
   // chosen folder no longer applies to it.
   checkMppsFolder();
+
+  // The one thing the row cannot supply. This absorbs the side effect of the
+  // deleted "Perform this step →" button, which existed only to cross a screen
+  // boundary that no longer exists.
+  const folder = $('#mpps-folder');
+  if (!folder.value.trim()) folder.focus();
 }
 
 function clearWorklistSelection() {
@@ -810,11 +957,11 @@ function clearWorklistSelection() {
   // is no longer picked, so it cannot go on adding a flag to the command.
   state.mpps.mismatch = null;
   renderMppsMismatch();
-  for (const tr of $$('#view-worklist [data-result] tr.pick-row')) {
+  for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
   }
-  $('#mwl-selected').hidden = true;
+  if (!state.steps.selectedUid) setPanelMode(null);
   renderMppsPanel();
   updateAllPreviews();
 }
@@ -835,14 +982,14 @@ function renderMwlCorrelation() {
 
   const uid = last.studyInstanceUid;
   const present = state.mwl.matches.some((m) => attrOf(m, 'StudyInstanceUID') === uid);
+  const info = '<button type="button" class="info-btn" aria-expanded="false" ' +
+    'aria-controls="info-correlation" aria-label="Why this is correlation"></button>';
   el.hidden = false;
   el.innerHTML = present
-    ? `The study you performed (<code>${esc(uid)}</code>) <b>still matches this query.</b> ` +
-      'That is not evidence the SCP refused anything: some SCPs keep a scheduled step visible ' +
-      'after a performed step is reported, and this app cannot see the SCP\'s worklist rules.'
-    : `The study you performed (<code>${esc(uid)}</code>) <b>no longer matches this query.</b> ` +
-      'That is a correlation, not proof. An item can drop out of a query because of the date ' +
-      'filter, the station AE or the SCP\'s own rules; all that has been re-read here is the query.';
+    ? 'The study you performed <b>still matches this query.</b> Some SCPs keep a scheduled ' +
+      `step visible after one is reported. ${info}`
+    : 'The study you performed <b>no longer matches this query.</b> That is correlation, not ' +
+      `proof — the date filter or the SCP's own rules can do the same. ${info}`;
 }
 
 function wireWorklist() {
@@ -855,40 +1002,63 @@ function wireWorklist() {
     });
   }
   ['mwl-date', 'mwl-modality', 'mwl-station', 'mwl-limit', 'mwl-patientname', 'mwl-patientid', 'mwl-accession']
-    .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+    .forEach((id) => $(`#${id}`).addEventListener('input', () => {
+      renderMwlMoreSummary();
+      updateAllPreviews();
+    }));
+  renderMwlMoreSummary();
 
   // Delegated, because the table's innerHTML is replaced on every fetch.
-  const results = $('#view-worklist [data-result]');
+  const results = $('#mwl-results');
   results.addEventListener('click', (e) => {
+    // The "open — not closed" badge is the shortest path to the fix: it picks
+    // the row AND puts the panel straight into closing mode.
+    const badge = e.target.closest('.pill.session.open');
+    if (badge) {
+      e.stopPropagation();
+      selectStepRow(badge.dataset.stepUid);
+      return;
+    }
     const tr = e.target.closest('tr.pick-row');
     if (tr) selectWorklistRow(Number(tr.dataset.idx));
   });
   results.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
     const tr = e.target.closest('tr.pick-row');
     if (!tr) return;
+    // Arrowing moves focus only. Selecting on arrow would re-seed the Type 1
+    // fields and re-spawn the folder scan on every keypress through the list.
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const next = e.key === 'ArrowDown' ? tr.nextElementSibling : tr.previousElementSibling;
+      if (next && next.classList.contains('pick-row')) { e.preventDefault(); next.focus(); }
+      return;
+    }
+    if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
     selectWorklistRow(Number(tr.dataset.idx));
   });
 
-  $('#mwl-clearsel').addEventListener('click', clearWorklistSelection);
-
-  // The hand-off. The selection is already carried by state.mwl.selectedIdx,
-  // so this only has to put the operator in front of the one thing still
-  // missing — the folder. Nothing is sent: the MPPS screen still shows the
-  // exact command and still waits to be told to run it.
-  $('#mwl-perform').addEventListener('click', () => {
-    showView('mpps');
-    const folder = $('#mpps-folder');
-    if (!folder.value.trim()) folder.focus();
-    checkMppsFolder();
+  $('#mwl-clearsel').addEventListener('click', () => {
+    if (state.steps.selectedUid) clearStepsSelection();
+    else clearWorklistSelection();
+    setPanelMode(null);
   });
 
-  $('#view-worklist [data-run]').addEventListener('click', async () => {
+  // The stranded-open-step alert's own button.
+  $('#mwl-open-alert').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-show-step]');
+    if (!btn) return;
+    $('#session-steps').open = true;
+    selectStepRow(btn.dataset.showStep);
+  });
+
+  $('#mwl-run').addEventListener('click', async () => {
     const miss = connMissing();
-    $('#view-worklist [data-result]').hidden = true;
+    $('#mwl-results').hidden = true;
+    $('#mwl-foot').hidden = true;
     const c = consoleEl('worklist'); c.hidden = true; c.textContent = '';
     if (miss.length) {
+      $('#mwl-peer').open = true;
+      revealConsole();
       appendConsole('worklist', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr');
       return;
     }
@@ -902,9 +1072,37 @@ function wireWorklist() {
       // No parseable answer means nothing was re-read, so the correlation note
       // from an earlier query would be stale. Take it down.
       $('#mwl-correlation').hidden = true;
+      revealConsole();
       appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
     }
   });
+}
+
+/** The peer bar's one line, so folding four fields away stays honest. */
+function renderMwlPeerSummary() {
+  const el = $('#mwl-peer-sum');
+  if (!el) return;
+  const c = state.conn;
+  const set = c.host && c.port && c.calledAe;
+  el.textContent = set
+    ? `— ${c.calledAe} @ ${c.host}:${c.port} ← ${c.callingAe || 'DCM-CLI'}`
+    : '— no peer set: fill in host, port and called AE';
+  el.classList.toggle('changed', !set);
+}
+
+/** One line naming the filters folded away under More filters. */
+function renderMwlMoreSummary() {
+  const el = $('#mwl-more-sum');
+  if (!el) return;
+  const parts = [];
+  for (const [id, label] of [
+    ['mwl-station', 'station AE'], ['mwl-patientid', 'patient ID'], ['mwl-limit', 'limit'],
+  ]) {
+    const v = $(`#${id}`).value.trim();
+    if (v) parts.push(`${label} ${v}`);
+  }
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
+  el.classList.toggle('changed', parts.length > 0);
 }
 
 // --------------------------------------------------------------------------
@@ -1020,8 +1218,26 @@ async function checkMppsFolder() {
   box.textContent = 'Reading the folder…';
   renderMppsMismatch();
 
-  const { stdout } = await runCapture('mpps-scan', ['info', folder, '--json']);
+  // Bounded, because a lost exit event must not leave the panel reading
+  // "Reading the folder…" for the rest of the session. This scan is advisory:
+  // it exists to offer the mismatch as a choice BEFORE anything is sent. The
+  // engine still refuses a real mismatch on its own, and wireMpps turns that
+  // refusal back into the same choice, so giving up here loses a convenience,
+  // never a safeguard.
+  const scanned = await Promise.race([
+    runCapture('mpps-scan', ['info', folder, '--json']),
+    new Promise((r) => setTimeout(() => r(null), 20000)),
+  ]);
   if (token !== mppsScanToken) return; // a newer folder was chosen meanwhile
+
+  if (!scanned) {
+    box.className = 'folder-check warn';
+    box.textContent = 'Could not read this folder in time. The engine checks it again when it runs.';
+    renderMppsMismatch();
+    updateAllPreviews();
+    return;
+  }
+  const { stdout } = scanned;
 
   let scan = null;
   try { scan = JSON.parse(stdout); } catch { scan = null; }
@@ -1030,8 +1246,7 @@ async function checkMppsFolder() {
   if (!studies) {
     box.className = 'folder-check warn';
     box.textContent =
-      'This folder could not be read. Nothing is assumed about it here — the engine will ' +
-      'say exactly why when the step runs.';
+      'This folder could not be read. The engine will say exactly why when it runs.';
     renderMppsMismatch();
     updateAllPreviews();
     return;
@@ -1040,8 +1255,8 @@ async function checkMppsFolder() {
   if (studies.length === 0) {
     box.className = 'folder-check warn';
     box.textContent =
-      `No DICOM instances under this folder (${scan.filesExamined} file(s) examined). ` +
-      'A performed step has to describe images that exist.';
+      `No DICOM instances here (${scan.filesExamined} files examined). ` +
+      'A step has to describe images that exist.';
     renderMppsMismatch();
     updateAllPreviews();
     return;
@@ -1064,15 +1279,13 @@ async function checkMppsFolder() {
 
   if (!declared) {
     box.textContent =
-      `1 study, ${instances} instance(s). The worklist row carries no Study Instance UID, so ` +
-      `the step adopts the one the images already have (${study.studyInstanceUid}). That ` +
-      'direction needs no flag and changes nothing on disk.';
+      `1 study, ${instances} instances. The row named no study, so the step adopts the ` +
+      'images\'. No flag needed.';
   } else if (declared === study.studyInstanceUid) {
-    box.textContent =
-      `1 study, ${instances} instance(s) — the Study Instance UID matches the worklist row.`;
+    box.textContent = `1 study, ${instances} instances — matches the worklist row.`;
   } else {
     box.className = 'folder-check warn';
-    box.textContent = `1 study, ${instances} instance(s).`;
+    box.textContent = `1 study, ${instances} instances.`;
     state.mpps.mismatch = {
       kind: 'one-study',
       declared,
@@ -1103,24 +1316,23 @@ function renderMppsMismatch() {
   panel.hidden = false;
 
   if (m.kind === 'many') {
-    panel.className = 'mismatch bad';
+    panel.className = 'mismatch compact bad';
     choices.hidden = true;
     $('#mpps-mismatch-head').textContent =
-      `This folder holds ${m.studies.length} studies, and one performed step describes exactly one.`;
+      `This folder holds ${m.studies.length} studies. One performed step describes exactly one.`;
     $('#mpps-mismatch-uids').innerHTML = m.studies.slice(0, 5).map((s) =>
       `<div class="uid-line"><span class="uid-k">${esc(String(s.instanceCount))} instance(s)</span>` +
       `<code>${esc(s.studyInstanceUid)}</code></div>`).join('') +
       (m.studies.length > 5 ? `<div class="uid-line dim">… and ${m.studies.length - 5} more</div>` : '');
     $('#mpps-mismatch-body').innerHTML =
-      'Study Instance UID is the key the RIS reconciles the step against, so sending two studies ' +
-      'under one step would attribute half these images to the wrong order. <b>Re-stamping cannot ' +
-      'fix this</b> — adopting the worklist identity gives one folder one identity, and doing it ' +
-      'here would merge these studies into a single study that never existed. Split the folder ' +
-      'and perform one step per study.';
+      '<b>Re-stamping cannot fix this</b> — it would merge them into a study that never ' +
+      'existed. Split the folder and perform one step per study.' +
+      '<button type="button" class="info-btn" aria-expanded="false" ' +
+      'aria-controls="info-many-studies" aria-label="Why one step is one study"></button>';
     return;
   }
 
-  panel.className = 'mismatch';
+  panel.className = 'mismatch compact';
   choices.hidden = false;
 
   // A new mismatch starts on the recommended choice again. Carrying "send
@@ -1133,16 +1345,16 @@ function renderMppsMismatch() {
   }
 
   $('#mpps-mismatch-head').textContent =
-    'These images belong to a different study than the worklist item.';
+    'These images belong to a different study than the worklist row.';
   $('#mpps-mismatch-uids').innerHTML =
-    `<div class="uid-line"><span class="uid-k">Worklist item</span><code>${esc(m.declared)}</code></div>` +
+    `<div class="uid-line"><span class="uid-k">Worklist row</span><code>${esc(m.declared)}</code></div>` +
     `<div class="uid-line"><span class="uid-k">This folder</span><code>${esc(m.onDisk)}</code>` +
     `<span class="uid-x">${esc(m.description || `${m.instances} instance(s)`)}</span></div>`;
   $('#mpps-mismatch-body').innerHTML =
-    'That is normal for stock images: the RIS invented its Study Instance UID before these ' +
-    'pictures existed, so nothing on disk could be carrying it. It still has to be resolved ' +
-    'before anything is sent, because a step naming one study while the images carry another ' +
-    'is a pair of records the archive can never reconcile.';
+    'Normal for stock images. It has to be resolved before anything is sent — the two records ' +
+    'never reconcile otherwise.' +
+    '<button type="button" class="info-btn" aria-expanded="false" ' +
+    'aria-controls="info-mismatch-why" aria-label="Why this happens"></button>';
 }
 
 BUILDERS.mpps = () => {
@@ -1204,9 +1416,31 @@ BUILDERS.mpps = () => {
   if (retrieveAe) argv.push('--retrieve-ae', retrieveAe);
 
   if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
-  if ($('#mpps-dryrun').checked) argv.push('--dry-run');
+  if (mppsDryRun()) argv.push('--dry-run');
   return argv;
 };
+
+/**
+ * Whether the perform toggle is on Dry run.
+ *
+ * A two-state segmented toggle rather than a checkbox with an eighteen-word
+ * label: the mode is then legible at a glance instead of parsed from a
+ * sentence. Dry run is still the default posture.
+ */
+function mppsDryRun() {
+  const active = $('#mpps-mode .chip.active');
+  return !active || active.dataset.mode === 'dry';
+}
+
+/** Keeps the run button, the hint and the command in step with the toggle. */
+function renderMppsMode() {
+  const dry = mppsDryRun();
+  $('#mpps-run').textContent = dry ? 'Dry run' : 'Perform step';
+  $('#mpps-mode-hint').textContent = dry
+    ? 'Nothing is sent in dry run.'
+    : 'This opens a step on the peer and sends the images.';
+  $('#mpps-mode-hint').classList.toggle('live', !dry);
+}
 
 /** One line naming everything folded away under Advanced that is not a default. */
 function renderMppsAdvSummary() {
@@ -1239,15 +1473,13 @@ function renderMppsAdvSummary() {
 
   el.textContent = parts.length
     ? `— ${parts.join(' · ')}`
-    : '— all defaults: images to the MPPS peer, step ID and description from the worklist row';
+    : '— all defaults: images to the MPPS peer, step ID from the row';
   el.classList.toggle('changed', parts.length > 0);
 }
 
-/** Shows either the "pick a row first" note or the form, and fills the form. */
+/** Fills the action panel from the selected row. */
 function renderMppsPanel() {
   const a = worklistAttrs(selectedWorklistItem());
-  $('#mpps-nosel').hidden = Boolean(a);
-  $('#mpps-body').hidden = !a;
   if (!a) return;
 
   const chip = (value, missing) => (value
@@ -1276,30 +1508,35 @@ function renderMppsPanel() {
   ];
   $('#mpps-attrs').innerHTML = cells.map(([k, v]) => attrCell(k, v)).join('');
   const filled = cells.filter(([, v]) => v !== '').length;
+  // Always visible, and it replaces the twenty-seven words that used to say
+  // nothing was wrong. A counter says the same thing and can be read at a
+  // glance, which is the whole trade this screen is making.
   $('#mpps-assert-sum').textContent =
-    `— ${filled} of ${cells.length} attributes came back from the SCP`;
+    `${filled} of ${cells.length} attributes returned by the SCP`;
 
-  // Say what the engine will do about anything the SCP left out, rather than
-  // quietly filling it in here.
+  // Anything the SCP left out that the engine is Type 1 about. Inline and
+  // amber, never behind the info icon: the third of these stops the N-CREATE
+  // outright, and that cannot be something you discover by opening a
+  // disclosure.
   const notes = [];
   if (!a.studyInstanceUid) {
-    notes.push('This row carries no <b>Study Instance UID</b>. It is Type 1 inside ' +
-      'ScheduledStepAttributesSequence, and the engine will take it from the folder only if ' +
-      'that folder holds exactly one study.');
+    notes.push('No <b>Study Instance UID</b> on this row. Type 1 — the engine takes it from ' +
+      'the folder if the folder holds one study.');
   }
   if (!a.modality) {
-    notes.push('This row carries no <b>Modality</b>. It is Type 1, and the engine will take it ' +
-      'from the folder only if the folder holds exactly one.');
+    notes.push('No <b>Modality</b> on this row. Type 1 — the engine takes it from the folder ' +
+      'if the folder holds one.');
   }
-  if (!$('#mpps-stepid').value.trim()) {
-    notes.push('<b>Performed step ID</b> is Type 1 and there is no scheduled step ID to fall ' +
-      'back on. Fill it in under Advanced; the engine refuses the N-CREATE without it.');
+  const stepIdMissing = !$('#mpps-stepid').value.trim();
+  if (stepIdMissing) {
+    notes.push('<b>Performed step ID</b> is empty. It is Type 1; the engine refuses the ' +
+      'N-CREATE without it.');
+    // Escalated, because the field that fixes it lives under Advanced.
+    $('#mpps-adv').open = true;
   }
-  const note = $('#mpps-attr-note');
-  note.innerHTML = notes.length
-    ? notes.join(' ')
-    : 'Every value above came back from the SCP in this query. Attributes not shown ' +
-      '(start date and time) are taken at the moment the step is created.';
+  const warn = $('#mpps-type1-warn');
+  warn.hidden = notes.length === 0;
+  warn.innerHTML = notes.join('<br>');
 
   renderMppsAdvSummary();
 }
@@ -1346,16 +1583,18 @@ function parseMppsReport(text, errText = '') {
 }
 
 function renderMppsTotals(r) {
-  const box = $('#view-mpps [data-totals]');
+  const box = $('#mpps-totals');
   if (r.found == null) { box.hidden = true; box.classList.remove('show'); return; }
-  const cell = (n, lbl, cls = '') =>
-    `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
+  const cell = (n, lbl, cls = '', extra = '') =>
+    `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}${extra}</div></div>`;
   const complete = r.acknowledged != null && r.acknowledged === r.found;
   box.innerHTML =
     cell(r.found, 'found') +
     cell(r.sent, 'sent') +
     cell(r.acknowledged, 'acknowledged', complete ? 'ok' : 'fail') +
-    cell(r.referenced, 'referenced in MPPS', complete ? 'ok' : 'fail');
+    cell(r.referenced, 'referenced in MPPS', complete ? 'ok' : 'fail',
+      '<button type="button" class="info-btn" aria-expanded="false" ' +
+      'aria-controls="info-performed-series" aria-label="How performed series are built"></button>');
   box.hidden = false;
   box.classList.add('show');
 }
@@ -1375,9 +1614,7 @@ function renderMppsOutcome({ code, report, dryRun }) {
   if (dryRun) {
     box.className = 'outcome';
     box.innerHTML = '<span class="outcome-head">Dry run — nothing was sent.</span>' +
-      'No connection was opened, no procedure step was created and no images left this machine. ' +
-      'PerformedSeriesSequence cannot be previewed: it is built from what the archive ' +
-      'acknowledges, and nothing has been acknowledged.';
+      'No connection, no step, no images. Performed series cannot be previewed.';
     setStatus('mpps', code === 0 ? 'ok' : 'fail', code === 0 ? 'Plan ready' : 'Scan failed');
     return;
   }
@@ -1385,35 +1622,37 @@ function renderMppsOutcome({ code, report, dryRun }) {
   if (report.status === 'COMPLETED' && code === 0) {
     box.className = 'outcome ok';
     box.innerHTML = '<span class="outcome-head">Step COMPLETED.</span>' +
-      'Every instance found on disk was acknowledged by the archive and is referenced in the ' +
-      'MPPS. <b>What the MPPS SCP does with the scheduled worklist entry is not visible from ' +
-      'here</b> — re-query the worklist if you need to see whether it still matches.';
+      'Every instance found on disk was acknowledged and referenced.' +
+      '<button type="button" class="info-btn" aria-expanded="false" ' +
+      'aria-controls="info-completed" aria-label="What this does not say"></button>';
     setStatus('mpps', 'ok', 'COMPLETED');
     return;
   }
 
   box.className = 'outcome bad';
+  revealConsole();
   let head = 'The step was not completed.';
   let body;
   if (report.status === 'DISCONTINUED') {
+    // A shortfall is the one place words are cheap. It stays long on purpose,
+    // it stays red, and it is never rounded up to a caveat on a success.
     head = 'Step DISCONTINUED — this is a failure.';
     body = (report.shortfall ? `${esc(report.shortfall)} ` : '') +
-      'There is no override for this. COMPLETED asserts the work is fully accounted for, and ' +
-      'the performed series above name only what the archive actually took. Resend the ' +
-      'outstanding instances and open a new step, or find out why the archive refused them.';
+      '<b>There is no override.</b> Resend the outstanding instances and open a new step, or ' +
+      'find out why the archive refused them.';
   } else if (report.neverOpened) {
-    head = 'N-CREATE failed — the step was never opened.';
-    body = 'Nothing was sent. The images are untouched; the output above says why the MPPS peer ' +
-      'refused. Fix the peer and run this again.';
+    head = 'N-CREATE failed — no step was opened.';
+    body = 'Nothing was sent, the images are untouched. The output says why.';
   } else if (report.stillInProgress) {
-    head = 'N-SET failed — the step is still IN PROGRESS on the peer.';
-    body = 'The images were sent, but the closing N-SET did not land, so the step is open on the ' +
-      'MPPS peer. It is in <b>Steps this session</b> — pick it there and close it once the peer ' +
-      'is reachable, or run the command the output above prints. Do that before quitting: this ' +
-      'app remembers the UID only until it closes.';
+    // Half the old text was directions to a screen that is gone. The control
+    // itself replaces them.
+    const peer = state.conn.calledAe || 'the MPPS peer';
+    head = `N-SET failed — the step is still open on ${peer}.`;
+    body = 'Close it before quitting; this app remembers the UID only until it closes. ' +
+      '<button class="btn ghost small" id="mpps-close-now">Close this step</button>';
   } else {
     body = 'The engine exited ' + esc(String(code)) + ' without reporting a closed step. The ' +
-      'output above is the whole story; nothing here is inferred beyond it.';
+      'output above is the whole story.';
   }
   box.innerHTML = `<span class="outcome-head">${esc(head)}</span>${body}`;
   setStatus('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
@@ -1458,43 +1697,56 @@ function wireMpps() {
     renderMppsAdvSummary();
     updateAllPreviews();
   });
-  $('#mpps-dryrun').addEventListener('change', () => {
-    $('#view-mpps [data-run]').textContent = $('#mpps-dryrun').checked ? 'Dry run' : 'Perform step';
-    updateAllPreviews();
+  for (const chip of $$('#mpps-mode .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#mpps-mode .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderMppsMode();
+      updateAllPreviews();
+    });
+  }
+
+  // The assert grid: read once, then trusted, so it opens on demand behind the
+  // counter line rather than occupying eleven cells of permanent screen.
+  $('#mpps-assert-toggle').addEventListener('click', () => {
+    const grid = $('#mpps-attrs');
+    grid.hidden = !grid.hidden;
+    $('#mpps-assert-toggle').textContent = grid.hidden ? 'Show all' : 'Hide';
   });
 
-  $('#mpps-changestep').addEventListener('click', () => showView('worklist'));
-
-  $('#mpps-requery').addEventListener('click', () => {
-    showView('worklist');
-    $('#view-worklist [data-run]').click();
-  });
-
-  $('#mpps-goto-steps').addEventListener('click', () => showView('steps'));
-
-  $('#view-mpps [data-cancel]').addEventListener('click', () => {
+  $('#mpps-cancel').addEventListener('click', () => {
     const id = state.activeRuns.mpps;
     if (id) window.dcm.cancel(id);
   });
 
-  $('#view-mpps [data-run]').addEventListener('click', async () => {
+  // The inline "Close this step" the still-IN-PROGRESS outcome offers. It puts
+  // the panel into closing mode without leaving the screen, which is the whole
+  // reason the third screen could go.
+  $('#mpps-outcome').addEventListener('click', (e) => {
+    if (!e.target.closest('#mpps-close-now')) return;
+    const open = state.steps.entries.find((x) => x.status === 'IN PROGRESS');
+    if (open) { $('#session-steps').open = true; selectStepRow(open.mppsUid); }
+  });
+
+  $('#mpps-run').addEventListener('click', async () => {
     const item = selectedWorklistItem();
     clearConsole('mpps');
     $('#mpps-outcome').hidden = true;
-    $('#view-mpps [data-totals]').hidden = true;
-    $('#mpps-after').hidden = true;
+    $('#mpps-totals').hidden = true;
 
     if (!item) {
+      revealConsole();
       appendConsole('mpps', 'Select a worklist row first.\n', 'stderr');
       return;
     }
     const folder = $('#mpps-folder').value.trim();
     if (!folder) {
+      revealConsole();
       appendConsole('mpps', 'Choose the folder holding this study\'s images.\n', 'stderr');
       return;
     }
 
-    const dryRun = $('#mpps-dryrun').checked;
+    const dryRun = mppsDryRun();
     if (!dryRun) {
       const miss = connMissing();
       if (miss.length) {
@@ -1520,13 +1772,17 @@ function wireMpps() {
     const uid = mppsNextUid();
     const storePeer = mppsStore();
     setStatus('mpps', 'running', dryRun ? 'Scanning…' : 'Performing…');
-    $('#view-mpps [data-run]').disabled = true;
-    if (!dryRun) $('#view-mpps [data-cancel]').hidden = false;
+    $('#mpps-run').disabled = true;
+    if (!dryRun) {
+      $('#mpps-cancel').hidden = false;
+      // During a real transfer the stream is the interesting thing.
+      revealConsole();
+    }
 
     const { code, stdout, stderr } = await runStreaming('mpps', argv);
 
-    $('#view-mpps [data-run]').disabled = false;
-    $('#view-mpps [data-cancel]').hidden = true;
+    $('#mpps-run').disabled = false;
+    $('#mpps-cancel').hidden = true;
 
     // The engine's own study-mismatch refusal, in case the folder changed
     // between the scan above and the run. It is right to refuse; what it
@@ -1537,8 +1793,7 @@ function wireMpps() {
       box.hidden = false;
       box.className = 'outcome bad';
       box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different ' +
-        'study than the worklist item.</span>Nothing was sent and nothing on disk was touched. ' +
-        'The two ways forward are offered above the peer settings; pick one and run this again.';
+        'study.</span>Nothing was sent, nothing on disk touched. Pick one of the two options above.';
       setStatus('mpps', 'fail', 'Study mismatch');
       return;
     }
@@ -1553,11 +1808,15 @@ function wireMpps() {
         status: report.status,
         code,
       };
-      const remembered = rememberStep({
+      rememberStep({
         report, attrs, uid, folder, peer: { ...state.conn }, store: storePeer,
       });
-      $('#mpps-after').hidden = false;
-      $('#mpps-goto-steps').hidden = !remembered;
+      // The badge column, and only the badge column. Everything else in the
+      // table is what the SCP returned and stays exactly as it was returned;
+      // a fresh query is still the only thing that may replace it.
+      refreshSessionBadges();
+      // The one button now does both jobs, so after a run it says which one.
+      $('#mwl-run').textContent = 'Re-query worklist';
       // The UID is spent: a step is identified by it, and a second N-CREATE
       // carrying the same one would be a different step claiming the same
       // identity. Mint the next one now so the preview shows what will run.
@@ -1567,11 +1826,14 @@ function wireMpps() {
     renderMppsOutcome({ code, report, dryRun });
   });
 
-  renderMppsPanel();
+  // Resting state: no row picked, so the panel is one line of empty note.
+  setPanelMode(null);
+  renderMppsMode();
+  renderMppsAdvSummary();
 }
 
 // --------------------------------------------------------------------------
-// View: STEPS THIS SESSION — what this app did since it was opened
+// Session steps — what this app did since it was opened
 // --------------------------------------------------------------------------
 /**
  * Adds a step this app just performed to the session list.
@@ -1607,6 +1869,9 @@ function rememberStep({ report, attrs, uid, folder, peer, store }) {
     patientName: attrs.patientName || '',
     patientId: attrs.patientId || '',
     studyInstanceUid: attrs.studyInstanceUid || '',
+    // Recorded so a badge can be matched on the study AND the scheduled step,
+    // rather than on a study UID alone.
+    scheduledStepId: attrs.scheduledStepId || '',
     modality: attrs.modality || '',
     at: new Date(),
     folder,
@@ -1661,8 +1926,14 @@ function stepsCloseArgv() {
     const code = $('#steps-reasoncode').value.trim();
     if (code) argv.push('--reason-code', code);
   }
-  if ($('#steps-dryrun').checked) argv.push('--dry-run');
+  if (stepsDryRun()) argv.push('--dry-run');
   return argv;
+}
+
+/** Whether the closing toggle is on Dry run. Same segmented control as perform. */
+function stepsDryRun() {
+  const active = $('#steps-mode .chip.active');
+  return !active || active.dataset.mode === 'dry';
 }
 
 function renderStepsClose() {
@@ -1672,11 +1943,13 @@ function renderStepsClose() {
   // A closed step is history and offers nothing. Taking the controls down is
   // the honest form of that: a disabled button beside a complete command still
   // reads as something that could be made to work.
-  $('#steps-pick-title').textContent = closed ? 'This step is closed' : 'Close this step';
   $('#steps-close').hidden = !e || closed;
+  if (state.steps.selectedUid) {
+    $('#mwl-detail-title').textContent = closed ? 'This step is closed' : 'Close this step';
+  }
 
   $('#steps-reason-row').hidden = stepsVerb() !== 'discontinue';
-  const dry = $('#steps-dryrun').checked;
+  const dry = stepsDryRun();
   const btn = $('#steps-close-run');
   btn.textContent = dry ? 'Dry run' : (stepsVerb() === 'complete' ? 'Complete step' : 'Discontinue step');
   btn.disabled = !e || closed;
@@ -1687,9 +1960,10 @@ function renderStepsClose() {
   row.hidden = !e || closed || !e.folder;
   if (!row.hidden) {
     $('#steps-series-label').innerHTML =
-      `Name the images in <code>${esc(e.folder)}</code> as the performed series ` +
-      '<span class="dim">— adds <code>--series-from</code>, which asserts what is on this disk ' +
-      'rather than what the archive acknowledged.</span>';
+      'Name the images in this folder as the performed series ' +
+      '<button type="button" class="info-btn" aria-expanded="false" ' +
+      'aria-controls="info-series-from" aria-label="What series-from asserts"></button> ' +
+      '<code>--series-from</code>';
   }
 
   const note = $('#steps-note');
@@ -1697,32 +1971,35 @@ function renderStepsClose() {
     note.textContent = '';
   } else if (closed) {
     note.innerHTML =
-      `This app set this step to <b>${esc(e.status)}</b>, and COMPLETED and DISCONTINUED are ` +
-      'both final — a conformant SCP refuses an N-SET that moves out of either, including ' +
-      're-setting the same value. If the peer disagrees, the peer is the authority; nothing ' +
-      'here can ask it.';
+      `This app set this step to <b>${esc(e.status)}</b>. Both COMPLETED and DISCONTINUED are ` +
+      'final; a conformant SCP refuses an N-SET out of either.';
   } else {
     const c = e.counts || {};
     let series;
     if (!e.folder) {
-      series = 'No folder is remembered for this step, so PerformedSeriesSequence will be empty ' +
-        'unless you add one on the command line: the N-SET will claim the work finished and name ' +
-        'no images.';
+      series = 'No folder remembered. Performed series will be empty — the N-SET claims the ' +
+        'work finished and names no images.';
     } else if (stepFullyAcknowledged(e)) {
-      series = `All ${c.found} instance(s) found in that folder were acknowledged by the ` +
-        'archive, so a scan of it and what the archive holds are the same set.';
+      series = `All ${c.found} instances in that folder were acknowledged, so the two sets match.`;
     } else if (c.found != null && c.acknowledged != null) {
-      series = `Only ${c.acknowledged} of ${c.found} instance(s) were acknowledged, so a scan ` +
-        'of that folder would name images the archive may not hold. Left off by default for ' +
-        'that reason.';
+      // A shortfall stays visible and stays specific.
+      series = `Only ${c.acknowledged} of ${c.found} were acknowledged, so a scan of that folder ` +
+        'would name images the archive may not hold. Off by default.';
     } else {
-      series = 'This run reported no counts, so there is nothing here that says a scan of that ' +
-        'folder matches what the archive took.';
+      series = 'This run reported no counts, so nothing here says that folder matches what the ' +
+        'archive took.';
     }
+    // Naming the actual peer makes the invariant checkable rather than merely
+    // stated: the N-SET goes where the N-CREATE went, not where the peer bar
+    // now points.
+    const peer = e.peer && e.peer.host
+      ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}`
+      : (e.peer && e.peer.calledAe) || '?';
     note.innerHTML =
-      `This app opened this step on <b>${esc(e.peer.calledAe || '?')}</b> and has not closed it. ` +
-      'Whether it is still open there is not knowable from here — if someone else already ' +
-      `closed it, the peer refuses the N-SET below and says so. ${series}`;
+      `This app opened this step on <b>${esc(peer)}</b> and has not closed it. The N-SET goes ` +
+      'there.<button type="button" class="info-btn" aria-expanded="false" ' +
+      'aria-controls="info-close-peer" aria-label="Why that peer"></button> ' +
+      `<span class="series-note">${series}</span>`;
   }
 
   $('#steps-close-cmd').textContent = 'dcm ' + stepsCloseArgv().map(quoteArg).join(' ');
@@ -1730,18 +2007,20 @@ function renderStepsClose() {
 
 function clearStepsSelection() {
   state.steps.selectedUid = null;
-  for (const tr of $$('#view-steps [data-result] tr.pick-row')) {
+  for (const tr of $$('#steps-results tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
   }
-  $('#steps-selected').hidden = true;
+  if (state.mwl.selectedIdx == null) setPanelMode(null);
 }
 
 function selectStepRow(uid) {
   const e = state.steps.entries.find((x) => x.mppsUid === uid);
   if (!e) return;
+  // One panel, one selection: picking a session step releases the worklist row.
+  if (state.mwl.selectedIdx != null) clearWorklistSelection();
   state.steps.selectedUid = uid;
-  for (const tr of $$('#view-steps [data-result] tr.pick-row')) {
+  for (const tr of $$('#steps-results tr.pick-row')) {
     const on = tr.dataset.uid === uid;
     tr.classList.toggle('row-selected', on);
     tr.setAttribute('aria-pressed', on ? 'true' : 'false');
@@ -1762,11 +2041,14 @@ function selectStepRow(uid) {
     attrCell('MPPS peer', peerLine(e.peer), 'not known for this run') +
     attrCell('Storage peer', peerLine(e.store), 'not known for this run') +
     attrCell('Folder sent', e.folder || '', 'none');
-  $('#steps-selected').hidden = false;
+  setPanelMode('close');
   // A fresh selection starts on the option that suits it, rather than
-  // inheriting a choice made about a different step.
+  // inheriting a choice made about a different step. This default IS the
+  // shortfall invariant: a folder is only offered as the performed series when
+  // every instance in it was acknowledged.
   $('#steps-series').checked = Boolean(e.folder) && stepFullyAcknowledged(e);
   renderStepsClose();
+  $('#mwl-detail').scrollIntoView({ block: 'nearest' });
 }
 
 function formatStepWhen(e) {
@@ -1776,19 +2058,21 @@ function formatStepWhen(e) {
 
 /** Draws the session list. */
 function renderSteps() {
-  const box = $('#view-steps [data-result]');
+  const box = $('#steps-results');
+  const strip = $('#session-steps');
   const entries = state.steps.entries;
   const keep = state.steps.selectedUid;
 
+  // With no separate screen, an empty session list simply does not render.
+  // Nothing to explain, so nothing to explain it with.
   if (!entries.length) {
-    box.innerHTML =
-      '<div class="empty-note">Nothing performed yet in this session.<br>' +
-      'A step appears here the moment <b>Perform a step (MPPS)</b> opens one on a peer. ' +
-      'A dry run opens nothing, so it adds nothing, and a step performed before this app ' +
-      'was opened — or by anything else — is not known here.</div>';
+    strip.hidden = true;
+    box.innerHTML = '';
     clearStepsSelection();
+    renderOpenAlert();
     return;
   }
+  strip.hidden = false;
 
   const statusClass = (s) => (s === 'COMPLETED' ? 'ok' : s === 'DISCONTINUED' ? 'bad' : 'warn');
   const rows = entries.map((e) => {
@@ -1808,16 +2092,24 @@ function renderSteps() {
 
   const open = entries.filter((e) => e.status === 'IN PROGRESS').length;
   box.innerHTML =
-    `<div class="section-title">${entries.length} step(s) this session` +
-    `${open ? ` — ${open} still IN PROGRESS, click one to close it` : ''}</div>` +
     '<table><thead><tr><th class="pick-cell"></th><th>Status</th><th>Patient</th><th>Modality</th>' +
     '<th>Study Instance UID</th><th>Acknowledged</th><th>Performed at</th><th>MPPS peer</th></tr></thead>' +
     `<tbody>${rows}</tbody></table>`;
+
+  // The summary carries the count and, when it matters, the one that still
+  // needs an action — so a step left open is legible with the strip closed.
+  const sum = $('#session-steps-sum');
+  sum.textContent = open
+    ? `— ${entries.length}, ${open} still IN PROGRESS`
+    : `— ${entries.length}`;
+  sum.classList.toggle('changed', open > 0);
+  if (open) strip.open = true;
 
   // Re-drawing must not silently drop a selection that still exists — a close
   // that just landed re-renders this table under the operator's cursor.
   if (keep && entries.some((e) => e.mppsUid === keep)) selectStepRow(keep);
   else clearStepsSelection();
+  renderOpenAlert();
 }
 
 function wireSteps() {
@@ -1829,11 +2121,16 @@ function wireSteps() {
     });
   }
   $('#steps-reasoncode').addEventListener('input', renderStepsClose);
-  $('#steps-dryrun').addEventListener('change', renderStepsClose);
   $('#steps-series').addEventListener('change', renderStepsClose);
-  $('#steps-clearsel').addEventListener('click', clearStepsSelection);
+  for (const chip of $$('#steps-mode .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#steps-mode .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderStepsClose();
+    });
+  }
 
-  const results = $('#view-steps [data-result]');
+  const results = $('#steps-results');
   results.addEventListener('click', (e) => {
     const tr = e.target.closest('tr.pick-row');
     if (tr) selectStepRow(tr.dataset.uid);
@@ -1850,13 +2147,15 @@ function wireSteps() {
     const e = stepsSelected();
     clearConsole('steps');
     if (!e) return;
-    const dry = $('#steps-dryrun').checked;
+    const dry = stepsDryRun();
     const verb = stepsVerb();
     setStatus('steps', 'running', dry ? 'Building…' : 'Closing…');
     $('#steps-close-run').disabled = true;
+    if (!dry) revealConsole();
     const { code } = await runStreaming('steps', stepsCloseArgv());
     $('#steps-close-run').disabled = false;
     setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Closed') : 'Failed');
+    if (code !== 0) revealConsole();
 
     // The entry moves only when a real N-SET was accepted. This is not the app
     // repainting a row from what it hoped happened: the engine exits zero only
@@ -1865,6 +2164,8 @@ function wireSteps() {
     if (!dry && code === 0) {
       e.status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
       renderSteps();
+      // The worklist row's badge names this app's own step, so it moves with it.
+      refreshSessionBadges();
     }
   });
 
@@ -2748,6 +3049,68 @@ async function checkMcpStatus() {
 }
 
 /** Ctrl/Cmd+Enter runs the active view's primary action. */
+// --------------------------------------------------------------------------
+// Info icons — one handler for every circled-i in the app
+// --------------------------------------------------------------------------
+/**
+ * One short line stays on screen; the reasoning behind it opens as a block
+ * directly under that line.
+ *
+ * Deliberately a block and not a floating popover. These explanations run to
+ * 40-90 words, and at this column width a popover wide enough to hold one
+ * would cover the very rows it is explaining and would need edge-collision
+ * code against the page, the capped table scroll and the panel — measurement
+ * logic this renderer has no business growing. A block cannot be clipped and
+ * cannot cover data.
+ *
+ * Warnings that matter when they arise are never put in here: the mismatch
+ * choice, the folder verdicts, the missing Type 1 notes and every failed
+ * outcome stay inline.
+ */
+function infoBtnFor(pop) {
+  return $(`.info-btn[aria-controls="${pop.id}"]`);
+}
+
+function closeInfo(pop, focusBtn = false) {
+  pop.hidden = true;
+  const btn = infoBtnFor(pop);
+  if (btn) {
+    btn.setAttribute('aria-expanded', 'false');
+    if (focusBtn) btn.focus();
+  }
+}
+
+function closeAllInfo(except) {
+  for (const p of $$('.info-pop:not([hidden])')) if (p !== except) closeInfo(p);
+}
+
+function wireInfo() {
+  document.addEventListener('click', (e) => {
+    // A click inside an open explanation is someone reading or selecting it.
+    if (e.target.closest('.info-pop')) return;
+    const btn = e.target.closest('.info-btn');
+    if (!btn) { closeAllInfo(); return; }
+    // The icons inside a <label class="choice"> and inside a <summary> would
+    // otherwise pick the radio / toggle the disclosure on the way past.
+    e.preventDefault();
+    e.stopPropagation();
+    const pop = document.getElementById(btn.getAttribute('aria-controls'));
+    if (!pop) return;
+    const opening = pop.hidden;
+    closeAllInfo(pop); // only one open at a time, so layout grows by one block
+    pop.hidden = !opening;
+    btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const open = $$('.info-pop:not([hidden])');
+    if (!open.length) return;
+    e.stopPropagation();
+    open.forEach((p, i) => closeInfo(p, i === 0));
+  });
+}
+
 function wireKeyboard() {
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -2863,6 +3226,7 @@ async function boot() {
   mountConnectionPanels();
   mountWebPanels();
 
+  wireInfo();
   wireEcho();
   wireSend();
   wireReceive();

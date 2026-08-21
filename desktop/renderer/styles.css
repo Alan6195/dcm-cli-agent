@@ -638,3 +638,223 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
 #steps-series-row { align-items: flex-start; }
 #steps-series-row input { margin-top: 3px; flex: 0 0 auto; }
 #steps-series-label code { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+
+/* ==========================================================================
+ * THE ONE WORKSPACE: worklist -> perform -> close
+ *
+ * Formerly three screens. The action panel sits BELOW the table, not beside
+ * it: at this column width (~857px of usable .view on a 1180px window) the
+ * command preview needs the full width to stay one or two readable lines, and
+ * that preview is the thing that makes the action checkable. A side panel
+ * would cost the table its Accession and Patient ID columns to buy a gutter
+ * that .conn-grid and .choice physically cannot fit in.
+ *
+ * The table therefore has a fixed height and scrolls inside itself, so the
+ * panel is always in the same place on screen whatever the result count.
+ * ========================================================================== */
+
+#view-worklist .table-scroll {
+  max-height: 320px;          /* header 24 + 10 rows @28 = 304; the 11th peeks */
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-bottom: 1px solid var(--border);
+}
+#mwl-table { table-layout: fixed; width: 100%; }
+#mwl-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* border-bottom vanishes under border-collapse on a sticky cell, so the rule
+ * under the header is drawn as an inset shadow instead. */
+#mwl-table thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg);
+  box-shadow: inset 0 -1px 0 var(--border);
+  border-bottom: none;
+}
+
+/* ---------------- Query bar ---------------- */
+.qbar-label {
+  color: var(--text-dim); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 1px; margin-right: 2px;
+}
+.qbar-count { color: var(--text-dim); font-size: 12px; margin: 0 0 6px; }
+#view-worklist .form-row.qbar-fields { align-items: flex-end; }
+#view-worklist label.narrow { width: 96px; flex: none; }
+
+/* ---------------- Table footnote ----------------
+ * A trust invariant, so it stays visible rather than going behind the icon. */
+.table-foot {
+  color: var(--text-dim); font-size: 12px; line-height: 1.5;
+  margin: 8px 0 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+}
+.table-foot .foot-sep { color: var(--text-faint); margin: 0 4px; }
+.table-foot b { color: var(--text); }
+
+/* ---------------- Row states ----------------
+ * Selection is still the only row state this app draws from its own knowledge.
+ * Hover and selection are facts about this window's pointer and this window's
+ * pick; the session badge in the last column is a fact about what this app
+ * sent. Nothing here is ever derived from what the SCP might now think. */
+#mwl-table tr.pick-row:hover td { background: rgba(255, 255, 255, 0.045); }
+#mwl-table tr.pick-row:hover .pick-dot { border-color: var(--text-dim); }
+#mwl-table tr.row-selected td { background: var(--accent-soft); color: var(--text); }
+#mwl-table tr.row-selected:hover td { background: var(--accent-soft); }
+#mwl-table tr.row-selected td.pick-cell { box-shadow: inset 3px 0 0 var(--accent); }
+tr.pick-row { scroll-margin-block: 28px; }
+
+/* ---------------- Session badge ----------------
+ * "here" means: this app sent this, from this window, in this session. It
+ * never says the RIS considers the order done - that is not knowable from this
+ * side, and only a fresh query may change anything else in this table. The
+ * badge lives in its own column and touches no other cell, and never the row
+ * background. */
+.pill.session {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 1px 9px 1px 7px; margin: 0;
+  font-size: 10.5px; font-weight: 600; line-height: 15px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.pill.session::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+.pill.session.done    { color: var(--green); background: var(--green-soft); border-color: rgba(52, 211, 153, 0.35); }
+.pill.session.stopped { color: var(--red);   background: var(--red-soft);   border-color: rgba(248, 113, 113, 0.35); }
+.pill.session.open    { color: var(--amber); background: var(--amber-soft); border-color: rgba(251, 191, 36, 0.35); cursor: pointer; }
+.pill.session.open::before { animation: pulse 1s infinite; }
+
+/* A step this app opened that no row in the current results accounts for. */
+.open-alert {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  border: 1px solid var(--amber); border-left-width: 3px;
+  background: var(--amber-soft); color: var(--amber);
+  border-radius: 9px; padding: 9px 12px; margin-bottom: 12px; font-size: 12.5px;
+}
+.open-alert b { color: var(--amber); }
+
+/* ---------------- Info icon ----------------
+ * One short line stays on screen; the reasoning opens as a block directly
+ * under that line. Deliberately not a floating popover: at this column width a
+ * popover wide enough for 40-90 words would cover the rows it explains and
+ * would need edge-collision code this renderer has no business growing.
+ * Warnings that matter when they arise are never put in here - the mismatch
+ * choice, the folder verdicts, the Type 1 notes and every failed outcome all
+ * stay inline. */
+.info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; flex: none;
+  padding: 0; margin-left: 6px; vertical-align: -3px;
+  border: 1px solid var(--border-2); border-radius: 50%;
+  background: transparent; color: var(--text-dim);
+  font-family: var(--sans); font-size: 10.5px; font-weight: 700; line-height: 1;
+  cursor: pointer; transition: all 0.12s;
+}
+.info-btn::before { content: "i"; }
+.info-btn:hover { color: var(--accent); border-color: var(--accent); }
+.info-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.info-btn[aria-expanded="true"] {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
+}
+
+.info-pop {
+  display: block;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-2);
+  border-radius: 8px;
+  background: var(--bg-2);
+  padding: 9px 12px;
+  margin: 6px 0 10px;
+  color: var(--text-dim);
+  font-size: 12.5px; line-height: 1.6;
+  font-weight: 400; font-style: normal;
+  animation: fade 0.12s ease;
+}
+.info-pop p { margin: 0 0 8px; }
+.info-pop p:last-child { margin: 0; }
+.info-pop b { color: var(--text); }
+.info-pop code {
+  font-family: var(--mono); color: var(--accent);
+  background: var(--bg-3); padding: 1px 5px; border-radius: 4px;
+}
+
+/* ---------------- The action panel ----------------
+ * The panel wears the same accent edge as the selected row's pick cell, so the
+ * row and the panel read as one object. */
+#mwl-detail {
+  border-color: var(--border-2);
+  border-left: 3px solid var(--border);
+}
+#mwl-detail.open { border-left-color: var(--accent); }
+.empty-note.dense { padding: 6px 0; }
+.step-hero.compact { padding: 10px 12px 2px; margin-bottom: 10px; }
+.step-hero.compact .hero-uid { margin: 4px 0 10px; }
+
+/* The counter line that replaces the 27-word "nothing is wrong" note. */
+.assert-line {
+  display: flex; align-items: baseline; gap: 8px;
+  color: var(--text-dim); font-size: 12px; margin-bottom: 10px;
+}
+
+/* Folder, mode and go on one line: three controls always used together, and
+ * 60px of vertical saved over three stacked rows. */
+.detail-run {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 4px; flex-wrap: wrap;
+}
+.detail-run .path-pick { flex: 1; min-width: 240px; }
+.detail-run .chip-row.seg { margin: 0; gap: 0; flex: none; }
+.chip-row.seg .chip { border-radius: 0; margin: 0; padding: 5px 12px; }
+.chip-row.seg .chip:first-child { border-radius: 20px 0 0 20px; }
+.chip-row.seg .chip:last-child { border-radius: 0 20px 20px 0; border-left: none; }
+.mode-hint { color: var(--text-dim); font-size: 11.5px; margin: 0 0 10px; }
+.mode-hint.live { color: var(--amber); }
+
+/* The command line is the check on everything above it, so it keeps the full
+ * column and is never truncated - only scrolled, if it runs past four lines. */
+#view-worklist .cmd-preview { max-height: 84px; overflow-y: auto; }
+
+/* The mismatch choice stays a real choice - compact, never folded away. */
+.mismatch.compact { padding: 10px 12px; margin-bottom: 10px; }
+.mismatch.compact .mismatch-head { font-size: 12.5px; margin-bottom: 6px; }
+.mismatch.compact .mismatch-body { margin-top: 6px; font-size: 12px; line-height: 1.5; }
+.mismatch.compact .choice-list { gap: 6px; margin-top: 8px; }
+.mismatch.compact .choice { padding: 8px 10px; gap: 9px; }
+.mismatch.compact .choice-head { margin-bottom: 3px; font-size: 12.5px; }
+.mismatch.compact .choice-why { font-size: 12px; line-height: 1.5; }
+.mismatch.compact .choice-flag { margin-top: 5px; }
+.series-note { display: block; margin-top: 5px; }
+
+/* ---------------- Density in the workspace ----------------
+ * Ten rows plus the action panel on a 1180x800 window, before a run.
+ * Scoped, so Query, Speed test and the rest keep their present rhythm. */
+#view-worklist .view-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+#view-worklist .view-head h1 { font-size: 18px; margin: 0; }
+#view-worklist .view-head .lede {
+  margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); max-width: none;
+}
+#view-worklist .chip-row { gap: 6px; margin-bottom: 10px; }
+#view-worklist .chip { padding: 5px 12px; font-size: 12px; }
+#view-worklist .chip-input { width: 210px; }
+#view-worklist .form-row { gap: 10px; margin-bottom: 10px; }
+#view-worklist label { gap: 4px; font-size: 12px; }
+#view-worklist input[type="text"], #view-worklist input[type="number"] { padding: 6px 9px; border-radius: 6px; }
+#view-worklist table { font-size: 12.5px; }
+#view-worklist th { padding: 5px 10px; font-size: 10px; letter-spacing: 0.5px; }
+#view-worklist td { padding: 5px 10px; line-height: 1.35; }
+#view-worklist td .pill { padding: 1px 8px; font-size: 10.5px; line-height: 15px; margin: 0; }
+#view-worklist .pick-dot { width: 10px; height: 10px; }
+#view-worklist td.uid-cell { max-width: none; font-size: 11px; }
+#view-worklist .cmd-preview { padding: 8px 12px; margin-bottom: 10px; line-height: 1.45; }
+#view-worklist .actions { margin: 0 0 10px; gap: 10px; }
+#view-worklist .btn { padding: 7px 14px; }
+#view-worklist .btn.small { padding: 4px 10px; font-size: 12px; }
+#view-worklist .conn-panel { padding: 10px 12px 12px; margin-bottom: 10px; }
+#view-worklist .conn-title { margin-bottom: 8px; }
+#view-worklist .adv { margin-bottom: 10px; }
+#view-worklist .adv > summary { padding: 7px 12px; }
+#view-worklist .adv .adv-body { padding: 4px 12px 8px; }
+#view-worklist .pick-panel { padding: 10px 12px 12px; margin-bottom: 12px; }
+#view-worklist .pick-head { margin-bottom: 8px; gap: 8px; }
+#view-worklist .folder-check { padding: 8px 11px; margin: 0 0 10px; }
+#view-worklist .outcome { padding: 10px 12px; margin-bottom: 10px; }
+#view-worklist .console { max-height: 200px; padding: 10px 12px; }
+#view-worklist .attr-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 7px 16px; margin-bottom: 10px; }
+#view-worklist .totals { gap: 10px; margin-bottom: 10px; }
+#view-worklist .correlation-note { margin-bottom: 10px; }
