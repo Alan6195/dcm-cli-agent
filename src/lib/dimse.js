@@ -55,7 +55,24 @@ const DEFAULT_TIMEOUTS = Object.freeze({
    * stall detector and the most operationally important of the four.
    */
   pdu: 60000,
-  /** Grace period before releasing after the last response. */
+  /**
+   * Grace period between the last response and A-RELEASE-RQ.
+   *
+   * This is a FIXED SLEEP, not a settling timeout: dcmjs-dimse implements it as
+   * `on('done', () => setTimeout(sendAssociationReleaseRequest, linger))`, so
+   * every association pays it in full whatever the payload. A loopback C-ECHO
+   * and a four-instance C-STORE both cost ~1020 ms, essentially all of it here.
+   *
+   * It is kept because releasing the instant the last response is dispatched is
+   * how a client loses a response that was still in flight — and in this tool a
+   * lost C-STORE response is not a slow report, it is a file settled as
+   * UNANSWERED and a shortfall that never happened. The whole point of the
+   * accounting is that its numbers are true, so the default errs toward waiting.
+   *
+   * Override it with --linger or DCM_LINGER when the cost matters more than the
+   * margin: a loopback test suite is the obvious case, and it is why the flag
+   * exists at all.
+   */
   linger: 1000,
 });
 
@@ -77,13 +94,31 @@ const Phase = Object.freeze({
  * @param {object} opts
  * @returns {{connect: number, association: number, pdu: number, linger: number}}
  */
+/**
+ * DCM_LINGER, when it is a usable number.
+ *
+ * Read here rather than in each command so one environment variable covers
+ * every association a process opens, which is what a test suite or a CI job
+ * actually wants. A nonsense value is ignored rather than throwing: this is a
+ * performance dial, and failing a transfer because an environment variable was
+ * mistyped would be a worse outcome than paying the default grace period.
+ *
+ * @returns {number|undefined}
+ */
+function envLinger() {
+  const raw = process.env.DCM_LINGER;
+  if (raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function resolveTimeouts(opts = {}) {
   const pdu = opts.timeout ?? DEFAULT_TIMEOUTS.pdu;
   return {
     connect: opts.connectTimeout ?? DEFAULT_TIMEOUTS.connect,
     association: opts.associationTimeout ?? DEFAULT_TIMEOUTS.association,
     pdu,
-    linger: opts.lingerTimeout ?? DEFAULT_TIMEOUTS.linger,
+    linger: opts.lingerTimeout ?? envLinger() ?? DEFAULT_TIMEOUTS.linger,
   };
 }
 

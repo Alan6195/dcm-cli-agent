@@ -1,6 +1,6 @@
 {
   "name": "dcm-cli-agent",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "A single-binary DICOM CLI for folders of DICOM files: C-ECHO, C-STORE, C-FIND, a permissive receiver, tag inspection and editing, inventory and de-identification.",
   "license": "MIT",
   "type": "commonjs",
@@ -29,7 +29,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test \"test/unit/*.test.js\" \"test/e2e/*.test.js\"",
+    "test": "node tools/run-tests.js",
     "test:unit": "node --test \"test/unit/*.test.js\"",
     "test:e2e": "node --test \"test/e2e/*.test.js\"",
     "fixtures": "node tools/make-fixtures.js",
