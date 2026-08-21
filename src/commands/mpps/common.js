@@ -30,8 +30,61 @@ const ATTRIBUTE_FLAGS = [
   'patient-sex', 'modality', 'requested-procedure-id',
   'requested-procedure-description', 'scheduled-step-id', 'step-id',
   'step-description', 'station-name', 'station-ae', 'location',
-  'start-date', 'start-time', 'mpps-uid',
+  'start-date', 'start-time', 'mpps-uid', 'unscheduled',
 ];
+
+/** Flags that build PerformedSeriesSequence from a folder scan. */
+const SERIES_FROM_FLAGS = ['series-from', 'no-recurse', 'retrieve-ae'];
+
+/**
+ * Reads a flag that takes no value, and says so when one was swallowed.
+ *
+ * The parser gives a flag the next token unless that token is another flag, so
+ * `dcm mpps update --no-status 2.25.1` reads the UID as the value of
+ * --no-status and then reports a missing UID — two lies about one typo. The
+ * flags here never take a value, so a value is always this mistake.
+ *
+ * @param {Map} flags
+ * @param {string} name
+ * @param {string} [swallowedHint] What the swallowed token probably was.
+ * @returns {boolean}
+ */
+function booleanFlag(flags, name, swallowedHint) {
+  const raw = flags.get(name);
+  if (typeof raw === 'string') {
+    throw new args.UsageError(
+      `--${name} takes no value, but "${raw}" was read as one` +
+        (swallowedHint ? ` — that looks like ${swallowedHint}` : '') +
+        `.\nPut --${name} after the positional argument, or write it last.`
+    );
+  }
+  if (Array.isArray(raw)) {
+    throw new args.UsageError(`--${name} was given more than once.`);
+  }
+  return flags.has(name);
+}
+
+/**
+ * Every value of a repeatable flag, in the order they were typed.
+ *
+ * args.resolve() refuses a repeated flag, which is right for a hostname and
+ * wrong for --study-uid: one performed step may fulfil several scheduled steps,
+ * and PS3.3 represents that as several items in
+ * ScheduledStepAttributesSequence.
+ *
+ * @param {Map} flags
+ * @param {string} name
+ * @returns {string[]}
+ */
+function repeatedValues(flags, name) {
+  if (!flags.has(name)) return [];
+  const raw = flags.get(name);
+  const list = Array.isArray(raw) ? raw : [raw];
+  for (const value of list) {
+    if (value === true) throw new args.UsageError(`--${name} expects a value.`);
+  }
+  return list.map((value) => String(value));
+}
 
 /**
  * Resolves the MPPS peer.
@@ -116,7 +169,36 @@ function timeoutsFrom(flags) {
 function resolveAttributes(flags, connection, now = new Date()) {
   const flagValue = (name) => args.resolve(flags, { name });
 
-  const studyUidFlag = flagValue('study-uid');
+  const studyUids = repeatedValues(flags, 'study-uid');
+  const unscheduled = booleanFlag(flags, 'unscheduled');
+
+  // The two say opposite things about the same sequence, and picking a winner
+  // would mean guessing which one was meant. --unscheduled asserts that no
+  // order lies behind this step; --study-uid names the order it came from.
+  if (unscheduled && studyUids.length) {
+    throw new args.UsageError(
+      '--unscheduled and --study-uid ask for opposite things. --unscheduled emits ' +
+        'ScheduledStepAttributesSequence as one zero-length item, which is how PS3.3 says ' +
+        '"this step fulfils no scheduled step at all"; --study-uid names the study the step ' +
+        'is being reconciled against, and it can only live inside a populated item. Drop one.'
+    );
+  }
+  if (unscheduled && flags.has('from-worklist')) {
+    throw new args.UsageError(
+      '--unscheduled and --from-worklist ask for opposite things. A worklist item IS the ' +
+        'scheduled step; an unscheduled step is one that was never scheduled.'
+    );
+  }
+  if (studyUids.length > 1 && flags.has('from-worklist')) {
+    throw new args.UsageError(
+      `--study-uid was given ${studyUids.length} times alongside --from-worklist. There it ` +
+        'is the flag that narrows the file to one item, so several of them describe no ' +
+        'single item. Build the multi-step case from flags, or narrow the worklist to one ' +
+        'study and pass that.'
+    );
+  }
+
+  const studyUidFlag = studyUids.length ? studyUids[0] : undefined;
   const accessionFlag = flagValue('accession');
 
   let fromWorklist = {};
@@ -138,7 +220,13 @@ function resolveAttributes(flags, connection, now = new Date()) {
   };
 
   const attrs = {
-    studyInstanceUid: pick('study-uid', 'studyInstanceUid'),
+    studyInstanceUid: studyUidFlag !== undefined
+      ? studyUidFlag
+      : (fromWorklist.studyInstanceUid ?? ''),
+    // Only set when the step fulfils more than one scheduled step; see
+    // mpps.scheduledStepSequence() for what the extra items carry and why.
+    scheduledStudyUids: studyUids.length > 1 ? studyUids : undefined,
+    unscheduled,
     accessionNumber: pick('accession', 'accessionNumber'),
     patientId: pick('patient-id', 'patientId'),
     patientName: pick('patient-name', 'patientName'),
@@ -182,6 +270,41 @@ function resolveAttributes(flags, connection, now = new Date()) {
     : (attrs.scheduledProcedureStepId || '');
 
   return { attrs, source };
+}
+
+/**
+ * Builds PerformedSeriesSequence from --series-from, or reports that no source
+ * was given at all.
+ *
+ * The distinction the caller needs is between "no sequence" and "an empty
+ * sequence", so `built` is undefined when no folder was named rather than being
+ * an empty result. On an N-SET those two are different messages: an absent
+ * PerformedSeriesSequence leaves what the SCP holds alone, and a present empty
+ * one replaces it with nothing.
+ *
+ * @param {Map} flags
+ * @param {string} retrieveAeTitle
+ * @returns {{built: object|undefined, sourceLabel: string, assertedFromDisk: boolean}}
+ */
+function resolveSeriesFromFolder(flags, retrieveAeTitle) {
+  const seriesFrom = args.resolve(flags, { name: 'series-from' });
+  if (seriesFrom === undefined) {
+    return {
+      built: undefined,
+      sourceLabel: 'nothing — no performed series was given',
+      assertedFromDisk: false,
+    };
+  }
+
+  // Required lazily: an update that names no folder should not pay for the
+  // scanner, and the scanner pulls in the DICOM parser.
+  const { scan } = require('../../lib/scan');
+  const scanned = scan(seriesFrom, { recurse: !flags.has('no-recurse') });
+  const built = mpps.buildPerformedSeriesSequenceFromFolder(scanned.studies, {
+    retrieveAeTitle,
+    seriesMeta: mpps.seriesMetaFromScan(scanned.studies),
+  });
+  return { built, sourceLabel: `a scan of ${seriesFrom}`, assertedFromDisk: true };
 }
 
 /**
@@ -273,6 +396,10 @@ function formatDataset(dataset) {
 module.exports = {
   CONNECTION_FLAGS,
   ATTRIBUTE_FLAGS,
+  SERIES_FROM_FLAGS,
+  booleanFlag,
+  repeatedValues,
+  resolveSeriesFromFolder,
   resolveConnection,
   resolveStoreConnection,
   timeoutsFrom,

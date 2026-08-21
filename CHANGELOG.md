@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.12.0
+
+For the team testing an MWL/MPPS server in CI: the messages a receiver is
+least likely to have been tested against.
+
+- **`dcm mpps update <mpps-uid>`** — the interim N-SET. A step can now report
+  progress and stay open, in both shapes a real modality sends: carrying
+  `PerformedProcedureStepStatus = IN PROGRESS`, or with the status attribute
+  absent entirely (`--no-status`). `--series-from` grows
+  `PerformedSeriesSequence` across successive updates; leaving it off omits
+  the sequence, which is the default and must not be read as erasing what the
+  step already holds. Attributes PS3.4 F.7.2-1 marks N-CREATE-only — patient
+  identity, the scheduled step, `PerformedProcedureStepID`, the station AE,
+  start date/time, modality — are refused by name rather than sent.
+- **`dcm scp` was refusing that message with `0x0106`**, treating any
+  non-terminal status on an N-SET as illegal. That was wrong: F.7.2-1 lets an
+  N-SET carry the status and F.8.2 closes only the terminal states. It is also
+  the precise behaviour that makes real modalities abandon a session and leave
+  a worklist entry uncleared, so our own receiver was modelling the bug it
+  exists to help people find. Fixed; a finished step still refuses everything,
+  and `0x0110`, `0x0111`, `0x0112` and `0x0120` enforcement is untouched.
+- **`--unscheduled`** on `start` and `perform` emits `(0040,0270)` as one
+  zero-length item, which is how PS3.3 represents a walk-in exam with no prior
+  order. Type 1 descent is suppressed for that shape only — a populated item
+  still requires `StudyInstanceUID`. `perform --unscheduled` still takes the
+  study UID from the folder for the C-STORE and says so, because those two
+  identities differing is the point. **Known limit:** dcmjs reads a
+  one-empty-item sequence back as `[]`, so `dcm scp` cannot receive this shape
+  and `--unscheduled` cannot be rehearsed against it. The message on the wire
+  is correct; verified byte for byte.
+- **`--json-raw` is now genuinely raw.** It claimed values exactly as received
+  and did not deliver: a `PatientWeight` of `"12.5 kg"` came back as the JSON
+  number `12.5`, silently dropping the unit, and over-long or lowercase values
+  were repaired on the way past. That produced false passes for anyone using
+  this tool to observe what their server actually emitted. Values are now
+  carried as received, with an `_elements` sidecar giving `{vr, length}` per
+  tag — and `_rawUnavailable` with a reason when the octets could not be
+  re-read, because a report that cannot tell "clean" from "not examined" is
+  the same false pass in a different coat.
+- **`dcm find --check-vr`** reports every VR conformance violation in what the
+  peer returned: over-long values against the VR maximum, non-enumerated and
+  lowercase CS, DS/IS carrying non-numeric characters, odd-length values,
+  embedded backslashes creating unintended VM. One line per violation for a
+  human, `vrViolations` in JSON, exit 1 when any are found.
+- **`dcm find --set <Key>=<Value>`** stamps a value into the outgoing C-FIND
+  identifier byte for byte, bypassing client-side validation, so a server's
+  own coercion can be tested with a deliberately hostile value. It announces
+  itself loudly whenever it is used — the same framing as
+  `--allow-study-mismatch`: the explicit "I know what I am doing" path.
+- **Fixed: `complete`/`discontinue --series-from` silently merged multiple
+  studies.** A folder holding two studies produced a `PerformedSeriesSequence`
+  spanning both, exit 0, no warning — while `perform` correctly refused the
+  same folder. Since the sequence feeds an expected-image count, that quietly
+  poisoned reconciliation. Both closing verbs now apply `perform`'s guard and
+  its wording, and `--study-uid` scopes a legitimately mixed folder.
+- **Fixed: the "asserted from disk" caveat never appeared under `--dry-run`**,
+  which is exactly when someone is reading the dataset. It was emitted after
+  the dry-run return.
+- `0x0106` and `0x0120` now translate to English instead of "Unrecognised
+  failure" — they are the two codes an MPPS client meets most, and the generic
+  wrapper buried the peer's Error Comment, which is usually the explanation.
+- MCP gains `dcm_mpps_update`, and `--unscheduled` / `--study-uid` on the
+  tools that take them, so an assistant-driven rehearsal exercises the same
+  paths as the CLI.
+
 ## v0.11.0
 
 One screen for one job.

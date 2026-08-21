@@ -38,11 +38,15 @@ Connection:
 Scheduled step (the order this work came from):
   --study-uid <uid>      Study Instance UID. Type 1, and THE correlation key —
                          the RIS matches the step to the order and to the images
-                         on this and nothing else.
+                         on this and nothing else. Repeatable; see below.
   --accession <text>     Accession Number.
   --requested-procedure-id <id>
   --requested-procedure-description <text>
   --scheduled-step-id <id>       Scheduled Procedure Step ID.
+  --unscheduled          There is no order. Emits ScheduledStepAttributesSequence
+                         as exactly one ZERO-LENGTH item, which is how PS3.3
+                         represents a walk-in or ER exam. Refuses --study-uid and
+                         --from-worklist, which say the opposite.
 
 Performed step (what is actually being done):
   --modality <MOD>       Modality, e.g. CT. Type 1.
@@ -87,6 +91,36 @@ Note:
   the attribute they reconcile on was blank. From this end it looks like it
   worked. Days later the order is still open.
 
+Unscheduled steps (--unscheduled):
+  A walk-in, an ER exam, a repeat nobody booked: the work is real and no
+  scheduled procedure step lies behind it. PS3.3 C.4.14 is specific about the
+  shape — ScheduledStepAttributesSequence is PRESENT and holds exactly ONE
+  ZERO-LENGTH item. All three of the obvious alternatives are wrong, and each
+  is wrong differently:
+
+    omitting the sequence         it is Type 1; an SCP that checks refuses it
+    --study-uid ""                a present, empty Type 1, which is the shape
+                                  SCPs accept and then never reconcile
+    an item with blank values     seven empty attributes is not a zero-length
+                                  item, and the item is no longer zero-length
+
+  Inside a POPULATED item StudyInstanceUID stays Type 1 and is still checked.
+  The exemption applies to the zero-length shape and to nothing else, so a
+  half-filled scheduled step cannot borrow it.
+
+One step, several scheduled steps (--study-uid, repeated):
+  A single acquisition can fulfil more than one order — a chest and an abdomen
+  booked separately, done in one pass. PS3.3 represents that as several items
+  in ScheduledStepAttributesSequence, and repeating --study-uid emits one
+  populated item per UID.
+
+  Only the FIRST item carries --accession, --scheduled-step-id and the
+  requested-procedure attributes. There is one of each on the command line, and
+  copying them onto every item would assert that several different orders share
+  one accession number. The rest are emitted as the empty Type 2 attributes
+  they are. This form cannot be combined with --from-worklist, where
+  --study-uid is the flag that narrows the file to a single item.
+
 Examples:
   dcm mpps start --host ris.example.org --port 11112 --called-ae MPPSSCP \\
     --study-uid 1.2.840.113619.2.55.3.1 --modality CT --step-id STEP001
@@ -95,6 +129,10 @@ Examples:
     PatientID=12345 > wl.json
   dcm mpps start --host ris.example.org --port 11112 --called-ae MPPSSCP \\
     --from-worklist wl.json
+
+  # A walk-in radiograph nobody booked.
+  dcm mpps start --host ris.example.org --port 11112 --called-ae MPPSSCP \\
+    --unscheduled --modality DX --step-id WALKIN-014
 `.trimStart();
 
 /**
@@ -155,6 +193,20 @@ async function run(parsed) {
   const dataset = mpps.buildCreateDataset(attrs);
   mpps.assertCreatable(dataset);
 
+  const scheduledSteps = dataset.ScheduledStepAttributesSequence;
+  if (attrs.unscheduled) {
+    log.info(
+      '--unscheduled: ScheduledStepAttributesSequence is one zero-length item. The step ' +
+        'names no order, so there is no Study Instance UID for the RIS to reconcile it on.'
+    );
+  } else if (scheduledSteps.length > 1) {
+    log.info(
+      `${scheduledSteps.length} scheduled steps in one performed step; only the first item ` +
+        'carries the accession and scheduled-step attributes, because there is one of each ' +
+        'on the command line.'
+    );
+  }
+
   const mppsUidFlag = args.resolve(flags, { name: 'mpps-uid' });
   const mppsSopInstanceUid = mppsUidFlag !== undefined
     ? mpps.requireUid(mppsUidFlag, '--mpps-uid')
@@ -177,6 +229,8 @@ async function run(parsed) {
         dryRun: true,
         mppsSopInstanceUid,
         sopClassUid: mpps.MPPS_SOP_CLASS,
+        unscheduled: Boolean(attrs.unscheduled),
+        scheduledStepItems: scheduledSteps.length,
         dataset,
       }, null, 2));
       return 0;
@@ -222,6 +276,8 @@ async function run(parsed) {
       mppsSopInstanceUid,
       sopClassUid: mpps.MPPS_SOP_CLASS,
       performedProcedureStepStatus: verdict.ok ? mpps.Status.IN_PROGRESS : null,
+      unscheduled: Boolean(attrs.unscheduled),
+      scheduledStepItems: scheduledSteps.length,
       studyInstanceUid: attrs.studyInstanceUid,
       peer: connection,
       status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
@@ -239,11 +295,27 @@ async function run(parsed) {
   log.out(`${log.color.green('IN PROGRESS')}  procedure step opened on ${connection.calledAe}`);
   log.out('');
   log.out(`  ${log.color.bold('MPPS SOP Instance UID')}  ${log.color.bold(mppsSopInstanceUid)}`);
-  log.out(`  study                  ${attrs.studyInstanceUid}`);
+  if (attrs.unscheduled) {
+    log.out(`  study                  ${log.color.yellow('none — unscheduled step')}`);
+  } else if (scheduledSteps.length > 1) {
+    log.out(`  studies                ${scheduledSteps.length} scheduled steps:`);
+    for (const item of scheduledSteps) log.out(`    ${item.StudyInstanceUID}`);
+  } else {
+    log.out(`  study                  ${attrs.studyInstanceUid}`);
+  }
   log.out(`  performed step ID      ${attrs.performedProcedureStepId}`);
   log.out(`  station AE             ${attrs.performedStationAeTitle}`);
   log.out(`  started                ${attrs.startDate} ${attrs.startTime}`);
   log.out('');
+  if (attrs.unscheduled) {
+    log.out(log.color.yellow(
+      'This step names no scheduled procedure step, so nothing will reconcile it against an\n' +
+        'order — there is no order. The RIS has only PerformedProcedureStepID and the\n' +
+        'station AE to file it under, and whether it creates an unscheduled entry or drops\n' +
+        'the step is its own business and is not visible from here.'
+    ));
+    log.out('');
+  }
   log.out(
     log.color.dim(
       'Keep that UID. It is the only handle on this step:\n' +

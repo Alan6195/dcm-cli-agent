@@ -9,15 +9,18 @@
  * legally claim, and refusing a transition the SCP would refuse anyway.
  */
 
+const path = require('path');
+
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const { validateUid } = require('../../lib/uid');
 const mpps = require('../../lib/mpps');
 const common = require('./common');
 
 /** Flags both verbs accept. `reason` and `reason-code` are ignored by complete. */
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
-  'series-from', 'no-recurse', 'retrieve-ae',
+  'series-from', 'study-uid', 'no-recurse', 'retrieve-ae',
   'end-date', 'end-time', 'dry-run', 'reason', 'reason-code',
 ];
 
@@ -66,6 +69,9 @@ What was performed:
                          is the ONLY source this verb has, and it asserts what
                          is on your disk. READ THE NOTE BELOW before using it.
                          Given nothing, the step is closed naming no images.
+  --study-uid <uid>      Scope --series-from to this one study. Only needed when
+                         the folder holds more than one: without it, such a
+                         folder is refused rather than merged.
   --no-recurse           With --series-from, do not descend into subfolders.
   --retrieve-ae <AE>     Retrieve AE Title recorded against each performed
                          series — the AE the images can be fetched from.
@@ -94,6 +100,17 @@ Note: --series-from asserts what is on YOUR DISK, not what the archive holds.
   When the performed series matters, use 'dcm mpps perform'. It does the
   N-CREATE, the C-STORE and the N-SET in one process, so the acknowledgement
   ledger never has to survive anything.
+
+Note: --series-from describes ONE study, so a folder holding two is refused.
+  A performed procedure step is about a single study — Study Instance UID is
+  Type 1 inside ScheduledStepAttributesSequence and is the key the RIS
+  reconciles the step against — so a PerformedSeriesSequence built from two
+  studies would attribute half those images to the wrong order. Anything
+  downstream that totals ReferencedImageSequence into an expected image count
+  would then get a number the step's own scheduled attributes contradict, and
+  nothing in the N-SET would show it. Pass --study-uid to name which study in
+  the folder this step performed, or split the folder and close one step per
+  study. It is the same refusal 'dcm mpps perform' gives.
 
 Note: closing the step here says nothing about the worklist entry.
   This command reports what the MPPS SCP answered. Whether that SCP, or a RIS
@@ -132,6 +149,96 @@ function resolveMppsUid(positional) {
 }
 
 /**
+ * Checks --study-uid is a UID at all.
+ *
+ * Called before the scan as well as inside the scoping, because scanning a
+ * large tree to then reject the value for a stray space is a slow way to say
+ * something that was knowable immediately.
+ *
+ * @param {string} uid
+ * @returns {string}
+ */
+function requireStudyUidFlag(uid) {
+  const verdict = validateUid(uid);
+  if (!verdict.valid) {
+    throw new args.UsageError(
+      `--study-uid "${uid}" is not a valid DICOM UID: ${verdict.reason}.`
+    );
+  }
+  return uid;
+}
+
+/**
+ * Narrows a scan down to the one study this step is allowed to describe.
+ *
+ * One performed procedure step is one study. The builder in lib/mpps.js walks
+ * every study a scan found, so handing it a scan wholesale is what merged two
+ * studies into one PerformedSeriesSequence: the sequence claimed series from
+ * both, while ScheduledStepAttributesSequence named only one, and any count
+ * taken off ReferencedImageSequence came out wrong with nothing to show for it.
+ * Scoping happens here, at the caller, so the builder keeps its single job.
+ *
+ * @param {object} scanned From scan().
+ * @param {string} seriesFrom The folder as the operator wrote it.
+ * @param {string|undefined} requestedStudyUid --study-uid, if given.
+ * @returns {{studies: Map<string, object>, sourceLabel: string}}
+ */
+function scopeToOneStudy(scanned, seriesFrom, requestedStudyUid) {
+  if (requestedStudyUid !== undefined) {
+    requireStudyUidFlag(requestedStudyUid);
+
+    const study = scanned.studies.get(requestedStudyUid);
+    if (!study) {
+      // Naming a study the folder does not hold has to be refused, not turned
+      // into an empty sequence: an empty PerformedSeriesSequence is a legal
+      // N-SET, so a typo here would close the step claiming no images at all.
+      const found = [...scanned.studies.values()]
+        .slice(0, 5)
+        .map((s) => `  ${s.studyInstanceUid}  ${s.instances.length} instance(s)  ${s.patientName ?? ''}`);
+      throw new args.UsageError(
+        `--study-uid ${requestedStudyUid} is not in ${path.resolve(seriesFrom)}. ` +
+          (scanned.studies.size === 0
+            ? 'No DICOM instances were found there at all.'
+            : `The scan found ${scanned.studies.size} stud${scanned.studies.size === 1 ? 'y' : 'ies'}:\n` +
+              `${found.join('\n')}${scanned.studies.size > 5 ? `\n  … and ${scanned.studies.size - 5} more` : ''}`) +
+          '\nNothing was sent.'
+      );
+    }
+
+    return {
+      studies: new Map([[requestedStudyUid, study]]),
+      sourceLabel: `a scan of ${seriesFrom}, scoped to study ${requestedStudyUid}`,
+    };
+  }
+
+  if (scanned.studies.size > 1) {
+    // The same refusal `dcm mpps perform` gives, in perform's own words, so an
+    // operator who has met one recognises the other. Required lazily because
+    // perform pulls in the store and re-stamp machinery a close never uses.
+    //
+    // Only the ambiguous case is delegated. A folder holding no DICOM at all is
+    // left alone deliberately: this verb already warns, loudly and by name,
+    // that it is about to mark a step COMPLETED naming no images, and that
+    // warning is the more useful one here.
+    const { assertOneStudy } = require('./perform');
+    try {
+      assertOneStudy(scanned, seriesFrom, '');
+    } catch (err) {
+      if (err.name !== 'UsageError') throw err;
+      throw new args.UsageError(
+        `${err.message}\n` +
+          '\n' +
+          'Or name the one this step performed:\n' +
+          '  --study-uid <uid>          Build PerformedSeriesSequence from that study alone\n' +
+          '                             and ignore the rest of the folder.'
+      );
+    }
+  }
+
+  return { studies: scanned.studies, sourceLabel: `a scan of ${seriesFrom}` };
+}
+
+/**
  * Builds PerformedSeriesSequence from the one source this verb has.
  *
  * A folder scan, or nothing at all. The acknowledged-instance ledger belongs to
@@ -144,17 +251,33 @@ function resolveMppsUid(positional) {
  */
 function resolvePerformedSeries(flags, retrieveAeTitle) {
   const seriesFrom = args.resolve(flags, { name: 'series-from' });
+  const requestedStudyUid = args.resolve(flags, { name: 'study-uid' });
 
   if (seriesFrom !== undefined) {
+    if (requestedStudyUid !== undefined) requireStudyUidFlag(requestedStudyUid);
+
     // Required lazily: a close that names no folder should not pay for the
     // scanner, and the scanner pulls in the DICOM parser.
     const { scan } = require('../../lib/scan');
     const scanned = scan(seriesFrom, { recurse: !flags.has('no-recurse') });
-    const built = mpps.buildPerformedSeriesSequenceFromFolder(scanned.studies, {
+    const { studies, sourceLabel } = scopeToOneStudy(scanned, seriesFrom, requestedStudyUid);
+
+    // Both of these take the scoped map. seriesMeta keyed off the whole scan
+    // would let a second study's series description reach this step's sequence.
+    const built = mpps.buildPerformedSeriesSequenceFromFolder(studies, {
       retrieveAeTitle,
-      seriesMeta: mpps.seriesMetaFromScan(scanned.studies),
+      seriesMeta: mpps.seriesMetaFromScan(studies),
     });
-    return { built, sourceLabel: `a scan of ${seriesFrom}`, assertedFromDisk: true };
+    return { built, sourceLabel, assertedFromDisk: true };
+  }
+
+  if (requestedStudyUid !== undefined) {
+    throw new args.UsageError(
+      '--study-uid scopes the folder --series-from scans, and no folder was given, so ' +
+        'there is nothing to scope. It does not name the study being closed: the step is ' +
+        'named by its MPPS SOP Instance UID, and the study it belongs to was fixed when ' +
+        '`dcm mpps start` created it.'
+    );
   }
 
   return {
@@ -162,6 +285,35 @@ function resolvePerformedSeries(flags, retrieveAeTitle) {
     sourceLabel: 'nothing — no performed series was given',
     assertedFromDisk: false,
   };
+}
+
+/**
+ * Prints the caveat a folder-scanned performed series must carry.
+ *
+ * The USAGE promises this appears "every time", and --dry-run is the run where
+ * it matters most: that is when a human is reading the dataset and deciding
+ * whether to send it. It lives in one function so the two callers cannot drift
+ * into two different accounts of the same claim.
+ *
+ * @param {number} seriesCount
+ * @param {{dryRun?: boolean}} [opts] Whether the assertion has been made yet.
+ */
+function reportAssertedFromDisk(seriesCount, opts = {}) {
+  const claim = opts.dryRun ? 'would assert' : 'now asserts';
+  log.out(
+    log.color.yellow(
+      `The ${seriesCount} performed series above were built by scanning your disk.`
+    )
+  );
+  log.out(
+    log.color.dim(
+      'Nothing here confirms the archive holds those instances — they were not sent by\n' +
+        `this command and nobody acknowledged them. The MPPS ${claim} they exist. If\n` +
+        'that is not certain, use `dcm mpps perform`, which sends the images itself and\n' +
+        'names only what the archive acknowledged.'
+    )
+  );
+  log.out('');
 }
 
 /**
@@ -265,6 +417,9 @@ async function finish(parsed, spec) {
     log.out('N-SET dataset that would be sent:');
     log.out(common.formatDataset(dataset));
     log.out('');
+    // Before the "nothing was sent" line, not after: the caveat is about the
+    // dataset printed above, and this is the moment someone is reading it.
+    if (assertedFromDisk) reportAssertedFromDisk(built.items.length, { dryRun: true });
     log.out(log.color.dim('--dry-run: no connection was opened and nothing was sent.'));
     return 0;
   }
@@ -339,22 +494,7 @@ async function finish(parsed, spec) {
     log.out('');
   }
 
-  if (assertedFromDisk) {
-    log.out(
-      log.color.yellow(
-        `The ${built.items.length} performed series above were built by scanning your disk.`
-      )
-    );
-    log.out(
-      log.color.dim(
-        'Nothing here confirms the archive holds those instances — they were not sent by\n' +
-          'this command and nobody acknowledged them. The MPPS now asserts they exist. If\n' +
-          'that is not certain, use `dcm mpps perform`, which sends the images itself and\n' +
-          'names only what the archive acknowledged.'
-      )
-    );
-    log.out('');
-  }
+  if (assertedFromDisk) reportAssertedFromDisk(built.items.length);
 
   log.out(
     log.color.dim(
@@ -366,4 +506,6 @@ async function finish(parsed, spec) {
   return 0;
 }
 
-module.exports = { finish, usageFor, FLAGS, resolveMppsUid, resolvePerformedSeries };
+module.exports = {
+  finish, usageFor, FLAGS, resolveMppsUid, resolvePerformedSeries, scopeToOneStudy,
+};

@@ -62,6 +62,23 @@ const EXACT = new Map([
     hint: 'Often benign on a re-send. If it appears on a first send, the source may be emitting colliding UIDs.',
   }],
   [0x0112, { label: 'No such object instance', plain: 'The referenced SOP Instance does not exist on the peer.' }],
+  // The two an MPPS client is most likely to meet. Without entries here they
+  // rendered as "Unrecognised failure", which buries the peer's Error Comment —
+  // and on these two codes that comment is usually the whole explanation.
+  [0x0106, {
+    label: 'Invalid attribute value',
+    plain: 'The peer rejected the value of an attribute in this message.',
+    hint: 'On an MPPS N-SET this is often the status itself: some receivers wrongly refuse an interim "IN PROGRESS" update, and some refuse any change once the step is COMPLETED or DISCONTINUED. The Error Comment from the peer names the attribute when it sends one.',
+  }],
+  [0x0120, {
+    label: 'Missing attribute',
+    plain: 'The peer required an attribute this message did not carry.',
+    hint: 'A Type 1 attribute is absent or empty. On an MPPS N-CREATE the usual causes are ScheduledStepAttributesSequence, PerformedProcedureStepID or PerformedStationAETitle. The Error Comment names it when the peer sends one.',
+  }],
+  [0x0121, {
+    label: 'Missing attribute value',
+    plain: 'An attribute the peer requires was present but empty.',
+  }],
   [0x0117, {
     label: 'Invalid SOP Instance UID',
     plain: 'The receiver rejected the SOP Instance UID as malformed.',

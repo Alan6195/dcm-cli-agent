@@ -32,6 +32,44 @@ const EXTRA_MWL_KEYS =
   'RequestedProcedureID, PatientBirthDate, PatientSex';
 
 /**
+ * What `raw` changes about a query result, said once for both query tools.
+ *
+ * Spelled here rather than twice because the two tools differ in what they do
+ * with the answer and not in what raw means, and two copies of a paragraph this
+ * detailed drift apart on the first edit.
+ */
+const RAW_DESCRIPTION =
+  'Return values exactly as they came off the wire instead of rendered for reading (`dcm find --json-raw`). ' +
+  'A DICOM parser normally repairs as it reads — PatientWeight sent as "12.5 kg" arrives as the number 12.5 with the unit silently gone — and that repair is correct when consuming a study and wrong when TESTING the peer that sent it, because the violation disappears before anyone can see it. Raw re-reads the received octets and never turns a value into a number. ' +
+  'Each match also carries "_elements", a sidecar keyed by tag holding vr, length (the Value Length field including any pad octet, so an odd length is visible), keyword, vm and the value text; a sequence carries "items", and "vrSource": "dictionary" means the peer sent no VR and ours came from the data dictionary. ' +
+  'Two shape changes to expect: a Decimal or Integer String is now text rather than a number, and a Person Name is an object like [{"Alphabetic": "DOE^JANE"}] rather than a string — so a raw PatientName must NOT be copied straight into an MPPS patientName parameter. Leave this off unless the octets are the thing under test.';
+
+/**
+ * The VR conformance gate, said once for both query tools.
+ */
+const CHECK_VR_DESCRIPTION =
+  'Audit the elements the peer returned for VR conformance violations and report every one (`dcm find --check-vr`): values over the VR maximum (LO 64, SH 16, PN 64 per component group, AE 16, CS 16, DS 16, IS 12, UI 64), lowercase or non-enumerated Code Strings, Decimal and Integer Strings carrying non-numeric characters, odd-length value fields, and a backslash creating a second value against an attribute defined as VM 1. ' +
+  'Findings land in vrViolations, with vrElementsExamined beside them so "no violations" can be told apart from "nothing was examined"; a match whose octets could not be re-read is listed in vrUnreadable and is never counted as clean. ' +
+  'This is an audit of the PEER, not of this tool: a violation here is a finding about what the peer emitted. Off by default, because turning every lookup into a conformance audit buries the answer to the question actually asked.';
+
+/**
+ * The injection parameter, said once for both query tools.
+ *
+ * Deliberately not called `set`: dcm_edit already has a `set` that writes
+ * ordinary values into files, and an assistant carrying that habit across
+ * would reach for this one to "fix" a query. The name has to be unreachable by
+ * accident, because the whole purpose of the parameter is to send something
+ * wrong on purpose.
+ */
+const INJECT_DESCRIPTION =
+  'A CONFORMANCE TEST INSTRUMENT: stamp values into the outgoing C-FIND identifier VERBATIM, with no client-side checking of any kind — not the length, not the VR\'s character repertoire, not an enumeration (`dcm find --set`). Given as {"PatientSex": "male", "(0010,1030)": "12.5 kg"}. ' +
+  'IT EXISTS TO SEND SOMETHING WRONG ON PURPOSE AND SEE WHAT THE PEER DOES WITH IT. It is never the way to make a query work: if a query is being refused or returning nothing, that is a real answer about the peer or about the matching keys, and stamping a value past the refusal replaces a finding with a guess. A response that looks wrong after an injection is very likely the peer answering exactly what it was asked. ' +
+  'Applied last, so it overwrites a default return key or a matching key naming the same attribute, and NOT routed into the Scheduled Procedure Step Sequence the way an ordinary worklist key is — name the path if that is where it belongs, e.g. {"ScheduledProcedureStepSequence/Modality": "ct"}. An unknown or private tag is refused rather than injected, because the encoder would drop it without saying so. ' +
+  'This only ever builds a QUERY. It reads; it changes nothing on the peer and writes no file. ' +
+  'The identifier is encoded and read back before the association is opened, and the query is REFUSED if any injected value did not survive byte for byte — the dataset writer silently shortens an over-long value, so an over-long AE Title would otherwise leave as a perfectly legal 16-character one and a test written to prove the peer rejects it would pass without ever having asked. Over-long AE, CS, DS, IS and UI values are refused for that reason; LO and PN carry at any length, and lowercase, non-enumerated, non-numeric and backslash-bearing values all go out as typed. ' +
+  'Every injection is named in the result, in "injected", so there is no way to run an injected query and get an answer that does not say so.';
+
+/**
  * How a dcm_worklist row becomes a dcm_mpps_perform call.
  *
  * The CLI hands a worklist item to MPPS through a file: `dcm find --mwl
@@ -169,36 +207,164 @@ function register(server, z, rt) {
     async (a) => textResult(await runCommand('echo', peerArgv(a)))
   );
 
+  /**
+   * The three fidelity/injection parameters both query tools take.
+   *
+   * @returns {Record<string, object>}
+   */
+  const inspectionSchema = () => ({
+    raw: z.boolean().optional().describe(RAW_DESCRIPTION),
+    checkVr: z.boolean().optional().describe(CHECK_VR_DESCRIPTION),
+    injectVerbatim: z.record(z.string(), z.string()).optional().describe(INJECT_DESCRIPTION),
+  });
+
+  /**
+   * Pushes the fidelity/injection half of a find argument vector, and returns
+   * the output flag the caller has to append last.
+   *
+   * `--json` and `--json-raw` are two different shapes and the command refuses
+   * both at once, so exactly one is chosen here rather than in each tool.
+   *
+   * @param {string[]} argv  Argument vector being built, mutated in place.
+   * @param {object} a  Tool arguments.
+   * @returns {string} The output flag to push after the matching keys.
+   */
+  const inspectionArgv = (argv, a) => {
+    if (a.checkVr) argv.push('--check-vr');
+    // Attached form is not available: `set` is pair-valued in the tokenizer, so
+    // the next token is taken as its value even though it looks like a
+    // matching key. Two tokens is therefore both correct and repeatable.
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+    return a.raw ? '--json-raw' : '--json';
+  };
+
+  /**
+   * Note text for the conformance and injection halves of a query result.
+   *
+   * Both are recorded in the JSON document by the command itself; this says
+   * what they MEAN, which is the part that decides whether an assistant reports
+   * a bug in the peer or a bug in its own query.
+   *
+   * @param {object} p  The parsed document.
+   * @returns {string[]}
+   */
+  function inspectionNotes(p) {
+    const notes = [];
+
+    if (Array.isArray(p.vrViolations)) {
+      notes.push(
+        p.vrViolations.length === 0
+          ? `VR conformance: no violations over ${p.vrElementsExamined} element(s) returned. ` +
+            'That is a statement about what came back on this query and about nothing else — ' +
+            'other queries against the same peer can still return malformed values.'
+          : `VR conformance: ${p.vrViolations.length} violation(s) over ` +
+            `${p.vrElementsExamined} element(s) returned. These are findings about what the ` +
+            'PEER emitted, not about this query. The command exits non-zero on any violation ' +
+            'so it can be used as a CI gate.'
+      );
+      if (p.vrUnreadable && p.vrUnreadable.length) {
+        notes.push(
+          `${p.vrUnreadable.length} match(es) could not be re-read at the octet level, so no ` +
+            'conformance statement is possible for them. They are NOT counted as clean.'
+        );
+      }
+    }
+
+    if (Array.isArray(p.injected) && p.injected.length) {
+      notes.push(
+        'INJECTED, VERBATIM AND UNCHECKED: ' +
+          p.injected.map((i) => `${i.attribute} ${i.tag} = ${JSON.stringify(i.value)}`).join(', ') +
+          '. Nothing about these values was validated before they went on the wire. Whatever ' +
+          'came back may be the peer answering exactly what it was asked, so read an odd ' +
+          'answer as a finding about the peer only after ruling that out.'
+      );
+    }
+
+    if (p.raw) {
+      notes.push(
+        'Values are raw: a Decimal or Integer String is the text that arrived rather than a ' +
+          'number, and a Person Name is [{"Alphabetic": "..."}] rather than a string. Do not ' +
+          'copy a raw PatientName into an MPPS patientName parameter — read .Alphabetic first.'
+      );
+    }
+
+    return notes;
+  }
+
   // ---- Query -------------------------------------------------------------
   server.registerTool(
     'dcm_query',
     {
       title: 'DICOM C-FIND',
       description:
-        'Query a peer for stored studies, series or instances (C-FIND). Note: a peer can accept images and still return zero matches — storing and indexing are separate operations, so zero matches is not proof a transfer failed. For Modality Worklist (what is scheduled, not what is stored) use dcm_worklist instead: the matching keys are a different vocabulary and level "mwl" here gives you no help with them.',
+        'Query a peer for stored studies, series or instances (C-FIND). Note: a peer can accept images and still return zero matches — storing and indexing are separate operations, so zero matches is not proof a transfer failed. For Modality Worklist (what is scheduled, not what is stored) use dcm_worklist instead: the matching keys are a different vocabulary and level "mwl" here gives you no help with them. ' +
+        'For testing the peer rather than consuming its data: raw returns values as the octets carried them instead of repaired for reading, checkVr audits what came back for VR conformance violations, and injectVerbatim sends a deliberately non-conformant identifier to see how the peer handles it.',
       inputSchema: {
         ...peerSchema(),
         level: z.enum(['study', 'series', 'image', 'mwl']).optional().describe('Query level (default study). "series" requires StudyInstanceUID; "image" requires StudyInstanceUID and SeriesInstanceUID. "mwl" works but prefer dcm_worklist.'),
         keys: z.record(z.string(), z.string()).optional().describe('Matching keys as DICOM keyword→value, e.g. {"PatientID":"12345"}. Values take * and ? wildcards and hyphenated date ranges. An empty value requests the key without matching on it.'),
         limit: z.number().int().optional().describe('Stop after this many matches.'),
+        ...inspectionSchema(),
       },
     },
     async (a) => {
       const argv = peerArgv(a);
       if (a.level && a.level !== 'study') argv.push(`--${a.level}`);
       opt(argv, '--limit', a.limit);
+      const output = inspectionArgv(argv, a);
       for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
-      argv.push('--json');
-      return jsonResult(await runCommand('find', argv));
+      argv.push(output);
+      return queryResult(await runCommand('find', argv));
     }
   );
+
+  /**
+   * Presents a `dcm find` result for dcm_query.
+   *
+   * jsonResult drops the document on a non-zero exit, which is wrong for both
+   * of the ways this command exits non-zero having answered: zero matches, and
+   * a VR violation. The numbers ARE the answer in either case, so
+   * the document always survives; the exit code still decides isError, because
+   * "did my study arrive" wants a failing result when it did not and a
+   * conformance gate wants one when the peer misbehaved.
+   *
+   * @param {{code:number, out:string, err:string}} result  From runCommand.
+   * @returns {object}  MCP tool result.
+   */
+  function queryResult(result) {
+    let parsed;
+    try {
+      parsed = JSON.parse(result.out);
+    } catch {
+      return jsonResult(result);
+    }
+    if (!parsed || typeof parsed.count !== 'number') return jsonResult(result);
+
+    const notes = inspectionNotes(parsed);
+    if (parsed.count === 0) {
+      notes.push(
+        'Zero matches. A peer can accept instances via C-STORE and still return nothing ' +
+          'here — storing and indexing are separate operations — so this is not by itself ' +
+          'proof that a transfer failed.'
+      );
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(parsed, null, 2) + (notes.length ? `\n\n${notes.join('\n\n')}` : ''),
+      }],
+      structuredContent: parsed,
+      isError: result.code !== 0,
+    };
+  }
 
   server.registerTool(
     'dcm_worklist',
     {
       title: 'Modality Worklist (C-FIND MWL)',
       description:
-        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all. Each row carries the keys the MPPS tools need — StudyInstanceUID above all — and structuredContent.mppsHandoff names which parameter of dcm_mpps_perform each one goes to, so going from a scheduled row to a performed step needs no guessing.',
+        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all. Each row carries the keys the MPPS tools need — StudyInstanceUID above all — and structuredContent.mppsHandoff names which parameter of dcm_mpps_perform each one goes to, so going from a scheduled row to a performed step needs no guessing. When the worklist SCP is the thing UNDER TEST rather than the thing being consumed, checkVr audits what it returned for VR conformance violations and fails on any, raw returns the values as the octets carried them, and injectVerbatim sends a deliberately non-conformant identifier to see how it copes.',
       inputSchema: {
         ...peerSchema(),
         modality: z.string().optional().describe('Modality the procedure is scheduled on, e.g. CT, MR, CR, US.'),
@@ -209,6 +375,7 @@ function register(server, z, rt) {
         accessionNumber: z.string().optional(),
         keys: z.record(z.string(), z.string()).optional().describe(`Any other matching key as DICOM keyword→value, for what the named parameters do not cover: ${EXTRA_MWL_KEYS}. A named parameter wins if it sets the same key.`),
         limit: z.number().int().optional().describe('Stop after this many scheduled procedures.'),
+        ...inspectionSchema(),
       },
     },
     async (a) => {
@@ -248,8 +415,9 @@ function register(server, z, rt) {
       const argv = peerArgv(a);
       argv.push('--mwl');
       opt(argv, '--limit', a.limit);
+      const output = inspectionArgv(argv, a);
       for (const [k, v] of pairs) argv.push(`${k}=${v}`);
-      argv.push('--json');
+      argv.push(output);
 
       return worklistResult(await runCommand('find', argv));
     }
@@ -266,6 +434,11 @@ function register(server, z, rt) {
    * a success whatever the exit code, and only a query that failed to produce
    * one falls through to the ordinary JSON handling.
    *
+   * A VR violation is the exception to that leniency. checkVr is asked for
+   * precisely so a malformed answer fails, and reporting a run that found
+   * violations as a plain success would turn the one parameter meant to be a
+   * gate into a parameter that reports and shrugs.
+   *
    * @param {{code:number, out:string, err:string}} result  From runCommand.
    * @returns {object}  MCP tool result.
    */
@@ -278,26 +451,29 @@ function register(server, z, rt) {
     }
     if (!parsed || typeof parsed.count !== 'number') return jsonResult(result);
 
-    const note = parsed.count === 0
-      ? '\n\nNo scheduled procedures matched. That is a legitimate answer — nothing may be ' +
+    const notes = inspectionNotes(parsed);
+    notes.push(parsed.count === 0
+      ? 'No scheduled procedures matched. That is a legitimate answer — nothing may be ' +
         'booked for this date, station or modality. Re-run with scheduledDate "any" and no ' +
         'other filters before concluding the worklist SCP is at fault.'
-      : '\n\nTo report what was performed against one of these rows, pass its keys to ' +
+      : 'To report what was performed against one of these rows, pass its keys to ' +
         'dcm_mpps_perform as named parameters: StudyInstanceUID as studyUid, ' +
         'AccessionNumber as accessionNumber, ScheduledProcedureStepID as scheduledStepId, ' +
         'Modality as modality, and the patient keys likewise. The full mapping is in ' +
         'structuredContent.mppsHandoff. Do not write these rows to a file and pass them as ' +
         'fromWorklist: this JSON is rendered for reading, and the MPPS commands refuse it ' +
-        'by name.';
+        'by name.');
 
     // Additive: `count` and `matches` keep the shape every existing consumer
     // reads. The handoff table rides along so the mapping is machine-readable
     // and not only prose in the note above.
     const structured = parsed.count === 0 ? parsed : { ...parsed, mppsHandoff: MPPS_HANDOFF };
 
+    const violations = Array.isArray(parsed.vrViolations) ? parsed.vrViolations.length : 0;
     return {
-      content: [{ type: 'text', text: JSON.stringify(structured, null, 2) + note }],
+      content: [{ type: 'text', text: JSON.stringify(structured, null, 2) + `\n\n${notes.join('\n\n')}` }],
       structuredContent: structured,
+      isError: violations > 0,
     };
   }
 
@@ -471,7 +647,8 @@ function register(server, z, rt) {
    */
   const stepSchema = () => ({
     studyUid: z.string().optional().describe(
-      'Study Instance UID — StudyInstanceUID from the dcm_worklist row. Type 1 inside ScheduledStepAttributesSequence, and THE correlation key: the RIS ties the step to the order and to the images on this and little else. dcm_mpps_perform takes it from the folder when the folder holds exactly one study and this is not given. When it is given and the folder disagrees, the call is refused by default and the refusal names the two ways forward — adoptWorklistIdentity, which stamps this UID onto a copy of the images the way a modality does, and allowStudyMismatch, which sends them as they are and accepts that nothing will reconcile. Neither is chosen for you.'),
+      'Study Instance UID — StudyInstanceUID from the dcm_worklist row. Type 1 inside ScheduledStepAttributesSequence, and THE correlation key: the RIS ties the step to the order and to the images on this and little else. dcm_mpps_perform takes it from the folder when the folder holds exactly one study and this is not given. When it is given and the folder disagrees, the call is refused by default and the refusal names the two ways forward — adoptWorklistIdentity, which stamps this UID onto a copy of the images the way a modality does, and allowStudyMismatch, which sends them as they are and accepts that nothing will reconcile. Neither is chosen for you. ' +
+      'When NO order lies behind the work at all, this is not the parameter to leave blank — a present-but-empty Type 1 is the shape SCPs accept and then never reconcile. Use unscheduled, which emits the zero-length scheduled step PS3.3 defines for exactly that. On dcm_mpps_start, studyUids carries several when one step fulfils several scheduled steps.'),
     accessionNumber: z.string().optional().describe('AccessionNumber from the worklist row. The second correlation key an SCP tries.'),
     scheduledStepId: z.string().optional().describe('ScheduledProcedureStepID from the worklist row. The third correlation key, and what stepId defaults to.'),
     modality: z.string().optional().describe('Modality of the performed step, e.g. CT. Type 1. dcm_mpps_perform reads it from the folder when the folder holds exactly one modality, and refuses to guess when it holds several.'),
@@ -488,7 +665,7 @@ function register(server, z, rt) {
     requestedProcedureDescription: z.string().optional(),
     startDate: z.string().optional().describe('YYYYMMDD the step started. Default: today, local time on this machine.'),
     startTime: z.string().optional().describe('HHMMSS the step started. Default: now, local time on this machine.'),
-    mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. Either way the UID is returned, and it remains the only handle on the step: nothing here writes it down and MPPS has no query service, so keep it if the step will be closed by a later call.'),
+    mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. Either way the UID is returned, and it remains the only handle on the step: nothing here writes it down and MPPS has no query service, so keep it if the step will be updated or closed by a later call.'),
     fromWorklist: z.string().optional().describe(
       'Path to a JSON file of worklist attributes, as written by `dcm find --mwl --json-raw`. It is NOT the output of dcm_worklist or `dcm find --mwl --json`: that form is rendered for people to read, which turns sequences into strings, and it is refused by name rather than sent malformed. Over MCP prefer the named parameters above — they carry the same values with no file involved. Named parameters win over anything in the file.'),
   });
@@ -522,8 +699,23 @@ function register(server, z, rt) {
     opt(argv, '--start-date', a.startDate);
     opt(argv, '--start-time', a.startTime);
     opt(argv, '--mpps-uid', a.mppsUid);
+    // Accepted by start and perform alike, and refused by both alongside
+    // studyUid or fromWorklist — those say an order exists, this says none
+    // does, and resolving that here would be picking one on the caller's
+    // behalf. Described separately on each tool, because what it does to the
+    // C-STORE differs between them.
+    if (a.unscheduled) argv.push('--unscheduled');
     return argv;
   };
+
+  /**
+   * What --unscheduled means, for the half of the description both tools share.
+   */
+  const UNSCHEDULED_SHAPE =
+    'Report work that NO ORDER LIES BEHIND — a walk-in, an ER exam, a repeat nobody booked. ' +
+    'On the wire this is not an omitted or blanked-out scheduled step: ScheduledStepAttributesSequence is PRESENT and holds exactly ONE ZERO-LENGTH item, which is how PS3.3 C.4.14 represents "there was no order". All three of the obvious alternatives are wrong and each is wrong differently — omitting the sequence fails a Type 1 check, an empty studyUid is the present-but-blank Type 1 that SCPs accept and then never reconcile, and an item carrying seven blank attributes is not a zero-length item. ' +
+    'Inside a POPULATED item StudyInstanceUID stays Type 1 and is still checked; the exemption covers the zero-length shape and nothing else. ' +
+    'Refused together with studyUid or fromWorklist, which say the opposite. Nothing reconciles an unscheduled step against an order, because there is no order: the receiving system has only PerformedProcedureStepID and the station AE to file it under, and what it does with it is not visible from here.';
 
   /**
    * The sentences an MPPS result has to end with, assembled from the fields the
@@ -612,11 +804,92 @@ function register(server, z, rt) {
       );
     }
 
+    // The interim N-SET. `statusSent` is emitted by that verb and by no other,
+    // on both the dry-run and the live path.
+    //
+    // These two sentences are the whole reason the verb has two shapes, and the
+    // command says them on stdout where a person reads them and nowhere an
+    // assistant does: under --json only the document survives into a tool
+    // result. Without them "the sequence was not sent" and "the sequence was
+    // sent empty" look like the same answer, and they are opposites.
+    if (p.statusSent !== undefined) {
+      notes.push(
+        p.statusSent
+          ? 'The update carried PerformedProcedureStepStatus IN PROGRESS, re-asserting that the ' +
+            'step is running. That is the shape a watchdog on the far end reads as a sign of life.'
+          : 'The update carried NO PerformedProcedureStepStatus — the attribute is absent from ' +
+            'the dataset, not empty — so the receiver keeps whatever status it holds. The step ' +
+            'is still open either way; no end date or time was sent.'
+      );
+
+      if (p.performedSeriesSent && p.seriesCount === 0) {
+        notes.push(
+          'PerformedSeriesSequence WAS SENT AND IS EMPTY. N-SET replaces rather than appends, ' +
+            'so this ERASED whatever performed series the step held. Omit seriesFrom to leave ' +
+            'them alone.'
+        );
+      } else if (p.performedSeriesSent) {
+        notes.push(
+          `PerformedSeriesSequence carried ${p.seriesCount} series and REPLACED the one the step ` +
+            'held — N-SET does not append. The next update has to carry these again alongside ' +
+            'anything new, or they are lost. Point seriesFrom at the growing folder each time ' +
+            'and it stays cumulative for you.'
+        );
+      } else {
+        notes.push(
+          'PerformedSeriesSequence was NOT SENT, so whatever the step already held is untouched. ' +
+            'An absent sequence is not an empty one and must not be read as erasing anything — ' +
+            'that is the point of leaving seriesFrom off.'
+        );
+      }
+
+      if (!p.ok) {
+        notes.push(
+          'The step is whatever the SCP held before this ran, which this end cannot see. An ' +
+            'interim update is the message a receiver is least likely to have been tested ' +
+            'against, so a refusal here — on a step a closing N-SET would take cleanly — is a ' +
+            'finding about the peer rather than about this call. If the refusal was 0x0106 on ' +
+            'the status, retry with omitStatus true: some receivers accept only the ' +
+            'status-absent shape, and knowing which one a peer takes is itself the result.'
+        );
+      }
+    }
+
+    if (p.interimUpdates) {
+      const { attempted, accepted, failures } = p.interimUpdates;
+      notes.push(
+        `Interim updates at chunk boundaries: ${accepted} of ${attempted} accepted.` +
+          (failures && failures.length
+            ? ` Refused: ${failures.join('; ')}. A refused progress report does NOT stop the ` +
+              'transfer and does not affect the numbers above — the images are the work, the ' +
+              'update is a report about it, and the closing N-SET still carried the full ' +
+              'sequence. These refusals are findings about the peer.'
+            : '')
+      );
+    }
+
     if (p.assertedFromDisk) {
       notes.push(
         'The performed series above were built by scanning a local folder. Nothing here ' +
           'confirms the archive holds those instances — they were not sent by this call and ' +
           'nobody acknowledged them. The MPPS now asserts they exist.'
+      );
+    }
+
+    if (p.unscheduled) {
+      notes.push(
+        'This step is UNSCHEDULED: ScheduledStepAttributesSequence is one zero-length item and ' +
+          'the step names no study, so nothing will reconcile it against an order — there is no ' +
+          'order.' +
+          // Two names for one value: the live document calls the folder's study
+          // imagesStudyInstanceUid, the dry-run document calls it
+          // studyInstanceUid. Read both rather than say nothing on a dry run,
+          // which is the one place this divergence is most worth explaining.
+          ((p.imagesStudyInstanceUid || p.studyInstanceUid)
+            ? ` The images ${p.dryRun ? 'would be' : 'were'} filed under ${p.imagesStudyInstanceUid || p.studyInstanceUid}, which is the folder's own ` +
+              'Study Instance UID and is what the archive and any later query use. The step and ' +
+              'the images diverge here on purpose.'
+            : '')
       );
     }
 
@@ -684,7 +957,8 @@ function register(server, z, rt) {
         'PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing, because naming a SOP Instance UID the archive does not hold is a fabricated clinical record that everything downstream believes. Instances stored with a warning status are referenced (the archive holds them) but do not count as acknowledged, so a run with warnings still ends DISCONTINUED. ' +
         'What this tool reports is what the MPPS SCP answered. It cannot see the worklist: if the item stops appearing in dcm_worklist afterwards, that is the SCP correlating the step to the order, not proof that this call changed anything. ' +
         'WHEN THE IMAGES DO NOT CARRY THE WORKLIST\'S STUDY INSTANCE UID this is refused by default, because the step would name one study and the images would belong to another and the archive would never reconcile them. That is the normal state of affairs when rehearsing a worklist against stock or phantom images, and adoptWorklistIdentity is the answer to it: it stamps the worklist\'s identity onto a COPY of the images, which is exactly what a real modality does with a UID the RIS invented before the patient was on the table. allowStudyMismatch is the other way past the refusal and means something quite different — send them as they are and accept that nothing reconciles. Neither is implied by any other parameter. ' +
-        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting, including the re-stamp that would be applied.',
+        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting, including the re-stamp that would be applied. ' +
+        'Two paths worth knowing about: updateEachChunk sends an interim N-SET at each chunk boundary carrying only what the archive has acknowledged so far, and unscheduled reports work no order lies behind, where the step names no study but the C-STORE still uses the folder\'s own.',
       inputSchema: {
         folder: z.string().describe('Folder of DICOM files that were produced. Must hold exactly one study: a performed procedure step describes one study, and Study Instance UID is what the RIS reconciles on. adoptWorklistIdentity does not relax this — stamping one identity onto two studies would merge them into a study that never existed, so a folder holding several is refused and has to be split.'),
         ...peerSchema(),
@@ -705,6 +979,14 @@ function register(server, z, rt) {
         allowStudyMismatch: z.boolean().optional().describe(
           'Open the step against the worklist\'s study and send the images unchanged, under the different study they carry. THE ARCHIVE WILL VERY LIKELY NEVER RECONCILE THE STEP WITH THE IMAGES: an archive files images by the Study Instance UID inside them and a RIS reconciles the step by the one in the step, so the step sits open against a study that has no images while the images land under a study that has no step, and no later action joins them up. ' +
           'This is the explicit "I know what I am doing" path. It exists because it is also the only one that sends the ORIGINAL BYTES, private tags and all, which re-stamping cannot. It is not implied by any other parameter, and it cannot be combined with adoptWorklistIdentity, which asks for the opposite. If the goal is a rehearsal that behaves like the real thing, adoptWorklistIdentity is the one you want.'),
+        unscheduled: z.boolean().optional().describe(
+          `${UNSCHEDULED_SHAPE} ` +
+          'HERE THE C-STORE STILL USES THE FOLDER\'S OWN STUDY INSTANCE UID. The images keep the study they carry and are sent under it, because that is what the archive files them by and what a later query finds them under; only the STEP names no study. So the two identities diverge on purpose, and the result prints both — imagesStudyInstanceUid is the folder\'s, stepStudyInstanceUid is null. A run where they differ silently is exactly the run nobody can debug afterwards, which is why it is said in the result rather than only here. ' +
+          'The folder must still hold exactly one study; unscheduled does not relax that.'),
+        updateEachChunk: z.boolean().optional().describe(
+          'Send an interim N-SET at every chunk boundary except the last, carrying PerformedProcedureStepStatus IN PROGRESS and the performed series built from what the archive has ACKNOWLEDGED SO FAR — never from what is still queued and never from a folder listing, so the same honesty rule as the closing N-SET, applied earlier. Default off. ' +
+          'What it is for: a transfer of 412 instances at chunk 200 spans three associations and by default sends no MPPS traffic between them, so a receiver watching for signs of life sees nothing for the whole transfer. This is how you exercise that path. Not sent after the last chunk, because the closing N-SET follows immediately with the same sequence. ' +
+          'A REFUSED INTERIM UPDATE DOES NOT STOP THE TRANSFER and does not change whether the step ends COMPLETED: the images are the work, an update is a progress report about it. Refusals are counted and named in interimUpdates. A peer that refuses the status-bearing shape with 0x0106 is a finding about that peer: the message is conformant, and dcm_receiver_start accepts it.'),
         endDate: z.string().optional().describe('YYYYMMDD the step ended. Default: now, local time.'),
         endTime: z.string().optional().describe('HHMMSS the step ended. Default: now, local time.'),
         dryRun: z.boolean().optional().describe('Scan the folder and return the N-CREATE that would be sent, along with the re-stamp that would be applied and any study-UID mismatch. Opens no connection, creates no step, sends no images and writes no copy.'),
@@ -731,6 +1013,7 @@ function register(server, z, rt) {
       opt(argv, '--staging', a.staging);
       if (a.keepStaging) argv.push('--keep-staging');
       if (a.allowStudyMismatch) argv.push('--allow-study-mismatch');
+      if (a.updateEachChunk) argv.push('--update-each-chunk');
 
       opt(argv, '--end-date', a.endDate);
       opt(argv, '--end-time', a.endTime);
@@ -750,17 +1033,76 @@ function register(server, z, rt) {
         'Tell an MPPS SCP that work has begun on a scheduled study: N-CREATE with status IN PROGRESS. Returns the MPPS SOP Instance UID it generated in mppsSopInstanceUid, which is the ONLY handle on the step. KEEP IT: nothing here writes it down — this tool holds no records of any kind — and MPPS has no query service, so a UID that is lost cannot be recovered from this tool or from the SCP, and the step can then never be closed. ' +
         'Use this only when the images are sent by something else, or when the step has to stay open while other work happens; dcm_mpps_perform does start, store and close as one transaction and is the usual choice. ' +
         'Every Type 1 attribute is checked here before anything goes on the wire, and a missing one is refused by name. That is not belt and braces: many SCPs accept an N-CREATE carrying an empty Type 1, answer success, and then never reconcile the step against the order, so from this end it looks like it worked and days later the order is still open. ' +
+        'A step opened here can be refreshed while it runs with dcm_mpps_update (an interim N-SET, which leaves it open) and must eventually be closed with dcm_mpps_complete or dcm_mpps_discontinue. Two shapes are reachable from here that a scheduled study does not need: unscheduled, for work no order lies behind, and studyUids, for one step that fulfils several scheduled steps. ' +
         'Opening a step says nothing about the worklist entry — whether the SCP moves the scheduled step to ARRIVED or STARTED is its business and is not visible from here.',
       inputSchema: {
         ...peerSchema(),
         ...stepSchema(),
+        unscheduled: z.boolean().optional().describe(
+          `${UNSCHEDULED_SHAPE} ` +
+          'Nothing is sent by this tool, so there is no second identity to diverge from: the step simply names no study. If images follow later from dcm_send, they keep their own Study Instance UID and the archive files them under it.'),
+        studyUids: z.array(z.string()).optional().describe(
+          'Several Study Instance UIDs, when ONE performed step fulfils SEVERAL scheduled steps — a chest and an abdomen booked separately and acquired in one pass. PS3.3 represents that as several items in ScheduledStepAttributesSequence, and this emits one populated item per UID, in the order given (studyUid, if also set, is the first). ' +
+          'ONLY THE FIRST ITEM carries accessionNumber, scheduledStepId and the requested-procedure attributes: there is one of each here, and copying an accession onto every item would assert that different orders share it. The rest are emitted as the empty Type 2 attributes they are. ' +
+          'Cannot be combined with fromWorklist, where studyUid is the selector that narrows the file to one item, nor with unscheduled. dcm_mpps_perform refuses several UIDs entirely — it sends one folder, and one folder is one study — so a grouped step is opened here, sent with dcm_send, and closed with dcm_mpps_complete.'),
         dryRun: z.boolean().optional().describe('Build and return the N-CREATE dataset without connecting.'),
       },
     },
     async (a) => {
       const argv = ['start', ...peerArgv(a), ...stepArgv(a)];
+      // After stepArgv, so an explicit studyUid stays item 1 and the order here
+      // is the order the sequence comes out in. The CLI accumulates repeated
+      // --study-uid into one item each; nothing needs deduplicating, because
+      // two identical UIDs would be two identical orders and the operator is
+      // the one who can say whether that was meant.
+      for (const uid of a.studyUids || []) opt(argv, '--study-uid', uid);
       if (a.dryRun) argv.push('--dry-run');
       argv.push('--json');
+      return mppsResult(await runCommand('mpps', argv));
+    }
+  );
+
+  server.registerTool(
+    'dcm_mpps_update',
+    {
+      title: 'Report progress on a running step (interim MPPS N-SET)',
+      description:
+        'Refresh a procedure step that is still running WITHOUT closing it: an interim N-SET. This is what a modality sends part-way through a long acquisition — the series performed so far, and a step that is still IN PROGRESS. No end date and no end time are sent, because the step has not ended. Use dcm_mpps_complete or dcm_mpps_discontinue to close it; this verb cannot, and re-sending an interim update against an already-closed step is refused by the SCP. ' +
+        'The two things it is for: telling the far end the device is still alive on a step that would otherwise be silent for the whole acquisition, and GROWING PerformedSeriesSequence as more series are acquired. ' +
+        'PERFORMED SERIES REPLACE, THEY DO NOT APPEND. N-SET is attribute-level replacement (PS3.4 F.7.2), so an update naming only the series acquired since the last one does not add them — it ERASES the earlier ones. Every update has to carry the CUMULATIVE sequence, which is what pointing seriesFrom at a growing folder does for you. ' +
+        'OMITTING seriesFrom IS NOT THE SAME AS SENDING AN EMPTY ONE AND MUST NOT BE READ AS ERASING ANYTHING. With seriesFrom left off, PerformedSeriesSequence is absent from the dataset entirely and whatever the step already holds survives untouched — that is the default, and it is what "report progress, do not restate the performed series" means. A seriesFrom folder that scans to nothing is the opposite: a PRESENT, EMPTY sequence, which wipes what the step holds. That case is warned about loudly in the result. ' +
+        'TWO WIRE SHAPES, BOTH LEGAL AND BOTH COMMON, and a receiver that handles one and not the other fails in production rather than in testing — which is why both are reachable here. By default the update carries PerformedProcedureStepStatus IN PROGRESS, re-asserting the step is running. With omitStatus the attribute is ABSENT from the dataset entirely, which tells the receiver "these attributes changed, the step is still running" and leaves its own status alone. ' +
+        'BOTH SHAPES ARE REHEARSABLE against dcm_receiver_start, which accepts the status-bearing update and the status-absent one. Against a real peer, try both: this is exactly the message receivers are least likely to have been tested against, and a 0x0106 on the status-bearing shape is a real finding — PS3.4 F.7.2-1 lists PerformedProcedureStepStatus among the attributes an N-SET may carry, and a receiver that refuses it is why modalities give up mid-exam and leave a worklist entry uncleared. ' +
+        'An update cannot change what the step IS. Patient identity, the scheduled step and its Study Instance UID, PerformedProcedureStepID, the station AE, the start date and time and the modality are all N-CREATE-only; the parameters that would carry them are not offered here, and an end date or time is refused because an end time on a step still reporting IN PROGRESS is a contradiction some receivers resolve by closing the step under you. ' +
+        'As with every verb here, what the SCP then does with the scheduled procedure step is not visible from this end.',
+      inputSchema: {
+        mppsUid: z.string().describe('The MPPS SOP Instance UID returned by dcm_mpps_start or dcm_mpps_perform. Required, and there is no way around it: this tool keeps no records, so there is no directory to pick a step out of, and MPPS has no query service, so the SCP cannot be asked what it is holding either.'),
+        ...peerSchema(),
+        seriesFrom: z.string().optional().describe(
+          'Build the CUMULATIVE PerformedSeriesSequence by scanning this folder. Point it at the folder the acquisition is filling and successive updates carry a growing sequence, which is what the replace-not-append rule requires. ' +
+          'IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record that everything downstream believes. The result says so every time. The honest version is dcm_mpps_perform with updateEachChunk, which sends the images itself and names only what the archive acknowledged at each chunk boundary. ' +
+          'LEAVE IT OFF and PerformedSeriesSequence is not sent at all and the step keeps what it holds. That is the default and it erases nothing.'),
+        retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — the AE the images can be fetched from.'),
+        omitStatus: z.boolean().optional().describe(
+          'Send NO PerformedProcedureStepStatus at all — the attribute is ABSENT from the dataset, which is not the same as present-and-empty. Default false, which sends IN PROGRESS. ' +
+          'Both shapes are legal and receivers branch on them differently, so exercise both. Note that omitStatus with no seriesFrom would be an N-SET carrying nothing whatever, and is refused locally rather than sent: add seriesFrom, or drop omitStatus for the keep-alive shape.'),
+        dryRun: z.boolean().optional().describe('Build and return the interim N-SET dataset without connecting. The clearest way to see the difference between the two shapes before sending either.'),
+        recurse: z.boolean().optional().describe('With seriesFrom, recurse into subfolders (default true).'),
+      },
+    },
+    async (a) => {
+      const argv = ['update'];
+      // Positional, and it must precede the flags the tokenizer reads.
+      if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+      argv.push(...peerArgv(a));
+
+      opt(argv, '--series-from', a.seriesFrom);
+      opt(argv, '--retrieve-ae', a.retrieveAe);
+      if (a.omitStatus) argv.push('--no-status');
+      if (a.dryRun) argv.push('--dry-run');
+      if (a.recurse === false) argv.push('--no-recurse');
+      argv.push('--json');
+
       return mppsResult(await runCommand('mpps', argv));
     }
   );
@@ -774,7 +1116,10 @@ function register(server, z, rt) {
   const finishSchema = () => ({
     mppsUid: z.string().describe('The MPPS SOP Instance UID returned by dcm_mpps_start or dcm_mpps_perform. Required, and there is no way around it: this tool keeps no records, so there is no directory to pick a step out of, and MPPS has no query service, so the SCP cannot be asked what it is holding either.'),
     ...peerSchema(),
-    seriesFrom: z.string().optional().describe('Build PerformedSeriesSequence by scanning this folder. It is the ONLY source this tool has here, and IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record. The result says plainly that the sequence was asserted from disk. Only the process that did the C-STORE knows what the archive actually acknowledged and that is written nowhere, so when the performed series matters use dcm_mpps_perform, which sends the images and closes the step in one go. Omit this and the step is closed naming no images at all.'),
+    seriesFrom: z.string().optional().describe('Build PerformedSeriesSequence by scanning this folder. It is the ONLY source this tool has here, and IT ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS — a local folder can contain instances the archive refused, never received, or rejected as duplicates, and naming one of those in an MPPS is a fabricated record. The result says plainly that the sequence was asserted from disk. Only the process that did the C-STORE knows what the archive actually acknowledged and that is written nowhere, so when the performed series matters use dcm_mpps_perform, which sends the images and closes the step in one go. Omit this and the step is closed naming no images at all. A folder holding more than one study is REFUSED rather than merged — see studyUid.'),
+    studyUid: z.string().optional().describe(
+      'Narrow seriesFrom to this one study, for a folder that holds more than one. A performed procedure step describes a SINGLE study, so a sequence built from two would attribute half the images to the wrong order, and anything downstream that totals ReferencedImageSequence into an expected image count would get a number the step\'s own scheduled attributes contradict — with nothing in the N-SET showing it. So such a folder is refused unless this names which study the step performed. ' +
+      'It SCOPES; it does not re-stamp anything and it does not change what the step names. Refused when the UID is malformed, when the folder does not hold that study (refused rather than closed with an empty sequence), and when given without seriesFrom. With a single-study folder it is unnecessary.'),
     retrieveAe: z.string().optional().describe('Retrieve AE Title recorded against each performed series — the AE the images can be fetched from.'),
     endDate: z.string().optional().describe('YYYYMMDD. Default: today, local time.'),
     endTime: z.string().optional().describe('HHMMSS. Default: now, local time.'),
@@ -796,6 +1141,7 @@ function register(server, z, rt) {
     argv.push(...peerArgv(a));
 
     opt(argv, '--series-from', a.seriesFrom);
+    opt(argv, '--study-uid', a.studyUid);
     opt(argv, '--retrieve-ae', a.retrieveAe);
     opt(argv, '--end-date', a.endDate);
     opt(argv, '--end-time', a.endTime);
@@ -809,7 +1155,7 @@ function register(server, z, rt) {
     {
       title: 'Close a procedure step as COMPLETED (MPPS N-SET)',
       description:
-        'Close a step left open by dcm_mpps_start, or by a dcm_mpps_perform whose closing N-SET failed: N-SET to COMPLETED. ' +
+        'Close a step left open by dcm_mpps_start, refreshed by any number of dcm_mpps_update calls, or left open by a dcm_mpps_perform whose closing N-SET failed: N-SET to COMPLETED. ' +
         'COMPLETED asserts that the work finished and is fully accounted for. The only performed-series source this tool has here is seriesFrom, which scans a folder and therefore asserts what is on your disk rather than what the archive holds — the result labels that plainly. Completing without it is legal DICOM and warns, because it claims the work finished and names no images at all. Only the process that did the C-STORE knows what the archive acknowledged, and that is written nowhere, so when the performed series matters use dcm_mpps_perform instead. ' +
         'The step is named by its UID and by nothing else: no records are kept, so there is no listing to pick it out of. ' +
         'Note that this tool does not re-check the transfer: it sets the status you asked for. dcm_mpps_perform is the verb that refuses to say COMPLETED when instances are unaccounted for, because it is the one that did the sending and knows. ' +
@@ -826,7 +1172,7 @@ function register(server, z, rt) {
     {
       title: 'Close a procedure step as DISCONTINUED (MPPS N-SET)',
       description:
-        'Close a step that did not finish: N-SET to DISCONTINUED. This is the honest ending for an abandoned or partial acquisition, and it is what dcm_mpps_perform sets by itself when the archive did not acknowledge every instance. As with dcm_mpps_complete, the step is named by its UID and by nothing else, and seriesFrom is the only performed-series source — a folder scan, labelled as one. ' +
+        'Close a step that did not finish: N-SET to DISCONTINUED. This is the honest ending for an abandoned or partial acquisition, and it is what dcm_mpps_perform sets by itself when the archive did not acknowledge every instance. It is also the right ending for a step dcm_mpps_update kept alive and nothing ever completed — a step left IN PROGRESS forever is worse for the receiving system than one explicitly discontinued. As with dcm_mpps_complete, the step is named by its UID and by nothing else, and seriesFrom is the only performed-series source — a folder scan, labelled as one. ' +
         'reason is free text: it is recorded in the result and NOT sent. A discontinuation reason is a coded attribute whose CodeValue, CodingSchemeDesignator and CodeMeaning are all Type 1, so carrying free text there means inventing a code value that means nothing to the receiver — the same fabrication as naming instances that do not exist. reasonCode sends a real one. The result says which of the two happened. ' +
         'As with every verb here, what the SCP then does with the scheduled step is not visible from this end.',
       inputSchema: {

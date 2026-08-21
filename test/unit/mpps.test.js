@@ -857,7 +857,7 @@ test('the N-service status codes an MPPS SCP actually returns are translated', (
 test('the dispatcher routes exactly the verbs it offers', () => {
   assert.deepEqual(
     Object.keys(dispatcher.VERBS),
-    ['start', 'complete', 'discontinue', 'perform']
+    ['start', 'update', 'complete', 'discontinue', 'perform']
   );
   for (const load of Object.values(dispatcher.VERBS)) {
     const mod = load();

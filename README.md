@@ -484,9 +484,38 @@ The individual steps exist too, for a workflow that spans processes:
 
 ```bash
 dcm mpps start --from-worklist worklist.json ...        # prints the MPPS UID
+dcm mpps update <mpps-uid> --series-from ./acquired ... # still running
 dcm mpps complete <mpps-uid> --series-from ./acquired ...
 dcm mpps discontinue <mpps-uid> --reason-code 110501^DCM^"Equipment failure" ...
 ```
+
+**Reporting progress without closing the step.** `dcm mpps update` sends an
+interim N-SET: the step stays open, and `--series-from` grows
+`PerformedSeriesSequence` as series complete. It is how a modality says "still
+working", and it is the message receivers are least likely to have been tested
+against — a server that refuses it with `0x0106` makes real devices abandon the
+session, after which the worklist entry never clears.
+
+Both wire shapes are reachable, because receivers handle them differently and
+you want to know which one yours takes:
+
+```bash
+dcm mpps update <uid> ...                  # carries PerformedProcedureStepStatus = IN PROGRESS
+dcm mpps update <uid> --no-status ...      # the status attribute is absent entirely
+```
+
+Leaving `--series-from` off omits `PerformedSeriesSequence` from the message,
+which is not the same as sending an empty one: absent means "nothing to say
+about the series", empty means "there are none". Attributes that are
+N-CREATE-only per PS3.4 F.7.2-1 — patient identity, the scheduled step,
+`PerformedProcedureStepID`, the station AE, start time, modality — are refused
+by name rather than quietly sent.
+
+**Walk-in exams.** `--unscheduled` on `start` and `perform` emits the scheduled
+step sequence as one zero-length item, which is how PS3.3 represents a
+procedure with no prior order. `perform --unscheduled` still takes the study
+UID from the folder for the C-STORE, and says so, because those two identities
+differing is the whole point.
 
 The tool keeps no records of any kind, which is why `perform` is the path worth
 using. Only the process that ran the C-STORE knows which instances the archive
@@ -530,6 +559,33 @@ It enforces the legal status transitions, refuses a duplicate step or a missing
 Type 1 attribute the way a conformant SCP does, and when a step finishes it
 correlates back to the worklist item on Study Instance UID and stops returning
 it — which is what a real RIS does. `--keep-performed` leaves them in.
+
+**Checking what a peer actually emitted.** `--json-raw` carries values exactly
+as received — a `PatientWeight` of `"12.5 kg"` stays that string rather than
+becoming the number `12.5` — with an `_elements` sidecar giving the VR and
+length per tag. `--check-vr` then reports every conformance violation in what
+came back:
+
+```bash
+dcm find --mwl --check-vr --host ris.example.org --port 11112 --called-ae WORKLIST
+```
+
+```
+VR conformance: 4 violations over 13 elements returned.
+  match 0  (0010,0040) PatientSex  CS  "male" is not one of M, F, O
+  match 0  (0010,1030) PatientWeight  DS  "12.5 kg" is not a valid DS value
+  match 0  (0032,1060) RequestedProcedureDescription  LO  72 characters, LO permits 64
+```
+
+It exits 1 when any are found, and emits `vrViolations` under `--json`. This
+exists because a tool that quietly repairs a violation on the way past reports
+a clean pass whether or not the server was right — which is the worst possible
+answer for anyone testing their own coercion.
+
+And `--set <Key>=<Value>` stamps a value into the outgoing C-FIND identifier
+byte for byte, bypassing validation, so you can hand a server something
+deliberately hostile and watch what it does. It announces itself loudly every
+time, for the same reason `--allow-study-mismatch` does.
 
 ### dcm info
 

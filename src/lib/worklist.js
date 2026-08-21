@@ -651,6 +651,20 @@ function transitionRefusal(current, next) {
     return `the step is already ${current} and may no longer be updated`;
   }
   if (next === '') return undefined;
+  if (next === MPPS_IN_PROGRESS) {
+    // An N-SET that keeps the step IN PROGRESS is legal and useful: PS3.4
+    // F.7.2-1 lists PerformedProcedureStepStatus among the attributes an N-SET
+    // may carry, and F.8.2 closes only the terminal states. It is how a
+    // modality says "still working" and grows PerformedSeriesSequence as
+    // series complete.
+    //
+    // Refusing it was a real bug here, and an expensive class of one: a
+    // receiver that answers an interim update with 0x0106 makes devices
+    // abandon the session, after which the worklist entry never clears. The
+    // step reached this line only because it is not terminal, so the rule
+    // above still protects a finished record.
+    return undefined;
+  }
   if (!MPPS_TERMINAL_STATUSES.includes(next)) {
     // Kept short on purpose: this reason travels in Error Comment, which is LO
     // and holds 64 characters, and the client can only act on what it receives.

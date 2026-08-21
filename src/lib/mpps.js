@@ -50,14 +50,24 @@ const Status = Object.freeze({
 /**
  * Legal PerformedProcedureStepStatus transitions (PS3.4 F.7.2).
  *
- * IN PROGRESS is the only non-terminal state. COMPLETED and DISCONTINUED are
- * both final: a conformant SCP refuses an N-SET that tries to move out of one,
- * including re-setting the same value. That refusal is correct behaviour and
- * catching it here turns a confusing 0x0110 from the far end into a sentence
- * that says what happened.
+ * IN PROGRESS is the only non-terminal state, and it has a self-edge: an
+ * interim N-SET re-asserts IN PROGRESS while adding to the step, which is how a
+ * modality reports progress on a long acquisition without closing it. PS3.4
+ * F.7.2-1 marks PerformedProcedureStepStatus as usable on the N-SET, and F.8.2
+ * constrains only the terminal states, so IN PROGRESS -> IN PROGRESS is legal
+ * and receivers that refuse it are the reason devices abandon sessions.
+ *
+ * COMPLETED and DISCONTINUED are both final: a conformant SCP refuses an N-SET
+ * that tries to move out of one, including re-setting the same value. That
+ * refusal is correct behaviour and catching it here turns a confusing 0x0110
+ * from the far end into a sentence that says what happened. Adding the
+ * self-edge above does not touch that — both terminal rows are still empty, so
+ * nothing may leave a terminal state and nothing may re-enter one.
  */
 const LEGAL_TRANSITIONS = Object.freeze({
-  [Status.IN_PROGRESS]: Object.freeze([Status.COMPLETED, Status.DISCONTINUED]),
+  [Status.IN_PROGRESS]: Object.freeze([
+    Status.IN_PROGRESS, Status.COMPLETED, Status.DISCONTINUED,
+  ]),
   [Status.COMPLETED]: Object.freeze([]),
   [Status.DISCONTINUED]: Object.freeze([]),
 });
@@ -97,6 +107,43 @@ const CREATE_TYPE_2 = Object.freeze([
   'PerformedSeriesSequence',
   'ProcedureCodeSequence',
 ]);
+
+/**
+ * Attributes PS3.4 F.7.2-1 permits on the N-CREATE and on nothing else, keyed
+ * by the flag that would carry one into an N-SET.
+ *
+ * The N-SET column of that table is blank for every attribute here: patient
+ * identity, the whole relationship module in ScheduledStepAttributesSequence,
+ * and the four attributes that fix what and where the step is —
+ * PerformedProcedureStepID, PerformedStationAETitle, the start date and time,
+ * and Modality. They describe the step as created; an N-SET reports progress
+ * against it.
+ *
+ * Sending one anyway is worse than useless. Some SCPs answer 0x0105 "No Such
+ * Attribute" and the whole update is lost; others accept it and overwrite the
+ * identity the RIS already reconciled against, which is how a step ends up
+ * pointing at a different study than the images did. Refusing locally, by
+ * name, is the only version of this that is easy to act on.
+ */
+const CREATE_ONLY_ATTRIBUTES = Object.freeze({
+  'patient-id': 'PatientID',
+  'patient-name': 'PatientName',
+  'patient-birth-date': 'PatientBirthDate',
+  'patient-sex': 'PatientSex',
+  'study-uid': 'ScheduledStepAttributesSequence[1].StudyInstanceUID',
+  accession: 'ScheduledStepAttributesSequence[1].AccessionNumber',
+  'requested-procedure-id': 'ScheduledStepAttributesSequence[1].RequestedProcedureID',
+  'requested-procedure-description':
+    'ScheduledStepAttributesSequence[1].RequestedProcedureDescription',
+  'scheduled-step-id': 'ScheduledStepAttributesSequence[1].ScheduledProcedureStepID',
+  'from-worklist': 'ScheduledStepAttributesSequence',
+  unscheduled: 'ScheduledStepAttributesSequence',
+  'step-id': 'PerformedProcedureStepID',
+  'station-ae': 'PerformedStationAETitle',
+  'start-date': 'PerformedProcedureStepStartDate',
+  'start-time': 'PerformedProcedureStepStartTime',
+  modality: 'Modality',
+});
 
 /** Type 2 attributes of one ScheduledStepAttributesSequence item. */
 const SCHEDULED_STEP_TYPE_2 = Object.freeze([
@@ -309,6 +356,50 @@ function buildScheduledStepItem(attrs = {}) {
   return item;
 }
 
+/**
+ * The ScheduledStepAttributesSequence of an unscheduled (walk-in) step.
+ *
+ * PS3.3 C.4.14 is specific about the shape: the sequence is PRESENT and holds
+ * exactly ONE ZERO-LENGTH ITEM. It is not omitted — omitting a Type 1 sequence
+ * is a different message, and an SCP that checks Type 1 refuses it — and the
+ * item is not a populated item with blank values either, because a present
+ * StudyInstanceUID that happens to be empty is precisely the shape SCPs accept
+ * and then never reconcile.
+ *
+ * "One zero-length item" means an item with no elements at all, which is why
+ * this returns a bare object rather than going through
+ * buildScheduledStepItem(): that builder emits the Type 2 attributes, and an
+ * item carrying seven empty attributes is not zero-length.
+ *
+ * A fresh array and item each call, so no caller can mutate a shared one.
+ *
+ * @returns {Array<Record<string, unknown>>}
+ */
+function unscheduledStepSequence() {
+  return [{}];
+}
+
+/**
+ * True for the sequence above: exactly one item, and that item empty.
+ *
+ * Two items that are both empty is not this shape — it is two scheduled steps
+ * whose correlation keys were forgotten — so the length check is not
+ * incidental.
+ *
+ * @param {unknown} steps
+ * @returns {boolean}
+ */
+function isUnscheduledStepSequence(steps) {
+  return (
+    Array.isArray(steps) &&
+    steps.length === 1 &&
+    Boolean(steps[0]) &&
+    typeof steps[0] === 'object' &&
+    !Array.isArray(steps[0]) &&
+    Object.keys(steps[0]).length === 0
+  );
+}
+
 /** Coerces a sequence-shaped input to an array of plain objects. */
 function normaliseSequence(value) {
   if (value === undefined || value === null || value === '') return [];
@@ -316,6 +407,44 @@ function normaliseSequence(value) {
   return arr
     .filter((item) => item && typeof item === 'object')
     .map((item) => stripPrivate(item));
+}
+
+/**
+ * Chooses the ScheduledStepAttributesSequence for an N-CREATE.
+ *
+ * Three shapes, in the order they take precedence:
+ *
+ *   unscheduled            one zero-length item — a walk-in or ER exam that no
+ *                          worklist ever scheduled
+ *   scheduledSteps[]       items supplied whole by the caller
+ *   scheduledStudyUids[]   one populated item per Study Instance UID, for the
+ *                          step that fulfils several scheduled steps at once
+ *
+ * The multi-UID case only carries the scheduled-step Type 2 attributes on the
+ * FIRST item. There is one --accession, one --scheduled-step-id and one
+ * --requested-procedure-id on the command line, and copying them onto every
+ * item would assert that several different orders share one accession number.
+ * The rest are emitted empty, which is what Type 2 means and what is actually
+ * known. Use --from-worklist per step if the descriptors matter.
+ *
+ * @param {object} attrs
+ * @returns {Array<Record<string, unknown>>}
+ */
+function scheduledStepSequence(attrs = {}) {
+  if (attrs.unscheduled) return unscheduledStepSequence();
+
+  if (Array.isArray(attrs.scheduledSteps) && attrs.scheduledSteps.length) {
+    return attrs.scheduledSteps.map((step) => buildScheduledStepItem(step));
+  }
+
+  const uids = Array.isArray(attrs.scheduledStudyUids) ? attrs.scheduledStudyUids : [];
+  if (uids.length > 1) {
+    return uids.map((uid, i) =>
+      buildScheduledStepItem(i === 0 ? { ...attrs, studyInstanceUid: uid } : { studyInstanceUid: uid })
+    );
+  }
+
+  return [buildScheduledStepItem(attrs)];
 }
 
 /**
@@ -332,10 +461,7 @@ function normaliseSequence(value) {
  * @returns {Record<string, unknown>}
  */
 function buildCreateDataset(attrs = {}) {
-  const scheduledSteps =
-    Array.isArray(attrs.scheduledSteps) && attrs.scheduledSteps.length
-      ? attrs.scheduledSteps.map((s) => buildScheduledStepItem(s))
-      : [buildScheduledStepItem(attrs)];
+  const scheduledSteps = scheduledStepSequence(attrs);
 
   const dataset = {
     // Type 1.
@@ -381,8 +507,14 @@ function missingType1(dataset) {
     if (isEmptyValue(dataset?.[key])) missing.push(key);
   }
 
+  // The descent into the sequence is suppressed for the unscheduled shape and
+  // for that shape ONLY. A zero-length item is how PS3.3 says "no order lies
+  // behind this step", so there is no correlation key to demand. Inside a
+  // POPULATED item StudyInstanceUID is still Type 1 — a half-filled item is a
+  // scheduled step whose key was forgotten, which is the failure this check
+  // exists for, and it must not be able to borrow the walk-in exemption.
   const steps = dataset?.ScheduledStepAttributesSequence;
-  if (Array.isArray(steps)) {
+  if (Array.isArray(steps) && !isUnscheduledStepSequence(steps)) {
     steps.forEach((step, i) => {
       if (isEmptyValue(step?.StudyInstanceUID)) {
         missing.push(`ScheduledStepAttributesSequence[${i + 1}].StudyInstanceUID`);
@@ -401,8 +533,10 @@ const TYPE_1_HELP = Object.freeze({
   PerformedProcedureStepStartTime: '--start-time, or leave it to default to now',
   PerformedProcedureStepStatus: 'set internally — report this as a bug',
   Modality: '--modality, or --from-worklist',
-  ScheduledStepAttributesSequence: '--study-uid, or --from-worklist',
-  StudyInstanceUID: '--study-uid, or --from-worklist',
+  ScheduledStepAttributesSequence:
+    '--study-uid, or --from-worklist, or --unscheduled if no order lies behind this step',
+  StudyInstanceUID:
+    '--study-uid, or --from-worklist, or --unscheduled if no order lies behind this step',
 });
 
 /**
@@ -626,6 +760,114 @@ function buildSetDataset(params) {
   }
 
   return dataset;
+}
+
+/**
+ * Builds the dataset of an INTERIM N-SET — one that reports progress and
+ * leaves the step running.
+ *
+ * A separate builder rather than a flag on buildSetDataset(), and the reason is
+ * worth stating. buildSetDataset()'s contract is "this dataset closes the
+ * step", and the two things that make it safe are exactly the two things an
+ * interim update must not do: it refuses a non-terminal status, and it stamps
+ * PerformedProcedureStepEndDate/Time unconditionally. A mode flag would have to
+ * disable both guards, so every reader of every call site would have to trace
+ * the flag before knowing whether the returned dataset ends a procedure step.
+ * Two builders, two contracts, and neither of them has a mode.
+ *
+ * What goes in is only what the caller asked for. An N-SET is attribute-level
+ * REPLACEMENT, not a merge, so an attribute that is present replaces what the
+ * SCP holds and an attribute that is absent leaves it alone. That is why
+ * `status` and `performedSeries` are distinguished by being undefined rather
+ * than by being empty:
+ *
+ *   status omitted           the status attribute is absent from the dataset.
+ *                            The SCP reads "these attributes changed, the step
+ *                            is still running" and its own status is untouched.
+ *   performedSeries omitted  PerformedSeriesSequence is absent, so whatever the
+ *                            N-CREATE or an earlier update established survives.
+ *   performedSeries []       the sequence is present and empty, which ERASES
+ *                            what the SCP holds. Legal, occasionally meant,
+ *                            never accidental — the caller has to pass it.
+ *
+ * @param {object} [params]
+ * @param {string} [params.status] IN PROGRESS, or omitted for no status at all.
+ * @param {Array<object>} [params.performedSeries] Omitted to leave the sequence alone.
+ * @returns {Record<string, unknown>}
+ */
+function buildInterimSetDataset(params = {}) {
+  const { status, performedSeries } = params;
+
+  if (status !== undefined && status !== Status.IN_PROGRESS) {
+    throw new args.UsageError(
+      `An interim N-SET leaves the step running, so the only status it may carry is ` +
+        `${Status.IN_PROGRESS}, not "${status}". ` +
+        `${Status.COMPLETED} and ${Status.DISCONTINUED} close a step — use ` +
+        '`dcm mpps complete` or `dcm mpps discontinue`, which also stamp the end date and ' +
+        'time that a terminal status has to be accompanied by.'
+    );
+  }
+
+  const dataset = {};
+  if (status !== undefined) dataset.PerformedProcedureStepStatus = status;
+  if (performedSeries !== undefined) {
+    dataset.PerformedSeriesSequence = Array.isArray(performedSeries) ? performedSeries : [];
+  }
+
+  // PerformedProcedureStepEndDate/Time are deliberately absent and there is no
+  // way to add them here. An end time on a running step is a contradiction the
+  // SCP cannot resolve: some record it and report the step as having ended
+  // while its status still says IN PROGRESS, which is how a sweeper decides a
+  // live exam is finished and closes the order under it.
+
+  if (Object.keys(dataset).length === 0) {
+    throw new args.UsageError(
+      'This N-SET would carry no attributes at all — no status, and no performed series. ' +
+        'An N-SET says what changed, so one that says nothing changed is not a message the ' +
+        'far end can act on; a conformant SCP is entitled to refuse it and a lenient one ' +
+        'will record an update that reports nothing.\n' +
+        '\n' +
+        'The two shapes this is probably meant to be:\n' +
+        `  keep-alive              drop --no-status, and the update carries ${Status.IN_PROGRESS}\n` +
+        '  status-absent update    add --series-from <folder>, so the sequence is what changed\n' +
+        '\n' +
+        'Between them those cover both branches a receiver takes on an interim N-SET — a ' +
+        'status it recognises, and no status at all — and neither of them is empty.'
+    );
+  }
+
+  return dataset;
+}
+
+/**
+ * Refuses flags that would carry an N-CREATE-only attribute into an N-SET.
+ *
+ * Named by attribute rather than by flag, because the flag is what was typed
+ * and the attribute is what is actually wrong: `--station-ae` is a perfectly
+ * good flag on `dcm mpps start` and the message has to explain why the same
+ * word is refused three commands later.
+ *
+ * @param {Map} flags
+ * @param {string} verb Used in the message, e.g. 'update'.
+ */
+function assertNoCreateOnlyFlags(flags, verb) {
+  const offending = Object.keys(CREATE_ONLY_ATTRIBUTES).filter((name) => flags.has(name));
+  if (offending.length === 0) return;
+
+  const lines = offending.map(
+    (name) => `  --${name} would set ${CREATE_ONLY_ATTRIBUTES[name]}`
+  );
+
+  throw new args.UsageError(
+    `${offending.length === 1 ? 'That attribute is' : 'Those attributes are'} N-CREATE-only:\n` +
+      `${lines.join('\n')}\n` +
+      'PS3.4 F.7.2-1 leaves the N-SET column blank for all of these. They fix what the step ' +
+      'is, who it is for and where it ran, and they are settled when the step is created; an ' +
+      `N-SET reports progress against a step that already exists. \`dcm mpps ${verb}\` will ` +
+      'not send them.\n' +
+      'If one of them is wrong, the step itself is wrong: discontinue it and open a new one ' +
+      'with `dcm mpps start`.'
+  );
 }
 
 /**
@@ -1017,6 +1259,7 @@ module.exports = {
   LEGAL_TRANSITIONS,
   CREATE_TYPE_1,
   CREATE_TYPE_2,
+  CREATE_ONLY_ATTRIBUTES,
   SCHEDULED_STEP_TYPE_2,
 
   dicomDate,
@@ -1031,6 +1274,9 @@ module.exports = {
   assertLegalTransition,
 
   buildScheduledStepItem,
+  scheduledStepSequence,
+  unscheduledStepSequence,
+  isUnscheduledStepSequence,
   buildCreateDataset,
   missingType1,
   assertCreatable,
@@ -1039,6 +1285,8 @@ module.exports = {
   buildPerformedSeriesSequenceFromFolder,
   seriesMetaFromScan,
   buildSetDataset,
+  buildInterimSetDataset,
+  assertNoCreateOnlyFlags,
   parseReasonCode,
 
   flattenWorklistItem,

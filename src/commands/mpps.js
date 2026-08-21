@@ -12,6 +12,7 @@ const { UsageError } = require('../lib/args');
  */
 const VERBS = {
   start: () => require('./mpps/start'),
+  update: () => require('./mpps/update'),
   complete: () => require('./mpps/complete'),
   discontinue: () => require('./mpps/discontinue'),
   perform: () => require('./mpps/perform'),
@@ -29,6 +30,7 @@ Usage:
 
 Verbs:
   start        Open a step: N-CREATE with status IN PROGRESS
+  update       Report progress and leave the step open: interim N-SET
   perform      Open a step, send a folder, close it — one transaction
   complete     Close a step: N-SET to COMPLETED
   discontinue  Close a step that did not finish: N-SET to DISCONTINUED
@@ -40,7 +42,17 @@ The usual sequence is one command:
     --from-worklist wl.json
 
 start / complete are the same transaction taken apart, for when the images are
-sent by something else or the step has to stay open in between.
+sent by something else or the step has to stay open in between. 'update' is the
+interim N-SET that goes between them: it adds performed series to an open step,
+or re-asserts IN PROGRESS, and sends no end date or time because the step has
+not ended. Its --no-status form omits the status attribute entirely, which is a
+different message on the wire and one receivers handle on a different branch.
+
+A step that was never scheduled — a walk-in or an ER exam — is 'start' or
+'perform' with --unscheduled. PS3.3 represents it as
+ScheduledStepAttributesSequence PRESENT holding exactly one ZERO-LENGTH item,
+which is what that flag emits; it is not the same as omitting the sequence, and
+it is not the same as an item whose StudyInstanceUID is blank.
 
 This command writes nothing to disk and remembers nothing between runs:
   There is no record directory and no local database of steps. 'perform' needs

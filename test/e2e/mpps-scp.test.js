@@ -658,15 +658,18 @@ test('missingType1 names every Type 1 attribute that is absent or empty', () => 
   );
 });
 
-test('the legal transitions are IN PROGRESS to COMPLETED or DISCONTINUED, once', () => {
+test('a running step accepts interim updates; a finished one accepts nothing', () => {
   assert.equal(worklist.transitionRefusal('IN PROGRESS', 'COMPLETED'), undefined);
   assert.equal(worklist.transitionRefusal('IN PROGRESS', 'DISCONTINUED'), undefined);
   assert.equal(worklist.transitionRefusal('IN PROGRESS', ''), undefined, 'attributes only');
   assert.match(worklist.transitionRefusal('IN PROGRESS', 'IN BITS'), /not a legal status/);
-  assert.match(
+  assert.equal(
     worklist.transitionRefusal('IN PROGRESS', 'IN PROGRESS'),
-    /not a legal status/,
-    're-asserting the current status is not a change, and is not accepted as one'
+    undefined,
+    'an interim N-SET re-asserting IN PROGRESS is legal: PS3.4 F.7.2-1 lets an '
+      + 'N-SET carry the status and F.8.2 closes only the terminal states. This '
+      + 'receiver used to refuse it with 0x0106, which is what makes real '
+      + 'modalities give up on a session and leave the worklist entry uncleared.'
   );
   assert.match(worklist.transitionRefusal('COMPLETED', 'DISCONTINUED'), /already COMPLETED/);
   assert.match(
@@ -765,6 +768,11 @@ test('the sending and receiving halves agree about Type 1 and the transitions', 
     [...worklist.MPPS_TERMINAL_STATUSES]
   );
 
+  // No exemptions: the two halves must agree about every transition, including
+  // the interim self-edge. They did not always — this receiver used to refuse
+  // an N-SET re-asserting IN PROGRESS with 0x0106, which is the exact shape of
+  // behaviour that makes real modalities abandon a session. It accepts it now,
+  // and this loop is what keeps the two halves from drifting apart again.
   for (const [from, allowed] of Object.entries(mpps.LEGAL_TRANSITIONS)) {
     for (const to of Object.values(mpps.Status)) {
       assert.equal(
@@ -773,6 +781,28 @@ test('the sending and receiving halves agree about Type 1 and the transitions', 
         `${from} -> ${to}`
       );
     }
+  }
+
+  assert.equal(
+    worklist.transitionRefusal(mpps.Status.IN_PROGRESS, mpps.Status.IN_PROGRESS) === undefined,
+    true,
+    'an interim N-SET re-asserting IN PROGRESS is accepted'
+  );
+  assert.equal(
+    worklist.transitionRefusal(mpps.Status.IN_PROGRESS, '') === undefined,
+    true,
+    'and so is the same update with the status attribute absent'
+  );
+  for (const terminal of [mpps.Status.COMPLETED, mpps.Status.DISCONTINUED]) {
+    assert.deepEqual(
+      [...mpps.LEGAL_TRANSITIONS[terminal]],
+      [],
+      'the self-edge must not have opened a terminal state to anything'
+    );
+    assert.ok(
+      worklist.transitionRefusal(terminal, mpps.Status.IN_PROGRESS) !== undefined,
+      'and a finished step still cannot be reopened'
+    );
   }
 });
 

@@ -16,7 +16,7 @@ const FLAGS = [
   ...common.ATTRIBUTE_FLAGS,
   'store-host', 'store-port', 'store-called-ae',
   'chunk', 'retry', 'no-recurse', 'retrieve-ae',
-  'end-date', 'end-time', 'dry-run',
+  'end-date', 'end-time', 'dry-run', 'update-each-chunk',
   'adopt-worklist-identity', 'restamp', 'study-uid-only',
   'staging', 'keep-staging', 'allow-study-mismatch',
 ];
@@ -48,9 +48,13 @@ Storage peer (where the images go — often not the same system):
 Scheduled and performed step:
   --study-uid <uid>      Study Instance UID. Taken from the folder when the
                          folder holds exactly one study and this is not given.
+                         Not repeatable here; see the note below.
   --modality <MOD>       Taken from the folder when it holds exactly one.
   --step-id <id>         Performed Procedure Step ID. Type 1.
   --station-ae <AE>      Performed Station AE Title. Default: --calling-ae.
+  --unscheduled          No order lies behind this work. See the note below —
+                         the images keep their own Study Instance UID and the
+                         step names none, and that divergence is the point.
   --from-worklist <file.json>   Take the step attributes from a worklist item.
   See 'dcm mpps start --help' for the full list — it is the same set.
 
@@ -73,6 +77,9 @@ Transfer:
   --retrieve-ae <AE>     Retrieve AE Title recorded against each performed
                          series. Default: the storage peer's called AE, which is
                          where the images were actually sent.
+  --update-each-chunk    Send an interim N-SET at every chunk boundary except
+                         the last, carrying the performed series acknowledged so
+                         far. Default: off. See the note below.
 
 Other:
   --end-date / --end-time    Default: now, local time.
@@ -140,6 +147,48 @@ When the worklist has no Study Instance UID:
   is being written to describe images that exist. Nothing on disk is changed.
   The reverse is not symmetric, which is why it needs one.
 
+Unscheduled steps (--unscheduled):
+  A walk-in or ER exam that no worklist ever scheduled. The performed step's
+  ScheduledStepAttributesSequence is emitted as exactly ONE ZERO-LENGTH item,
+  which is how PS3.3 C.4.14 represents "no order lies behind this".
+
+  The images still carry their own Study Instance UID and are still sent under
+  it, because that is what the archive files them by and it is what a later
+  query will find them under. So the two identities DIVERGE on purpose: the
+  C-STORE uses the folder's study, the MPPS names no study at all. The report
+  prints both, because a run where they differ silently is exactly the run
+  nobody can debug afterwards.
+
+  Nothing reconciles an unscheduled step against an order — there is no order.
+  Whether the receiving system files it, creates an unscheduled entry for it, or
+  drops it, happens on its side and is not visible from here.
+
+  --unscheduled refuses --study-uid and --from-worklist, which say the opposite.
+
+Note: --study-uid is not repeatable here, unlike on 'dcm mpps start'.
+  One folder is one study — the guard above refuses two — so a step that
+  fulfils several scheduled steps has no folder to send. Open it with
+  'dcm mpps start --study-uid A --study-uid B', send the images with 'dcm send',
+  and close it with 'dcm mpps complete'.
+
+Interim updates during the transfer (--update-each-chunk):
+  A transfer of 412 instances at --chunk 200 spans three associations and, by
+  default, sends no MPPS traffic between them. A receiver watching for signs of
+  life sees nothing for the whole transfer.
+
+  With this flag, an interim N-SET goes out at each chunk boundary carrying
+  PerformedProcedureStepStatus IN PROGRESS and the performed series built from
+  what the archive has acknowledged SO FAR — never from what is still queued,
+  and never from the folder listing. The same honesty rule as the closing N-SET,
+  applied earlier.
+
+  Not after the last chunk: the closing N-SET follows immediately and carries
+  the same sequence, so an update there would be the same message twice.
+
+  A failed interim update does NOT stop the transfer. The images are the work;
+  an update is a progress report about it. Failures are counted, named, and
+  reported at the end, and the closing N-SET still carries the full sequence.
+
 Note: if the N-CREATE fails, nothing is sent. There is no point storing images
   against a procedure step that was never opened, and a half-done transaction is
   harder to reason about than one that stopped at the first step.
@@ -174,7 +223,20 @@ Examples:
 function adoptFromScan(attrs, study, opts = {}) {
   const adopted = [];
 
-  if (!attrs.studyInstanceUid) {
+  if (attrs.unscheduled) {
+    // The one case where the folder's study is adopted for the TRANSFER and
+    // deliberately withheld from the STEP. buildCreateDataset() reads
+    // attrs.unscheduled and emits the zero-length item regardless of what is in
+    // attrs.studyInstanceUid, so setting it here only feeds the C-STORE, the
+    // one-study guard and the report. Saying so out loud is required: two
+    // identities diverging quietly is the failure this note exists to prevent.
+    attrs.studyInstanceUid = study.studyInstanceUid;
+    adopted.push(
+      `--study-uid from the folder (${study.studyInstanceUid}) for the C-STORE ONLY — ` +
+        '--unscheduled means the performed step names no study at all, so the images and ' +
+        'the step will not share an identity.'
+    );
+  } else if (!attrs.studyInstanceUid) {
     attrs.studyInstanceUid = study.studyInstanceUid;
     // The asymmetry here is deliberate and worth stating out loud. A worklist
     // item with no Study Instance UID is a scheduled step that has not been
@@ -385,6 +447,109 @@ async function stageRestamped(params) {
   return { result, ...rescanned };
 }
 
+/**
+ * The C-STORE loop with an interim N-SET at each chunk boundary.
+ *
+ * Only reached under --update-each-chunk; without the flag the transfer goes
+ * through store.storeLedger() exactly as it always has, so the default path is
+ * untouched by this feature.
+ *
+ * The duplication with store.storeLedger() is real and it is the same
+ * duplication that file already apologises for at the bottom. It disappears the
+ * moment storeLedger() takes an optional `onChunk({index, count})` hook, which
+ * is a four-line change there and would let this function delete itself. It is
+ * one study here rather than storeLedger()'s loop over many, because
+ * assertOneStudy() has already refused anything else.
+ *
+ * @param {object} params
+ * @param {object} params.mpps {connection, mppsSopInstanceUid, retrieveAeTitle, scanned}
+ * @param {{attempted: number, accepted: number, failed: string[]}} params.interim Filled in place.
+ * @returns {Promise<object>} The reconciled ledger result.
+ */
+async function storeWithInterimUpdates(params) {
+  const { ledger, metaByPath, connection, timeouts, chunkSize, retries } = params;
+  const { mpps: mppsParams, interim } = params;
+  const { chunk } = require('../../lib/scan');
+
+  for (const studyLedger of ledger.studies.values()) {
+    const chunks = chunk(studyLedger.entries, chunkSize);
+    log.info(
+      `  ${studyLedger.studyInstanceUid}: ${studyLedger.entries.length} instance(s) in ` +
+        `${chunks.length} association(s), with an interim N-SET after each but the last`
+    );
+
+    for (let i = 0; i < chunks.length; i++) {
+      const label = `  chunk ${i + 1}/${chunks.length}`;
+      await sendChunkAndReport(chunks[i], { ...params, studyLedger, label });
+
+      // Not after the last chunk: the closing N-SET follows immediately and
+      // would carry exactly the same sequence.
+      if (i === chunks.length - 1) continue;
+
+      // Built from the whole ledger, not from this chunk, because
+      // PerformedSeriesSequence REPLACES rather than appends — an update
+      // naming only the newest chunk would erase the earlier ones. Entries in
+      // chunks not yet sent are unsettled, so they are not ACKNOWLEDGED and
+      // cannot leak into this: the sequence is exactly what the archive has
+      // taken so far and nothing more.
+      const soFar = mpps.buildPerformedSeriesSequence(store.allEntries(ledger), {
+        retrieveAeTitle: mppsParams.retrieveAeTitle,
+        seriesMeta: mpps.seriesMetaFromScan(mppsParams.scanned.studies),
+      });
+
+      interim.attempted += 1;
+      log.info(
+        `${label}: interim N-SET — ${soFar.items.length} series, ` +
+          `${soFar.referenced} instance(s) acknowledged so far`
+      );
+
+      const update = await mpps.nSet({
+        connection: mppsParams.connection,
+        timeouts,
+        mppsSopInstanceUid: mppsParams.mppsSopInstanceUid,
+        dataset: mpps.buildInterimSetDataset({
+          status: mpps.Status.IN_PROGRESS,
+          performedSeries: soFar.items,
+        }),
+      });
+      const verdict = common.describeNResult(update, 'N-SET');
+
+      if (verdict.ok) {
+        interim.accepted += 1;
+        continue;
+      }
+
+      // Deliberately not fatal. The images are the work; the update is a
+      // progress report about it, and abandoning a transfer because a report
+      // was refused would lose more than it protects. It is counted and named
+      // instead, and the closing N-SET still carries the full sequence.
+      const why = verdict.lines.join(' ') || verdict.reason;
+      interim.failed.push(`chunk ${i + 1}: ${why}`);
+      log.warn(
+        `${label}: the interim N-SET was not accepted — ${why}. The transfer continues; ` +
+          'this is a finding about the peer, not a reason to stop sending images.'
+      );
+    }
+  }
+
+  return ledger.reconcile();
+}
+
+/**
+ * One chunk, with the retry policy and the progress line storeLedger() prints.
+ *
+ * @param {Array<object>} entries
+ * @param {object} params
+ */
+async function sendChunkAndReport(entries, params) {
+  const { metaByPath, studyLedger, connection, timeouts, retries, label } = params;
+  await store.sendChunkWithRetry({
+    entries, metaByPath, studyLedger, connection, timeouts, retries, label,
+  });
+  const soFar = studyLedger.reconcile();
+  log.info(`${label}: ${soFar.acknowledged}/${soFar.found} acknowledged so far`);
+}
+
 /** Prints the four counts that matter, side by side. */
 function reportCounts(totals, referenced, notReferenced) {
   log.out('');
@@ -497,6 +662,25 @@ async function performTransaction(parsed, session) {
   const retries = args.resolve(flags, { name: 'retry', type: 'number', fallback: 1 });
   if (!Number.isInteger(retries) || retries < 0) {
     throw new args.UsageError(`--retry must be zero or a positive integer, got "${retries}".`);
+  }
+
+  const updateEachChunk = common.booleanFlag(flags, 'update-each-chunk');
+
+  // Repeatable on `dcm mpps start`, refused here. One folder is one study — the
+  // guard below refuses two — so there is no folder that fulfils several
+  // scheduled steps, and accepting the flag would produce a step naming studies
+  // no image in the transfer belongs to.
+  const studyUids = common.repeatedValues(flags, 'study-uid');
+  if (studyUids.length > 1) {
+    throw new args.UsageError(
+      `--study-uid was given ${studyUids.length} times. A performed step CAN fulfil several ` +
+        'scheduled steps, but this command sends one folder, and one folder is one study — ' +
+        'so the extra studies would be named by a step whose images do not belong to them.\n' +
+        'Open it in two halves instead:\n' +
+        `  dcm mpps start ${studyUids.map((u) => `--study-uid ${u}`).join(' ')} ...\n` +
+        '  dcm send <folder> ...\n' +
+        '  dcm mpps complete <mpps-uid> ...'
+    );
   }
 
   // --- The two ways past a study-UID mismatch, resolved before anything runs.
@@ -631,6 +815,9 @@ async function performTransaction(parsed, session) {
       mppsSopInstanceUid,
       sopClassUid: mpps.MPPS_SOP_CLASS,
       studyInstanceUid: attrs.studyInstanceUid,
+      unscheduled: Boolean(attrs.unscheduled),
+      stepStudyInstanceUid: attrs.unscheduled ? null : attrs.studyInstanceUid,
+      updateEachChunk,
       found: scanned.candidates,
       unreadable: scanned.readErrors.length,
       series: study.series.size,
@@ -655,7 +842,12 @@ async function performTransaction(parsed, session) {
       return scanned.readErrors.length ? 1 : 0;
     }
     log.out(`MPPS SOP Instance UID  ${mppsSopInstanceUid}`);
-    log.out(`study                  ${attrs.studyInstanceUid}`);
+    if (attrs.unscheduled) {
+      log.out(`images filed under     ${attrs.studyInstanceUid}  ${log.color.dim('(the folder\'s study)')}`);
+      log.out(`step would name        ${log.color.yellow('no study — unscheduled')}`);
+    } else {
+      log.out(`study                  ${attrs.studyInstanceUid}`);
+    }
     log.out(`would send             ${scanned.candidates} instance(s) in ${study.series.size} series`);
     if (restampPlan.length) {
       log.out('');
@@ -765,9 +957,17 @@ async function performTransaction(parsed, session) {
   // --- 2. C-STORE ----------------------------------------------------------
   log.info('');
   log.info(`C-STORE: sending ${scanned.candidates} instance(s) to ${storeConnection.calledAe}`);
-  const result = await store.storeLedger({
-    ledger, metaByPath, connection: storeConnection, timeouts, chunkSize, retries,
-  });
+
+  const interim = { attempted: 0, accepted: 0, failed: [] };
+  const result = updateEachChunk
+    ? await storeWithInterimUpdates({
+        ledger, metaByPath, connection: storeConnection, timeouts, chunkSize, retries,
+        mpps: { connection, mppsSopInstanceUid, retrieveAeTitle, scanned },
+        interim,
+      })
+    : await store.storeLedger({
+        ledger, metaByPath, connection: storeConnection, timeouts, chunkSize, retries,
+      });
   const entries = store.allEntries(ledger);
 
   // --- 3. PerformedSeriesSequence, from acknowledged instances only --------
@@ -854,6 +1054,14 @@ async function performTransaction(parsed, session) {
         : null,
       studyUidMismatch: mismatch,
       allowStudyMismatch: allowMismatch,
+      unscheduled: Boolean(attrs.unscheduled),
+      // Under --unscheduled these two differ on purpose: the images are filed
+      // under the folder's study, the step names none.
+      imagesStudyInstanceUid: attrs.studyInstanceUid,
+      stepStudyInstanceUid: attrs.unscheduled ? null : attrs.studyInstanceUid,
+      interimUpdates: updateEachChunk
+        ? { attempted: interim.attempted, accepted: interim.accepted, failures: interim.failed }
+        : null,
       explanation: finalStatus === mpps.Status.DISCONTINUED ? shortfallSentence : null,
       message: setVerdict.ok ? '' : setVerdict.lines.join(' '),
     }, null, 2));
@@ -863,7 +1071,12 @@ async function performTransaction(parsed, session) {
   const colour = finalStatus === mpps.Status.COMPLETED ? log.color.green : log.color.yellow;
   log.out('');
   log.out(`${log.color.bold('MPPS SOP Instance UID')}  ${mppsSopInstanceUid}`);
-  log.out(`study                  ${attrs.studyInstanceUid}`);
+  if (attrs.unscheduled) {
+    log.out(`images filed under     ${attrs.studyInstanceUid}  ${log.color.dim('(the folder\'s study)')}`);
+    log.out(`step names             ${log.color.yellow('no study — unscheduled')}`);
+  } else {
+    log.out(`study                  ${attrs.studyInstanceUid}`);
+  }
   log.out(`images sent to         ${storeConnection.calledAe} at ${storeConnection.host}:${storeConnection.port}`);
   log.out(`MPPS sent to           ${connection.calledAe} at ${connection.host}:${connection.port}`);
   if (restamped) {
@@ -885,7 +1098,27 @@ async function performTransaction(parsed, session) {
         `${mismatch.onDisk}. Nothing on either side will reconcile them.`
     ));
   }
+  if (attrs.unscheduled) {
+    log.out('');
+    log.out(log.color.yellow(
+      'The images and the performed step do not share an identity, which is what\n' +
+        '--unscheduled means: the archive files these images under the study they carry, and\n' +
+        'the step names no study for anything to reconcile it against. There is no order, so\n' +
+        'there is nothing to reconcile with.'
+    ));
+  }
   reportCounts(totals, built.referenced, built.skipped.length);
+  if (updateEachChunk) {
+    log.out('');
+    log.out(`  interim N-SETs       ${interim.accepted}/${interim.attempted} accepted`);
+    for (const failure of interim.failed) log.out(`    ${log.color.yellow(failure)}`);
+    if (interim.attempted === 0) {
+      log.out(log.color.dim(
+        '    none were sent: the transfer fitted in one association, and no update goes out\n' +
+          '    after the last chunk because the closing N-SET carries the same sequence.'
+      ));
+    }
+  }
   log.out('');
   log.out(`  performed series     ${built.items.length}`);
   for (const item of built.items) {
