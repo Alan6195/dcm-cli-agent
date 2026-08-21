@@ -433,6 +433,12 @@ function updateAllPreviews() {
   // The collapsed peer bar's summary is the reason four fields may be folded
   // away, so it is refreshed by the same hook that catches every edit to them.
   try { renderMwlPeerSummary(); } catch { /* before the DOM is wired */ }
+  // The sweep's list of commands is a preview too — it just holds several
+  // commands rather than one, and it is built from the same peer connection.
+  // Refreshed from the same hook so that editing the peer, picking a saved
+  // profile, switching views or choosing a folder with Browse... cannot leave
+  // the listed commands missing flags the single preview above already shows.
+  try { renderSpeedPlan(); } catch { /* before the DOM is wired */ }
 }
 
 // --------------------------------------------------------------------------
@@ -460,21 +466,138 @@ function wireEcho() {
 // --------------------------------------------------------------------------
 // View: SEND
 // --------------------------------------------------------------------------
+/**
+ * The four speed presets, named exactly as the engine names them.
+ *
+ * The number of associations each one opens is repeated here only to say it in
+ * the sentence an operator reads; the engine owns the value, and the command
+ * carries the preset name rather than the number, so the two cannot drift into
+ * disagreeing about what was sent.
+ */
+const SEND_SPEEDS = {
+  'normal': {
+    associations: 1,
+    hint: 'One association at a time — ordinary clinical traffic, and the only setting that adds nothing to the receiver’s association count.',
+  },
+  'fast': {
+    associations: 4,
+    hint: 'Four at a time — a backlog or a migration, to a receiver you already know tolerates a handful at once.',
+  },
+  'very-fast': {
+    associations: 8,
+    hint: 'Eight at a time — a bulk move you are watching, on a link with the bandwidth to make the concurrency pay.',
+  },
+  'insane': {
+    associations: 16,
+    hint: 'Sixteen at a time — a benchmark against a receiver you own, not a thing to point at someone else’s archive.',
+  },
+};
+
+/** Which preset the Send screen is set to. */
+function sendSpeed() {
+  const active = $('#send-speed .chip.active');
+  return active ? active.dataset.speed : 'normal';
+}
+
+/**
+ * True when a typed association count has displaced the preset outright.
+ *
+ * The chip row has no off position — Normal ships active — so typing a number
+ * into Parallel is the only way a user says "no preset". When they do, the
+ * command must carry no --speed at all, not --speed plus --parallel. The engine
+ * gates its chunk derivation on the flag being *present* rather than on the
+ * preset supplying the width (resolveSpeedPlan, src/commands/send.js), so a
+ * --speed the user never engaged goes on sizing the chunks off their typed
+ * number: Parallel 4 over a 100-instance study used to mean one association of
+ * up to 200 and would silently become four of 25. Same field, same value,
+ * different transfer. A CLI user typing `--parallel 4` gets the old behaviour,
+ * and this box has to agree with the CLI.
+ */
+function sendPresetInert() {
+  return $('#send-parallel').value.trim() !== '';
+}
+
+/**
+ * The one line under the chip row, and the amber block insane earns.
+ *
+ * One line that changes rather than four permanent paragraphs: the descriptions
+ * only matter at the moment of choosing, and this screen has been too talkative
+ * before. Insane is the exception — its cost lands on someone else's receiver,
+ * so it is marked in the row itself and says what going too wide looks like.
+ *
+ * The row also has an off state, because the command has one. The preview is
+ * the command on this screen; a highlighted chip beside a command with no
+ * --speed in it would be the screen describing a run that is not the run.
+ */
+function renderSendSpeed() {
+  const speed = sendSpeed();
+  const preset = SEND_SPEEDS[speed] || SEND_SPEEDS.normal;
+  const inert = sendPresetInert();
+  $('#send-speed').classList.toggle('inert', inert);
+  $('#send-speed-hint').textContent = inert
+    ? `Not in use. Parallel ${$('#send-parallel').value.trim()} under Advanced replaces the preset, `
+      + 'so the command carries --parallel and no --speed — including the chunk size, which goes back '
+      + 'to the default. Clear that field to send a preset instead.'
+    : preset.hint;
+  $('#send-speed-hint').classList.toggle('live', inert);
+  // The amber block is about what insane costs a receiver. Nothing is being
+  // asked of any receiver on insane's behalf while the preset is off the line.
+  $('#send-speed-danger').hidden = speed !== 'insane' || inert;
+}
+
+/**
+ * One line naming any override folded away under Advanced.
+ *
+ * Folding the controls away must never fold away the values they hold: what is
+ * under there decides what goes on the wire, so the summary says so whether the
+ * section is open or shut.
+ */
+function renderSendAdvSummary() {
+  const el = $('#send-adv-sum');
+  if (!el) return;
+  const speed = sendSpeed();
+  const parallel = $('#send-parallel').value.trim();
+  const chunk = $('#send-chunk').value.trim();
+  const parts = [];
+  if (parallel) parts.push(`--parallel ${parallel}`);
+  if (chunk) parts.push(`--chunk ${chunk}`);
+  if (!parts.length) {
+    el.textContent = `— nothing set; --speed ${speed} sizes the associations and how many run at once`;
+  } else if (parallel) {
+    // Not "overrides --speed": there is no --speed on the command line to
+    // override. Saying otherwise would leave the summary naming a flag the
+    // preview below it does not show. See sendPresetInert.
+    el.textContent = `— ${parts.join(' · ')}; the ${speed} preset is not used`;
+  } else {
+    // A typed chunk size really is half an override: the preset still supplies
+    // the association count, so --speed stays on the line and the engine says
+    // what it displaced.
+    el.textContent = `— ${parts.join(' · ')} replaces that half of --speed ${speed}`;
+  }
+  el.classList.toggle('changed', parts.length > 0);
+}
+
 BUILDERS.send = () => {
   const folder = $('#send-folder').value.trim();
   const argv = ['send'];
   if (folder) argv.push(folder);
   argv.push(...connArgs());
+  const parallel = $('#send-parallel').value.trim();
   const chunk = $('#send-chunk').value.trim();
+  // The preset first, then the flag that can beat half of it, so the command
+  // reads in the order the engine resolves it — except that a typed Parallel
+  // beats all of it and the preset is left off entirely. See sendPresetInert
+  // for why the flag cannot stay on the line once its width has been displaced.
+  // --parallel 1 counts as typed: someone who typed it meant it.
+  if (!parallel) argv.push('--speed', sendSpeed());
+  if (parallel) argv.push('--parallel', parallel);
+  if (chunk) argv.push('--chunk', chunk);
   const retry = $('#send-retry').value.trim();
   const timeout = $('#send-timeout').value.trim();
-  if (chunk) argv.push('--chunk', chunk);
   if (retry) argv.push('--retry', retry);
   if (timeout) argv.push('--timeout', timeout);
   const syntax = $('#send-syntax').value;
   if (syntax) argv.push('--transfer-syntax', syntax);
-  const parallel = $('#send-parallel').value.trim();
-  if (parallel && parallel !== '1') argv.push('--parallel', parallel);
   if ($('#send-dryrun').checked) argv.push('--dry-run');
   if ($('#send-norecurse').checked) argv.push('--no-recurse');
   if ($('#send-rewrite').checked) argv.push('--rewrite-series-uid');
@@ -508,8 +631,29 @@ function showTotals(t, ok) {
 }
 
 function wireSend() {
-  ['send-folder', 'send-chunk', 'send-retry', 'send-timeout', 'send-parallel'].forEach((id) =>
+  ['send-folder', 'send-retry', 'send-timeout'].forEach((id) =>
     $(`#${id}`).addEventListener('input', updateAllPreviews));
+  // The two override fields also move the Advanced summary, which is the only
+  // thing on screen naming them while the disclosure is shut — and Parallel
+  // decides whether the preset is on the command line at all, so the chip row
+  // above has to be repainted from the same keystroke.
+  ['send-chunk', 'send-parallel'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', () => {
+      renderSendSpeed();
+      renderSendAdvSummary();
+      updateAllPreviews();
+    }));
+  for (const chip of $$('#send-speed .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#send-speed .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderSendSpeed();
+      renderSendAdvSummary();
+      updateAllPreviews();
+    });
+  }
+  renderSendSpeed();
+  renderSendAdvSummary();
   $('#send-syntax').addEventListener('change', updateAllPreviews);
   ['send-dryrun', 'send-norecurse', 'send-rewrite'].forEach((id) =>
     $(`#${id}`).addEventListener('change', updateAllPreviews));
@@ -2227,6 +2371,24 @@ function speedRuns() {
       });
     });
   } else if (mode === 'parallel') {
+    // The presets first, because sweeping them is what finds the ceiling: each
+    // one sizes its own associations, so a run that comes back narrow came back
+    // narrow for a reason the receiver decided, not because the chunk size
+    // happened to cap it.
+    const presets = $$('.speed-opt').filter((c) => c.checked);
+    presets.forEach((c, i) => {
+      const preset = SEND_SPEEDS[c.value] || {};
+      runs.push({
+        label: `speed ${c.value}`,
+        title: `${c.value} · ${preset.associations} association${preset.associations === 1 ? '' : 's'}`,
+        transferSyntax: null,
+        chunk: baseChunk,
+        speed: c.value,
+        callingAe: ae(c.value, i + 1),
+      });
+    });
+    // Anything typed here is still honoured, and still numbered after the
+    // presets so the calling AE Titles stay unique in the peer's ingress log.
     const counts = $('#speed-parallels').value.split(',').map((x) => x.trim()).filter(Boolean);
     counts.forEach((n, i) => {
       runs.push({
@@ -2235,7 +2397,7 @@ function speedRuns() {
         transferSyntax: null,
         chunk: baseChunk,
         parallel: n,
-        callingAe: ae(`P${n}`, i + 1),
+        callingAe: ae(`P${n}`, presets.length + i + 1),
       });
     });
   } else {
@@ -2262,9 +2424,10 @@ function speedArgv(run) {
   if (state.conn.port) argv.push('--port', String(state.conn.port));
   if (state.conn.calledAe) argv.push('--called-ae', state.conn.calledAe);
   argv.push('--calling-ae', run.callingAe);
+  if (run.speed) argv.push('--speed', run.speed);
+  if (run.parallel) argv.push('--parallel', run.parallel);
   if (run.chunk) argv.push('--chunk', run.chunk);
   if (run.transferSyntax) argv.push('--transfer-syntax', run.transferSyntax);
-  if (run.parallel && run.parallel !== '1') argv.push('--parallel', run.parallel);
   argv.push('--label', run.label, '--json');
   return argv;
 }
@@ -2274,7 +2437,133 @@ BUILDERS.speed = () => {
   return runs.length ? speedArgv(runs[0]) : ['send'];
 };
 
-/** Renders the comparison table once runs have results. */
+/**
+ * The line under the preset checkboxes, plus the one caveat that can quietly
+ * ruin the sweep.
+ *
+ * A chunk size typed into the field below applies to every run and beats each
+ * preset's own sizing, which is exactly the trap the presets exist to close —
+ * so it is said on screen, before the benchmark, rather than left to be noticed
+ * in the engine's warning afterwards.
+ */
+function renderSpeedParallelHint() {
+  const el = $('#speed-parallel-hint');
+  if (!el) return;
+  const baseChunk = $('#speed-chunk').value.trim();
+  if (baseChunk) {
+    el.textContent = `Chunk size ${baseChunk} below applies to every run and overrides each preset's own sizing, `
+      + 'so a preset may not reach its association count. Clear it to compare the presets as they ship.';
+    el.classList.add('live');
+    return;
+  }
+  // Not the Ack column. A refused association is retried, and the retry lands
+  // in a slot that has since freed, so every instance still gets acknowledged
+  // and the run still exits 0 — the ceiling shows up only as a width the run
+  // never reached. Sending people to the Ack column pointed them at the one
+  // column that structurally cannot show this.
+  el.textContent = 'This is how you find the receiver\'s ceiling — read the Width column afterwards, not the '
+    + 'Ack column: a refused association is retried, so a preset the receiver will not accept still '
+    + 'acknowledges every instance and comes back narrow rather than short or slow.';
+  el.classList.remove('live');
+}
+
+/**
+ * Every command in the sweep, on screen before any of them runs.
+ *
+ * The preview above shows one command, and a sweep is several — so the whole
+ * list is laid out here as soon as the options change. Nothing gets sent that
+ * was not written out first.
+ */
+function renderSpeedPlan(runs) {
+  const progress = $('#speed-progress');
+  if (!progress) return;
+  // While a sweep is in flight this box is the live progress list, and the loop
+  // addresses its lines positionally (#speed-line-<i>) against the runs array
+  // it captured before starting. Rebuilding it from the current form remaps
+  // index to run: completed rates are wiped, and if a preset checkbox moved,
+  // the next measured rate lands on a line labelled with a different run's
+  // title, calling AE and command. Nothing on this screen is disabled during a
+  // sweep except the Run button, so this is an ordinary click away. Only the
+  // sweep's own explicit-argument call gets through.
+  if (!runs && speedRunning) return;
+  const list = runs || speedRuns();
+  if (!list.length) { progress.hidden = true; progress.innerHTML = ''; return; }
+  progress.hidden = false;
+  progress.innerHTML =
+    `<div class="section-title">${list.length} run${list.length === 1 ? '' : 's'}, in order</div>` +
+    list.map((r, i) =>
+      `<div class="run-line" id="speed-line-${i}">` +
+        `<span>${esc(r.title)} · ${esc(r.callingAe)}</span><span class="rate">waiting…</span></div>` +
+      // r.argv is set once, by runSpeedTest, at the moment the sweep is frozen.
+      // Before that there is no sweep to freeze and the current form is the
+      // truth. Either way the string printed here is the argv that is spawned.
+      `<div class="run-cmd">dcm ${esc((r.argv || speedArgv(r)).map(quoteArg).join(' '))}</div>`
+    ).join('');
+}
+
+/**
+ * The width a run actually ran at, from the run's own JSON.
+ *
+ * `parallel` is what was asked for. `parallelAchieved` is measured — the fewest
+ * simultaneously *accepted* associations any single study in the run reached
+ * (see planJson in src/commands/send.js). The two come apart when a study does
+ * not split into enough chunks to fill the pool, and again when the receiver
+ * refuses the extra associations; a rejected association is retried, so that
+ * second case ends with every instance acknowledged and only the width short.
+ *
+ * The reason is per-study and this row is not, so the row states the measured
+ * fact and nothing more — the engine's per-study warning names the cause, and
+ * that warning now reaches the console below.
+ *
+ * @returns {{got:number, asked:number, short:boolean}|null} null pre-0.14 JSON.
+ */
+function achievedWidth(d) {
+  if (typeof d.parallelAchieved !== 'number' || typeof d.parallel !== 'number') return null;
+  return { got: d.parallelAchieved, asked: d.parallel, short: d.parallelAchieved < d.parallel };
+}
+
+/**
+ * What a row actually ran, reduced to a key, so that two rows which resolved to
+ * the same transfer can be recognised as the same transfer.
+ *
+ * At 100 instances, fast, very-fast and insane all clamp to 25-instance chunks,
+ * split into 4, and run 4 wide: three byte-identical transfers. Stamping
+ * FASTEST on whichever of them drew the best sample tells the operator that 16
+ * wide beat 8 and 4, on a difference that is run-to-run variation.
+ *
+ * Keyed on how the instances were actually divided — instances and chunk count
+ * per study — rather than on the chunk size, which is only the cap. Ten
+ * instances go in one association whether the cap is 25 or 200, and calling
+ * those two runs different because their caps differed is the same mistake in
+ * miniature: reporting what was asked for instead of what happened. The
+ * negotiated syntax is in the key because in the transfer-syntax sweep it is
+ * the whole point of the comparison.
+ *
+ * Width comes from parallelAchieved, which is measured and is a floor, so two
+ * runs of one configuration can occasionally measure apart and miss the tie.
+ * That is the error worth having: the alternative is keying on the dispatched
+ * count, which would group a run the receiver refused with one it accepted.
+ */
+function effectiveRun(d) {
+  const syntaxes = (d.negotiatedTransferSyntaxes || []).map((t) => t.name).sort().join('+');
+  const shape = Array.isArray(d.studies) && d.studies.length
+    ? d.studies.map((s) => `${s.instances}/${s.chunks}`).join(',')
+    : `${d.found}/?`;
+  return `${syntaxes}|${d.parallelAchieved}|${shape}`;
+}
+
+/**
+ * Renders the comparison table once runs have results.
+ *
+ * Two things this table is not allowed to do, because they are the whole reason
+ * --speed exists: attribute a throughput figure to a width the run never
+ * reached, and declare a winner between runs that did identical work.
+ *
+ * So the row is labelled with the width that was *measured* alongside the one
+ * that was requested, and the badge goes to every row that resolved to the same
+ * effective transfer as the fastest one rather than to whichever of them drew
+ * the best sample.
+ */
 function renderSpeedResults(results) {
   const box = $('#view-speed [data-result]');
   box.hidden = false;
@@ -2285,16 +2574,32 @@ function renderSpeedResults(results) {
     return;
   }
 
-  const best = Math.max(...ok.map((r) => r.data.megabytesPerSecond || 0));
+  const bestRate = Math.max(...ok.map((r) => r.data.megabytesPerSecond || 0));
+  const winner = ok.find((r) => (r.data.megabytesPerSecond || 0) === bestRate);
+  const winningRun = effectiveRun(winner.data);
+  // Every successful run that did the same work as the fastest one. Usually
+  // just the fastest one; more than that means the sweep found no difference.
+  const tied = ok.filter((r) => effectiveRun(r.data) === winningRun);
+  const isTie = tied.length > 1;
+  const badge = isTie ? 'TIED FASTEST' : 'FASTEST';
+  const short = results.filter((r) => r.data && (achievedWidth(r.data) || {}).short);
+
   const rows = results.map((r) => {
     if (!r.data) {
-      return `<tr><td>${esc(r.run.title)}</td><td colspan="6" class="dim">failed — see output</td></tr>`;
+      return `<tr><td>${esc(r.run.title)}</td><td colspan="8" class="dim">failed — see output</td></tr>`;
     }
     const d = r.data;
-    const isBest = (d.megabytesPerSecond || 0) === best && d.ok;
+    const isBest = d.ok && effectiveRun(d) === winningRun;
+    const w = achievedWidth(d);
+    const width = !w
+      ? '—'
+      : w.short
+        ? `<span class="warn-inline">${w.got} of ${w.asked}</span>`
+        : String(w.got);
     const negotiated = (d.negotiatedTransferSyntaxes || []).map((t) => t.name).join(', ') || '—';
-    return `<tr class="${isBest ? 'best' : ''}">
-      <td>${esc(r.run.title)}${isBest ? '<span class="badge-best">FASTEST</span>' : ''}</td>
+    return `<tr class="${isBest ? (isTie ? 'best tied' : 'best') : ''}">
+      <td>${esc(r.run.title)}${isBest ? `<span class="badge-best${isTie ? ' tied' : ''}">${badge}</span>` : ''}</td>
+      <td class="num width">${width}</td>
       <td class="mono">${esc(r.run.callingAe)}</td>
       <td>${esc(negotiated)}</td>
       <td class="num">${(d.elapsedMs / 1000).toFixed(2)}s</td>
@@ -2305,15 +2610,57 @@ function renderSpeedResults(results) {
     </tr>`;
   }).join('');
 
+  const notes = [];
+  if (short.length) {
+    notes.push(
+      `<div class="local-note"><b>${short.length} run${short.length === 1 ? '' : 's'} did not reach the ` +
+      `width ${short.length === 1 ? 'it' : 'they'} asked for.</b> Where Width reads "N of M", the MB/s ` +
+      'beside it is the rate for N concurrent associations, not for M — it is not a measurement of M ' +
+      'and cannot be compared to one. The engine warned per study in the output below, and that warning ' +
+      'names the reason: either the study did not split into enough chunks to fill the pool, or the peer ' +
+      'never had that many accepted at once. Achieved width is a floor, so it can read low by one on a ' +
+      'run whose last chunks drain early; it never reads high.</div>'
+    );
+  }
+  if (tied.length > 1) {
+    const names = tied.map((r) => r.run.title.split('·')[0].trim());
+    notes.push(
+      `<div class="local-note"><b>${esc(names.join(', '))} resolved to the same transfer.</b> The same ` +
+      `instances went in the same number of associations, ${tied[0].data.parallelAchieved} at a time, over ` +
+      'the same negotiated syntax — so the gaps between their rates are run-to-run variation and not a ' +
+      'difference between the settings. Asking for more than this bought nothing here; to tell the wider ' +
+      'settings apart, sweep a folder with enough instances to fill them.</div>'
+    );
+  }
+
   box.innerHTML =
     '<div class="section-title">Comparison</div>' +
-    '<table><thead><tr><th>Run</th><th>Calling AE</th><th>Negotiated syntax</th>' +
+    '<table><thead><tr><th>Run</th><th class="num">Width</th><th>Calling AE</th><th>Negotiated syntax</th>' +
     '<th class="num">Elapsed</th><th class="num">MB/s</th><th class="num">Inst/s</th>' +
     '<th class="num">On the wire</th><th class="num">Ack</th></tr></thead>' +
-    `<tbody>${rows}</tbody></table>`;
+    `<tbody>${rows}</tbody></table>` +
+    notes.join('');
 }
 
+/**
+ * True from the moment a sweep freezes its runs until the last one has exited.
+ *
+ * A flag rather than a look at state.activeRuns.speed: that key is deleted when
+ * each child exits and re-set only after the next one has been spawned, so
+ * there is a gap between runs in which a keystroke would still rebuild the live
+ * list. See the guard at the top of renderSpeedPlan.
+ */
+let speedRunning = false;
+
 function wireSpeed() {
+  // Every control on this screen changes which commands the sweep will run, so
+  // they all land on the same refresh: the caveat line, then updateAllPreviews,
+  // which repaints both the single preview and the full list of commands.
+  const refreshSpeed = () => {
+    renderSpeedParallelHint();
+    updateAllPreviews();
+  };
+
   for (const chip of $$('#speed-mode .chip')) {
     chip.addEventListener('click', () => {
       $$('#speed-mode .chip').forEach((c) => c.classList.remove('active'));
@@ -2323,12 +2670,15 @@ function wireSpeed() {
       $('#speed-chunk-opts').hidden = mode !== 'chunk';
       $('#speed-parallel-opts').hidden = mode !== 'parallel';
       $('#speed-repeat-opts').hidden = mode !== 'repeat';
-      updateAllPreviews();
+      refreshSpeed();
     });
   }
   ['speed-folder', 'speed-aeprefix', 'speed-chunk', 'speed-chunks', 'speed-repeats', 'speed-parallels']
-    .forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
-  $$('.ts-opt').forEach((c) => c.addEventListener('change', updateAllPreviews));
+    .forEach((id) => $(`#${id}`).addEventListener('input', refreshSpeed));
+  $$('.ts-opt').forEach((c) => c.addEventListener('change', refreshSpeed));
+  $$('.speed-opt').forEach((c) => c.addEventListener('change', refreshSpeed));
+  renderSpeedParallelHint();
+  renderSpeedPlan();
 
   $('#view-speed [data-cancel]').addEventListener('click', () => {
     speedCancelled = true;
@@ -2343,7 +2693,6 @@ let speedCancelled = false;
 
 async function runSpeedTest() {
   const folder = $('#speed-folder').value.trim();
-  const progress = $('#speed-progress');
   const box = $('#view-speed [data-result]');
   const c = consoleEl('speed');
   box.hidden = true;
@@ -2367,37 +2716,59 @@ async function runSpeedTest() {
   }
 
   speedCancelled = false;
+  speedRunning = true;
   $('#view-speed [data-run]').disabled = true;
   $('#view-speed [data-cancel]').hidden = false;
   setStatus('speed', 'running', `Running 1/${runs.length}…`);
-  progress.hidden = false;
-  progress.innerHTML = runs
-    .map((r, i) => `<div class="run-line" id="speed-line-${i}"><span>${esc(r.title)} · ${esc(r.callingAe)}</span><span class="rate">waiting…</span></div>`)
-    .join('');
+  // Each run's argv is frozen here, at the moment it is written on screen, and
+  // dispatched from the same array below. speedArgv reads the folder and the
+  // peer connection live, so building it again at dispatch time would let an
+  // edit made mid-sweep spawn a command that differs from the one printed
+  // against its line — and a sweep whose later runs measured a different folder
+  // is not a comparison at all.
+  for (const r of runs) r.argv = speedArgv(r);
+  renderSpeedPlan(runs);
 
   const results = [];
-  for (let i = 0; i < runs.length; i++) {
-    if (speedCancelled) break;
-    setStatus('speed', 'running', `Running ${i + 1}/${runs.length}…`);
-    const line = $(`#speed-line-${i} .rate`);
-    if (line) line.textContent = 'sending…';
+  try {
+    for (let i = 0; i < runs.length; i++) {
+      if (speedCancelled) break;
+      setStatus('speed', 'running', `Running ${i + 1}/${runs.length}…`);
+      const line = $(`#speed-line-${i} .rate`);
+      if (line) line.textContent = 'sending…';
 
-    const { code, stdout, stderr } = await runCapture('speed', speedArgv(runs[i]));
-    let data = null;
-    try {
-      data = JSON.parse(stdout);
-    } catch {
-      appendConsole('speed', `\n--- ${runs[i].title} ---\n${stdout || stderr}\n`, 'stderr');
-    }
-    results.push({ run: runs[i], data, code });
+      const { code, stdout, stderr } = await runCapture('speed', runs[i].argv);
+      let data = null;
+      try {
+        data = JSON.parse(stdout);
+      } catch {
+        appendConsole('speed', `\n--- ${runs[i].title} ---\n${stdout || stderr}\n`, 'stderr');
+      }
+      // Everything the engine says about what a run actually did is on stderr,
+      // and --json does not silence it: the per-study shortfall warning naming
+      // the width the study really ran at, and any flag a preset displaced.
+      // Discarding stderr whenever stdout parsed meant throwing it away on
+      // precisely the runs whose numbers reach the table.
+      if (data && stderr.trim()) {
+        appendConsole('speed', `\n--- ${runs[i].title} ---\n${stderr}`, 'stderr');
+      }
+      results.push({ run: runs[i], data, code });
 
-    if (line) {
-      line.textContent = data
-        ? `${data.megabytesPerSecond} MB/s · ${(data.elapsedMs / 1000).toFixed(2)}s`
-        : `failed (exit ${code})`;
+      if (line) {
+        const w = data ? achievedWidth(data) : null;
+        // The line's own label says how many associations were asked for, so a
+        // rate written beside it has to carry what was reached.
+        line.textContent = data
+          ? `${data.megabytesPerSecond} MB/s · ${(data.elapsedMs / 1000).toFixed(2)}s`
+            + (w && w.short ? ` · ran ${w.got} of ${w.asked} wide` : '')
+          : `failed (exit ${code})`;
+      }
+      const parent = $(`#speed-line-${i}`);
+      if (parent) parent.classList.add('done');
     }
-    const parent = $(`#speed-line-${i}`);
-    if (parent) parent.classList.add('done');
+  } finally {
+    // Unlocked even if a run threw, or the form stays frozen for the session.
+    speedRunning = false;
   }
 
   $('#view-speed [data-run]').disabled = false;

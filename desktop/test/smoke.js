@@ -153,6 +153,381 @@ async function runSmoke(win, app) {
     }
 
     // ---------------------------------------------------------------------
+    // Speed as a first-class choice.
+    //
+    // The whole claim of this screen is that the preview is the command, so
+    // the check is not "a chip is highlighted" but "clicking the chip put
+    // --speed <preset> in the command and nothing else moved". Every preset is
+    // clicked and its command captured, then the Advanced overrides are typed
+    // in and the command has to carry both flags at once — that is what the
+    // engine does, and the screen must not pretend otherwise.
+    // ---------------------------------------------------------------------
+    {
+      await win.webContents.executeJavaScript(`showView('send'); true`);
+      const pick = (preset) => `(() => {
+        document.querySelector('#send-speed .chip[data-speed=' + ${JSON.stringify(JSON.stringify(preset))} + ']').click();
+        return JSON.stringify({
+          cmd: document.querySelector('#view-send [data-cmd]').textContent,
+          hint: document.querySelector('#send-speed-hint').textContent,
+          amber: !document.querySelector('#send-speed-danger').hidden,
+          advSum: document.querySelector('#send-adv-sum').textContent,
+        });
+      })()`;
+
+      const perPreset = {};
+      for (const preset of ['normal', 'fast', 'very-fast', 'insane']) {
+        // eslint-disable-next-line no-await-in-loop
+        const raw = await win.webContents.executeJavaScript(pick(preset));
+        const r = JSON.parse(raw);
+        perPreset[preset] = r;
+        process.stdout.write(`send --speed ${preset}: ${r.cmd}\n`);
+        if (!r.cmd.includes(`--speed ${preset}`)) {
+          throw new Error(`the ${preset} chip did not reach the command: ${r.cmd}`);
+        }
+        if (!r.hint || r.hint.length < 20) {
+          throw new Error(`the ${preset} chip has no one-line description`);
+        }
+        // Only insane raises the amber block; the other three must not.
+        if (r.amber !== (preset === 'insane')) {
+          throw new Error(`the amber warning is wrong for ${preset}: shown=${r.amber}`);
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await wait(120);
+        if (preset === 'fast') {
+          // eslint-disable-next-line no-await-in-loop
+          await shot(win, outDir, 'send-speed-fast');
+        }
+      }
+      await shot(win, outDir, 'send-speed-insane');
+
+      // The preset has to survive the whole way to the engine, so insane is
+      // actually run as a dry run. Ten fixture instances cannot fill sixteen
+      // associations, so this is also the case the engine warns about — and
+      // that warning has to reach the app's console, not just its own stderr.
+      if (fixtures) {
+        await win.webContents.executeJavaScript(`
+          document.querySelector('#send-folder').value = ${JSON.stringify(fixtures)};
+          document.querySelector('#send-dryrun').checked = true;
+          document.querySelector('#view-send [data-run]').click();
+          true
+        `);
+        await waitFor(
+          win,
+          "!document.querySelector('#view-send [data-status]').className.includes('running')",
+          25000,
+          'the insane dry run to finish'
+        );
+        const insaneOut = await win.webContents.executeJavaScript(
+          `document.querySelector('#view-send [data-console]').textContent`
+        );
+        fs.writeFileSync(path.join(outDir, 'send-insane-console.txt'), insaneOut || '');
+        process.stdout.write(`insane dry run says:\n${insaneOut}\n`);
+        if (/Unknown option/.test(insaneOut || '')) {
+          throw new Error('the engine this app spawns does not know --speed');
+        }
+        await shot(win, outDir, 'send-speed-insane-dryrun');
+      }
+
+      fs.writeFileSync(
+        path.join(outDir, 'send-speed-cmds.txt'),
+        Object.entries(perPreset).map(([k, v]) => `${k}\t${v.cmd}`).join('\n') + '\n'
+      );
+
+      // The raw numbers still exist, under Advanced, and still win — but they
+      // do not win the same way, so the two cases are checked separately.
+      //
+      // A typed chunk size beats half the preset: the preset still supplies the
+      // association count, so --speed stays on the line and the engine says
+      // what it displaced.
+      const chunkOnly = await win.webContents.executeJavaScript(`(() => {
+        document.querySelector('#send-speed .chip[data-speed="fast"]').click();
+        document.querySelector('#send-adv').open = true;
+        const set = (id, v) => {
+          const el = document.querySelector('#' + id);
+          el.value = v;
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+        };
+        set('send-parallel', '');
+        set('send-chunk', '50');
+        return JSON.stringify({
+          cmd: document.querySelector('#view-send [data-cmd]').textContent,
+          advSum: document.querySelector('#send-adv-sum').textContent,
+          inert: document.querySelector('#send-speed').classList.contains('inert'),
+        });
+      })()`);
+      process.stdout.write(`send chunk override: ${chunkOnly}\n`);
+      {
+        const o = JSON.parse(chunkOnly);
+        for (const needed of ['--speed fast', '--chunk 50']) {
+          if (!o.cmd.includes(needed)) {
+            throw new Error(`a typed chunk size dropped ${needed}: ${o.cmd}`);
+          }
+        }
+        if (o.cmd.includes('--parallel')) {
+          throw new Error(`a --parallel appeared with nothing typed in it: ${o.cmd}`);
+        }
+        if (o.inert) {
+          throw new Error('a typed chunk size switched the preset off; it only replaces half of it');
+        }
+      }
+
+      // A typed association count replaces the preset outright. The command
+      // must carry no --speed at all: the engine gates its chunk derivation on
+      // the flag being present rather than on the preset supplying the width,
+      // so leaving --speed on the line would keep re-deriving the chunk size
+      // from the typed number — a different transfer from the one this field
+      // produced before presets existed, and a different one from what the same
+      // flags give a CLI user. The screen has to agree: the preview is the
+      // command, so a preset that is not on the line must not look chosen.
+      const override = await win.webContents.executeJavaScript(`(() => {
+        const set = (id, v) => {
+          const el = document.querySelector('#' + id);
+          el.value = v;
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+        };
+        set('send-parallel', '6');
+        set('send-chunk', '50');
+        document.querySelector('#send-adv').scrollIntoView({ block: 'center' });
+        return JSON.stringify({
+          cmd: document.querySelector('#view-send [data-cmd]').textContent,
+          advSum: document.querySelector('#send-adv-sum').textContent,
+          changed: document.querySelector('#send-adv-sum').classList.contains('changed'),
+          inert: document.querySelector('#send-speed').classList.contains('inert'),
+          hint: document.querySelector('#send-speed-hint').textContent,
+        });
+      })()`);
+      await wait(250);
+      await shot(win, outDir, 'send-speed-advanced');
+      // And a frame of the chip row itself, which is the half of this that is
+      // easy to get wrong: the command has no --speed in it, so the presets
+      // above must not look like one of them is deciding anything.
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#send-speed').scrollIntoView({ block: 'center' }); true`
+      );
+      await wait(250);
+      await shot(win, outDir, 'send-speed-inert');
+      process.stdout.write(`send advanced override: ${override}\n`);
+      fs.writeFileSync(path.join(outDir, 'send-override-cmd.txt'), JSON.parse(override).cmd);
+      {
+        const o = JSON.parse(override);
+        for (const needed of ['--parallel 6', '--chunk 50']) {
+          if (!o.cmd.includes(needed)) {
+            throw new Error(`the override command is missing ${needed}: ${o.cmd}`);
+          }
+        }
+        if (o.cmd.includes('--speed')) {
+          throw new Error(
+            `a typed association count left --speed on the command line, which re-derives the chunk `
+            + `size from the typed number: ${o.cmd}`
+          );
+        }
+        // Shutting the disclosure must not hide the values it holds.
+        for (const needed of ['--parallel 6', '--chunk 50']) {
+          if (!o.advSum.includes(needed)) {
+            throw new Error(`Advanced folds away a value without naming it: ${o.advSum}`);
+          }
+        }
+        // ...and must not name a flag that is no longer being sent.
+        if (/overrides --speed|replaces that half of --speed/.test(o.advSum)) {
+          throw new Error(`the summary still describes the preset as merely overridden: ${o.advSum}`);
+        }
+        if (!/not used/.test(o.advSum)) {
+          throw new Error(`the summary does not say the preset is out of the run: ${o.advSum}`);
+        }
+        if (!o.changed) throw new Error('the Advanced summary is not marked as changed');
+        if (!o.inert) {
+          throw new Error('the preset chips still look chosen while no --speed is being sent');
+        }
+        if (!/Not in use/.test(o.hint)) {
+          throw new Error(`the chip row's own line does not say the preset is off: ${o.hint}`);
+        }
+      }
+
+      // Put the screen back to a clean preset for anything that follows.
+      await win.webContents.executeJavaScript(`(() => {
+        const clear = (id) => {
+          const el = document.querySelector('#' + id);
+          el.value = '';
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+        };
+        clear('send-parallel');
+        clear('send-chunk');
+        document.querySelector('#send-adv').open = false;
+        document.querySelector('#send-speed .chip[data-speed="normal"]').click();
+        return true;
+      })()`);
+    }
+
+    // ---------------------------------------------------------------------
+    // The speed-test sweep. Four presets, four commands, all four on screen
+    // before anything is sent.
+    // ---------------------------------------------------------------------
+    {
+      const sweep = await win.webContents.executeJavaScript(`(() => {
+        showView('speed');
+        document.querySelector('#speed-folder').value = ${JSON.stringify(fixtures || '/tmp/study')};
+        document.querySelector('#speed-folder').dispatchEvent(new Event('input', {bubbles:true}));
+        state.conn = { host: 'bench.example.org', port: '11112', calledAe: 'BENCH', callingAe: '' };
+        syncConnInputs();
+        document.querySelector('#speed-mode .chip[data-mode="parallel"]').click();
+        return JSON.stringify({
+          hint: document.querySelector('#speed-parallel-hint').textContent,
+          cmds: Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent),
+          titles: Array.from(document.querySelectorAll('#speed-progress .run-line span:first-child')).map((e) => e.textContent),
+          custom: document.querySelector('#speed-parallels').value,
+        });
+      })()`);
+      await wait(300);
+      await shot(win, outDir, 'speed-preset-sweep');
+      const s = JSON.parse(sweep);
+      s.cmds.forEach((c) => process.stdout.write(`sweep run: ${c}\n`));
+      process.stdout.write(`sweep hint: ${s.hint}\n`);
+      fs.writeFileSync(path.join(outDir, 'speed-sweep-cmds.txt'), s.cmds.join('\n') + '\n');
+      for (const preset of ['normal', 'fast', 'very-fast', 'insane']) {
+        if (!s.cmds.some((c) => c.includes(`--speed ${preset}`))) {
+          throw new Error(`the sweep does not run ${preset}: ${JSON.stringify(s.cmds)}`);
+        }
+      }
+      if (s.cmds.length !== 4) {
+        throw new Error(`the sweep should be four runs, got ${s.cmds.length}`);
+      }
+      // Calling AE Titles have to stay distinct or the peer's log cannot be read
+      // per run — and they are capped at 16 characters by DICOM.
+      const aes = s.titles.map((t) => t.split('·').pop().trim());
+      if (new Set(aes).size !== aes.length) {
+        throw new Error(`the sweep reuses a calling AE Title: ${JSON.stringify(aes)}`);
+      }
+      for (const a of aes) {
+        if (a.length > 16) throw new Error(`calling AE Title over 16 characters: ${a}`);
+      }
+      process.stdout.write(`sweep calling AEs: ${JSON.stringify(aes)}\n`);
+
+      // Custom entry survives, and is additive rather than replacing the sweep.
+      const custom = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#speed-parallels');
+        el.value = '12';
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        return JSON.stringify({
+          cmds: Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent),
+        });
+      })()`);
+      const cu = JSON.parse(custom);
+      process.stdout.write(`sweep with custom count: ${cu.cmds.length} runs, last = ${cu.cmds[cu.cmds.length - 1]}\n`);
+      if (cu.cmds.length !== 5 || !cu.cmds[4].includes('--parallel 12')) {
+        throw new Error(`custom association counts were dropped: ${JSON.stringify(cu.cmds)}`);
+      }
+
+      // A typed chunk size beats every preset, so the screen has to say so
+      // before the benchmark rather than after it.
+      const capped = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#speed-parallels');
+        el.value = '';
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        const ch = document.querySelector('#speed-chunk');
+        ch.value = '200';
+        ch.dispatchEvent(new Event('input', {bubbles:true}));
+        return JSON.stringify({
+          hint: document.querySelector('#speed-parallel-hint').textContent,
+          live: document.querySelector('#speed-parallel-hint').classList.contains('live'),
+          first: document.querySelector('#speed-progress .run-cmd').textContent,
+        });
+      })()`);
+      process.stdout.write(`sweep, chunk typed: ${capped}\n`);
+      {
+        const c = JSON.parse(capped);
+        if (!c.live || !c.hint.includes('override')) {
+          throw new Error(`a typed chunk size overrides the presets silently: ${c.hint}`);
+        }
+        if (!c.first.includes('--chunk 200')) {
+          throw new Error(`the typed chunk size is not in the command: ${c.first}`);
+        }
+      }
+      // The listed commands are a preview like any other, so they have to move
+      // when the peer moves. Nothing in this box is touched by editing the peer
+      // panel, which is how the four commands used to sit there with no
+      // --host in them while the single preview above already had one.
+      const peerEdit = await win.webContents.executeJavaScript(`(() => {
+        const ch = document.querySelector('#speed-chunk');
+        ch.value = '';
+        ch.dispatchEvent(new Event('input', {bubbles:true}));
+        state.conn = { host: '', port: '', calledAe: '', callingAe: '' };
+        syncConnInputs();
+        updateAllPreviews();
+        const before = Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent);
+        const host = document.querySelector('#view-speed [data-conn-host]');
+        host.value = 'bench.example.org';
+        host.dispatchEvent(new Event('input', {bubbles:true}));
+        const port = document.querySelector('#view-speed [data-conn-port]');
+        port.value = '11112';
+        port.dispatchEvent(new Event('input', {bubbles:true}));
+        const called = document.querySelector('#view-speed [data-conn-calledae]');
+        called.value = 'BENCH';
+        called.dispatchEvent(new Event('input', {bubbles:true}));
+        return JSON.stringify({
+          before,
+          after: Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent),
+          preview: document.querySelector('#view-speed [data-cmd]').textContent,
+        });
+      })()`);
+      {
+        const p = JSON.parse(peerEdit);
+        if (p.before.some((c) => c.includes('--host'))) {
+          throw new Error(`the sweep commands carried a peer that was cleared: ${JSON.stringify(p.before)}`);
+        }
+        for (const c of p.after) {
+          for (const needed of ['--host bench.example.org', '--port 11112', '--called-ae BENCH']) {
+            if (!c.includes(needed)) {
+              throw new Error(`editing the peer left a listed command missing ${needed}: ${c}`);
+            }
+          }
+        }
+        // The two previews on this screen must not disagree about the peer.
+        if (!p.preview.includes('--host bench.example.org')) {
+          throw new Error(`the single preview did not pick up the peer: ${p.preview}`);
+        }
+        process.stdout.write(`sweep after peer edit: ${p.after[0]}\n`);
+      }
+
+      // A sweep in flight owns the progress box: the loop writes measured rates
+      // into #speed-line-<i> against the array it froze at the start, so a
+      // rebuild from the live form would land one run's rate on another run's
+      // labelled line and wipe the rates already there. Nothing on this screen
+      // is disabled during a sweep except Run, so this is one ordinary click.
+      const frozen = await win.webContents.executeJavaScript(`(() => {
+        const snap = () => document.querySelector('#speed-progress').innerHTML;
+        const before = snap();
+        speedRunning = true;
+        const box = document.querySelector('.speed-opt[value="insane"]');
+        box.checked = false;
+        box.dispatchEvent(new Event('change', {bubbles:true}));
+        const during = snap();
+        speedRunning = false;
+        box.checked = true;
+        box.dispatchEvent(new Event('change', {bubbles:true}));
+        const after = snap();
+        return JSON.stringify({ held: before === during, restored: before === after,
+          lines: document.querySelectorAll('#speed-progress .run-line').length });
+      })()`);
+      {
+        const f = JSON.parse(frozen);
+        process.stdout.write(`sweep list frozen mid-run: ${frozen}\n`);
+        if (!f.held) {
+          throw new Error('the progress list was rebuilt from the form while a sweep was in flight');
+        }
+        if (!f.restored || f.lines !== 4) {
+          throw new Error(`the progress list did not come back after the sweep: ${frozen}`);
+        }
+      }
+
+      // Back to the transfer-syntax comparison, which is what the live speed
+      // run further down expects to find.
+      await win.webContents.executeJavaScript(`(() => {
+        document.querySelector('#speed-mode .chip[data-mode="syntax"]').click();
+        return true;
+      })()`);
+    }
+
+    // ---------------------------------------------------------------------
     // The one workspace: query -> pick a row -> perform -> close.
     //
     // No MWL SCP is needed. The renderer is fed matches in the shape
@@ -762,6 +1137,13 @@ async function runSmoke(win, app) {
 
 
     // Live speed test against a receiver started by the harness caller.
+    //
+    // The preset sweep rather than the transfer-syntax one, because the preset
+    // sweep is the case the table used to get wrong: a fixture folder cannot
+    // fill four, eight or sixteen associations, so every preset above normal
+    // comes back narrower than it asked for, and the table used to print the
+    // number it asked for beside a real MB/s and stamp FASTEST on the winner of
+    // the noise between runs that were byte-identical.
     if (process.env.DCM_SMOKE_PEER_PORT && fixtures) {
       const port = process.env.DCM_SMOKE_PEER_PORT;
       await win.webContents.executeJavaScript(`
@@ -769,16 +1151,75 @@ async function runSmoke(win, app) {
         document.querySelector('#speed-folder').value = ${JSON.stringify(fixtures)};
         state.conn = { host: '127.0.0.1', port: '${port}', calledAe: 'SMOKE', callingAe: '' };
         syncConnInputs();
-        document.querySelectorAll('.ts-opt')[1].checked = true;
+        updateAllPreviews();
+        document.querySelector('#speed-mode .chip[data-mode="parallel"]').click();
         document.querySelector('#view-speed [data-run]').click();
         true
       `);
-      await wait(20000);
-      await shot(win, outDir, 'speed-result');
-      const rows = await win.webContents.executeJavaScript(
-        `document.querySelectorAll('#view-speed [data-result] tbody tr').length`
+      await waitFor(
+        win,
+        "!document.querySelector('#view-speed [data-status]').className.includes('running')",
+        90000,
+        'the four-preset sweep to finish'
       );
-      process.stdout.write(`speed rows: ${rows}\n`);
+      await shot(win, outDir, 'speed-result');
+      // The comparison table is the point of the screen and it sits below the
+      // fold after four runs, so it gets a frame of its own rather than being
+      // verified only through the DOM.
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#view-speed [data-result]').scrollIntoView({ block: 'start' }); true`
+      );
+      await wait(300);
+      await shot(win, outDir, 'speed-comparison');
+      const table = await win.webContents.executeJavaScript(`(() => {
+        const rows = Array.from(document.querySelectorAll('#view-speed [data-result] tbody tr'));
+        return JSON.stringify({
+          headers: Array.from(document.querySelectorAll('#view-speed [data-result] thead th')).map((e) => e.textContent),
+          rows: rows.map((tr) => Array.from(tr.children).map((td) => td.textContent.trim())),
+          badges: rows.map((tr) => (tr.querySelector('.badge-best') || {}).textContent || ''),
+          notes: Array.from(document.querySelectorAll('#view-speed [data-result] .local-note')).map((e) => e.textContent),
+          console: document.querySelector('#view-speed [data-console]').textContent,
+          progress: Array.from(document.querySelectorAll('#speed-progress .run-line')).map((e) => e.textContent),
+        });
+      })()`);
+      const t = JSON.parse(table);
+      fs.writeFileSync(path.join(outDir, 'speed-table.json'), JSON.stringify(t, null, 2));
+      process.stdout.write(`speed rows: ${t.rows.length}\n`);
+      t.rows.forEach((r) => process.stdout.write(`speed row: ${JSON.stringify(r)}\n`));
+      t.notes.forEach((n) => process.stdout.write(`speed note: ${n}\n`));
+      process.stdout.write(`speed console:\n${t.console}\n`);
+
+      // The measured width has to be a column of its own, beside the rate it
+      // qualifies. Reading it off the run's own title is what went wrong.
+      if (!t.headers.includes('Width')) {
+        throw new Error(`the comparison table has no achieved-width column: ${JSON.stringify(t.headers)}`);
+      }
+      const widths = t.rows.map((r) => r[1]);
+      if (!widths.some((w) => /\d+ of \d+/.test(w))) {
+        throw new Error(
+          `no row reports falling short of the width it asked for, over a folder too small to fill `
+          + `sixteen associations: ${JSON.stringify(widths)}`
+        );
+      }
+      // The engine's per-study warning is on stderr and --json does not silence
+      // it. It used to be discarded on every run whose stdout parsed — that is,
+      // on exactly the runs whose numbers reach the table.
+      if (!/association\(s\)/.test(t.console) || !/wide|accepted at once/.test(t.console)) {
+        throw new Error(`the engine's shortfall warning did not reach the app: ${t.console.slice(0, 400)}`);
+      }
+      // Fixture studies resolve every preset to the same transfer, so there is
+      // no winner to declare and the table must not declare one.
+      const badged = t.badges.filter(Boolean);
+      if (badged.length > 1 && !badged.every((b) => /TIED/.test(b))) {
+        throw new Error(`more than one row is badged and not as a tie: ${JSON.stringify(badged)}`);
+      }
+      if (!t.notes.length) {
+        throw new Error('a table with a short row carries no caveat under it');
+      }
+      // The transient list has to agree with the table it sits above.
+      if (!t.progress.some((p) => /of \d+ wide/.test(p))) {
+        throw new Error(`the progress lines report rates with no width: ${JSON.stringify(t.progress)}`);
+      }
     }
 
     // Live tag load + edit preview.

@@ -279,6 +279,8 @@ Options I actually use:
 | Option | Meaning |
 | --- | --- |
 | `--chunk <n>` | Instances per association. Default 200. |
+| `--speed <preset>` | `normal`, `fast`, `very-fast` or `insane`. Picks how many associations run at once *and* sizes the chunks to fill them. Read below before using it. |
+| `--parallel <n>` | Associations at once, 1–16. Default 1. Wins over a preset's association count. |
 | `--retry <n>` | Retry a chunk where fewer came back than went out. Default 1. |
 | `--dry-run` | Scan and show the plan. Doesn't connect. |
 | `--no-recurse` | Only files directly in the folder. |
@@ -291,6 +293,68 @@ Always worth a dry run first on anything big:
 ```bash
 dcm send ./studies --dry-run --chunk 100
 ```
+
+#### Speed presets
+
+C-STORE is sequential inside one association, so opening several at once is the
+only real lever on throughput. But `--parallel` on its own is a trap, and I
+walked into it: the concurrency you actually get is
+`min(--parallel, ceil(instances / --chunk))`. At the default chunk of 200 a
+2508-instance CT is 13 chunks, so `--parallel 16` runs 13 wide and says nothing
+about it. I wrote down a throughput figure from a real transfer to a staging
+PACS and attributed it to a concurrency that run never had.
+
+`--speed` sets both halves so that can't happen. It picks the association count
+and then derives a chunk size that can fill it, aiming at about two chunks per
+worker so nobody idles at the tail, held between 25 and 200 instances — below 25
+an association costs more in setup and release than it carries.
+
+| Preset | Associations | What it's for |
+| --- | --- | --- |
+| `normal` | 1 | Ordinary clinical traffic. The default, and the only setting that adds nothing to the receiver's association count. |
+| `fast` | 4 | A backlog or a migration, to a receiver you know tolerates a handful at once. |
+| `very-fast` | 8 | A bulk move you're watching, on a link with enough bandwidth for the concurrency to pay. |
+| `insane` | 16 | A benchmark, against a receiver you own. Not a default for production traffic, and not a thing to point at someone else's archive. |
+
+```bash
+dcm send ./ct --host pacs.example.org --port 11112 --called-ae ARCHIVE --speed fast
+```
+
+The size is derived per study, from that study's own instance count, because
+chunking and the worker pool are both per study. A folder holding a 30-instance
+study and a 20000-instance one gives the first a chunk of 25 and the second 200.
+An explicit `--chunk` is one number for the whole run and beats the derivation;
+an explicit `--parallel` beats the preset's association count. Either one says
+on stderr what it displaced, so you can't half-configure a benchmark and not be
+told.
+
+**The ceiling isn't yours to set.** The receiver decides how many associations
+it will accept, and going past that limit gets the extras rejected rather than
+slowing anything down. A receiver at its limit answers A-ASSOCIATE-RJ with
+reason 2, "local limit exceeded", and that is a *transient* rejection: the chunk
+is retried, the retry lands in a slot that has since freed, and every instance
+ends up acknowledged. So the usual outcome is the quiet one — a clean exit 0
+whose throughput was measured at a width you never got. The loud outcome, a
+shortfall between instances found and acknowledged with a non-zero exit, is what
+a *permanent* rejection gives you, and it is the rarer case. Ask what the
+receiver allows before you reach past `fast`, and read the width rather than
+just the exit code.
+
+Which is what the line under the report is for. It reports the width that ran,
+not the one that was asked for:
+
+```
+parallelism       4 of the 16 requested concurrent association(s) — --speed insane
+```
+
+That number is measured from associations the peer actually accepted, not
+workers dispatched, and it's a floor across the whole run — it can read one low
+when the tail drains early, and it never reads high. `--json` carries it as
+`parallelAchieved` alongside a per-study `studies` array.
+
+`dcm send --help` is the long version: the arithmetic worked through, what each
+JSON field does and doesn't mean, and what the concurrency costs the receiver
+and the link rather than this machine.
 
 #### --rewrite-series-uid changes what you send
 

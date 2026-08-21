@@ -3,7 +3,7 @@
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,
 shows it, and runs it. Echo, Send (with a live transfer report), a Receiver you
-can start and stop, Query, Inventory, Tag inspector, Tag editor and De-identify —
+can start and stop, Query, Inventory, Speed test, Tag inspector, Tag editor and De-identify —
 plus a DICOMweb group: test a server URL, send over STOW-RS, query over QIDO-RS,
 and run a local DICOMweb hub for testing.
 
@@ -30,6 +30,57 @@ Launch behavior worth knowing, all deliberate:
 - window size, position and maximized state are remembered across launches
   (and reset if the monitor they were on is gone);
 - saved connection profiles survive updates and the v0.5 → v0.6 rename.
+
+## Speed, on the Send and Speed test screens
+
+**Send a study** asks for a speed, not for two numbers. Normal, Fast, Very fast
+and Insane sit in a chip row, in place of the Chunk size and Parallel
+associations boxes, because those two were never independent: the concurrency a
+run reaches is `min(parallel, chunk count)`, so typing a parallel count without
+sizing the chunks to match set up a run that quietly went narrower than it said.
+The preset sets both, and the engine derives the chunk size per study.
+
+The raw inputs are still there under **Advanced**, and which one you type
+matters, so the screen says which:
+
+- a **Chunk size** replaces only that half. The command keeps `--speed` and adds
+  `--chunk`, and the engine names the half that was displaced;
+- a **Parallel associations** count replaces the preset outright. The command
+  drops `--speed` entirely rather than carrying both — a preset that has lost
+  its association count would still be sizing chunks off your number, for a
+  width you did not ask it for. The chip row goes inert and says so, since a
+  highlighted chip beside a command with no `--speed` in it would be the screen
+  describing a run that isn't the run. Clear the field to go back to the preset.
+
+**Insane is marked amber**, and selecting it opens a block explaining why. It is
+a benchmark setting for a receiver you own. Sixteen associations is not a number
+this end gets to choose — the receiver decides how many it accepts and rejects
+the rest — and the cost of the ones it does accept lands on it and on the link,
+not here.
+
+**Speed test** sweeps the four presets instead of asking the operator to type a
+list of association counts. That list was the same trap in a different screen:
+the widths went out as `--parallel`, which overrides the preset's sizing, so the
+sweep could compare four runs that had all clamped to the same real width. Typed
+counts are still available as an optional extra field, with what they override
+written next to them.
+
+Two things the results table is not allowed to do, because they are the whole
+point of the feature:
+
+- **Width is measured, not requested.** The column reads the engine's
+  `parallelAchieved` — associations the receiver actually accepted — and shows
+  `N of M` in amber when the run fell short of what it asked for. It is a floor:
+  it can read one low on a run whose tail drains early, and never reads high.
+  The engine's per-study shortfall warnings arrive on stderr even under `--json`,
+  and now reach the console under the table instead of being dropped whenever
+  the JSON parsed.
+- **FASTEST goes to a transfer, not to a row.** At 100 instances, Fast,
+  Very fast and Insane all clamp to the same chunk size and run the same width:
+  three identical transfers. Badging whichever of them drew the best sample
+  would claim 16 wide beat 8 on run-to-run noise. Rows that resolved to the same
+  effective transfer — same negotiated syntax, same measured width, same
+  division of instances into associations — are all badged TIED FASTEST.
 
 ## Why it's built this way
 

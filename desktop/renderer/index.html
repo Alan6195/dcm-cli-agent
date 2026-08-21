@@ -126,8 +126,26 @@
           </label>
         </div>
         <div class="conn-host" data-conn></div>
+
+        <div class="section-title">Speed</div>
+        <div class="chip-row" id="send-speed">
+          <button class="chip active" data-speed="normal">Normal</button>
+          <button class="chip" data-speed="fast">Fast</button>
+          <button class="chip" data-speed="very-fast">Very fast</button>
+          <button class="chip warn" data-speed="insane">Insane</button>
+        </div>
+        <p class="mode-hint" id="send-speed-hint"></p>
+        <div class="local-note" id="send-speed-danger" hidden>
+          <b>Insane is a benchmark setting, against a receiver you own.</b> The receiver decides how many
+          associations it will accept, and going past that limit gets the extras rejected. A rejected
+          association is retried, so this usually does not arrive as a slower run or as a shortfall between
+          instances found and acknowledged: it arrives as a run that reports a narrower parallelism than the
+          sixteen it asked for, at the bottom of the output. A study also has to split into at least sixteen
+          chunks before sixteen associations can run at once, so a small one runs narrower than this no matter
+          what the receiver allows.
+        </div>
+
         <div class="form-row triple">
-          <label>Chunk size<input type="number" id="send-chunk" placeholder="200" min="1" /></label>
           <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
           <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
         </div>
@@ -146,15 +164,33 @@
               <option value="jpeg-baseline">JPEG Baseline (lossy)</option>
             </select>
           </label>
-          <label>Parallel associations <span class="dim">(1–16)</span>
-            <input type="number" id="send-parallel" placeholder="1" min="1" max="16" />
-          </label>
         </div>
         <div class="checks">
           <label><input type="checkbox" id="send-dryrun" checked /> Dry run first (scan &amp; plan, no connection)</label>
           <label><input type="checkbox" id="send-norecurse" /> Don't recurse into subfolders</label>
           <label><input type="checkbox" id="send-rewrite" /> Rewrite Series UIDs <span class="warn-inline">(changes your data)</span></label>
         </div>
+
+        <details class="adv" id="send-adv">
+          <summary>Advanced <span class="adv-sum" id="send-adv-sum"></span></summary>
+          <div class="adv-body">
+            <p class="mode-hint">A preset sets both of these together, because setting one alone caps the other.
+              A chunk size typed here replaces the preset's half of that and leaves its association count in
+              place — the command carries both flags and the engine names what it displaced. An association
+              count typed here replaces the preset outright: the command drops <code>--speed</code>, because a
+              preset that has lost its width would still be sizing the chunks off your number. Clear the field
+              to go back to the preset.</p>
+            <div class="form-row triple">
+              <label>Parallel associations <span class="dim">(1–16)</span>
+                <input type="number" id="send-parallel" placeholder="from the preset" min="1" max="16" />
+              </label>
+              <label>Chunk size <span class="dim">(instances per association)</span>
+                <input type="number" id="send-chunk" placeholder="from the preset" min="1" />
+              </label>
+            </div>
+          </div>
+        </details>
+
         <div class="cmd-preview" data-cmd></div>
         <div class="actions">
           <button class="btn primary" data-run>Run</button>
@@ -524,7 +560,7 @@
         <div class="chip-row" id="speed-mode">
           <button class="chip active" data-mode="syntax">Transfer syntaxes</button>
           <button class="chip" data-mode="chunk">Chunk sizes</button>
-          <button class="chip" data-mode="parallel">Parallel associations</button>
+          <button class="chip" data-mode="parallel">Speed presets</button>
           <button class="chip" data-mode="repeat">Repeat the same run</button>
         </div>
 
@@ -548,9 +584,16 @@
         </div>
 
         <div id="speed-parallel-opts" hidden>
+          <div class="checks inline-checks">
+            <label><input type="checkbox" class="speed-opt" value="normal" checked /> Normal <span class="dim">(1)</span></label>
+            <label><input type="checkbox" class="speed-opt" value="fast" checked /> Fast <span class="dim">(4)</span></label>
+            <label><input type="checkbox" class="speed-opt" value="very-fast" checked /> Very fast <span class="dim">(8)</span></label>
+            <label><input type="checkbox" class="speed-opt" value="insane" checked /> Insane <span class="warn-inline">(16 — a receiver you own)</span></label>
+          </div>
+          <p class="mode-hint" id="speed-parallel-hint"></p>
           <div class="form-row">
-            <label class="grow">Association counts to try <span class="dim">(comma separated — check what the peer allows)</span>
-              <input type="text" id="speed-parallels" value="1, 2, 4" />
+            <label class="grow">Also try these association counts <span class="dim">(optional, comma separated — each is sent as --parallel, which overrides the preset's chunk sizing)</span>
+              <input type="text" id="speed-parallels" value="" placeholder="e.g. 2, 6, 12" />
             </label>
           </div>
         </div>
@@ -565,7 +608,9 @@
           <label>Calling AE prefix <span class="dim">(a run number is appended)</span>
             <input type="text" id="speed-aeprefix" value="AST" maxlength="10" />
           </label>
-          <label>Chunk size<input type="number" id="speed-chunk" placeholder="200" min="1" /></label>
+          <label>Chunk size <span class="dim">(blank = each run decides)</span>
+            <input type="number" id="speed-chunk" placeholder="200" min="1" />
+          </label>
         </div>
 
         <div class="cmd-preview" data-cmd></div>
@@ -578,7 +623,7 @@
         <div class="speed-progress" id="speed-progress" hidden></div>
         <div class="result-table" data-result hidden></div>
         <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
-        <p class="mcp-note dim">Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for.</p>
+        <p class="mcp-note dim">Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for. Width is measured the same way: it is the associations the peer actually had open at once, not the number the run asked for, and it is a floor — it can read one low on a run whose last chunks drain early, and never reads high.</p>
       </section>
 
       <!-- WEB PING (DICOMweb) -->

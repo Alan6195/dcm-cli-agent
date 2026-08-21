@@ -71,9 +71,16 @@ function countLine(label, value, colorFn) {
 /**
  * Reports what a dry run would do.
  *
- * @param {{scanned: object, chunkSize: number, rewriteSeriesUid: boolean}} params
+ * `chunkSize` is a number when one size covers the run, or a function of a
+ * study's instance count when --speed derives a size per study. There is no
+ * single number to divide by in that case, and printing the smallest turned
+ * every other study's association count into an upper bound.
+ *
+ * @param {{scanned: object, chunkSize: number|function, rewriteSeriesUid: boolean}} params
  */
 function dryRun({ scanned, chunkSize, rewriteSeriesUid }) {
+  const sizeFor = typeof chunkSize === 'function' ? chunkSize : () => chunkSize;
+
   log.out('');
   log.out(BAR);
   log.out('DRY RUN — nothing was sent and no connection was opened');
@@ -82,7 +89,8 @@ function dryRun({ scanned, chunkSize, rewriteSeriesUid }) {
   let totalAssociations = 0;
 
   for (const [studyUid, study] of scanned.studies) {
-    const associations = Math.ceil(study.instances.length / chunkSize);
+    const studyChunkSize = sizeFor(study.instances.length);
+    const associations = Math.ceil(study.instances.length / studyChunkSize);
     totalAssociations += associations;
 
     log.out('');
@@ -96,7 +104,7 @@ function dryRun({ scanned, chunkSize, rewriteSeriesUid }) {
     log.out(`  series         ${study.series.size}`);
     log.out(`  instances      ${study.instances.length}`);
     log.out(`  size           ${bytes(study.bytes)}`);
-    log.out(`  associations   ${associations} (chunk size ${chunkSize})`);
+    log.out(`  associations   ${associations} (chunk size ${studyChunkSize})`);
     log.out(`  transfer syntaxes:`);
     for (const ts of study.transferSyntaxes) {
       log.out(`    ${transferSyntaxName(ts)}`);
