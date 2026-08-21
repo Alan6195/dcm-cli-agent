@@ -547,10 +547,23 @@ const TYPE_1_HELP = Object.freeze({
  * against the order, so the failure is invisible from this end and shows up
  * days later as an order nobody closed.
  *
+ * `exemptKeywords` is how `--set` lifts the check, and it lifts it BY NAME
+ * only. An attribute the operator typed a value for — including an empty one —
+ * is an attribute they decided about, and refusing it would make the flag
+ * unable to ask the one question a conformance test most wants to ask: what
+ * does this SCP do with an empty Type 1? Every attribute nobody named is still
+ * checked, so the empty Type 1 stays impossible to reach by accident, which is
+ * the property this function actually exists to hold.
+ *
  * @param {Record<string, unknown>} dataset
+ * @param {{exemptKeywords?: Set<string>}} [opts]
  */
-function assertCreatable(dataset) {
-  const missing = missingType1(dataset);
+function assertCreatable(dataset, opts = {}) {
+  const exempt = opts.exemptKeywords ?? new Set();
+  const missing = missingType1(dataset).filter((name) => {
+    const leaf = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : name;
+    return !exempt.has(leaf);
+  });
   if (missing.length === 0) return;
 
   const lines = missing.map((name) => {
@@ -958,25 +971,57 @@ function stringifiedSequences(item) {
 }
 
 /**
- * Reads a structured worklist item from a JSON file.
+ * The `--from-worklist` value that means standard input.
  *
- * Accepts, in order of how people actually produce them:
- *   - `{ matches: [ ... ] }`, the shape a machine-readable `dcm find --mwl`
- *     export has (see the note in the `--from-worklist` help)
- *   - `{ items: [ ... ] }`, the hand-written shape `dcm scp --worklist` reads
- *   - a bare array of items
- *   - a single item object
- *
- * @param {string} file
- * @param {{studyUid?: string, accession?: string}} [select] Narrows a multi-item file.
- * @returns {{file: string, item: Record<string, unknown>, count: number}}
+ * One character, and it has to be recognised before anything path-shaped
+ * happens to it. `path.resolve('-')` is a file called `-` in the working
+ * directory, which is a real thing someone could create and never what was
+ * meant; and the POSIX workaround people reach for instead, `/dev/stdin`,
+ * resolves to `C:\proc\self\fd\0` on Windows — a path that cannot exist. Both
+ * failures read as "the worklist is missing" rather than "this build does not
+ * do pipes", which is why the token is checked first and nothing else can get
+ * at it.
  */
-function readWorklistFile(file, select = {}) {
-  const resolved = path.resolve(file);
+const STDIN_TOKEN = '-';
 
-  let raw;
+/** How the source is named in every message about it. */
+const STDIN_LABEL = 'standard input';
+
+/**
+ * Reads the raw worklist text from a file or from standard input.
+ *
+ * @param {string} file A path, or "-" for stdin.
+ * @returns {{label: string, raw: string, fromStdin: boolean}}
+ */
+function readWorklistSource(file) {
+  if (file === STDIN_TOKEN) {
+    let raw;
+    try {
+      // fd 0 rather than '/dev/stdin': the descriptor is the portable spelling
+      // and is what makes `dcm find --mwl --json-raw ... | dcm mpps start
+      // --from-worklist -` work on the platform the CI runners are on.
+      raw = fs.readFileSync(0, 'utf8');
+    } catch (err) {
+      throw new args.UsageError(
+        `--from-worklist - could not read ${STDIN_LABEL}: ${err.message}. ` +
+          'Something has to be piped in, e.g. ' +
+          '`dcm find --mwl --json-raw ... | dcm mpps start --from-worklist - ...`.'
+      );
+    }
+    if (raw.trim() === '') {
+      throw new args.UsageError(
+        `--from-worklist - read nothing from ${STDIN_LABEL}. ` +
+          'Nothing was piped in, or the producing command wrote its matches somewhere else — ' +
+          '`dcm find --mwl --json-raw` puts them on stdout, and only --json-raw carries the ' +
+          'sequences an N-CREATE needs.'
+      );
+    }
+    return { label: STDIN_LABEL, raw, fromStdin: true };
+  }
+
+  const resolved = path.resolve(file);
   try {
-    raw = fs.readFileSync(resolved, 'utf8');
+    return { label: resolved, raw: fs.readFileSync(resolved, 'utf8'), fromStdin: false };
   } catch (err) {
     if (err.code === 'ENOENT') {
       throw new args.UsageError(`--from-worklist "${resolved}" does not exist.`);
@@ -986,12 +1031,54 @@ function readWorklistFile(file, select = {}) {
     }
     throw new args.UsageError(`--from-worklist "${resolved}" could not be read: ${err.message}`);
   }
+}
+
+/**
+ * One line of the numbered preview a multi-item refusal prints.
+ *
+ * Extracted because --index is documented as being the number this preview
+ * shows, and a selector that means one thing and a preview that numbers
+ * another would be worse than no selector at all.
+ *
+ * @param {Record<string, unknown>} item
+ * @param {number} i Zero-based.
+ * @returns {string}
+ */
+function previewLine(item, i) {
+  return `  ${i + 1}. ${textOf(item.PatientName) || '(no name)'} · ` +
+    `Accession ${textOf(item.AccessionNumber) || '(none)'} · ` +
+    `Study ${textOf(item.StudyInstanceUID) || '(none)'}`;
+}
+
+/**
+ * Reads a structured worklist item from a JSON file or from standard input.
+ *
+ * Accepts, in order of how people actually produce them:
+ *   - `{ matches: [ ... ] }`, the shape a machine-readable `dcm find --mwl`
+ *     export has (see the note in the `--from-worklist` help)
+ *   - `{ items: [ ... ] }`, the hand-written shape `dcm scp --worklist` reads
+ *   - a bare array of items
+ *   - a single item object
+ *
+ * @param {string} file A path, or "-" for standard input.
+ * @param {{studyUid?: string, accession?: string, index?: number, first?: boolean}} [select]
+ *   Narrows a multi-item document. studyUid and accession filter; index and
+ *   first pick a row out of what is left.
+ * @returns {{file: string, item: Record<string, unknown>, count: number,
+ *   fromStdin: boolean, index: number, selectedBy: string}}
+ */
+function readWorklistFile(file, select = {}) {
+  const { label: resolved, raw, fromStdin } = readWorklistSource(file);
+
+  // How the source is named in a sentence. A path is quoted; stdin is not,
+  // because `--from-worklist "standard input"` reads as a filename.
+  const where = fromStdin ? `--from-worklist - (${STDIN_LABEL})` : `--from-worklist "${resolved}"`;
 
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    throw new args.UsageError(`--from-worklist "${resolved}" is not valid JSON: ${err.message}`);
+    throw new args.UsageError(`${where} is not valid JSON: ${err.message}`);
   }
 
   let items;
@@ -1001,13 +1088,13 @@ function readWorklistFile(file, select = {}) {
   else if (parsed && typeof parsed === 'object') items = [parsed];
   else {
     throw new args.UsageError(
-      `--from-worklist "${resolved}" must be a worklist item, an array of them, or an ` +
+      `${where} must be a worklist item, an array of them, or an ` +
         'object with a "matches" or "items" array.'
     );
   }
 
   if (items.length === 0) {
-    throw new args.UsageError(`--from-worklist "${resolved}" contains no worklist items.`);
+    throw new args.UsageError(`${where} contains no worklist items.`);
   }
 
   const flattened = items.map((item) => flattenWorklistItem(item));
@@ -1015,7 +1102,7 @@ function readWorklistFile(file, select = {}) {
   const stringified = flattened.flatMap((item) => stringifiedSequences(item));
   if (stringified.length) {
     throw new args.UsageError(
-      `--from-worklist "${resolved}" holds rendered text where sequences should be: ` +
+      `${where} holds rendered text where sequences should be: ` +
         `${[...new Set(stringified)].join(', ')}.\n` +
         'That file came from `dcm find --mwl --json`, which formats every value for a ' +
         'person to read and turns a sequence into a string. It cannot be fed to an ' +
@@ -1034,17 +1121,42 @@ function readWorklistFile(file, select = {}) {
   // which is not an override at all — it is the key this step will be
   // reconciled on, so naming a different one than the item carries means the
   // file does not describe the study being performed.
+  // --index and --first are positional selectors, and two of them state
+  // different rows, so both together is a mistake worth failing on rather than
+  // resolving by precedence. (--first IS --index 1, which is why the message
+  // says so instead of just refusing.)
+  if (select.index !== undefined && select.first) {
+    throw new args.UsageError(
+      `--index ${select.index} and --first both say which row to take. --first is --index 1; ` +
+        'give one of them.'
+    );
+  }
+
   if (flattened.length === 1) {
     const only = flattened[0];
     const itemStudyUid = textOf(only.StudyInstanceUID);
     if (select.studyUid && itemStudyUid && itemStudyUid !== select.studyUid) {
       throw new args.UsageError(
-        `--study-uid says ${select.studyUid} but the only item in "${resolved}" is for ` +
+        `--study-uid says ${select.studyUid} but the only item in ${resolved} is for ` +
           `${itemStudyUid}. Study Instance UID is what the RIS reconciles the performed ` +
           'step against, so these cannot disagree.'
       );
     }
-    return { file: resolved, item: only, count: 1 };
+    if (select.index !== undefined && select.index !== 1) {
+      throw new args.UsageError(
+        `--index ${select.index} names row ${select.index}, and ${where} holds one item. ` +
+          'Row numbers are 1-based and count the rows left after --study-uid and --accession ' +
+          'have filtered.'
+      );
+    }
+    return {
+      file: resolved,
+      item: only,
+      count: 1,
+      fromStdin,
+      index: 1,
+      selectedBy: 'the only item',
+    };
   }
 
   const wanted = flattened.filter((item) => {
@@ -1059,27 +1171,76 @@ function readWorklistFile(file, select = {}) {
       select.accession ? `--accession ${select.accession}` : undefined,
     ].filter(Boolean).join(' and ');
     throw new args.UsageError(
-      `--from-worklist "${resolved}" has ${flattened.length} items, none matching ` +
+      `${where} has ${flattened.length} items, none matching ` +
         `${how || 'the given selection'}.`
     );
   }
 
-  if (wanted.length > 1) {
-    const preview = wanted
-      .slice(0, 5)
-      .map((item, i) =>
-        `  ${i + 1}. ${textOf(item.PatientName) || '(no name)'} · ` +
-          `Accession ${textOf(item.AccessionNumber) || '(none)'} · ` +
-          `Study ${textOf(item.StudyInstanceUID) || '(none)'}`
+  // The numbering below is the numbering the refusal prints, and --index is
+  // documented against it: it counts the rows that survived --study-uid and
+  // --accession, not the rows in the document. Anything else would make the
+  // preview a list of numbers that do not select what they are next to.
+  const preview = wanted.slice(0, 5).map(previewLine);
+  const previewBlock =
+    `${preview.join('\n')}${wanted.length > 5 ? `\n  … and ${wanted.length - 5} more` : ''}`;
+
+  if (select.index !== undefined) {
+    if (select.index < 1 || select.index > wanted.length) {
+      throw new args.UsageError(
+        `--index ${select.index} is out of range: ${where} offers ` +
+          `${wanted.length} row${wanted.length === 1 ? '' : 's'} to choose from, numbered 1 to ` +
+          `${wanted.length}.\n${previewBlock}`
       );
+    }
+    return {
+      file: resolved,
+      item: wanted[select.index - 1],
+      count: flattened.length,
+      fromStdin,
+      index: select.index,
+      selectedBy: `--index ${select.index} of ${wanted.length}`,
+    };
+  }
+
+  if (select.first) {
+    return {
+      file: resolved,
+      item: wanted[0],
+      count: flattened.length,
+      fromStdin,
+      index: 1,
+      selectedBy: `--first of ${wanted.length}`,
+    };
+  }
+
+  if (wanted.length > 1) {
+    // Still the default, and deliberately: an MPPS step is a clinical record of
+    // one piece of work, and a tool that quietly picks a row when the operator
+    // did not say which one produces a step attributed to the wrong order with
+    // nothing on the wire to show for it. --index and --first are the ways to
+    // say it out loud.
     throw new args.UsageError(
-      `--from-worklist "${resolved}" holds ${wanted.length} worklist items, and an MPPS ` +
-        'procedure step describes exactly one. Narrow it with --study-uid or --accession:\n' +
-        `${preview.join('\n')}${wanted.length > 5 ? `\n  … and ${wanted.length - 5} more` : ''}`
+      `${where} holds ${wanted.length} worklist items, and an MPPS ` +
+        'procedure step describes exactly one. Say which:\n' +
+        `${previewBlock}\n` +
+        '  --study-uid <uid>   the one being performed, and the key it reconciles on\n' +
+        '  --accession <text>  the order number\n' +
+        '  --index <n>         the row above, by the number printed next to it\n' +
+        '  --first             the first row above, for a query written to return one'
     );
   }
 
-  return { file: resolved, item: wanted[0], count: flattened.length };
+  return {
+    file: resolved,
+    item: wanted[0],
+    count: flattened.length,
+    fromStdin,
+    index: 1,
+    selectedBy: [
+      select.studyUid ? `--study-uid ${select.studyUid}` : undefined,
+      select.accession ? `--accession ${select.accession}` : undefined,
+    ].filter(Boolean).join(' and ') || 'the only matching item',
+  };
 }
 
 /**
@@ -1225,7 +1386,26 @@ async function sendNRequest(params) {
  */
 function nCreate(params) {
   const { connection, timeouts, mppsSopInstanceUid, dataset } = params;
+  return sendNRequest({
+    connection, timeouts, request: createRequest(mppsSopInstanceUid, dataset),
+  });
+}
 
+/**
+ * Builds the N-CREATE request, without sending it.
+ *
+ * Separate from nCreate() so that the encoded octets can be read back before
+ * anything is opened — `--set` promises a value goes on the wire byte for byte,
+ * and the only way to keep that promise is to encode the dataset and look, on
+ * the dry run as well as on the live path. A dry run that printed a dataset the
+ * writer would then shorten would be exactly the false reassurance the flag
+ * exists to remove.
+ *
+ * @param {string} mppsSopInstanceUid
+ * @param {Record<string, unknown>} dataset
+ * @returns {object} An NCreateRequest with its dataset attached.
+ */
+function createRequest(mppsSopInstanceUid, dataset) {
   // Two arguments only. Passing a third (metaSopClassUid) makes the library
   // negotiate a context for the meta class and the real one never gets
   // proposed, so the peer answers nothing.
@@ -1234,23 +1414,33 @@ function nCreate(params) {
   // Mandatory: setDataset() is what flips CommandDataSetType. Without it the
   // command says "no dataset follows" and the SCP receives an empty N-CREATE.
   request.setDataset(new Dataset(dataset));
-
-  return sendNRequest({ connection, timeouts, request });
+  return request;
 }
 
 /**
- * Sends the N-SET that closes a procedure step.
+ * Sends the N-SET that closes or updates a procedure step.
  *
- * @param {object} params
+ * @param {object} params See {@link nCreate}.
  * @returns {Promise<object>} See {@link sendNRequest}.
  */
 function nSet(params) {
   const { connection, timeouts, mppsSopInstanceUid, dataset } = params;
+  return sendNRequest({
+    connection, timeouts, request: setRequest(mppsSopInstanceUid, dataset),
+  });
+}
 
+/**
+ * Builds the N-SET request, without sending it. See {@link createRequest}.
+ *
+ * @param {string} mppsSopInstanceUid
+ * @param {Record<string, unknown>} dataset
+ * @returns {object}
+ */
+function setRequest(mppsSopInstanceUid, dataset) {
   const request = new NSetRequest(MPPS_SOP_CLASS, mppsSopInstanceUid);
   request.setDataset(new Dataset(dataset));
-
-  return sendNRequest({ connection, timeouts, request });
+  return request;
 }
 
 module.exports = {
@@ -1291,11 +1481,16 @@ module.exports = {
 
   flattenWorklistItem,
   stringifiedSequences,
+  readWorklistSource,
   readWorklistFile,
   worklistToAttributes,
+  STDIN_TOKEN,
+  STDIN_LABEL,
 
   mppsContextAccepted,
   sendNRequest,
   nCreate,
+  createRequest,
   nSet,
+  setRequest,
 };

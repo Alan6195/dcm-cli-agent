@@ -11,6 +11,7 @@ const { NCreateRequest, NSetRequest } = dcmjsDimse.requests;
 const { SopClass, Status } = dcmjsDimse.constants;
 
 const { startScp, withTempDir } = require('../helpers/harness');
+const { generate, uid: fixtureUid } = require('../../tools/make-fixtures');
 const { runAssociation } = require('../../src/lib/dimse');
 const { tokenize } = require('../../src/lib/args');
 const log = require('../../src/lib/log');
@@ -37,8 +38,55 @@ const dispatcher = require('../../src/commands/mpps');
  */
 
 const CALLED_AE = 'MPPS-SCP';
-const FIXTURES = path.resolve(__dirname, '..', '..', 'fixtures', 'study-1');
-const STUDY_UID = '1.2.826.0.1.3680043.10.1337.1';
+
+/**
+ * The study these tests name, asked of the generator rather than copied out of
+ * it, so the two cannot drift.
+ */
+const STUDY_UID = fixtureUid(1);
+
+/** The two series that study holds, in the order the generator numbers them. */
+const SERIES_UIDS = [fixtureUid(1, 1), fixtureUid(1, 2)];
+
+/**
+ * Writes a synthetic study inside `dir` and hands back the path to it.
+ *
+ * Every test here builds the study it performs. This file used to read
+ * `fixtures/study-1` at the repo root — a directory .gitignore excludes so
+ * that nobody commits DICOM — which meant the suite passed on the one machine
+ * where an earlier manual run had left it lying around and failed on every
+ * machine that had not, CI included. A test that reads state it did not create
+ * reports a pass that means nothing.
+ *
+ * The shape is stated at the call site rather than inherited from the
+ * generator's defaults, because the counts here are load-bearing: two series of
+ * five instances is ten, and ten at `--chunk 4` is three associations, two
+ * boundaries, and interim updates carrying four instances and then eight. Tests
+ * that only need a folder with readable images in it ask for fewer and say so.
+ *
+ * The tree goes in a subdirectory of `dir` rather than in `dir` itself, because
+ * generate() clears its output directory and the callers keep --persist stores
+ * and staged copies alongside it.
+ */
+async function studyIn(dir, { seriesPerStudy = 2, instancesPerSeries = 5 } = {}) {
+  const root = path.join(dir, 'source');
+  const manifest = await generate({
+    outDir: root,
+    quiet: true,
+    studies: 1,
+    seriesPerStudy,
+    instancesPerSeries,
+    // Nothing below asserts anything about pixels, and 16x16 keeps ten
+    // instances cheap to write in a file that already stands up receivers.
+    rows: 16,
+    cols: 16,
+  });
+  assert.equal(
+    manifest.studies[0].studyInstanceUid, STUDY_UID,
+    'the generated study is the one these tests name'
+  );
+  return path.join(root, 'study-1');
+}
 
 /** Short timeouts: everything here is loopback, and a hang should fail fast. */
 const TIMEOUT = ['--timeout', '5000'];
@@ -97,16 +145,16 @@ async function withReceiver(fn) {
 }
 
 /**
- * A folder holding the first `count` instances of the fixture study.
+ * Copies the first `count` instances of the study at `source` into `dir`.
  *
  * Copied rather than referenced so a folder can GROW between two updates, which
  * is the only way to make `--series-from` produce a larger sequence the second
  * time and the only honest way to rehearse a modality mid-acquisition.
  */
-function stageInstances(dir, count) {
+function stageInstances(source, dir, count) {
   const files = [];
-  for (const series of fs.readdirSync(FIXTURES)) {
-    const seriesDir = path.join(FIXTURES, series);
+  for (const series of fs.readdirSync(source)) {
+    const seriesDir = path.join(source, series);
     for (const name of fs.readdirSync(seriesDir)) {
       files.push({ series, name, from: path.join(seriesDir, name) });
     }
@@ -170,6 +218,9 @@ async function converse(receiver, requests) {
 test('start -> update -> update -> complete, every message accepted', async () => {
   await withReceiver(async (receiver) => {
     await withTempDir('dcm-interim', async (dir) => {
+      // Two series of five. The two updates below reference five instances and
+      // then ten, and the first five sorted files are the whole of series-1.
+      const source = await studyIn(dir);
       const growing = path.join(dir, 'acquired');
       fs.mkdirSync(growing);
 
@@ -188,7 +239,7 @@ test('start -> update -> update -> complete, every message accepted', async () =
       // --no-status leaves PerformedProcedureStepStatus out of the dataset
       // altogether, which is one of the two legal interim shapes. The other
       // re-asserts IN PROGRESS and is exercised below.
-      stageInstances(growing, 5);
+      stageInstances(source, growing, 5);
       const first = await mppsJson(receiver, [
         'update', uid, '--no-status', '--series-from', growing, '--retrieve-ae', CALLED_AE,
       ]);
@@ -201,7 +252,7 @@ test('start -> update -> update -> complete, every message accepted', async () =
       // 3. Second interim update, with the folder grown. This is the message
       //    that exercises a receiver's merge rule: the sequence must get bigger
       //    rather than being replaced by only the new instances.
-      stageInstances(growing, 10);
+      stageInstances(source, growing, 10);
       const second = await mppsJson(receiver, [
         'update', uid, '--no-status', '--series-from', growing, '--retrieve-ae', CALLED_AE,
       ]);
@@ -251,6 +302,11 @@ test('a later update REPLACES the performed series rather than appending to it',
   // delta, and it is why omitting the sequence entirely has to be expressible:
   // omitting is the only way to leave what the step holds alone.
   await withTempDir('dcm-replace', async (dir) => {
+    // What is counted here is SERIES, not instances: two series, and one
+    // instance in each is enough to make either of them a legal update. The two
+    // must carry different Series Instance UIDs, which the generator gives them
+    // unless it is asked for the colliding-UID defect.
+    const source = await studyIn(dir, { instancesPerSeries: 1 });
     const persisted = path.join(dir, 'persisted');
     const receiver = await startScp({ ae: CALLED_AE, persist: persisted });
     try {
@@ -262,8 +318,8 @@ test('a later update REPLACES the performed series rather than appending to it',
       const seriesOf = (name) => {
         const only = path.join(dir, name);
         fs.mkdirSync(only, { recursive: true });
-        for (const file of fs.readdirSync(path.join(FIXTURES, name))) {
-          fs.copyFileSync(path.join(FIXTURES, name, file), path.join(only, file));
+        for (const file of fs.readdirSync(path.join(source, name))) {
+          fs.copyFileSync(path.join(source, name, file), path.join(only, file));
         }
         return only;
       };
@@ -292,6 +348,15 @@ test('a later update REPLACES the performed series rather than appending to it',
         first.json.performedSeriesSource,
         'and what survives is the sequence the LAST update carried'
       );
+      // The same claim, checked against the UID rather than against the label
+      // `performedSeriesSource` carries. Nameable only because this test now
+      // generates the study and therefore knows which UID belongs to which
+      // series: series-2 went second, so series-2 is what is left.
+      assert.equal(
+        step.elements.PerformedSeriesSequence[0].SeriesInstanceUID,
+        SERIES_UIDS[1],
+        'the surviving series is the one the second update named, not the first'
+      );
       assert.equal(step.status, mpps.Status.IN_PROGRESS, 'the step is still open throughout');
     } finally {
       receiver.close();
@@ -312,6 +377,9 @@ test('the keep-alive update carries IN PROGRESS and leaves the performed series 
   // attributes an N-SET may carry — so what is asserted now is the pair that
   // makes the shape useful: the receiver accepts it, and it deposits nothing.
   await withTempDir('dcm-keepalive', async (dir) => {
+    // Two series of five: the first update deposits all ten, and the ten is
+    // what the keep-alive then has to leave alone.
+    const source = await studyIn(dir);
     const persisted = path.join(dir, 'persisted');
     const receiver = await startScp({ ae: CALLED_AE, persist: persisted });
     try {
@@ -324,11 +392,11 @@ test('the keep-alive update carries IN PROGRESS and leaves the performed series 
       // series untouched" would be a claim about an empty sequence and would
       // hold whatever the receiver did with the message.
       const deposited = await mppsJson(receiver, [
-        'update', uid, '--no-status', '--series-from', FIXTURES,
+        'update', uid, '--no-status', '--series-from', source,
       ]);
       assert.equal(deposited.json.ok, true, deposited.output);
       const held = referencedIn(readStep(persisted, uid));
-      assert.equal(held, 10, 'the whole fixture study, deposited by the first update');
+      assert.equal(held, 10, 'the whole generated study, deposited by the first update');
 
       const alive = await mppsJson(receiver, ['update', uid]);
       assert.equal(alive.code, 0, alive.output);
@@ -363,21 +431,29 @@ test('a terminal step refuses a later interim update, and says why', async () =>
   // The rule the self-edge must not have loosened. Once the step is COMPLETED,
   // an interim update is refused — by this end if it can tell, and by the
   // receiver with 0x0110 if it cannot.
-  await withReceiver(async (receiver) => {
-    const started = await mppsJson(receiver, [
-      'start', '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-CLOSED',
-    ]);
-    const uid = started.json.mppsSopInstanceUid;
+  await withTempDir('dcm-terminal', async (dir) => {
+    // What the folder holds is incidental: the refusal is about the step's
+    // state, not about the sequence. It only has to hold enough for the update
+    // to be a legal message at all, which one instance per series is.
+    const source = await studyIn(dir, { instancesPerSeries: 1 });
+    await withReceiver(async (receiver) => {
+      const started = await mppsJson(receiver, [
+        'start', '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-CLOSED',
+      ]);
+      const uid = started.json.mppsSopInstanceUid;
 
-    assert.equal((await mppsJson(receiver, ['complete', uid])).json.ok, true);
+      assert.equal((await mppsJson(receiver, ['complete', uid])).json.ok, true);
 
-    const late = await mppsJson(receiver, ['update', uid, '--no-status', '--series-from', FIXTURES]);
-    assert.equal(late.code, 1, 'an update on a closed step must fail');
-    assert.equal(late.json.ok, false);
-    assert.equal(
-      late.json.status.code, '0x0110',
-      'PS3.4 F.8.2: a terminal step may no longer be updated'
-    );
+      const late = await mppsJson(receiver, [
+        'update', uid, '--no-status', '--series-from', source,
+      ]);
+      assert.equal(late.code, 1, 'an update on a closed step must fail');
+      assert.equal(late.json.ok, false);
+      assert.equal(
+        late.json.status.code, '0x0110',
+        'PS3.4 F.8.2: a terminal step may no longer be updated'
+      );
+    });
   });
 });
 
@@ -588,15 +664,23 @@ test('perform --unscheduled sends nothing when the step cannot be opened', async
   // under the folder's study and the step names none. And because the N-CREATE
   // is refused (previous test), NOT ONE INSTANCE is sent — perform's rule that
   // a step which was never opened gets no images holds for this path too.
-  await withReceiver(async (receiver) => {
-    const result = await mppsJson(receiver, [
-      'perform', FIXTURES, '--unscheduled', '--modality', 'DX', '--step-id', 'WALKIN-016',
-    ]);
+  await withTempDir('dcm-unscheduled', async (dir) => {
+    // Two instances is enough to make "not one instance was sent" a claim about
+    // something: what is asserted is zero, against a folder that is not empty.
+    const source = await studyIn(dir, { instancesPerSeries: 1 });
+    await withReceiver(async (receiver) => {
+      const result = await mppsJson(receiver, [
+        'perform', source, '--unscheduled', '--modality', 'DX', '--step-id', 'WALKIN-016',
+      ]);
 
-    assert.equal(result.code, 1);
-    assert.equal(result.json.stage, 'n-create');
-    assert.equal(result.json.sent, 0, 'no images go to an archive for a step that was never opened');
-    assert.equal(receiver.stats.stored, 0);
+      assert.equal(result.code, 1);
+      assert.equal(result.json.stage, 'n-create');
+      assert.equal(result.json.found, 2, 'there were images to send, and none were sent');
+      assert.equal(
+        result.json.sent, 0, 'no images go to an archive for a step that was never opened'
+      );
+      assert.equal(receiver.stats.stored, 0);
+    });
   });
 });
 
@@ -604,22 +688,28 @@ test('perform --unscheduled reports the two identities separately in its dry run
   // The divergence itself, where it can be asserted without the receiver: the
   // C-STORE would use the folder's study because that is what the archive files
   // images by, and the step names none.
-  log.configure({ noColor: true });
-  const sink = log.beginCapture();
-  try {
-    await dispatcher.run(tokenize([
-      'perform', FIXTURES, '--dry-run', '--json',
-      '--unscheduled', '--modality', 'DX', '--step-id', 'WALKIN-017',
-    ]));
-  } finally {
-    log.endCapture();
-  }
+  await withTempDir('dcm-unscheduled-dry', async (dir) => {
+    // The study UID is what this asserts, and the generator settles it; the
+    // instance count does not come into it.
+    const source = await studyIn(dir, { instancesPerSeries: 1 });
 
-  const parsed = JSON.parse(sink.out);
-  assert.equal(parsed.unscheduled, true);
-  assert.equal(parsed.studyInstanceUid, STUDY_UID, 'the images keep the study they carry');
-  assert.equal(parsed.stepStudyInstanceUid, null, 'and the step names none');
-  assert.deepEqual(parsed.dataset.ScheduledStepAttributesSequence, [{}]);
+    log.configure({ noColor: true });
+    const sink = log.beginCapture();
+    try {
+      await dispatcher.run(tokenize([
+        'perform', source, '--dry-run', '--json',
+        '--unscheduled', '--modality', 'DX', '--step-id', 'WALKIN-017',
+      ]));
+    } finally {
+      log.endCapture();
+    }
+
+    const parsed = JSON.parse(sink.out);
+    assert.equal(parsed.unscheduled, true);
+    assert.equal(parsed.studyInstanceUid, STUDY_UID, 'the images keep the study they carry');
+    assert.equal(parsed.stepStudyInstanceUid, null, 'and the step names none');
+    assert.deepEqual(parsed.dataset.ScheduledStepAttributesSequence, [{}]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -636,11 +726,14 @@ test('perform --update-each-chunk sends an interim N-SET at every boundary but t
   // accepted now, and the run is asserted end to end: what went out, what the
   // receiver took, and what it was left holding.
   await withTempDir('dcm-chunk-accepted', async (dir) => {
+    // Ten instances exactly, because every number below is derived from it:
+    // three chunks of 4/4/2, two boundaries, and updates at four and eight.
+    const source = await studyIn(dir);
     const persisted = path.join(dir, 'persisted');
     const receiver = await startScp({ ae: CALLED_AE, persist: persisted });
     try {
       const result = await mppsJson(receiver, [
-        'perform', FIXTURES, '--update-each-chunk', '--chunk', '4',
+        'perform', source, '--update-each-chunk', '--chunk', '4',
         '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-CHUNKED',
       ]);
 
@@ -729,6 +822,9 @@ test('a refused interim update costs no images: the run still lands as one closi
   // Everything else is real — the C-STORE, the ledger, the closing N-SET, and
   // the step the receiver writes to disk.
   await withTempDir('dcm-chunk-interim', async (dir) => {
+    // Ten again: two refused boundaries at --chunk 4, and ten acknowledged
+    // instances that the refusals must not have cost.
+    const source = await studyIn(dir);
     const persisted = path.join(dir, 'persisted');
     const receiver = await startScp({ ae: CALLED_AE, persist: persisted });
 
@@ -751,7 +847,7 @@ test('a refused interim update costs no images: the run still lands as one closi
 
     try {
       const result = await mppsJson(receiver, [
-        'perform', FIXTURES, '--update-each-chunk', '--chunk', '4',
+        'perform', source, '--update-each-chunk', '--chunk', '4',
         '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-HONEST',
       ]);
 
@@ -792,15 +888,21 @@ test('a refused interim update costs no images: the run still lands as one closi
 });
 
 test('one association means no interim updates, and the report says so', async () => {
-  await withReceiver(async (receiver) => {
-    const result = await mppsJson(receiver, [
-      'perform', FIXTURES, '--update-each-chunk', '--chunk', '200',
-      '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-ONECHUNK',
-    ]);
+  await withTempDir('dcm-chunk-single', async (dir) => {
+    // Ten instances under a chunk size of 200: one association, so no boundary
+    // to update at. The ten is what makes "no updates" mean "not because there
+    // was nothing to send".
+    const source = await studyIn(dir);
+    await withReceiver(async (receiver) => {
+      const result = await mppsJson(receiver, [
+        'perform', source, '--update-each-chunk', '--chunk', '200',
+        '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-ONECHUNK',
+      ]);
 
-    assert.equal(result.json.ok, true, result.output);
-    assert.equal(result.json.interimUpdates.attempted, 0);
-    assert.equal(result.json.acknowledged, 10);
+      assert.equal(result.json.ok, true, result.output);
+      assert.equal(result.json.interimUpdates.attempted, 0);
+      assert.equal(result.json.acknowledged, 10);
+    });
   });
 });
 
@@ -808,15 +910,20 @@ test('without the flag the transfer sends no MPPS traffic between chunks', async
   // The default has to stay exactly as it was: this is the control for the test
   // above, and it is what proves --update-each-chunk is opt-in.
   await withTempDir('dcm-chunk-default', async (dir) => {
+    // Ten at --chunk 4 again, and the ten matters: with a study small enough to
+    // fit one association there would be no boundary to stay silent at, and
+    // "no MPPS traffic between chunks" would hold vacuously.
+    const source = await studyIn(dir);
     const persisted = path.join(dir, 'persisted');
     const receiver = await startScp({ ae: CALLED_AE, persist: persisted });
     try {
       const result = await mppsJson(receiver, [
-        'perform', FIXTURES, '--chunk', '4',
+        'perform', source, '--chunk', '4',
         '--study-uid', STUDY_UID, '--modality', 'CT', '--step-id', 'PPS-DEFAULT',
       ]);
       assert.equal(result.json.ok, true, result.output);
       assert.equal(result.json.interimUpdates, null);
+      assert.equal(result.json.acknowledged, 10, 'three associations carried the whole study');
 
       const file = path.join(persisted, 'mpps', `${result.json.mppsSopInstanceUid}.json`);
       const step = JSON.parse(fs.readFileSync(file, 'utf8'));

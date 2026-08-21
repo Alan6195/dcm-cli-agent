@@ -331,7 +331,7 @@ function againstReceiver(items, argv) {
  * buffer is not guaranteed to hold nothing but the command's output.
  */
 function jsonFrom(stdout) {
-  const start = stdout.indexOf('{\n  "level"');
+  const start = stdout.indexOf('{\n  "schema"');
   assert.notEqual(start, -1, `no JSON document in output:\n${stdout}`);
 
   let depth = 0;

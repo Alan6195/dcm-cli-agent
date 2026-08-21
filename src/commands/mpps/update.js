@@ -2,6 +2,7 @@
 
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const json = require('../../lib/json');
 const mpps = require('../../lib/mpps');
 const common = require('./common');
 
@@ -17,8 +18,13 @@ const common = require('./common');
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
   ...common.SERIES_FROM_FLAGS,
+  ...common.INJECTION_FLAGS,
   'no-status',
   'dry-run',
+  // The same alias the closing verbs take. `--mpps-uid` is not an N-CREATE-only
+  // attribute — it names the step rather than setting one of its attributes —
+  // so it does not belong in the refusal list below.
+  'mpps-uid',
   // Accepted by the parser purely so they can be refused by attribute name
   // below. rejectUnknown() runs first and would otherwise get there ahead of
   // the explanation.
@@ -64,6 +70,20 @@ What the update carries:
                          it the update carries ${mpps.Status.IN_PROGRESS}.
 
 Other:
+  --mpps-uid <uid>       The step being updated, as a flag rather than an
+                         argument. Same value, same meaning; give one.
+  --set <Key>=<Value>    Stamp a value into the outgoing N-SET verbatim, with no
+                         client-side validation at all. Repeatable. It is
+                         applied after the dataset is built, so it reaches past
+                         the two refusals below: --set
+                         PerformedProcedureStepEndTime=120000 sends the end time
+                         this verb will not construct, and --set
+                         PerformedProcedureStepStatus=COMPLETED sends a terminal
+                         status from a verb whose whole point is not to. Both
+                         are worth doing deliberately against a receiver under
+                         test and neither should ever happen by accident, which
+                         is the difference this flag draws. Banners on stderr,
+                         "injected" in the JSON.
   --dry-run              Build and print the N-SET without connecting.
   --json                 Emit the result as JSON.
   --verbose              Log the full association negotiation.
@@ -150,20 +170,38 @@ Examples:
  * disk, so there is no file to read it out of, and MPPS has no query service,
  * so the peer cannot be asked which steps it is holding either.
  *
+ * Accepted as the argument or as --mpps-uid, which is what `dcm mpps start`
+ * calls the same value. See the note in finish.js for why both spellings exist
+ * and why giving both is refused.
+ *
  * @param {string|undefined} positional
+ * @param {string|undefined} flag
  * @returns {string}
  */
-function resolveMppsUid(positional) {
-  if (!positional) {
+function resolveMppsUid(positional, flag) {
+  if (positional && flag !== undefined) {
+    throw new args.UsageError(
+      positional === flag
+        ? `The MPPS SOP Instance UID was given twice, as an argument and as --mpps-uid ${flag}. ` +
+          'They agree, so nothing is ambiguous, but give one of them.'
+        : `Two different MPPS SOP Instance UIDs: "${positional}" as an argument and "${flag}" ` +
+          'as --mpps-uid. One of them names a step this command would update by mistake, and ' +
+          'nothing here can tell which. Give one.'
+    );
+  }
+
+  const uid = positional ?? flag;
+  if (!uid) {
     throw new args.UsageError(
       'Missing the MPPS SOP Instance UID. It is the value `dcm mpps start` printed as ' +
         '"MPPS SOP Instance UID", and it is the only handle on the step:\n' +
         '  dcm mpps update <mpps-uid> --host ... --port ... --called-ae ...\n' +
+        '  dcm mpps update --mpps-uid <mpps-uid> --host ... --port ... --called-ae ...\n' +
         'This tool keeps no record of the steps it opened, and MPPS has no query service, ' +
         'so a lost UID cannot be recovered from here or from the peer.'
     );
   }
-  return mpps.requireUid(positional, '<mpps-uid>');
+  return mpps.requireUid(uid, positional ? '<mpps-uid>' : '--mpps-uid');
 }
 
 /**
@@ -173,12 +211,21 @@ function resolveMppsUid(positional) {
  * @returns {Promise<number>}
  */
 async function run(parsed) {
-  const { flags, positionals } = parsed;
+  const { flags } = parsed;
 
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
+  if (flags.has('help')) return common.helpFor('update', flags, USAGE);
+
+  // The N-CREATE-only refusals below are thrown before any output, so without
+  // this wrapper `--json` gets prose on stderr and an empty stdout.
+  return common.guardVerb('update', flags, () => execute(parsed));
+}
+
+/**
+ * @param {{flags: Map, positionals: string[]}} parsed
+ * @returns {Promise<number>}
+ */
+async function execute(parsed) {
+  const { flags, positionals } = parsed;
 
   args.rejectUnknown(flags, FLAGS);
 
@@ -212,7 +259,9 @@ async function run(parsed) {
         `${positionals.join(', ')}.`
     );
   }
-  const mppsSopInstanceUid = resolveMppsUid(positionals[0]);
+  const mppsSopInstanceUid = resolveMppsUid(
+    positionals[0], args.resolve(flags, { name: 'mpps-uid' })
+  );
 
   // Nothing local says otherwise — no records are kept — so the step is assumed
   // open. The SCP is the authority and will refuse if it is not. Checking it
@@ -225,12 +274,22 @@ async function run(parsed) {
   const { built, sourceLabel, assertedFromDisk } =
     common.resolveSeriesFromFolder(flags, retrieveAeTitle);
 
+  const injections = common.parseInjections(flags);
+  const injected = common.injectionSummary(injections);
+
   const dataset = mpps.buildInterimSetDataset({
     status,
     // undefined, not [], when no folder was named: an absent sequence leaves
     // what the step already holds alone, and an empty one wipes it.
     performedSeries: built ? built.items : undefined,
   });
+  // Applied after the builder, which is what lets --set reach past its two
+  // refusals: the builder will not carry an end date on a running step or a
+  // status other than IN PROGRESS, and both are things a receiver's handling of
+  // needs testing. The builder's refusals stay the default; --set is the way to
+  // say the contradiction is deliberate.
+  common.applyInjections(dataset, injections);
+  common.verifyDataset('N-SET', mppsSopInstanceUid, dataset, injections);
 
   // The trap this whole verb is most likely to spring. A folder that scanned to
   // nothing still produces a PRESENT, EMPTY PerformedSeriesSequence, and on an
@@ -258,20 +317,25 @@ async function run(parsed) {
   }
 
   if (dryRun) {
+    common.reportInjections(injections, asJson, 'N-SET');
     if (asJson) {
-      log.out(JSON.stringify({
-        ok: true,
-        dryRun: true,
-        mppsSopInstanceUid,
-        performedProcedureStepStatus: status ?? null,
-        statusSent: status !== undefined,
-        performedSeriesSent: built !== undefined,
-        seriesCount: built ? built.items.length : 0,
-        instancesReferenced: built ? built.referenced : 0,
-        assertedFromDisk,
-        dataset,
-      }, null, 2));
-      return 0;
+      return json.result({
+        command: 'mpps update',
+        outcome: json.Outcome.OK,
+        message: 'Dry run: the interim N-SET was built and nothing was sent.',
+        payload: {
+          dryRun: true,
+          mppsSopInstanceUid,
+          performedProcedureStepStatus: status ?? null,
+          statusSent: status !== undefined,
+          performedSeriesSent: built !== undefined,
+          seriesCount: built ? built.items.length : 0,
+          instancesReferenced: built ? built.referenced : 0,
+          assertedFromDisk,
+          ...(injected.length ? { injected } : {}),
+          dataset,
+        },
+      });
     }
     log.out(`MPPS SOP Instance UID  ${mppsSopInstanceUid}`);
     log.out('');
@@ -300,7 +364,11 @@ async function run(parsed) {
     `  interim: status ${status ?? '(absent)'}, ` +
       `${built ? `${built.items.length} performed series from ${sourceLabel}` : 'no performed series sent'}`
   );
+  log.info(`AE  calling ${connection.callingAe} · called ${connection.calledAe}`);
 
+  common.reportInjections(injections, asJson, 'N-SET');
+
+  const peer = json.peerOf(connection);
   const result = await mpps.nSet({ connection, timeouts, mppsSopInstanceUid, dataset });
   const verdict = common.describeNResult(result, 'N-SET');
 
@@ -314,27 +382,32 @@ async function run(parsed) {
   }
 
   if (asJson) {
-    log.out(JSON.stringify({
-      ok: verdict.ok,
-      reason: verdict.reason,
-      mppsSopInstanceUid,
-      // The step is still running either way; this names what the update said
-      // about it, which is not the same thing as what the SCP now holds.
-      performedProcedureStepStatus: priorStatus,
-      statusSent: status !== undefined,
-      statusValue: status ?? null,
-      performedSeriesSent: built !== undefined,
-      seriesCount: built ? built.items.length : 0,
-      instancesReferenced: built ? built.referenced : 0,
-      instancesNotReferenced: built ? built.skipped.length : 0,
-      performedSeriesSource: sourceLabel,
-      assertedFromDisk,
-      endDateTimeSent: false,
-      peer: connection,
-      status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
-      message: verdict.lines.join(' '),
-    }, null, 2));
-    return verdict.ok ? 0 : 1;
+    return json.result({
+      command: 'mpps update',
+      peer,
+      outcome: verdict.envelope.outcome,
+      message: verdict.envelope.message,
+      detail: verdict.envelope.detail,
+      payload: {
+        reason: verdict.reason,
+        mppsSopInstanceUid,
+        // The step is still running either way; this names what the update said
+        // about it, which is not the same thing as what the SCP now holds.
+        performedProcedureStepStatus: priorStatus,
+        statusSent: status !== undefined,
+        statusValue: status ?? null,
+        performedSeriesSent: built !== undefined,
+        seriesCount: built ? built.items.length : 0,
+        instancesReferenced: built ? built.referenced : 0,
+        instancesNotReferenced: built ? built.skipped.length : 0,
+        performedSeriesSource: sourceLabel,
+        assertedFromDisk,
+        endDateTimeSent: false,
+        ...(injected.length ? { injected } : {}),
+        affectedSopInstanceUid: result.affectedSopInstanceUid ?? null,
+        status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
+      },
+    });
   }
 
   if (!verdict.ok) {

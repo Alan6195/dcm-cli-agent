@@ -13,6 +13,7 @@ const path = require('path');
 
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const json = require('../../lib/json');
 const { validateUid } = require('../../lib/uid');
 const mpps = require('../../lib/mpps');
 const common = require('./common');
@@ -20,8 +21,13 @@ const common = require('./common');
 /** Flags both verbs accept. `reason` and `reason-code` are ignored by complete. */
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
+  ...common.INJECTION_FLAGS,
   'series-from', 'study-uid', 'no-recurse', 'retrieve-ae',
   'end-date', 'end-time', 'dry-run', 'reason', 'reason-code',
+  // The UID is positional here and a flag on `start`, and over MCP both are
+  // "mppsUid". Accepting the flag as an alias costs one line and removes a
+  // "Unknown option: --mpps-uid" that says nothing about what to do instead.
+  'mpps-uid',
 ];
 
 /**
@@ -52,10 +58,16 @@ dcm mpps ${verb} — close a performed procedure step (N-SET, ${status})
 
 Usage:
   dcm mpps ${verb} <mpps-uid> --host <host> --port <port> --called-ae <AE> [options]
+  dcm mpps ${verb} --mpps-uid <uid> --host <host> --port <port> --called-ae <AE> [options]
 
 <mpps-uid> is the MPPS SOP Instance UID printed by 'dcm mpps start'. It is
 required. It is the only handle on the step: this command writes no records and
 MPPS has no query service, so there is nowhere to look a lost UID up.
+
+It may be written as the argument or as --mpps-uid, which is the spelling
+'dcm mpps start' uses for the same value and the one an MPPS tool over MCP
+takes. Both forms mean the same thing; giving both is refused, because two UIDs
+on one command line means one of them names a step this would close by mistake.
 
 Connection:
   --host <host>          MPPS peer hostname.                    [env DCM_HOST]
@@ -79,9 +91,36 @@ What was performed:
   --end-time <HHMMSS>    Default: now, local time.
 ${reasonBlock}
 Other:
+  --mpps-uid <uid>       The step being closed, as a flag rather than an
+                         argument. Same value, same meaning; give one.
+  --set <Key>=<Value>    Stamp a value into the outgoing N-SET verbatim, with no
+                         client-side validation at all. Repeatable. See below.
   --dry-run              Build and print the N-SET without connecting.
   --json                 Emit the result as JSON.
   --verbose              Log the full association negotiation.
+
+Injecting a value (--set):
+  --set <Keyword|(gggg,eeee)>=<Value> puts the value into the N-SET dataset
+  exactly as typed, with nothing checked — not length, not the VR's character
+  repertoire, not an enumeration. It is applied last, so it overwrites what the
+  flags produced, including the terminal status itself:
+
+    --set PerformedProcedureStepStatus=FINISHED
+    --set PerformedProcedureStepEndTime=25:00:00
+
+  That first one is the reason this exists here. ${status} is the only value
+  this verb will construct, so an SCP's handling of a status outside the three
+  PS3.4 defines cannot be exercised any other way.
+
+  This is the explicit "I know what I am doing" path, the same framing as
+  --allow-study-mismatch on 'dcm mpps perform'. A banner naming every injected
+  attribute goes to stderr whenever it is in use, and the injections are ALSO
+  recorded in the output — as "injected" in JSON, above the result otherwise —
+  so --quiet cannot produce a run that does not say what it did. An unknown or
+  private tag is refused rather than injected, and a value the dataset writer
+  would silently SHORTEN is refused before the association opens: a shortened
+  value is conformant, so the peer would answer it normally and the test would
+  pass without ever having asked the question.
 
 Note: --series-from asserts what is on YOUR DISK, not what the archive holds.
   PerformedSeriesSequence is a clinical record of work performed, and every
@@ -131,21 +170,51 @@ Example:
  * disk, so there is no file to read it out of, and MPPS has no query service,
  * so the peer cannot be asked which steps it is holding either.
  *
+ * Two spellings, one meaning. The UID is positional here and `--mpps-uid` on
+ * `dcm mpps start`, which is a difference nobody chose: the flag simply was
+ * never accepted on the closing verbs, so a script that had just read
+ * `mppsSopInstanceUid` out of start's JSON and written the obvious command line
+ * got "Unknown option: --mpps-uid" — a message that does not hint at the
+ * positional form. Over MCP both verbs already take one parameter named
+ * mppsUid, so the two spellings were only ever apart at the shell.
+ *
+ * Giving both is a mistake worth failing on rather than resolving by
+ * precedence: two UIDs on one command line means one of them is not the step
+ * being closed, and closing the wrong step is not recoverable from here.
+ *
  * @param {string|undefined} positional
+ * @param {string|undefined} flag
+ * @param {string} verb
  * @returns {string}
  */
-function resolveMppsUid(positional) {
-  if (!positional) {
+function resolveMppsUid(positional, flag, verb = 'complete') {
+  if (positional && flag !== undefined) {
+    if (positional === flag) {
+      throw new args.UsageError(
+        `The MPPS SOP Instance UID was given twice, as an argument and as --mpps-uid ${flag}. ` +
+          'They agree, so nothing is ambiguous, but give one of them.'
+      );
+    }
+    throw new args.UsageError(
+      `Two different MPPS SOP Instance UIDs: "${positional}" as an argument and ` +
+        `"${flag}" as --mpps-uid. One of them names a step this command would close by ` +
+        'mistake, and nothing here can tell which. Give one.'
+    );
+  }
+
+  const uid = positional ?? flag;
+  if (!uid) {
     throw new args.UsageError(
       'Missing the MPPS SOP Instance UID. It is the value `dcm mpps start` printed as ' +
         '"MPPS SOP Instance UID", and it is the only handle on the step:\n' +
-        '  dcm mpps complete <mpps-uid> --host ... --port ... --called-ae ...\n' +
+        `  dcm mpps ${verb} <mpps-uid> --host ... --port ... --called-ae ...\n` +
+        `  dcm mpps ${verb} --mpps-uid <mpps-uid> --host ... --port ... --called-ae ...\n` +
         'This tool keeps no record of the steps it opened, and MPPS has no query service, ' +
         'so a lost UID cannot be recovered from here or from the peer.'
     );
   }
 
-  return mpps.requireUid(positional, '<mpps-uid>');
+  return mpps.requireUid(uid, positional ? '<mpps-uid>' : '--mpps-uid');
 }
 
 /**
@@ -324,13 +393,25 @@ function reportAssertedFromDisk(seriesCount, opts = {}) {
  * @returns {Promise<number>}
  */
 async function finish(parsed, spec) {
+  const { flags } = parsed;
+  const { verb } = spec;
+
+  if (flags.has('help')) return common.helpFor(verb, flags, usageFor(verb));
+
+  // Outside this wrapper a UsageError — a malformed UID, a folder holding two
+  // studies, --reason on complete — reaches src/cli.js and prints prose to
+  // stderr with an empty stdout, which under --json is a promise broken.
+  return common.guardVerb(verb, flags, () => execute(parsed, spec));
+}
+
+/**
+ * @param {{flags: Map, positionals: string[]}} parsed
+ * @param {{verb: string, status: string}} spec
+ * @returns {Promise<number>}
+ */
+async function execute(parsed, spec) {
   const { flags, positionals } = parsed;
   const { verb, status } = spec;
-
-  if (flags.has('help')) {
-    log.out(usageFor(verb));
-    return 0;
-  }
 
   args.rejectUnknown(flags, FLAGS);
 
@@ -351,7 +432,9 @@ async function finish(parsed, spec) {
   const dryRun = flags.has('dry-run');
   const asJson = flags.has('json');
 
-  const mppsSopInstanceUid = resolveMppsUid(positionals[0]);
+  const mppsSopInstanceUid = resolveMppsUid(
+    positionals[0], args.resolve(flags, { name: 'mpps-uid' }), verb
+  );
 
   // Nothing local says otherwise — no records are kept — so the step is assumed
   // open. The SCP is the authority on that and will refuse if it is not.
@@ -371,6 +454,9 @@ async function finish(parsed, spec) {
     ? mpps.parseReasonCode(args.resolve(flags, { name: 'reason-code' }))
     : [];
 
+  const injections = common.parseInjections(flags);
+  const injected = common.injectionSummary(injections);
+
   const dataset = mpps.buildSetDataset({
     status,
     endDate,
@@ -378,6 +464,11 @@ async function finish(parsed, spec) {
     performedSeries: built.items,
     discontinuationReasonCode: reasonCode,
   });
+  // Last, so --set overwrites what the flags produced — including the terminal
+  // status itself, which is the only way to ask an SCP what it does with a
+  // PerformedProcedureStepStatus that is not one of the three legal values.
+  common.applyInjections(dataset, injections);
+  common.verifyDataset('N-SET', mppsSopInstanceUid, dataset, injections);
 
   // An empty PerformedSeriesSequence on a COMPLETED step is legal DICOM and
   // almost never what someone meant: it says the work finished and produced
@@ -400,17 +491,24 @@ async function finish(parsed, spec) {
   }
 
   if (dryRun) {
+    common.reportInjections(injections, asJson, 'N-SET');
     if (asJson) {
-      log.out(JSON.stringify({
-        ok: true, dryRun: true, mppsSopInstanceUid,
-        performedProcedureStepStatus: status,
-        seriesCount: built.items.length,
-        instancesReferenced: built.referenced,
-        assertedFromDisk,
-        reasonRecordedLocally: reason ?? null,
-        dataset,
-      }, null, 2));
-      return 0;
+      return json.result({
+        command: `mpps ${verb}`,
+        outcome: json.Outcome.OK,
+        message: 'Dry run: the N-SET was built and nothing was sent.',
+        payload: {
+          dryRun: true,
+          mppsSopInstanceUid,
+          performedProcedureStepStatus: status,
+          seriesCount: built.items.length,
+          instancesReferenced: built.referenced,
+          assertedFromDisk,
+          reasonRecordedLocally: reason ?? null,
+          ...(injected.length ? { injected } : {}),
+          dataset,
+        },
+      });
     }
     log.out(`MPPS SOP Instance UID  ${mppsSopInstanceUid}`);
     log.out('');
@@ -432,6 +530,14 @@ async function finish(parsed, spec) {
   );
   log.info(`  ${priorStatus} -> ${status}, ${built.items.length} performed series from ${sourceLabel}`);
 
+  // The three AE Titles are printed by the verbs that open a step, where a
+  // mismatch is decided; here the step already exists and is named by its UID,
+  // so only the two that decide whether this association is allowed matter.
+  log.info(`AE  calling ${connection.callingAe} · called ${connection.calledAe}`);
+
+  common.reportInjections(injections, asJson, 'N-SET');
+
+  const peer = json.peerOf(connection);
   const result = await mpps.nSet({ connection, timeouts, mppsSopInstanceUid, dataset });
   const verdict = common.describeNResult(result, 'N-SET');
 
@@ -445,24 +551,29 @@ async function finish(parsed, spec) {
   }
 
   if (asJson) {
-    log.out(JSON.stringify({
-      ok: verdict.ok,
-      reason: verdict.reason,
-      mppsSopInstanceUid,
-      performedProcedureStepStatus: verdict.ok ? status : priorStatus,
-      priorStatus,
-      seriesCount: built.items.length,
-      instancesReferenced: built.referenced,
-      instancesNotReferenced: built.skipped.length,
-      performedSeriesSource: sourceLabel,
-      assertedFromDisk,
-      reasonRecordedLocally: reason ?? null,
-      reasonSent: reasonCode.length ? reasonCode[0] : null,
-      peer: connection,
-      status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
-      message: verdict.lines.join(' '),
-    }, null, 2));
-    return verdict.ok ? 0 : 1;
+    return json.result({
+      command: `mpps ${verb}`,
+      peer,
+      outcome: verdict.envelope.outcome,
+      message: verdict.envelope.message,
+      detail: verdict.envelope.detail,
+      payload: {
+        reason: verdict.reason,
+        mppsSopInstanceUid,
+        performedProcedureStepStatus: verdict.ok ? status : priorStatus,
+        priorStatus,
+        seriesCount: built.items.length,
+        instancesReferenced: built.referenced,
+        instancesNotReferenced: built.skipped.length,
+        performedSeriesSource: sourceLabel,
+        assertedFromDisk,
+        reasonRecordedLocally: reason ?? null,
+        reasonSent: reasonCode.length ? reasonCode[0] : null,
+        ...(injected.length ? { injected } : {}),
+        affectedSopInstanceUid: result.affectedSopInstanceUid ?? null,
+        status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
+      },
+    });
   }
 
   if (!verdict.ok) {

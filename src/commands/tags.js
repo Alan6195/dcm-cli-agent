@@ -4,6 +4,7 @@ const path = require('path');
 
 const log = require('../lib/log');
 const args = require('../lib/args');
+const json = require('../lib/json');
 const tagLib = require('../lib/tags');
 const { scan, readMetadata } = require('../lib/scan');
 const { dcmjsDimse } = require('../lib/dimse');
@@ -11,7 +12,10 @@ const { BAR } = require('../lib/report');
 
 const { Dataset } = dcmjsDimse;
 
-const FLAGS = ['all', 'filter', 'private', 'depth', 'no-recurse', 'limit', 'value'];
+const FLAGS = [
+  'all', 'filter', 'private', 'depth', 'no-recurse', 'limit', 'value',
+  'expect-count', 'expect-empty', 'expect-nonempty',
+];
 
 const USAGE = `
 dcm tags — dump the DICOM tags in a file or folder
@@ -35,7 +39,14 @@ Options:
   --depth <n>       How far to walk into sequences. Default: 2.
   --limit <n>       Stop after n files.
   --no-recurse      Only look at files directly in the folder.
-  --json            Emit as JSON.
+  --json            Emit as one JSON result envelope.
+
+  --expect-count <n>   Assert exactly n files matched.
+  --expect-empty       Assert none did. This is the assertion for "no file in
+                       this tree still carries that identifier": with --value it
+                       answers the question directly, and unlike a bare exit code
+                       it cannot be satisfied by the folder being unreadable.
+  --expect-nonempty    Assert at least one did.
 
 Examples:
   dcm tags ./study/instance-1.dcm
@@ -86,14 +97,19 @@ function chooseFiles(scanned, { all, limit }) {
  * @returns {Promise<number>}
  */
 async function run(parsed) {
+  const { flags } = parsed;
+
+  if (flags.has('help')) return json.help('tags', flags, USAGE);
+
+  return json.guard('tags', flags, () => execute(parsed));
+}
+
+async function execute(parsed) {
   const { flags, positionals } = parsed;
 
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
-
   args.rejectUnknown(flags, FLAGS);
+
+  const declared = json.readExpectation(flags, args);
 
   const target = positionals[0];
   if (!target) {
@@ -112,9 +128,36 @@ async function run(parsed) {
 
   const scanned = scan(target, { recurse });
   if (scanned.candidates - scanned.readErrors.length === 0) {
-    log.error(`No readable DICOM instances found at ${path.resolve(target)}.`);
+    const headline = `No readable DICOM instances found at ${path.resolve(target)}.`;
+    log.error(headline);
     for (const failure of scanned.readErrors.slice(0, 5)) {
       log.error(`  ${failure.path}: ${failure.error}`);
+    }
+    if (asJson) {
+      // Not `empty`: nothing was examined, so no statement about which tags are
+      // present is possible. An --expect-empty that a missing folder could
+      // satisfy would pass the day the folder stops being produced.
+      return json.result({
+        command: 'tags',
+        outcome: json.Outcome.ERROR,
+        message: headline,
+        expectation: json.evaluateExpectation(declared, null),
+        detail: {
+          kind: 'error',
+          label: 'Nothing to read',
+          headline,
+          hint: 'Check the path, and whether the files are DICOM at all — `dcm info` reports why each was skipped.',
+          retryable: false,
+          raw: `candidates=${scanned.candidates} unreadable=${scanned.readErrors.length}`,
+        },
+        payload: {
+          path: path.resolve(target),
+          files: 0,
+          tags: 0,
+          results: [],
+          readErrors: scanned.readErrors,
+        },
+      });
     }
     return 1;
   }
@@ -190,9 +233,23 @@ async function run(parsed) {
     }
   }
 
+  // Files, not tags: "no file still carries this identifier" is the question
+  // --value is asked, and `matched` counts exactly that in both output modes.
+  const expectation = json.evaluateExpectation(declared, matched);
+  if (expectation) log.info(json.describeExpectation(expectation));
+
   if (asJson) {
-    log.out(JSON.stringify({ files: results.length, tags: shown, results }, null, 2));
-    return results.length > 0 ? 0 : 1;
+    const outcome = results.length > 0 ? json.Outcome.MATCHED : json.Outcome.EMPTY;
+    return json.result({
+      command: 'tags',
+      outcome,
+      exitCode: json.resolveExitCode({ outcome, expectation }),
+      expectation,
+      message: results.length > 0
+        ? `${shown} tag(s) across ${results.length} file(s).`
+        : 'Nothing matched.',
+      payload: { path: path.resolve(target), files: results.length, tags: shown, results },
+    });
   }
 
   log.out('');
@@ -206,12 +263,13 @@ async function run(parsed) {
       )
     );
   }
+  const proseOutcome = shown > 0 ? json.Outcome.MATCHED : json.Outcome.EMPTY;
   if ((filterMatch || valueMatch || privateOnly) && matched === 0) {
     log.out(log.color.yellow('Nothing matched.'));
-    return 1;
+    return json.resolveExitCode({ outcome: json.Outcome.EMPTY, expectation });
   }
 
-  return shown > 0 ? 0 : 1;
+  return json.resolveExitCode({ outcome: proseOutcome, expectation });
 }
 
 module.exports = { run, USAGE, makeMatcher, chooseFiles };

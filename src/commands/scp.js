@@ -6,6 +6,7 @@ const path = require('path');
 const log = require('../lib/log');
 const args = require('../lib/args');
 const worklist = require('../lib/worklist');
+const status = require('../lib/status');
 const { formatCode } = require('../lib/status');
 const { safeUidSegment, validateUid } = require('../lib/uid');
 const { dcmjsDimse } = require('../lib/dimse');
@@ -20,6 +21,8 @@ const {
   RejectResult,
   RejectSource,
   RejectReason,
+  AbortSource,
+  AbortReason,
   SopClass,
   TransferSyntax,
 } = dcmjsDimse.constants;
@@ -52,7 +55,9 @@ const MPPS_SOP_CLASS = SopClass.ModalityPerformedProcedureStep;
 const MAX_ERROR_COMMENT = 64;
 
 const FLAGS = ['port', 'ae', 'persist', 'accept-calling-ae', 'reject-after',
-  'prefer-syntax', 'prefer-uncompressed', 'worklist', 'keep-performed'];
+  'prefer-syntax', 'prefer-uncompressed', 'worklist', 'keep-performed',
+  'refuse-nset', 'refuse-nset-scope', 'refuse-ncreate',
+  'find-status', 'abort-find-after'];
 
 /**
  * Trims an error comment to what the element can legally carry.
@@ -64,6 +69,136 @@ function wireComment(text) {
   return text.length <= MAX_ERROR_COMMENT
     ? text
     : `${text.slice(0, MAX_ERROR_COMMENT - 3)}...`;
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection
+// ---------------------------------------------------------------------------
+
+/**
+ * Which N-SETs a `--refuse-nset` applies to.
+ *
+ * The scope exists because "refuse every N-SET" is the one setting that cannot
+ * express the case worth testing. A modality sends interim N-SETs while it is
+ * acquiring and one terminal N-SET when it stops, and the question a resilient
+ * client has to answer is whether a refused *interim* costs anything — whether
+ * the images still land and the step still closes. Refusing all of them
+ * refuses the close too, so the run fails for a reason that has nothing to do
+ * with the behaviour under test.
+ *
+ * `interim` is therefore the default rather than `all`. It is the narrower and
+ * less destructive reading of the flag, and it is the one that reproduces the
+ * receiver bug this project has actually met in the field: an SCP that answers
+ * an interim "still IN PROGRESS" update with 0x0106.
+ */
+const NSET_SCOPES = Object.freeze({
+  /** No terminal status on the message: a progress report. The default. */
+  INTERIM: 'interim',
+  /** COMPLETED or DISCONTINUED: the message that closes the step. */
+  TERMINAL: 'terminal',
+  /** Every N-SET, whatever it carries. */
+  ALL: 'all',
+});
+
+const NSET_SCOPE_VALUES = Object.freeze(Object.values(NSET_SCOPES));
+
+/**
+ * DIMSE status names, as `dcmjs-dimse` spells them, keyed for loose lookup.
+ *
+ * Derived from the library's own constants rather than written out here, so
+ * the set of names this accepts cannot drift from the set of codes that exist.
+ * A hex code is always accepted too, which is what keeps codes the library has
+ * no constant for — 0xA700 among them — reachable.
+ */
+const STATUS_NAMES = new Map(
+  Object.entries(Status)
+    .filter(([, value]) => typeof value === 'number')
+    .map(([name, value]) => [name.toLowerCase().replace(/[^a-z0-9]/g, ''), value])
+);
+
+/** A handful of names worth putting in front of someone reading --help. */
+const SUGGESTED_STATUS_NAMES = Object.freeze([
+  'invalid-attribute-value', 'processing-failure', 'missing-attribute',
+  'no-such-object-instance', 'not-authorized', 'resource-limitation',
+]);
+
+/**
+ * Parses a status for a fault-injection flag: `0x0106`, or a name.
+ *
+ * Hex must carry its `0x`. Bare digits are refused rather than guessed at,
+ * because `--refuse-nset 110` is ambiguous in the worst possible way: 110
+ * decimal is 0x006E, which is not a status at all, while the person typing it
+ * plainly meant Processing Failure. Silently picking either reading would
+ * produce a receiver that refuses with a code nobody asked for.
+ *
+ * Success, Pending and Cancel are refused as well. They are real DIMSE
+ * statuses and none of them refuses anything, so accepting one would build a
+ * fault knob that does nothing while reporting that it is armed.
+ *
+ * @param {string} raw
+ * @param {string} flagName Without the leading dashes, for the error message.
+ * @returns {number}
+ */
+function parseStatusCode(raw, flagName) {
+  const text = String(raw).trim();
+
+  let code;
+  if (/^0x[0-9a-f]{1,4}$/i.test(text)) {
+    code = Number.parseInt(text.slice(2), 16);
+  } else {
+    code = STATUS_NAMES.get(text.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  }
+
+  if (code === undefined) {
+    throw new args.UsageError(
+      `--${flagName} "${text}" is not a DIMSE status. Give a hex code such as 0x0106, ` +
+        `or a name such as ${SUGGESTED_STATUS_NAMES.slice(0, 3).join(', ')}.` +
+        (/^[0-9]+$/.test(text)
+          ? ` Bare digits are refused on purpose: "${text}" could be decimal or hex, and ` +
+            `guessing wrong would refuse with a code you did not ask for — write 0x${text}.`
+          : '')
+    );
+  }
+
+  const cls = status.classify(code);
+  if (cls !== status.Class.FAILURE && cls !== status.Class.WARNING) {
+    throw new args.UsageError(
+      `--${flagName} ${formatCode(code)} is a ${cls} status, which refuses nothing. ` +
+        'A fault injection flag needs a failure or warning code, e.g. 0x0106.'
+    );
+  }
+
+  return code;
+}
+
+/**
+ * Renders an injected status for a log line, e.g. `0x0106 Invalid attribute value`.
+ *
+ * @param {number} code
+ * @returns {string}
+ */
+function describeStatus(code) {
+  return `${formatCode(code)} ${status.describe(code).label}`;
+}
+
+/**
+ * Reads a non-negative integer flag, or undefined when it was not given.
+ *
+ * Undefined rather than 0 for "off", because 0 has a meaning here that is
+ * worth being able to ask for: `--abort-find-after 0` aborts before a single
+ * match is sent, which is the C-FIND that dies earliest.
+ *
+ * @param {Map} flags
+ * @param {string} name
+ * @returns {number|undefined}
+ */
+function optionalCount(flags, name) {
+  const value = args.resolve(flags, { name, type: 'number' });
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new args.UsageError(`--${name} must be a whole number of 0 or more, got "${value}".`);
+  }
+  return value;
 }
 
 const USAGE = `
@@ -106,19 +241,45 @@ Options:
                              it, by UID or dcmjs name. Default: take whatever
                              the sender proposed first, which is its preference.
   --prefer-uncompressed      Always pick an uncompressed syntax when offered.
+  --verbose                  Log full association negotiation for every peer.
+
+Fault injection (testing aids — every one of these is off by default):
   --reject-after <n>         Stop acknowledging after n instances in an
                              association, to simulate a receiver that goes
-                             quiet mid-transfer. Testing aid.
-  --verbose                  Log full association negotiation for every peer.
+                             quiet mid-transfer. C-STORE only.
+  --refuse-nset <status>     Refuse MPPS N-SET requests with this status.
+                             Scoped by --refuse-nset-scope; interim only by
+                             default, so the step can still be closed.
+  --refuse-nset-scope <s>    Which N-SETs --refuse-nset applies to:
+                             interim  — those carrying no terminal status, i.e.
+                                        a modality's progress reports (default)
+                             terminal — the one that COMPLETES or DISCONTINUES
+                             all      — every N-SET
+  --refuse-ncreate <status>  Refuse every MPPS N-CREATE with this status, so a
+                             client that cannot even open a step can be tested.
+  --find-status <status>     Answer every C-FIND with this failure status
+                             instead of matches. Worklist queries included.
+  --abort-find-after <n>     Send n Pending C-FIND responses and then A-ABORT
+                             the association, without ever sending the final
+                             Success. 0 aborts before the first match.
+
+  <status> is a hex code such as 0x0106, or a name such as
+  ${SUGGESTED_STATUS_NAMES.slice(0, 3).join(', ')}.
+  Bare digits are refused: write 0x0110, not 110.
 
 Examples:
   dcm scp --port 11112 --ae TEST-SCP --persist ./received
   dcm scp --port 11112 --ae WORKLIST --worklist ./worklist.json
   dcm scp --port 11112 --ae WORKLIST --worklist ./worklist.json --keep-performed
+  dcm find --mwl --host ris --port 104 --json-raw > wl.json
+  dcm scp --port 11112 --ae WORKLIST --worklist wl.json
+  dcm scp --port 11112 --worklist ./worklist.json --refuse-nset 0x0106
+  dcm scp --port 11112 --worklist ./worklist.json --abort-find-after 2
 
 Modality Worklist (--worklist):
   The file is a JSON array of worklist items, each a flat object of DICOM
-  keywords. An object with an "items" array works too.
+  keywords. An object with an "items" array works too, and so does a captured
+  "dcm find --mwl --json-raw" document — see Capture and replay below.
 
     [
       {
@@ -153,6 +314,37 @@ Modality Worklist (--worklist):
   exactly as you wrote it. Without --worklist every C-FIND still returns zero
   matches, worklist or not.
 
+Capture and replay:
+  A worklist query and a worklist fixture are the same rows, so a real answer
+  can be captured once and served back forever:
+
+    dcm find --mwl --host ris.example --port 104 --called-ae RIS \\
+      --json-raw ScheduledStationAETitle=CT01 > wl.json
+    dcm scp --port 11112 --ae WORKLIST --worklist wl.json
+
+  No editing in between. --worklist reads the "matches" array out of the
+  captured document, so the file the query wrote is the file the receiver
+  serves. That gives you two things worth having:
+
+    - An offline fixture built from real data rather than invented data. The
+      values are whatever the RIS actually emits, padding and empty Type 2
+      attributes included, which is exactly what a hand-written fixture
+      smooths over.
+    - A reproduction of one customer's worklist, at one moment, that can be
+      attached to a bug and replayed by anyone. "It returns nothing for this
+      patient" stops being a story about a system nobody else can reach.
+
+  Everything else in the document is ignored, including the per-match
+  "_elements" sidecar and the top-level envelope. Extra keys are never an
+  error: the capture format gains fields, and a reader that refused an unknown
+  one would break every time it did.
+
+  Capture what you want to serve. --json-raw records the rows the query
+  returned, so a narrowed query captures a narrowed worklist. Note also that a
+  captured document records a query that FAILED just as faithfully as one that
+  succeeded — as zero matches. This receiver says so on startup rather than
+  presenting it as an empty schedule.
+
 Modality Performed Procedure Step (MPPS):
   The receiver implements N-CREATE and N-SET for the MPPS SOP Class. A modality
   creates a step when it starts imaging and sets it to COMPLETED or
@@ -183,6 +375,69 @@ Modality Performed Procedure Step (MPPS):
   Without --worklist, MPPS still works: steps are created, validated and
   completed, and are simply not correlated with anything. The log says so each
   time a step finishes.
+
+Fault injection (testing aids):
+  Everything above describes a receiver behaving correctly. These flags make it
+  behave badly on purpose, so the client's handling of a bad peer can be tested
+  against a real association instead of being asserted about. They are off
+  unless asked for, every refusal they cause is logged as injected, and the
+  summary counts them separately from refusals this receiver decided on its
+  own — an injected fault must never be mistakable for a real one.
+
+  --reject-after <n>
+    The original, and C-STORE only: after n instances in one association,
+    every further C-STORE is answered 0xA700 Refused: out of resources.
+
+  --refuse-nset <status> [--refuse-nset-scope interim|terminal|all]
+    Answers MPPS N-SET requests with <status> instead of acting on them.
+
+    The scope is the point of the flag, not a detail of it. A modality sends
+    interim N-SETs while it acquires and one terminal N-SET when it stops, and
+    the question worth asking is what a refused INTERIM costs: whether the
+    images still land and the step still closes, or whether the client gives up
+    on a run that was going fine. Refusing every N-SET cannot answer that,
+    because it refuses the close as well. So "interim" is the default:
+
+      dcm scp --port 11112 --refuse-nset 0x0106
+
+    refuses each progress report with Invalid Attribute Value and lets the
+    closing COMPLETED through. That is the exact shape of a receiver bug this
+    project has met in the field — an SCP that reads a re-asserted IN PROGRESS
+    as an illegal transition — and it is now reproducible over a real
+    association rather than only by stubbing a client's send path.
+
+    --refuse-nset-scope terminal refuses only the message that closes the step,
+    which leaves a modality holding a step it cannot finish. --refuse-nset-scope
+    all refuses both.
+
+    The refusal is decided before the step is looked up, so it does not depend
+    on what this receiver would otherwise have said. A step whose N-SET was
+    refused is left exactly as it was: nothing is recorded, no worklist item is
+    retired. Only the MPPS SOP Class is affected; an N-SET for anything else is
+    still answered 0x0122 as usual.
+
+  --refuse-ncreate <status>
+    Answers every MPPS N-CREATE with <status>, so a client that cannot open a
+    step at all can be tested. No step is created, which means the N-SETs that
+    follow will honestly fail with 0x0112 — that is the situation, not a second
+    fault.
+
+  --find-status <status>
+    Answers every C-FIND with <status> and no matches, worklist queries
+    included. 0x0122 SOP Class Not Supported is the interesting one: it is what
+    a store-and-forward gateway returns after accepting the presentation
+    context, and it is the failure that looks most like an empty worklist.
+
+  --abort-find-after <n>
+    Sends n Pending responses and then A-ABORTs, with no final Success:
+
+      dcm scp --port 11112 --worklist ./worklist.json --abort-find-after 2
+
+    A client reading that must not report two matches as a complete answer. It
+    is the association-aborted-mid-C-FIND failure, on demand. If the query
+    matches fewer than n items the abort never fires and the query is answered
+    normally; the log says so, so a test cannot quietly pass on a worklist too
+    small to trip it.
 
 Note: completing a step is meant to remove its item from the worklist, so the
 same query that returned the patient a minute ago will return nothing
@@ -406,7 +661,27 @@ function makeScpClass(config, stats) {
       // Class UID (createWorklistFindRequest sets it there), but a peer that
       // spells it as the requested SOP Class is answered just the same.
       const sopClassUid = request.getAffectedSopClassUid?.() || request.getRequestedSopClassUid?.();
-      if (config.worklist && sopClassUid === MWL_FIND_SOP_CLASS) {
+      const isWorklist = sopClassUid === MWL_FIND_SOP_CLASS;
+
+      // --find-status is checked before anything else, including before the
+      // worklist is consulted. A forced status has to be what the peer sees
+      // whatever the query would have matched, or it is not a reproduction of
+      // a peer that refuses queries.
+      if (config.findStatus !== undefined) {
+        stats.faultsInjected = (stats.faultsInjected ?? 0) + 1;
+        const failure = CFindResponse.fromRequest(request);
+        if (isWorklist) failure.setAffectedSopClassUid(MWL_FIND_SOP_CLASS);
+        failure.setStatus(config.findStatus);
+        failure.setErrorComment(wireComment('--find-status is set on this receiver'));
+        log.warn(
+          `${log.color.cyan('->')} fault injection: --find-status is set, so this C-FIND is ` +
+            `answered ${describeStatus(config.findStatus)} instead of being matched`
+        );
+        callback([failure]);
+        return;
+      }
+
+      if (config.worklist && isWorklist) {
         this.worklistFind(request, callback);
         return;
       }
@@ -421,7 +696,65 @@ function makeScpClass(config, stats) {
 
       const finalResponse = CFindResponse.fromRequest(request);
       finalResponse.setStatus(Status.Success);
-      callback([finalResponse]);
+      this.answerFind(callback, [], finalResponse);
+    }
+
+    /**
+     * Sends a C-FIND answer, honouring --abort-find-after.
+     *
+     * Normally the Pending responses and the closing Success go out together,
+     * which is what every C-FIND SCU is written against. With the flag set and
+     * enough matches to reach it, the first n Pendings go out and the
+     * association is torn down instead — the peer never sends a final status,
+     * which is the case a client is most likely to mistake for a complete
+     * answer.
+     *
+     * The abort is written after the callback rather than instead of it: the
+     * library sends each response through the socket synchronously, so the
+     * Pendings are on the wire before the A-ABORT PDU follows them. Aborting
+     * first would produce a torn-down association with no partial answer at
+     * all, which is a different and much easier failure to notice.
+     *
+     * @param {function} callback
+     * @param {object[]} pendings
+     * @param {object} finalResponse
+     */
+    answerFind(callback, pendings, finalResponse) {
+      const limit = config.abortFindAfter;
+
+      if (limit === undefined) {
+        callback([...pendings, finalResponse]);
+        return;
+      }
+
+      if (pendings.length < limit) {
+        // Said out loud, because the alternative is a test that expected an
+        // abort, got a clean answer, and passed for the wrong reason.
+        log.warn(
+          `--abort-find-after ${limit} did not fire: this query matched only ` +
+            `${pendings.length} item(s), so the abort point was never reached and the query ` +
+            'was answered normally'
+        );
+        callback([...pendings, finalResponse]);
+        return;
+      }
+
+      // Counted as an injected fault and not as an abort: `stats.aborts` is
+      // what the PEER did to us, and folding our own deliberate teardown into
+      // it would make the summary claim the client misbehaved.
+      stats.faultsInjected = (stats.faultsInjected ?? 0) + 1;
+      log.warn(
+        `${log.color.cyan('->')} fault injection: --abort-find-after ${limit} reached; sending ` +
+          `${limit} Pending response(s) and then aborting the association with no final status`
+      );
+      callback(pendings.slice(0, limit));
+      this.sendAbort(AbortSource.ServiceUser, AbortReason.NotSpecified);
+      // PS3.8: an A-ABORT terminates the association, and the transport
+      // connection goes with it. Leaving the socket open would be a receiver
+      // that aborted and then sat there, which no real one does — and it would
+      // make every client wait out its own PDU timeout before noticing, so a
+      // fault meant to fail fast would take a minute to fail at all.
+      this.socket?.end();
     }
 
     /**
@@ -517,7 +850,6 @@ function makeScpClass(config, stats) {
       const finalResponse = CFindResponse.fromRequest(request);
       finalResponse.setAffectedSopClassUid(MWL_FIND_SOP_CLASS);
       finalResponse.setStatus(Status.Success);
-      responses.push(finalResponse);
 
       stats.worklistMatches = (stats.worklistMatches ?? 0) + matched.length;
       log.info(
@@ -525,7 +857,7 @@ function makeScpClass(config, stats) {
           `from ${file}`
       );
 
-      callback(responses);
+      this.answerFind(callback, responses, finalResponse);
     }
 
     /**
@@ -540,12 +872,40 @@ function makeScpClass(config, stats) {
      * @param {number} status
      * @param {string} reason
      */
-    refuseStep(response, callback, status, reason) {
+    refuseStep(response, callback, code, reason) {
       stats.mppsRefused = (stats.mppsRefused ?? 0) + 1;
-      response.setStatus(status);
+      response.setStatus(code);
       response.setErrorComment(wireComment(reason));
-      log.warn(`${log.color.cyan('->')} refused ${formatCode(status)}: ${reason}`);
+      log.warn(`${log.color.cyan('->')} refused ${formatCode(code)}: ${reason}`);
       callback(response);
+    }
+
+    /**
+     * Refuses an N-service request because a fault flag said to.
+     *
+     * Separate from {@link refuseStep} only in what it records: the reason
+     * names the flag, and the injected count is kept apart from the refusals
+     * this receiver decided on its own. Someone reading the summary has to be
+     * able to tell "the client sent something wrong" from "I told the receiver
+     * to say no", and one shared counter cannot say both.
+     *
+     * @param {object} response
+     * @param {function} callback
+     * @param {number} code
+     * @param {string} flag    e.g. '--refuse-nset'.
+     * @param {string} subject What is being refused, e.g. 'interim N-SET'.
+     */
+    injectRefusal(response, callback, code, flag, subject) {
+      stats.faultsInjected = (stats.faultsInjected ?? 0) + 1;
+      // Written to fit Error Comment's 64 characters uncut, because on an
+      // injected refusal the comment is the only place the client can learn
+      // that the peer was told to say this.
+      const reason = `${flag} is set, so this ${subject} is refused (${formatCode(code)})`;
+      log.warn(
+        `${log.color.cyan('->')} fault injection: ${flag} is set, so this ${subject} is ` +
+          `refused ${describeStatus(code)} without being acted on`
+      );
+      this.refuseStep(response, callback, code, reason);
     }
 
     /**
@@ -594,6 +954,17 @@ function makeScpClass(config, stats) {
           response, callback, Status.SopClassNotSupported,
           `this receiver implements N-CREATE for Modality Performed Procedure Step only, ` +
             `not for ${sopClassUid ?? '(no SOP Class UID)'}`
+        );
+        return;
+      }
+
+      // Injected before any of this receiver's own checking, so the answer is
+      // the one that was asked for rather than whichever refusal the dataset
+      // would have earned. A knob that only fires on datasets this receiver
+      // would otherwise have accepted is not a knob.
+      if (config.refuseNCreate !== undefined) {
+        this.injectRefusal(
+          response, callback, config.refuseNCreate, '--refuse-ncreate', 'N-CREATE'
         );
         return;
       }
@@ -700,6 +1071,40 @@ function makeScpClass(config, stats) {
         return;
       }
 
+      // --refuse-nset is decided here: after the SOP Class check, so a
+      // genuinely misdirected N-SET is still answered 0x0122 and the flag
+      // cannot be blamed for it, but before the step is looked up, so the
+      // refusal does not depend on what this receiver holds. The dataset has
+      // to be read first because the scope is a property of the message: an
+      // N-SET carrying a terminal status is the one that closes the step.
+      //
+      // Reading it here rather than unconditionally keeps the no-flags path
+      // byte for byte what it was, including the order in which an unreadable
+      // dataset and an unknown step are reported.
+      let elements;
+      if (config.refuseNSet) {
+        elements = this.stepElements(request, response, callback);
+        if (elements === undefined) return;
+
+        const carried = worklist.textOf(elements.PerformedProcedureStepStatus).trim().toUpperCase();
+        const terminal = worklist.MPPS_TERMINAL_STATUSES.includes(carried);
+        const { scope, code } = config.refuseNSet;
+        const inScope = scope === NSET_SCOPES.ALL
+          || (scope === NSET_SCOPES.TERMINAL ? terminal : !terminal);
+
+        if (inScope) {
+          this.injectRefusal(
+            response, callback, code, '--refuse-nset',
+            terminal ? 'terminal N-SET' : 'interim N-SET'
+          );
+          return;
+        }
+        log.debug(
+          `     --refuse-nset scope is "${scope}", and this is a ` +
+            `${terminal ? 'terminal' : 'interim'} N-SET, so it is handled normally`
+        );
+      }
+
       const step = steps.get(stepUid);
       if (!step) {
         this.refuseStep(
@@ -709,18 +1114,20 @@ function makeScpClass(config, stats) {
         return;
       }
 
-      const elements = this.stepElements(request, response, callback);
-      if (elements === undefined) return;
+      if (elements === undefined) {
+        elements = this.stepElements(request, response, callback);
+        if (elements === undefined) return;
+      }
 
       // An N-SET carries only what changes, so an absent status is not an empty
       // one: it means "these attributes changed, the step is still running".
       const next = worklist.textOf(elements.PerformedProcedureStepStatus).trim().toUpperCase();
       const refusal = worklist.transitionRefusal(step.status, next);
       if (refusal) {
-        const status = worklist.MPPS_TERMINAL_STATUSES.includes(step.status)
+        const code = worklist.MPPS_TERMINAL_STATUSES.includes(step.status)
           ? Status.ProcessingFailure // PS3.4 F.8.2: may no longer be updated.
           : Status.InvalidAttributeValue;
-        this.refuseStep(response, callback, status, refusal);
+        this.refuseStep(response, callback, code, refusal);
         return;
       }
 
@@ -906,11 +1313,67 @@ async function run(parsed) {
 
   const rejectAfter = args.resolve(flags, { name: 'reject-after', type: 'number', fallback: 0 });
 
+  // Fault injection. Parsed here, before the socket opens, so a bad status
+  // name fails as a usage error rather than as a receiver that looks armed and
+  // answers Success to everything.
+  const refuseNSetRaw = args.resolve(flags, { name: 'refuse-nset' });
+  const refuseNSetScope = args.resolve(flags, {
+    name: 'refuse-nset-scope', fallback: NSET_SCOPES.INTERIM,
+  });
+  if (!NSET_SCOPE_VALUES.includes(refuseNSetScope)) {
+    throw new args.UsageError(
+      `--refuse-nset-scope "${refuseNSetScope}" is not one of ${NSET_SCOPE_VALUES.join(', ')}.`
+    );
+  }
+  if (!refuseNSetRaw && flags.has('refuse-nset-scope')) {
+    throw new args.UsageError(
+      '--refuse-nset-scope only means something alongside --refuse-nset, which is not set. ' +
+        'Scoping a refusal that never happens would read as armed when it is not.'
+    );
+  }
+  const refuseNSet = refuseNSetRaw
+    ? { code: parseStatusCode(refuseNSetRaw, 'refuse-nset'), scope: refuseNSetScope }
+    : undefined;
+
+  const refuseNCreateRaw = args.resolve(flags, { name: 'refuse-ncreate' });
+  const refuseNCreate = refuseNCreateRaw
+    ? parseStatusCode(refuseNCreateRaw, 'refuse-ncreate')
+    : undefined;
+
+  const findStatusRaw = args.resolve(flags, { name: 'find-status' });
+  const findStatus = findStatusRaw ? parseStatusCode(findStatusRaw, 'find-status') : undefined;
+
+  const abortFindAfter = optionalCount(flags, 'abort-find-after');
+  if (findStatus !== undefined && abortFindAfter !== undefined) {
+    throw new args.UsageError(
+      '--find-status and --abort-find-after are two different C-FIND failures and only one ' +
+        'can happen: a query answered with a forced status never reaches the abort point.'
+    );
+  }
+
   // Loaded and validated before the socket opens. A worklist that turns out to
   // be unreadable is a mistake to report now, not one to discover as a stream
   // of empty answers once a modality is already polling.
   const worklistRaw = args.resolve(flags, { name: 'worklist' });
   const worklistSource = worklistRaw ? worklist.loadWorklistFile(worklistRaw) : undefined;
+  if (worklistSource?.shape === worklist.WORKLIST_SHAPES.MATCHES) {
+    const { command, outcome, ok } = worklistSource.capture ?? {};
+    log.info(
+      `--worklist "${worklistSource.file}" is a captured ${command ? `"dcm ${command}"` : 'query'} ` +
+        `document; serving its ${worklistSource.items.length} "matches" row(s) as the worklist.`
+    );
+    // A capture of a query that never ran is still a well-formed document with
+    // a "matches" array in it — an empty one. Replaying it looks exactly like
+    // an empty schedule, which is the confusion this whole receiver exists to
+    // prevent, so the recorded outcome is repeated rather than thrown away.
+    if (ok === false) {
+      log.warn(
+        `that capture records a query that did NOT succeed (outcome "${outcome ?? 'unknown'}"), ` +
+          'so its matches are whatever the query managed to collect before it failed. Re-capture ' +
+          'against a peer that answers before treating this file as a worklist.'
+      );
+    }
+  }
   if (worklistSource && worklistSource.items.length === 0) {
     log.warn(
       `--worklist "${worklistSource.file}" contains no items, so every worklist query will ` +
@@ -936,7 +1399,7 @@ async function run(parsed) {
     associations: 0, rejected: 0, echoes: 0, stored: 0,
     finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
     mppsCreated: 0, mppsCompleted: 0, mppsDiscontinued: 0, mppsRefused: 0,
-    worklistWithheld: 0,
+    worklistWithheld: 0, faultsInjected: 0,
   };
 
   const preferUncompressed = args.resolve(flags, {
@@ -952,9 +1415,27 @@ async function run(parsed) {
     );
   }
 
+  if (abortFindAfter !== undefined && !worklistSource) {
+    log.warn(
+      `--abort-find-after ${abortFindAfter} is set but no --worklist is loaded, so every C-FIND ` +
+        'matches zero items' +
+        (abortFindAfter === 0
+          ? ' and the abort fires immediately, before any answer at all.'
+          : ` and the abort point (${abortFindAfter} Pending response(s)) is never reached.`)
+    );
+  }
+  if (refuseNCreate !== undefined && refuseNSet) {
+    log.warn(
+      '--refuse-ncreate and --refuse-nset are both set. No step will ever be created, so the ' +
+        'N-SETs that follow fail with 0x0112 on their own and --refuse-nset is never what ' +
+        'refuses them.'
+    );
+  }
+
   const config = {
     ae, acceptCallingAe, persist, rejectAfter, preferUncompressed, preferSyntax,
     worklist: worklistSource, keepPerformed,
+    refuseNSet, refuseNCreate, findStatus, abortFindAfter,
   };
   const server = new Server(makeScpClass(config, stats));
 
@@ -980,6 +1461,13 @@ async function run(parsed) {
       log.out(`  MPPS completed        : ${stats.mppsCompleted}`);
       log.out(`  MPPS discontinued     : ${stats.mppsDiscontinued}`);
       log.out(`  MPPS refused          : ${stats.mppsRefused}`);
+      // Only when something was actually injected: a line reading 0 on every
+      // ordinary run would train people to skip the block it lives in, and
+      // this is the one line that must never be skipped.
+      if (stats.faultsInjected) {
+        log.out(`  faults injected       : ${stats.faultsInjected}`);
+        log.out('  (refusals above include the injected ones; they are not findings)');
+      }
       if (worklistSource) {
         log.out(`  worklist withheld     : ${stats.worklistWithheld}`);
       }
@@ -1027,6 +1515,36 @@ async function run(parsed) {
             : log.color.dim('(recorded, but correlated with nothing)')
         }`
       );
+      // Named on startup, and named as faults. A receiver that has been told
+      // to misbehave and does not say so is the most expensive kind of test
+      // rig there is: everything it refuses looks like a finding.
+      const faults = [];
+      if (rejectAfter > 0) {
+        faults.push(`--reject-after ${rejectAfter}: refuse C-STOREs past that count with 0xA700`);
+      }
+      if (refuseNSet) {
+        faults.push(
+          `--refuse-nset: answer ${refuseNSet.scope} MPPS N-SET(s) ` +
+            `${describeStatus(refuseNSet.code)}`
+        );
+      }
+      if (refuseNCreate !== undefined) {
+        faults.push(`--refuse-ncreate: answer every MPPS N-CREATE ${describeStatus(refuseNCreate)}`);
+      }
+      if (findStatus !== undefined) {
+        faults.push(`--find-status: answer every C-FIND ${describeStatus(findStatus)}`);
+      }
+      if (abortFindAfter !== undefined) {
+        faults.push(
+          `--abort-find-after ${abortFindAfter}: abort the association after that many Pending ` +
+            'C-FIND responses'
+        );
+      }
+      if (faults.length) {
+        log.warn(`  ${log.color.yellow('fault injection is ON')} — this receiver will misbehave on purpose:`);
+        for (const fault of faults) log.warn(`    ${fault}`);
+      }
+
       log.info('  press Ctrl+C to stop');
     });
 
@@ -1037,4 +1555,7 @@ async function run(parsed) {
   });
 }
 
-module.exports = { run, USAGE, makeScpClass };
+// parseStatusCode and NSET_SCOPES are exported for the tests. They are the two
+// pieces of fault configuration a test cannot reach through run(), which binds
+// a socket and then waits for a signal.
+module.exports = { run, USAGE, makeScpClass, parseStatusCode, NSET_SCOPES };

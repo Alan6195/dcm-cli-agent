@@ -12,6 +12,7 @@
 
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const json = require('../../lib/json');
 const statusLib = require('../../lib/status');
 const { resolveTimeouts } = require('../../lib/dimse');
 const { formatOutcome } = require('../../lib/reject');
@@ -25,7 +26,7 @@ const CONNECTION_FLAGS = [
 
 /** Scheduled- and performed-step attribute flags, shared by start and perform. */
 const ATTRIBUTE_FLAGS = [
-  'from-worklist',
+  'from-worklist', 'index', 'first',
   'study-uid', 'accession', 'patient-id', 'patient-name', 'patient-birth-date',
   'patient-sex', 'modality', 'requested-procedure-id',
   'requested-procedure-description', 'scheduled-step-id', 'step-id',
@@ -35,6 +36,186 @@ const ATTRIBUTE_FLAGS = [
 
 /** Flags that build PerformedSeriesSequence from a folder scan. */
 const SERIES_FROM_FLAGS = ['series-from', 'no-recurse', 'retrieve-ae'];
+
+/**
+ * The verbatim-injection flag, accepted by every verb that sends a dataset.
+ *
+ * Its own list rather than a member of one of the three above, because it is
+ * neither a connection detail nor a step attribute: it is the escape hatch out
+ * of the attribute model altogether.
+ */
+const INJECTION_FLAGS = ['set'];
+
+// --- --set: stamping a value in verbatim -----------------------------------
+
+/**
+ * The `--set` implementation, taken from `dcm find` rather than rewritten.
+ *
+ * The two halves of this feature shipped a release apart, and the thing that
+ * would make them unusable is drift: a tokenizer that splits on a different
+ * `=`, a path syntax that accepts `.` here and `/` there, one half refusing a
+ * private tag and the other silently dropping it. Sharing the parser makes
+ * that impossible rather than merely unlikely, and it is why the banner wording
+ * below is find's wording with the dataset named.
+ *
+ * Required lazily: `dcm mpps complete` should not pay for find's query
+ * machinery to discover that --set was not given.
+ *
+ * @returns {object} find's injection helpers.
+ */
+function injectionLib() {
+  return require('../find');
+}
+
+/**
+ * Parses --set into resolved injections. See find.js parseInjections().
+ *
+ * @param {Map} flags
+ * @returns {Array<{path: Array<object>, value: string, label: string, tag: string}>}
+ */
+function parseInjections(flags) {
+  return injectionLib().parseInjections(flags);
+}
+
+/**
+ * Stamps the injected values into a dataset, last, so they win.
+ *
+ * Applied after the dataset is built from the attribute flags and the worklist,
+ * precisely so --set can overwrite what either produced. Nothing is validated
+ * and nothing is routed: an attribute named without a path goes in at the top
+ * level, where the caller put it.
+ *
+ * @param {Record<string, unknown>} dataset
+ * @param {Array<object>} injections
+ */
+function applyInjections(dataset, injections) {
+  injectionLib().applyInjections(dataset, injections);
+}
+
+/**
+ * Refuses to send when an injected value would not survive the encoder.
+ *
+ * The same promise find makes, and for the same reason: dcmjs SHORTENS a value
+ * longer than its VR's maximum without failing, so `--set
+ * PerformedStationAETitle=STATIONNAMETOOLONG` would leave as a perfectly legal
+ * 16-character AE Title, the SCP would answer 0x0000, and a test written to
+ * prove the SCP rejects an over-long AE Title would pass without ever having
+ * asked. Stopping before the association is the only way the flag means what
+ * it says.
+ *
+ * @param {object} request An NCreateRequest or NSetRequest with its dataset set.
+ * @param {Array<object>} injections
+ */
+function verifyInjections(request, injections) {
+  if (!injections.length) return;
+  injectionLib().verifyInjections(request, injections);
+}
+
+/**
+ * Encodes the dataset and refuses if an injected value did not survive.
+ *
+ * Called once per verb, right after the injections are applied, so that BOTH
+ * the dry run and the live send are covered by the same check. A dry run is
+ * where a person reads the dataset and decides whether to send it; printing one
+ * that the writer would then shorten would be the false reassurance --set
+ * exists to remove.
+ *
+ * A no-op when nothing was injected, so an ordinary run pays nothing for it.
+ *
+ * @param {'N-CREATE'|'N-SET'} kind
+ * @param {string} mppsSopInstanceUid
+ * @param {Record<string, unknown>} dataset
+ * @param {Array<object>} injections
+ */
+function verifyDataset(kind, mppsSopInstanceUid, dataset, injections) {
+  if (!injections.length) return;
+  const request = kind === 'N-CREATE'
+    ? mpps.createRequest(mppsSopInstanceUid, dataset)
+    : mpps.setRequest(mppsSopInstanceUid, dataset);
+  verifyInjections(request, injections);
+}
+
+/**
+ * The banner shown whenever --set is in use.
+ *
+ * Loud, on stderr, and unconditional, because a dataset carrying a deliberately
+ * malformed value looks exactly like a dataset this tool built wrong. stderr
+ * rather than stdout so --json stays one document; the same facts also go into
+ * the document as `injected`, so --quiet cannot produce a run that does not say
+ * what it did.
+ *
+ * @param {Array<object>} injections
+ * @param {string} what 'N-CREATE' or 'N-SET'.
+ * @returns {string}
+ */
+function injectionBanner(injections, what) {
+  const lines = [
+    `--set is stamping ${injections.length} attribute${injections.length === 1 ? '' : 's'} ` +
+      `into the ${what} dataset verbatim.`,
+    '        Nothing about these values was checked — not length, not character',
+    '        repertoire, not enumeration, and not whether a UID is a UID. A refusal',
+    '        from the peer may be the peer answering exactly what it was asked.',
+  ];
+  for (const injection of injections) {
+    lines.push(`          ${injection.tag} ${injection.label} = ${JSON.stringify(injection.value)}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The record of what was injected, for the JSON document and the table.
+ *
+ * Same three keys as `dcm find` emits, so one consumer reads both.
+ *
+ * @param {Array<object>} injections
+ * @returns {Array<{tag: string, attribute: string, value: string}>}
+ */
+function injectionSummary(injections) {
+  return injections.map((i) => ({ tag: i.tag, attribute: i.label, value: i.value }));
+}
+
+/**
+ * The Type 1 attributes --set has taken responsibility for.
+ *
+ * An attribute the operator typed a value for is one they decided about, so
+ * assertCreatable() stops checking it — including when the value is empty,
+ * which is the one question about an SCP that cannot be asked any other way.
+ * Every attribute nobody named is still checked, so the accidental empty Type 1
+ * this tool exists to prevent stays prevented.
+ *
+ * @param {Array<object>} injections
+ * @returns {Set<string>}
+ */
+function exemptKeywords(injections) {
+  const exempt = new Set();
+  for (const injection of injections) {
+    for (const step of injection.path) exempt.add(step.keyword);
+  }
+  return exempt;
+}
+
+/**
+ * Announces --set on stdout when the document will not carry it.
+ *
+ * The banner is on stderr and --quiet silences stderr, so a human-mode run must
+ * also say it where the product is. In --json mode the `injected` array is that
+ * record and this stays quiet, because a second document on stdout parses as
+ * neither.
+ *
+ * @param {Array<object>} injections
+ * @param {boolean} asJson
+ * @param {string} what
+ */
+function reportInjections(injections, asJson, what) {
+  if (!injections.length) return;
+  log.warn(log.color.yellow(injectionBanner(injections, what)));
+  if (asJson) return;
+  log.out('');
+  log.out(log.color.yellow(
+    `--set stamped ${injections.map((i) => `${i.label}=${JSON.stringify(i.value)}`).join(', ')} ` +
+      `into the ${what} verbatim.`
+  ));
+}
 
 /**
  * Reads a flag that takes no value, and says so when one was swallowed.
@@ -84,6 +265,55 @@ function repeatedValues(flags, name) {
     if (value === true) throw new args.UsageError(`--${name} expects a value.`);
   }
   return list.map((value) => String(value));
+}
+
+/**
+ * The worklist provenance block, for the JSON document.
+ *
+ * Which row of which document became this step is the first thing anyone asks
+ * when a step is attributed to the wrong order, and with `--from-worklist -`
+ * there is no file left on disk to go back and look at. Recording it is the
+ * only way the answer survives the run.
+ *
+ * @param {object} source From resolveAttributes().
+ * @returns {{worklist?: object}}
+ */
+function worklistSource(source) {
+  if (!source?.worklist) return {};
+  return {
+    worklist: {
+      source: source.worklist,
+      fromStdin: Boolean(source.worklistFromStdin),
+      items: source.worklistItems,
+      index: source.worklistIndex,
+      selectedBy: source.worklistSelectedBy,
+    },
+  };
+}
+
+/**
+ * Reads --index as a 1-based row number.
+ *
+ * 1-based because the refusal it answers already prints the rows numbered from
+ * 1, and a selector that disagrees with the list it selects from is a trap
+ * rather than a convenience.
+ *
+ * @param {Map} flags
+ * @returns {number|undefined}
+ */
+function readIndexFlag(flags) {
+  if (!flags.has('index')) return undefined;
+  const raw = flags.get('index');
+  if (raw === true) throw new args.UsageError('--index expects a row number, e.g. --index 2.');
+  if (Array.isArray(raw)) throw new args.UsageError('--index was given more than once.');
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new args.UsageError(
+      `--index expects a whole number of 1 or more, got "${raw}". Rows are numbered from 1, ` +
+        'the way the refusal that lists them numbers them.'
+    );
+  }
+  return n;
 }
 
 /**
@@ -201,6 +431,15 @@ function resolveAttributes(flags, connection, now = new Date()) {
   const studyUidFlag = studyUids.length ? studyUids[0] : undefined;
   const accessionFlag = flagValue('accession');
 
+  const first = booleanFlag(flags, 'first');
+  const index = readIndexFlag(flags);
+  if ((first || index !== undefined) && !flags.has('from-worklist')) {
+    throw new args.UsageError(
+      `${first ? '--first' : `--index ${index}`} picks a row out of --from-worklist, and no ` +
+        'worklist was given, so there are no rows to pick from.'
+    );
+  }
+
   let fromWorklist = {};
   const source = {};
   const worklistFile = flagValue('from-worklist');
@@ -208,10 +447,20 @@ function resolveAttributes(flags, connection, now = new Date()) {
     const loaded = mpps.readWorklistFile(worklistFile, {
       studyUid: studyUidFlag,
       accession: accessionFlag,
+      index,
+      first,
     });
     fromWorklist = mpps.worklistToAttributes(loaded.item);
     source.worklist = loaded.file;
     source.worklistItems = loaded.count;
+    source.worklistFromStdin = loaded.fromStdin;
+    source.worklistIndex = loaded.index;
+    source.worklistSelectedBy = loaded.selectedBy;
+    // The item itself, so nothing downstream has to read the document a second
+    // time. That used to be merely wasteful; with `--from-worklist -` it is
+    // impossible — a pipe is consumed once — and with --index it would repeat
+    // the selection from flags that no longer describe it.
+    source.worklistItem = loaded.item;
   }
 
   const pick = (flagName, key) => {
@@ -307,6 +556,114 @@ function resolveSeriesFromFolder(flags, retrieveAeTitle) {
   return { built, sourceLabel: `a scan of ${seriesFrom}`, assertedFromDisk: true };
 }
 
+// --- The three AE Titles that decide attribution ---------------------------
+
+/**
+ * The AE Titles a performed procedure step is decided by.
+ *
+ * Three of them, and they are three different keys with three different owners:
+ *
+ *   calledAe                 tenancy. Which system, and which of its
+ *                            configurations, answers at all.
+ *   callingAe                identity on the wire. What the peer's access
+ *                            control sees, and what the images arrive under.
+ *   performedStationAeTitle  ATTRIBUTION. PS3.4 F.7.2-1 Type 1, and the key an
+ *                            MPPS SCP files the step under. It defaults to the
+ *                            calling AE, and --station-ae detaches the two.
+ *
+ * The failure this exists for is silent by construction: a step whose
+ * PerformedStationAETitle names no station the receiver knows is ACCEPTED —
+ * status 0x0000, everything looks fine — and then attributed to nobody, so it
+ * never reaches the worklist entry it was meant to close. Nothing on the wire
+ * says so. The only place it can be caught is here, before the N-CREATE, by
+ * printing what the three are about to be.
+ *
+ * @param {{callingAe?: string, calledAe?: string, performedStationAeTitle?: string}} spec
+ * @returns {object}
+ */
+function attributionOf(spec) {
+  const callingAe = spec.callingAe ?? null;
+  const calledAe = spec.calledAe ?? null;
+  const performedStationAeTitle = spec.performedStationAeTitle || null;
+
+  return {
+    calledAe,
+    callingAe,
+    performedStationAeTitle,
+    // Null rather than false when either side is unknown — a dry run resolves
+    // no called AE — because "they disagree" and "nothing said" are different
+    // facts and a test should be able to tell them apart.
+    performedStationMatchesCallingAe:
+      performedStationAeTitle === null || callingAe === null
+        ? null
+        : performedStationAeTitle === callingAe,
+  };
+}
+
+/**
+ * Prints the three AE Titles on one line, before the N-CREATE goes out.
+ *
+ * stderr, via log.info, for two reasons: stdout is the command's product and
+ * must stay a single JSON document under --json, and this line is wanted on
+ * every run rather than only the ones that fail. It is the last moment a
+ * mistyped --station-ae can be caught by a person reading the output.
+ *
+ * @param {object} attribution From attributionOf().
+ */
+function reportAttribution(attribution) {
+  const { callingAe, calledAe, performedStationAeTitle } = attribution;
+  log.info(
+    `AE  calling ${callingAe ?? '(none)'} · ` +
+      `performed station ${performedStationAeTitle ?? '(none)'} · ` +
+      `called ${calledAe ?? '(none)'}`
+  );
+
+  if (attribution.performedStationMatchesCallingAe !== false) return;
+
+  log.warn(
+    `PerformedStationAETitle is ${performedStationAeTitle}, but this association is being ` +
+      `opened as ${callingAe}.`
+  );
+  log.warn(
+    [
+      '        Those are different keys. The peer authorises on the CALLING AE and files',
+      '        the images under it; an MPPS SCP attributes the step on the PERFORMED',
+      '        STATION AE. A step naming a station the receiver does not know is accepted,',
+      '        answered 0x0000, and then attributed to nobody — nothing on the wire says',
+      '        so. That is legitimate when this tool is standing in for a station it is not',
+      `        running on; if it is not meant to, drop --station-ae or pass --calling-ae`,
+      `        ${performedStationAeTitle}.`,
+    ].join('\n')
+  );
+}
+
+// --- The result envelope ---------------------------------------------------
+
+/**
+ * Wraps a verb body so no terminal path can escape without a JSON document.
+ *
+ * The complaint this answers: `dcm mpps start --json` refusing a Type 1
+ * validation error exited 2 with a paragraph of English and an empty stdout,
+ * and a CI job cannot branch on prose. Every validation error in this command
+ * group is thrown as a UsageError before the first line of output, which is
+ * exactly the path a hand-written `if (asJson)` at the end of run() cannot
+ * cover. json.guard() covers it because it is outside the body rather than in
+ * it.
+ *
+ * @param {string} verb 'start', 'complete', ...
+ * @param {Map} flags
+ * @param {() => Promise<number>} fn
+ * @returns {Promise<number>}
+ */
+function guardVerb(verb, flags, fn) {
+  return json.guard(`mpps ${verb}`, flags, fn);
+}
+
+/** The `--help` path, as a document under --json and as text otherwise. */
+function helpFor(verb, flags, usage) {
+  return json.help(`mpps ${verb}`, flags, usage);
+}
+
 /**
  * Turns an N-service round trip into a verdict.
  *
@@ -315,21 +672,56 @@ function resolveSeriesFromFolder(flags, retrieveAeTitle) {
  * refused the MPPS presentation context; the context was accepted but no
  * response arrived; and a response arrived carrying a status.
  *
+ * Every branch also carries `envelope` — the {outcome, message, detail} triple
+ * src/lib/json.js takes — so the prose and the machine-readable record are
+ * derived from one decision rather than from two that can disagree. That is the
+ * whole point of the discriminator: "the peer refused the MPPS context" and
+ * "the peer never answered" are one exit code and one paragraph apart in the
+ * prose, and a CI job branching on the paragraph is branching on nothing.
+ *
  * @param {object} result From mpps.sendNRequest().
  * @param {string} verb  'N-CREATE' or 'N-SET'.
- * @returns {{ok: boolean, reason: string, lines: string[], status?: object}}
+ * @returns {{ok: boolean, reason: string, lines: string[], status?: object,
+ *   envelope: {outcome: string, message: string, detail: object}}}
  */
 function describeNResult(result, verb) {
   const { outcome, status, comment, contextAccepted } = result;
 
   if (outcome.kind !== 'completed') {
-    return { ok: false, reason: 'association', lines: formatOutcome(outcome) };
+    return {
+      ok: false,
+      reason: 'association',
+      lines: formatOutcome(outcome),
+      envelope: json.fromAssociationOutcome(outcome),
+    };
   }
 
   if (!contextAccepted) {
+    const headline =
+      'This peer does not support MPPS: it accepted the association and then refused the ' +
+      `presentation context for the Modality Performed Procedure Step SOP Class ` +
+      `(${mpps.MPPS_SOP_CLASS}), so the ${verb} was never carried.`;
     return {
       ok: false,
       reason: 'no-mpps-context',
+      envelope: {
+        // The peer answered and said no. Not a transport fault and not silence:
+        // it is a negotiation refusal, which has its own fix — a different host
+        // or AE Title — and detail.kind keeps it apart from an A-ASSOCIATE-RJ.
+        outcome: json.Outcome.REJECTED,
+        message: headline,
+        detail: {
+          kind: 'no-context',
+          label: 'MPPS presentation context refused',
+          headline,
+          hint:
+            'MPPS is frequently handled by a different system from the one that stores ' +
+            'images — a RIS or a broker rather than the archive. Check which host and AE ' +
+            'Title the site expects MPPS on.',
+          retryable: false,
+          raw: `presentation context for ${mpps.MPPS_SOP_CLASS} not accepted`,
+        },
+      },
       lines: [
         'This peer does not support MPPS.',
         '',
@@ -345,9 +737,30 @@ function describeNResult(result, verb) {
   }
 
   if (status === undefined) {
+    const headline =
+      `The association was established and released, but the peer never answered the ${verb}. ` +
+      'The MPPS presentation context was accepted, so this is not a negotiation problem — the ' +
+      'peer took the request and said nothing.';
     return {
       ok: false,
       reason: 'no-response',
+      envelope: {
+        // Silence AFTER a completed association, which is not the `timeout`
+        // outcome: nothing timed out, the association was released normally.
+        // The peer accepted the request and declined to answer it.
+        outcome: json.Outcome.REJECTED,
+        message: headline,
+        detail: {
+          kind: 'no-response',
+          label: 'No N-service response',
+          headline,
+          hint:
+            'Check the peer log at the matching timestamp; nothing here can tell whether it ' +
+            'acted on the request or dropped it.',
+          retryable: true,
+          raw: `association completed without a response to the ${verb}`,
+        },
+      },
       lines: [
         `The association was established and released, but the peer never answered the ${verb}.`,
         'The MPPS presentation context was accepted, so this is not a negotiation problem —',
@@ -359,7 +772,20 @@ function describeNResult(result, verb) {
 
   const described = statusLib.describe(status, comment);
   if (described.class === statusLib.Class.SUCCESS) {
-    return { ok: true, reason: 'success', lines: [], status: described };
+    return {
+      ok: true,
+      reason: 'success',
+      lines: [],
+      status: described,
+      // Emitted on success too. `detail.status.code` of "0x0000" is a positive
+      // statement that the peer answered about this step, which is what a CI
+      // preflight wants on the record — an absent detail proves nothing.
+      envelope: {
+        outcome: json.Outcome.OK,
+        message: `The peer accepted the ${verb} (${described.code} ${described.label}).`,
+        detail: json.statusDetail(described),
+      },
+    };
   }
 
   const lines = [`${described.code} ${described.label}`, described.plain];
@@ -370,6 +796,23 @@ function describeNResult(result, verb) {
     reason: described.class === statusLib.Class.WARNING ? 'warning' : 'refused',
     lines,
     status: described,
+    // The rich status record NewLumen already relies on, generalised into the
+    // envelope rather than dropped: detail.status keeps code, value, class,
+    // label, plain, hint and the peer's own comment, so a test can assert on
+    // the number instead of on the sentence describing it.
+    //
+    // The message is widened past json.fromStatus()'s to carry the peer's own
+    // comment, because that comment is usually the only sentence anywhere that
+    // names the attribute the peer objected to — 0x0120 "Missing Attribute"
+    // says a Type 1 is absent, and only the comment says which one. Dropping it
+    // from `message` to keep it solely in detail.status.peerComment would make
+    // the top-level sentence strictly less useful than the one it replaced.
+    envelope: {
+      ...json.fromStatus(described),
+      message: described.peerComment
+        ? `${described.plain} The peer said: ${described.peerComment}`
+        : described.plain,
+    },
   };
 }
 
@@ -397,8 +840,23 @@ module.exports = {
   CONNECTION_FLAGS,
   ATTRIBUTE_FLAGS,
   SERIES_FROM_FLAGS,
+  INJECTION_FLAGS,
   booleanFlag,
+  readIndexFlag,
+  worklistSource,
   repeatedValues,
+  parseInjections,
+  applyInjections,
+  verifyInjections,
+  verifyDataset,
+  injectionBanner,
+  injectionSummary,
+  exemptKeywords,
+  reportInjections,
+  attributionOf,
+  reportAttribution,
+  guardVerb,
+  helpFor,
   resolveSeriesFromFolder,
   resolveConnection,
   resolveStoreConnection,

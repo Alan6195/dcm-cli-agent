@@ -4,10 +4,14 @@ const path = require('path');
 
 const log = require('../lib/log');
 const args = require('../lib/args');
+const json = require('../lib/json');
 const { scan } = require('../lib/scan');
 const { bytes, transferSyntaxName, BAR } = require('../lib/report');
 
-const FLAGS = ['recurse', 'no-recurse', 'series', 'chunk'];
+const FLAGS = [
+  'recurse', 'no-recurse', 'series', 'chunk',
+  'expect-count', 'expect-empty', 'expect-nonempty',
+];
 
 const USAGE = `
 dcm info — inventory a folder or file
@@ -23,12 +27,19 @@ Options:
   --series        Break the output down to series level.
   --no-recurse    Only look at files directly in the folder.
   --chunk <n>     Show how many associations a send would use. Default: 200.
-  --json          Emit the inventory as JSON.
+  --json          Emit the inventory as one JSON result envelope.
+
+  --expect-count <n>   Assert the folder holds exactly n DICOM instances.
+  --expect-empty       Assert it holds none.
+  --expect-nonempty    Assert it holds at least one.
+                       With one of these the exit code answers that question:
+                       0 when the expectation held, 1 when it did not.
 
 Examples:
   dcm info ./study
   dcm info ./studies --series
   dcm info ./study --json
+  dcm info ./out --expect-count 12
 `.trimStart();
 
 /**
@@ -36,14 +47,19 @@ Examples:
  * @returns {Promise<number>}
  */
 async function run(parsed) {
+  const { flags } = parsed;
+
+  if (flags.has('help')) return json.help('info', flags, USAGE);
+
+  return json.guard('info', flags, () => execute(parsed));
+}
+
+async function execute(parsed) {
   const { flags, positionals } = parsed;
 
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
-
   args.rejectUnknown(flags, FLAGS);
+
+  const declared = json.readExpectation(flags, args);
 
   const target = positionals[0];
   if (!target) {
@@ -63,11 +79,24 @@ async function run(parsed) {
     onProgress: (done, total) => log.debug(`examined ${done}/${total} files`),
   });
 
+  // The inventory is what this command counts, so it is what an expectation is
+  // judged against. Computed before any output so the JSON and prose paths
+  // cannot drift.
+  const instanceCount = scanned.candidates - scanned.readErrors.length;
+  const expectation = json.evaluateExpectation(declared, instanceCount);
+  const outcome = scanned.studies.size === 0
+    ? json.Outcome.EMPTY
+    : (scanned.readErrors.length ? json.Outcome.ERROR : json.Outcome.OK);
+  const exitCode = json.resolveExitCode({
+    outcome, expectation, gateFailed: scanned.readErrors.length > 0,
+  });
+  if (expectation) log.info(json.describeExpectation(expectation));
+
   if (asJson) {
     const payload = {
       path: resolved,
       filesExamined: scanned.filesExamined,
-      dicomInstances: scanned.candidates - scanned.readErrors.length,
+      dicomInstances: instanceCount,
       unreadable: scanned.readErrors.length,
       ignored: scanned.ignored.length,
       totalBytes: scanned.totalBytes,
@@ -95,11 +124,27 @@ async function run(parsed) {
       })),
       readErrors: scanned.readErrors,
     };
-    log.out(JSON.stringify(payload, null, 2));
-    return scanned.readErrors.length > 0 ? 1 : 0;
+    return json.result({
+      command: 'info',
+      outcome,
+      exitCode,
+      expectation,
+      message: messageFor(outcome, instanceCount, scanned, expectation),
+      ...(scanned.readErrors.length
+        ? {
+          detail: {
+            kind: 'error',
+            label: 'Unreadable files',
+            headline: `${scanned.readErrors.length} file(s) in this tree could not be read, ` +
+              'so the inventory is incomplete and those instances would not be sent.',
+            retryable: false,
+            raw: `unreadable=${scanned.readErrors.length}`,
+          },
+        }
+        : {}),
+      payload,
+    });
   }
-
-  const instanceCount = scanned.candidates - scanned.readErrors.length;
 
   log.out('');
   log.out(BAR);
@@ -129,7 +174,7 @@ async function run(parsed) {
         log.out(`  ... and ${scanned.ignored.length - 15} more`);
       }
     }
-    return 1;
+    return exitCode;
   }
 
   // Modality roll-up across the whole tree.
@@ -245,11 +290,26 @@ async function run(parsed) {
       log.out(`  ... and ${scanned.readErrors.length - 20} more`);
     }
     log.out('');
-    log.out('These would not be sent. Exit code 1.');
-    return 1;
+    log.out('These would not be sent.');
+    return exitCode;
   }
 
-  return 0;
+  return exitCode;
+}
+
+/**
+ * The one-sentence `message`. Prose, so nothing should assert on it — the
+ * outcome and the expectation verdict are what a test reads.
+ */
+function messageFor(outcome, instanceCount, scanned, expectation) {
+  if (expectation && !expectation.held) return json.describeExpectation(expectation);
+  if (outcome === json.Outcome.EMPTY) {
+    return `No DICOM instances found; ${scanned.filesExamined} file(s) were examined.`;
+  }
+  if (outcome === json.Outcome.ERROR) {
+    return `${instanceCount} instance(s) inventoried, ${scanned.readErrors.length} unreadable.`;
+  }
+  return `${instanceCount} instance(s) across ${scanned.studies.size} study(ies).`;
 }
 
 module.exports = { run, USAGE };

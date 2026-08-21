@@ -5,6 +5,7 @@ const path = require('path');
 
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const json = require('../../lib/json');
 const { validateUid } = require('../../lib/uid');
 const mpps = require('../../lib/mpps');
 const restamp = require('../../lib/restamp');
@@ -14,6 +15,7 @@ const store = require('./store');
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
   ...common.ATTRIBUTE_FLAGS,
+  ...common.INJECTION_FLAGS,
   'store-host', 'store-port', 'store-called-ae',
   'chunk', 'retry', 'no-recurse', 'retrieve-ae',
   'end-date', 'end-time', 'dry-run', 'update-each-chunk',
@@ -55,7 +57,13 @@ Scheduled and performed step:
   --unscheduled          No order lies behind this work. See the note below —
                          the images keep their own Study Instance UID and the
                          step names none, and that divergence is the point.
-  --from-worklist <file.json>   Take the step attributes from a worklist item.
+  --from-worklist <file.json|->  Take the step attributes from a worklist item.
+                         "-" reads it from standard input, so a query can be
+                         piped straight in. A document holding more than one
+                         item is refused rather than guessed at.
+  --index <n> / --first  With --from-worklist, which row. --index is 1-based and
+                         numbered the way the refusal that lists the rows
+                         numbers them.
   See 'dcm mpps start --help' for the full list — it is the same set.
 
 When the images do not already carry the worklist's Study Instance UID:
@@ -83,6 +91,15 @@ Transfer:
 
 Other:
   --end-date / --end-time    Default: now, local time.
+  --set <Key>=<Value>    Stamp a value into the outgoing N-CREATE verbatim, with
+                         no client-side validation at all. Repeatable. It reaches
+                         the N-CREATE and NOT the closing N-SET: this command
+                         sends both, and most of what is legal on one is
+                         N-CREATE-only on the other, so stamping both would make
+                         the N-SET non-conformant in a way nobody asked for. Use
+                         'dcm mpps start' and 'dcm mpps complete' when the N-SET
+                         is what needs the injection. See 'dcm mpps start --help'
+                         for the full description; it is the same flag.
   --dry-run              Scan, build the N-CREATE, and print the plan. Opens no
                          connection and sends nothing.
   --json                 Emit the whole transaction as JSON.
@@ -354,26 +371,25 @@ function assertOneStudy(scanned, target, declaredStudyUid, opts = {}) {
 }
 
 /**
- * Reads StudyID out of the worklist item.
+ * Reads StudyID out of the worklist item common.resolveAttributes() selected.
  *
  * StudyID is not an MPPS attribute — it is not in the N-CREATE and
  * common.resolveAttributes() rightly does not carry it — but it is part of the
- * identity the RIS assigns, so `--adopt-worklist-identity` stamps it. The item
- * is re-read here with the same selection common.js used, which is cheap (a
- * small JSON file that has already parsed once) and keeps this need out of the
- * shared attribute resolver, where it would look like an MPPS attribute.
+ * identity the RIS assigns, so `--adopt-worklist-identity` stamps it.
  *
- * @param {Map} flags
- * @param {{worklist?: string}} source From common.resolveAttributes().
+ * It reads the item the resolver already selected rather than opening the
+ * document again. Re-reading was merely wasteful when the only source was a
+ * file; it is impossible once `--from-worklist -` exists, because a pipe can be
+ * consumed exactly once and the second read would find nothing. It would also
+ * re-run the selection from --study-uid and --accession alone, which no longer
+ * describes the chosen row when --index or --first made the choice.
+ *
+ * @param {{worklistItem?: Record<string, unknown>}} source
  * @returns {string}
  */
-function studyIdFromWorklist(flags, source) {
-  if (!source.worklist) return '';
-  const loaded = mpps.readWorklistFile(source.worklist, {
-    studyUid: args.resolve(flags, { name: 'study-uid' }),
-    accession: args.resolve(flags, { name: 'accession' }),
-  });
-  return mpps.worklistToAttributes(loaded.item).studyId ?? '';
+function studyIdFromWorklist(source) {
+  if (!source.worklistItem) return '';
+  return mpps.worklistToAttributes(source.worklistItem).studyId ?? '';
 }
 
 /**
@@ -603,6 +619,64 @@ function settleStaging(session, code) {
 }
 
 /**
+ * The envelope outcome for a transaction that got as far as the closing N-SET.
+ *
+ * Three things can be wrong here and they are not the same thing, which is
+ * exactly what the discriminator is for:
+ *
+ *   the N-SET itself failed        whatever it failed with — a refusal, an
+ *                                  abort, silence. The step is still open.
+ *   the N-SET succeeded, but the   the step is closed, honestly, as
+ *   step closed DISCONTINUED       DISCONTINUED. The transfer is what fell
+ *                                  short, and the outcome names why.
+ *   neither                        ok.
+ *
+ * A shortfall is attributed to whichever failure actually produced it, because
+ * "the archive refused four instances", "four instances went unanswered" and
+ * "four files could not be read off the disk" have three different fixes and
+ * only one of them is even about the peer. Refusal wins when several apply: a
+ * peer that said no has told you something the other two have not.
+ *
+ * @param {object} setVerdict From describeNResult().
+ * @param {string} finalStatus
+ * @param {object} totals From the transfer ledger.
+ * @param {string} shortfallSentence
+ * @returns {{outcome: string, message: string, detail?: object}}
+ */
+function transactionOutcome(setVerdict, finalStatus, totals, shortfallSentence) {
+  if (!setVerdict.ok) {
+    return {
+      outcome: setVerdict.envelope.outcome,
+      message:
+        `The images were sent, but the closing N-SET failed, so the step is still ` +
+        `${mpps.Status.IN_PROGRESS} on the peer. ${setVerdict.envelope.message}`,
+      detail: setVerdict.envelope.detail,
+    };
+  }
+
+  if (finalStatus === mpps.Status.COMPLETED) {
+    return {
+      outcome: json.Outcome.OK,
+      message: 'Every instance found was acknowledged and the step was closed COMPLETED.',
+      detail: setVerdict.envelope.detail,
+    };
+  }
+
+  let outcome = json.Outcome.ERROR;
+  if (totals.failed) outcome = json.Outcome.REJECTED;
+  else if (totals.unanswered) outcome = json.Outcome.TIMEOUT;
+
+  return {
+    outcome,
+    message: shortfallSentence,
+    // The peer answered 0x0000 to the N-SET, and saying so is worth more than
+    // it looks: it separates "the step was closed DISCONTINUED because the
+    // transfer fell short" from "the step was not closed at all".
+    detail: setVerdict.envelope.detail,
+  };
+}
+
+/**
  * The transaction the worklist workflow is actually for.
  *
  * A thin wrapper so the staging copy is settled on every exit, including the
@@ -614,14 +688,25 @@ function settleStaging(session, code) {
  * @returns {Promise<number>}
  */
 async function run(parsed) {
-  const session = {};
-  let code = 1;
-  try {
-    code = await performTransaction(parsed, session);
-    return code;
-  } finally {
-    settleStaging(session, code);
-  }
+  const { flags } = parsed;
+
+  if (flags.has('help')) return common.helpFor('perform', flags, USAGE);
+
+  // The guard is OUTSIDE the staging wrapper on purpose. json.guard() turns a
+  // throw into a document and a return code; if it were inside, a throw would
+  // become a code the finally block then treats as a clean exit, and the
+  // staging copy holding the exact bytes that were sent would be deleted at the
+  // one moment someone needs to look at them.
+  return common.guardVerb('perform', flags, async () => {
+    const session = {};
+    let code = 1;
+    try {
+      code = await performTransaction(parsed, session);
+      return code;
+    } finally {
+      settleStaging(session, code);
+    }
+  });
 }
 
 /**
@@ -631,11 +716,6 @@ async function run(parsed) {
  */
 async function performTransaction(parsed, session) {
   const { flags, positionals } = parsed;
-
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
 
   args.rejectUnknown(flags, FLAGS);
 
@@ -727,8 +807,14 @@ async function performTransaction(parsed, session) {
 
   const { attrs, source } = common.resolveAttributes(flags, connection);
   if (source.worklist) {
-    log.info(`worklist item read from ${source.worklist} (${source.worklistItems} item(s) in the file)`);
+    log.info(
+      `worklist item read from ${source.worklist} ` +
+        `(${source.worklistItems} item(s); took ${source.worklistSelectedBy})`
+    );
   }
+
+  const injections = common.parseInjections(flags);
+  const injected = common.injectionSummary(injections);
 
   if (attrs.studyInstanceUid) {
     const verdict = validateUid(attrs.studyInstanceUid);
@@ -750,7 +836,7 @@ async function performTransaction(parsed, session) {
   // before adoptFromScan() fills any blank from the folder. Stamping a value
   // that came off these very images back onto them would be a no-op dressed up
   // as a change, and would put attributes in the report that nothing asked for.
-  const orderedIdentity = { ...attrs, studyId: studyIdFromWorklist(flags, source) };
+  const orderedIdentity = { ...attrs, studyId: studyIdFromWorklist(source) };
 
   const adopted = adoptFromScan(attrs, study, { fromWorklist: Boolean(source.worklist) });
   for (const note of adopted) log.info(`  took ${note}`);
@@ -791,7 +877,22 @@ async function performTransaction(parsed, session) {
   }
 
   const dataset = mpps.buildCreateDataset(attrs);
-  mpps.assertCreatable(dataset);
+  // Before the Type 1 check, so an injected value counts as present. --set is
+  // the N-CREATE only: this command also sends a closing N-SET, and an
+  // attribute that is legal on one is frequently N-CREATE-only on the other, so
+  // stamping both would make the N-SET non-conformant in a way nobody asked
+  // for. Use `dcm mpps start` and `dcm mpps complete` when the N-SET is what
+  // needs the injection.
+  common.applyInjections(dataset, injections);
+  mpps.assertCreatable(dataset, { exemptKeywords: common.exemptKeywords(injections) });
+
+  // The three AE Titles that decide attribution, before anything is sent.
+  const attribution = common.attributionOf({
+    callingAe: connection.callingAe,
+    calledAe: connection.calledAe,
+    performedStationAeTitle: attrs.performedStationAeTitle,
+  });
+  common.reportAttribution(attribution);
 
   const mppsUidFlag = args.resolve(flags, { name: 'mpps-uid' });
   const mppsSopInstanceUid = mppsUidFlag !== undefined
@@ -804,13 +905,14 @@ async function performTransaction(parsed, session) {
         startTime: attrs.startTime,
       });
 
+  common.verifyDataset('N-CREATE', mppsSopInstanceUid, dataset, injections);
+
   const storeConnection = dryRun
     ? undefined
     : common.resolveStoreConnection(flags, connection);
 
   if (dryRun) {
     const plan = {
-      ok: true,
       dryRun: true,
       mppsSopInstanceUid,
       sopClassUid: mpps.MPPS_SOP_CLASS,
@@ -835,11 +937,29 @@ async function performTransaction(parsed, session) {
         : null,
       allowStudyMismatch: allowMismatch,
       studyUidMismatch: mismatch,
+      attribution,
+      ...(injected.length ? { injected } : {}),
+      ...common.worklistSource(source),
       dataset,
     };
+    // Outside the --json branch: the promise is that no run using --set
+    // produces output that does not say so, and a human dry run is a run.
+    common.reportInjections(injections, asJson, 'N-CREATE');
     if (asJson) {
-      log.out(JSON.stringify(plan, null, 2));
-      return scanned.readErrors.length ? 1 : 0;
+      // Unreadable files make the plan itself unsound — they count as found and
+      // can never be acknowledged, so the run they describe cannot end
+      // COMPLETED. Reporting `ok` alongside the exit code of 1 this has always
+      // returned would be the ambiguity the envelope exists to remove.
+      const unreadable = scanned.readErrors.length;
+      return json.result({
+        command: 'mpps perform',
+        outcome: unreadable ? json.Outcome.ERROR : json.Outcome.OK,
+        message: unreadable
+          ? `Dry run: ${unreadable} file(s) under ${path.resolve(target)} could not be read, ` +
+            'so a real run of this plan could not end COMPLETED. Nothing was sent.'
+          : 'Dry run: the N-CREATE was built and nothing was sent.',
+        payload: plan,
+      });
     }
     log.out(`MPPS SOP Instance UID  ${mppsSopInstanceUid}`);
     if (attrs.unscheduled) {
@@ -921,25 +1041,37 @@ async function performTransaction(parsed, session) {
   // --- 1. N-CREATE ---------------------------------------------------------
   log.info('');
   log.info(`N-CREATE: opening the step as ${mpps.Status.IN_PROGRESS}`);
+  common.reportInjections(injections, asJson, 'N-CREATE');
+
+  const peer = json.peerOf(connection);
   const created = await mpps.nCreate({ connection, timeouts, mppsSopInstanceUid, dataset });
   const createVerdict = common.describeNResult(created, 'N-CREATE');
 
   if (!createVerdict.ok) {
     if (asJson) {
-      log.out(JSON.stringify({
-        ok: false,
-        stage: 'n-create',
-        reason: createVerdict.reason,
-        mppsSopInstanceUid,
-        studyInstanceUid: attrs.studyInstanceUid,
-        found: scanned.candidates,
-        sent: 0,
-        acknowledged: 0,
-        referencedInMpps: 0,
-        performedProcedureStepStatus: null,
-        message: createVerdict.lines.join(' '),
-      }, null, 2));
-      return 1;
+      return json.result({
+        command: 'mpps perform',
+        peer,
+        outcome: createVerdict.envelope.outcome,
+        message: createVerdict.envelope.message,
+        detail: createVerdict.envelope.detail,
+        payload: {
+          stage: 'n-create',
+          reason: createVerdict.reason,
+          mppsSopInstanceUid,
+          studyInstanceUid: attrs.studyInstanceUid,
+          found: scanned.candidates,
+          sent: 0,
+          acknowledged: 0,
+          referencedInMpps: 0,
+          performedProcedureStepStatus: null,
+          attribution,
+          ...(injected.length ? { injected } : {}),
+          ...common.worklistSource(source),
+          storePeer: { ...storeConnection, inherited: undefined },
+          storeDefaultsInherited: storeConnection.inherited,
+        },
+      });
     }
     log.error('N-CREATE failed — the procedure step was never opened, so nothing was sent');
     common.reportNResult(createVerdict);
@@ -1013,8 +1145,12 @@ async function performTransaction(parsed, session) {
   const exitCode = setVerdict.ok && finalStatus === mpps.Status.COMPLETED ? 0 : 1;
 
   if (asJson) {
-    log.out(JSON.stringify({
-      ok: setVerdict.ok && finalStatus === mpps.Status.COMPLETED,
+    return json.result({
+      command: 'mpps perform',
+      peer,
+      ...transactionOutcome(setVerdict, finalStatus, totals, shortfallSentence),
+      exitCode,
+      payload: {
       stage: setVerdict.ok ? 'done' : 'n-set',
       mppsSopInstanceUid,
       sopClassUid: mpps.MPPS_SOP_CLASS,
@@ -1036,8 +1172,15 @@ async function performTransaction(parsed, session) {
         seriesInstanceUid: s.SeriesInstanceUID,
         instances: s.ReferencedImageSequence.length,
       })),
-      peer: { mpps: connection, store: { ...storeConnection, inherited: undefined } },
+      // The MPPS peer is the envelope's `peer`; the archive is its own key.
+      // They are frequently different systems and both have to be on the
+      // record, but `peer` is reserved by the envelope and means "the peer this
+      // command's outcome is about", which here is the MPPS one.
+      storePeer: { ...storeConnection, inherited: undefined },
       storeDefaultsInherited: storeConnection.inherited,
+      attribution,
+      ...(injected.length ? { injected } : {}),
+      ...common.worklistSource(source),
       restamp: restamped
         ? {
             source: path.resolve(target),
@@ -1063,9 +1206,8 @@ async function performTransaction(parsed, session) {
         ? { attempted: interim.attempted, accepted: interim.accepted, failures: interim.failed }
         : null,
       explanation: finalStatus === mpps.Status.DISCONTINUED ? shortfallSentence : null,
-      message: setVerdict.ok ? '' : setVerdict.lines.join(' '),
-    }, null, 2));
-    return exitCode;
+      },
+    });
   }
 
   const colour = finalStatus === mpps.Status.COMPLETED ? log.color.green : log.color.yellow;

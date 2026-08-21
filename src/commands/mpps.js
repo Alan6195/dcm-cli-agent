@@ -1,7 +1,7 @@
 'use strict';
 
-const log = require('../lib/log');
 const { UsageError } = require('../lib/args');
+const json = require('../lib/json');
 
 /**
  * dcm mpps — Modality Performed Procedure Step, dispatched one level below the
@@ -88,23 +88,29 @@ Run 'dcm mpps <verb> --help' for the verb's options.
 async function run(parsed) {
   const verb = parsed.positionals[0];
 
-  if (!verb) {
-    if (parsed.flags.has('help')) {
-      log.out(USAGE);
-      return 0;
+  if (!verb && parsed.flags.has('help')) return json.help('mpps', parsed.flags, USAGE);
+
+  // The dispatcher's own two refusals — no verb, and an unknown one — are
+  // terminal paths like any other, so under --json they emit a document rather
+  // than reaching src/cli.js and printing English onto an empty stdout. The
+  // verb's own guard runs inside this one and emits first; json.emit() is
+  // latched, so the outer guard cannot append a second document to a run the
+  // verb already answered.
+  return json.guard('mpps', parsed.flags, async () => {
+    if (!verb) {
+      throw new UsageError(`dcm mpps needs a verb: ${Object.keys(VERBS).join(', ')}`);
     }
-    throw new UsageError(`dcm mpps needs a verb: ${Object.keys(VERBS).join(', ')}`);
-  }
 
-  const loader = VERBS[verb];
-  if (!loader) {
-    throw new UsageError(
-      `unknown mpps verb '${verb}' — expected one of: ${Object.keys(VERBS).join(', ')}`
-    );
-  }
+    const loader = VERBS[verb];
+    if (!loader) {
+      throw new UsageError(
+        `unknown mpps verb '${verb}' — expected one of: ${Object.keys(VERBS).join(', ')}`
+      );
+    }
 
-  const mod = loader();
-  return mod.run({ ...parsed, positionals: parsed.positionals.slice(1) });
+    const mod = loader();
+    return mod.run({ ...parsed, positionals: parsed.positionals.slice(1) });
+  });
 }
 
 module.exports = { run, USAGE, VERBS };

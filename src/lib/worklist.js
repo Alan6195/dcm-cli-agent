@@ -222,11 +222,69 @@ function describeShape(value) {
 }
 
 /**
+ * Where a loaded worklist's items were found in the document.
+ *
+ * Reported so the receiver can say which of the three shapes it read. The
+ * distinction is not cosmetic: `matches` means the file is a captured query
+ * rather than a schedule someone wrote, and a capture can legitimately record
+ * a query that never ran, which is the one case where an empty worklist has an
+ * explanation worth printing.
+ */
+const WORKLIST_SHAPES = Object.freeze({
+  ARRAY: 'array',
+  ITEMS: 'items',
+  MATCHES: 'matches',
+});
+
+/**
+ * Summarises a captured `dcm find --json` document, when that is what was
+ * loaded.
+ *
+ * Only the envelope keys are read, and every one of them is optional: the
+ * reader's contract is that it tolerates whatever else the document carries,
+ * so it cannot then require any of it. See src/lib/json.js for what these
+ * mean.
+ *
+ * @param {Record<string, unknown>} parsed
+ * @returns {{command?: string, outcome?: string, ok?: boolean, count?: number}}
+ */
+function describeCapture(parsed) {
+  const capture = {};
+  if (typeof parsed.command === 'string') capture.command = parsed.command;
+  if (typeof parsed.outcome === 'string') capture.outcome = parsed.outcome;
+  if (typeof parsed.ok === 'boolean') capture.ok = parsed.ok;
+  if (typeof parsed.count === 'number') capture.count = parsed.count;
+  return capture;
+}
+
+/**
  * Loads and validates a worklist file.
  *
- * Both shapes people naturally hand-write are accepted: a bare array of items,
- * and an object with an `items` array (which leaves room for a comment or a
- * name alongside them).
+ * Three shapes are accepted. Two are the ones people hand-write: a bare array
+ * of items, and an object with an `items` array (which leaves room for a
+ * comment or a name alongside them).
+ *
+ * The third is a `dcm find --mwl --json-raw` document, which carries its rows
+ * in `matches`. Accepting it is what makes capture-and-replay a recipe rather
+ * than a trick:
+ *
+ *   dcm find --mwl --json-raw ... > wl.json
+ *   dcm scp --worklist wl.json
+ *
+ * Before this, that pipeline needed an undocumented `jq '{items: .matches}'`
+ * in the middle — a step nobody discovers on their own, and one that turns
+ * reproducing a customer's exact worklist into folklore. The whole document is
+ * kept rather than the array alone, because the envelope around `matches`
+ * records whether the query it came from actually ran.
+ *
+ * Everything outside the array it reads is ignored on purpose. The envelope
+ * grows keys — v0.12.0 added an `_elements` sidecar to every match and
+ * top-level conformance and attribution blocks — and a reader that refused a
+ * document carrying a key it had not been told about would break every time
+ * the capture format gained a field. Extra keys are data this reader has no
+ * use for, not errors. The `_elements` sidecar needs no special handling
+ * either: it is discarded by the same underscore rule that already discards
+ * dcmjs bookkeeping, in {@link toDataset}.
  *
  * Every failure here is a UsageError naming the file and the problem. A
  * receiver that starts with a silently empty worklist looks identical to one
@@ -234,7 +292,8 @@ function describeShape(value) {
  * three very different problems that must not share one symptom.
  *
  * @param {string} file Path as the user typed it.
- * @returns {{file: string, items: Array<Record<string, unknown>>}}
+ * @returns {{file: string, items: Array<Record<string, unknown>>, shape: string,
+ *   capture?: {command?: string, outcome?: string, ok?: boolean, count?: number}}}
  */
 function loadWorklistFile(file) {
   const resolved = path.resolve(file);
@@ -262,19 +321,39 @@ function loadWorklistFile(file) {
   }
 
   let items;
+  let shape;
+  let capture;
+  const isObject = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+
   if (Array.isArray(parsed)) {
     items = parsed;
-  } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.items)) {
+    shape = WORKLIST_SHAPES.ARRAY;
+  } else if (isObject && Array.isArray(parsed.items)) {
+    // `items` wins over `matches` if a document somehow carries both. A
+    // hand-written key is a deliberate statement about this file; `matches` is
+    // whatever a capture happened to bring along.
     items = parsed.items;
-  } else if (parsed && typeof parsed === 'object' && 'items' in parsed) {
+    shape = WORKLIST_SHAPES.ITEMS;
+  } else if (isObject && Array.isArray(parsed.matches)) {
+    items = parsed.matches;
+    shape = WORKLIST_SHAPES.MATCHES;
+    capture = describeCapture(parsed);
+  } else if (isObject && 'items' in parsed) {
     throw new args.UsageError(
       `--worklist "${resolved}" has an "items" property that is ${describeShape(parsed.items)}, ` +
         'not an array of worklist items.'
     );
+  } else if (isObject && 'matches' in parsed) {
+    throw new args.UsageError(
+      `--worklist "${resolved}" has a "matches" property that is ${describeShape(parsed.matches)}, ` +
+        'not an array of worklist items. A captured "dcm find --mwl --json-raw" document ' +
+        'carries its rows there.'
+    );
   } else {
     throw new args.UsageError(
       `--worklist "${resolved}" must be a JSON array of worklist items, or an object with an ` +
-        `"items" array. Found ${describeShape(parsed)}.`
+        '"items" array, or a captured "dcm find --mwl --json-raw" document with a "matches" ' +
+        `array. Found ${describeShape(parsed)}.`
     );
   }
 
@@ -288,7 +367,9 @@ function loadWorklistFile(file) {
     }
   });
 
-  return { file: resolved, items };
+  return capture
+    ? { file: resolved, items, shape, capture }
+    : { file: resolved, items, shape };
 }
 
 /**
@@ -324,6 +405,15 @@ function flattenItem(item) {
  * mistake `dcm find --mwl` guards against, and it would look like the answer
  * arrived with no scheduling information at all.
  *
+ * Underscore-prefixed keys are dropped at every level, not just the first.
+ * At the top level that leaves room for comments in a hand-written file and
+ * discards the `_elements` sidecar a captured `--json-raw` document carries.
+ * Deeper down it matters for a different reason: a sequence item that came off
+ * a wire once still holds dcmjs's `_vrMap`, and re-encoding that as if it were
+ * an attribute would put library bookkeeping into the answer. The same rule
+ * {@link plainElements} applies to a received dataset, applied to one going
+ * back out.
+ *
  * @param {Record<string, unknown>} item
  * @returns {Record<string, unknown>}
  */
@@ -333,14 +423,14 @@ function toDataset(item) {
 
   const provided = item.ScheduledProcedureStepSequence;
   if (Array.isArray(provided) && provided.length && provided[0] && typeof provided[0] === 'object') {
-    Object.assign(step, provided[0]);
+    Object.assign(step, plainElements(provided[0]));
   }
 
   for (const [key, value] of Object.entries(item)) {
-    if (key.startsWith('_')) continue; // Room for comments in the file.
+    if (key.startsWith('_')) continue; // Comments, and the --json-raw sidecar.
     if (key === 'ScheduledProcedureStepSequence') continue;
-    if (SPS_KEYS.includes(key)) step[key] = value;
-    else top[key] = value;
+    if (SPS_KEYS.includes(key)) step[key] = plainElements(value);
+    else top[key] = plainElements(value);
   }
 
   top.ScheduledProcedureStepSequence = [step];
@@ -677,6 +767,7 @@ module.exports = {
   SPS_KEYS,
   SUPPORTED_KEYS,
   DATE_KEYS,
+  WORKLIST_SHAPES,
   loadWorklistFile,
   flattenItem,
   toDataset,

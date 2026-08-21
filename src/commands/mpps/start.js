@@ -2,6 +2,7 @@
 
 const log = require('../../lib/log');
 const args = require('../../lib/args');
+const json = require('../../lib/json');
 const { validateUid } = require('../../lib/uid');
 const mpps = require('../../lib/mpps');
 const common = require('./common');
@@ -9,6 +10,7 @@ const common = require('./common');
 const FLAGS = [
   ...common.CONNECTION_FLAGS,
   ...common.ATTRIBUTE_FLAGS,
+  ...common.INJECTION_FLAGS,
   'dry-run',
 ];
 
@@ -66,8 +68,14 @@ Patient:
   --patient-sex <M|F|O>
 
 Other:
-  --from-worklist <file.json>   Take the attributes above from a worklist item.
+  --from-worklist <file.json|->  Take the attributes above from a worklist item.
+                         "-" reads the worklist from standard input.
+  --index <n>            With --from-worklist, take row n. 1-based, numbered the
+                         way the "holds N worklist items" refusal numbers them.
+  --first                With --from-worklist, take the first row.
   --mpps-uid <uid>       Use this MPPS SOP Instance UID instead of generating one.
+  --set <Key>=<Value>    Stamp a value into the outgoing N-CREATE verbatim, with
+                         no client-side validation at all. Repeatable. See below.
   --dry-run              Build and print the N-CREATE without connecting.
   --json                 Emit the result as JSON.
   --verbose              Log the full association negotiation.
@@ -83,6 +91,60 @@ Other:
   those attributes. Export with 'dcm find --mwl --json-raw' instead, which emits
   the attributes unrendered. If you pass the rendered form, this command says so
   by name rather than sending a malformed step.
+
+  Pass "-" to read it from standard input, which is what makes the two halves
+  of the workflow one command:
+
+    dcm find --mwl --json-raw --host ris --port 11112 --called-ae WORKLIST \\
+      PatientID=12345 | dcm mpps start --from-worklist - --host ris ...
+
+  "-" is recognised before the value is treated as a path. That is not a
+  detail: path.resolve("-") is a file called "-" in the working directory, and
+  the /dev/stdin people reach for instead becomes C:\\proc\\self\\fd\\0 on
+  Windows. Both fail as "the worklist is missing" rather than as "this build
+  does not do pipes".
+
+  A document holding more than one item is REFUSED rather than resolved by
+  guessing, because a step attributed to the wrong order looks exactly like a
+  step attributed to the right one. Say which row you mean: --study-uid or
+  --accession select by content, --index by the printed row number, --first
+  when the query was written to return exactly one and you want the pipeline to
+  fail loudly if it ever returns none.
+
+Injecting a value (--set):
+  --set <Keyword|(gggg,eeee)>=<Value> puts the value into the N-CREATE dataset
+  exactly as typed. Nothing is checked: not the length, not the VR's character
+  repertoire, not an enumeration, and not whether a UID is a UID — --set
+  StudyInstanceUID=not-a-uid goes out as typed where the flag would be refused.
+  It is applied last, so it overwrites whatever the flags and the worklist
+  produced, and it is NOT routed into ScheduledStepAttributesSequence the way
+  --study-uid is — name the path if that is where you want it:
+
+    --set PatientSex=male
+    --set PerformedProcedureStepStatus=STARTED
+    --set ScheduledStepAttributesSequence/StudyInstanceUID=1.2.3
+
+  This is the explicit "I know what I am doing" path, the same framing as
+  --allow-study-mismatch on 'dcm mpps perform'. No other flag implies it. A
+  banner naming every injected attribute is printed on stderr whenever it is in
+  use, and because --quiet silences stderr the injections are ALSO recorded in
+  the output itself — as "injected" in JSON, and above the result otherwise.
+  There is no way to run an injected N-CREATE and get output that does not say
+  so, which is what stops a deliberately odd response being read as a bug here.
+
+  The Type 1 check still runs, and --set feeds it rather than being blocked by
+  it: an attribute you gave a value for is exempt BY NAME, including when the
+  value is empty. So --set Modality= is how you ask an SCP what it does with an
+  empty Type 1 — the one question that cannot be asked any other way — while
+  every attribute you did not name is still checked, so the accidental empty
+  Type 1 stays impossible.
+
+Note: an unknown or private tag is refused rather than injected. The encoder
+  drops an attribute it has no dictionary entry for without saying so, and an
+  N-CREATE that silently lost the one attribute being tested is worse than one
+  that never ran. Over-long AE, CS, DS, IS and UI values are refused here too:
+  the dataset writer SHORTENS them without failing, so the peer would answer a
+  perfectly conformant message and the test would pass without having asked.
 
 Note:
   Every Type 1 attribute is checked here, before anything is sent. That is not
@@ -142,12 +204,23 @@ Examples:
  * @returns {Promise<number>}
  */
 async function run(parsed) {
-  const { flags, positionals } = parsed;
+  const { flags } = parsed;
 
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
+  if (flags.has('help')) return common.helpFor('start', flags, USAGE);
+
+  // Every terminal path below leaves through here. A Type 1 validation error is
+  // thrown before the first line of output, and under --json it used to reach
+  // src/cli.js, which prints English on stderr and leaves stdout empty — the
+  // exact "a CI job cannot branch on prose" complaint this answers.
+  return common.guardVerb('start', flags, () => execute(parsed));
+}
+
+/**
+ * @param {{flags: Map, positionals: string[]}} parsed
+ * @returns {Promise<number>}
+ */
+async function execute(parsed) {
+  const { flags, positionals } = parsed;
 
   args.rejectUnknown(flags, FLAGS);
 
@@ -190,8 +263,23 @@ async function run(parsed) {
     }
   }
 
+  const injections = common.parseInjections(flags);
+
   const dataset = mpps.buildCreateDataset(attrs);
-  mpps.assertCreatable(dataset);
+  // Applied before the Type 1 check rather than after, so an injected value
+  // counts as the attribute being present. See common.exemptKeywords() for why
+  // an injected EMPTY value is exempted rather than refused.
+  common.applyInjections(dataset, injections);
+
+  if (attrs.unscheduled && injections.some((i) => i.path[0].keyword === 'ScheduledStepAttributesSequence')) {
+    log.warn(
+      '--set is writing into ScheduledStepAttributesSequence on an --unscheduled step. That ' +
+        'sequence was one zero-length item, which is how PS3.3 C.4.14 says "no order lies ' +
+        'behind this step"; it is now a populated item and no longer means that.'
+    );
+  }
+
+  mpps.assertCreatable(dataset, { exemptKeywords: common.exemptKeywords(injections) });
 
   const scheduledSteps = dataset.ScheduledStepAttributesSequence;
   if (attrs.unscheduled) {
@@ -218,22 +306,48 @@ async function run(parsed) {
         startTime: attrs.startTime,
       });
 
+  // Encoded and read back here, before the dry run prints the dataset and
+  // before anything is opened, so both paths make the same promise.
+  common.verifyDataset('N-CREATE', mppsSopInstanceUid, dataset, injections);
+
   if (source.worklist) {
-    log.info(`worklist item read from ${source.worklist} (${source.worklistItems} item(s) in the file)`);
+    log.info(
+      `worklist item read from ${source.worklist} ` +
+        `(${source.worklistItems} item(s); took ${source.worklistSelectedBy})`
+    );
   }
 
+  // The three AE Titles that decide attribution, on one line, before anything
+  // is sent. On a dry run the called AE may not have been resolved at all.
+  const attribution = common.attributionOf({
+    callingAe: connection.callingAe,
+    calledAe: connection.calledAe,
+    performedStationAeTitle: attrs.performedStationAeTitle,
+  });
+  common.reportAttribution(attribution);
+
+  const injected = common.injectionSummary(injections);
+
   if (dryRun) {
+    common.reportInjections(injections, asJson, 'N-CREATE');
     if (asJson) {
-      log.out(JSON.stringify({
-        ok: true,
-        dryRun: true,
-        mppsSopInstanceUid,
-        sopClassUid: mpps.MPPS_SOP_CLASS,
-        unscheduled: Boolean(attrs.unscheduled),
-        scheduledStepItems: scheduledSteps.length,
-        dataset,
-      }, null, 2));
-      return 0;
+      return json.result({
+        command: 'mpps start',
+        outcome: json.Outcome.OK,
+        message: 'Dry run: the N-CREATE was built and nothing was sent.',
+        payload: {
+          dryRun: true,
+          mppsSopInstanceUid,
+          sopClassUid: mpps.MPPS_SOP_CLASS,
+          unscheduled: Boolean(attrs.unscheduled),
+          scheduledStepItems: scheduledSteps.length,
+          studyInstanceUid: attrs.studyInstanceUid,
+          attribution,
+          ...(injected.length ? { injected } : {}),
+          ...common.worklistSource(source),
+          dataset,
+        },
+      });
     }
     log.out(`MPPS SOP Instance UID  ${mppsSopInstanceUid}`);
     log.out(`SOP Class UID          ${mpps.MPPS_SOP_CLASS}`);
@@ -252,9 +366,10 @@ async function run(parsed) {
   );
   log.info(`  study ${attrs.studyInstanceUid}, modality ${attrs.modality}, step ${attrs.performedProcedureStepId}`);
 
-  const result = await mpps.nCreate({
-    connection, timeouts, mppsSopInstanceUid, dataset,
-  });
+  common.reportInjections(injections, asJson, 'N-CREATE');
+
+  const peer = json.peerOf(connection);
+  const result = await mpps.nCreate({ connection, timeouts, mppsSopInstanceUid, dataset });
   const verdict = common.describeNResult(result, 'N-CREATE');
 
   // The SCP echoes the instance UID it acted on. A mismatch means the step that
@@ -270,20 +385,30 @@ async function run(parsed) {
   }
 
   if (asJson) {
-    log.out(JSON.stringify({
-      ok: verdict.ok,
-      reason: verdict.reason,
-      mppsSopInstanceUid,
-      sopClassUid: mpps.MPPS_SOP_CLASS,
-      performedProcedureStepStatus: verdict.ok ? mpps.Status.IN_PROGRESS : null,
-      unscheduled: Boolean(attrs.unscheduled),
-      scheduledStepItems: scheduledSteps.length,
-      studyInstanceUid: attrs.studyInstanceUid,
-      peer: connection,
-      status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
-      message: verdict.lines.join(' '),
-    }, null, 2));
-    return verdict.ok ? 0 : 1;
+    return json.result({
+      command: 'mpps start',
+      peer,
+      outcome: verdict.envelope.outcome,
+      message: verdict.envelope.message,
+      detail: verdict.envelope.detail,
+      payload: {
+        // `reason` predates the envelope and is kept: it is the vocabulary the
+        // MCP layer and NewLumen's existing scripts already read, and `outcome`
+        // answers a coarser question than it does.
+        reason: verdict.reason,
+        mppsSopInstanceUid,
+        sopClassUid: mpps.MPPS_SOP_CLASS,
+        performedProcedureStepStatus: verdict.ok ? mpps.Status.IN_PROGRESS : null,
+        unscheduled: Boolean(attrs.unscheduled),
+        scheduledStepItems: scheduledSteps.length,
+        studyInstanceUid: attrs.studyInstanceUid,
+        attribution,
+        ...(injected.length ? { injected } : {}),
+        ...common.worklistSource(source),
+        affectedSopInstanceUid: result.affectedSopInstanceUid ?? null,
+        status: verdict.status ? { code: verdict.status.code, label: verdict.status.label } : null,
+      },
+    });
   }
 
   if (!verdict.ok) {

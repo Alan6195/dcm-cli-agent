@@ -100,7 +100,7 @@ function query(receiver, keys = [], extra = []) {
  * about the worklist instead of about reporter timing.
  */
 function extractJson(stdout) {
-  const start = stdout.indexOf('{\n  "level"');
+  const start = stdout.indexOf('{\n  "schema"');
   assert.notEqual(start, -1, `no JSON document in output:\n${stdout}`);
 
   let depth = 0;
@@ -121,7 +121,13 @@ function extractJson(stdout) {
   throw new Error(`unterminated JSON document in output:\n${stdout}`);
 }
 
-/** Parses the JSON form of a find result. */
+/**
+ * Parses the JSON form of a find result.
+ *
+ * The document is now the dcm.result/1 envelope. The command payload still
+ * lives at its top level — count, matches and the rest are where they were —
+ * so `parsed` keeps meaning what it did, alongside the envelope keys.
+ */
 async function queryJson(receiver, keys = []) {
   const result = await query(receiver, keys, ['--json']);
   return { ...result, parsed: extractJson(result.stdout) };

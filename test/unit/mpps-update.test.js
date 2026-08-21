@@ -2,13 +2,48 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('path');
 
+const { withTempDir } = require('../helpers/harness');
+const { generate, uid: fixtureUid } = require('../../tools/make-fixtures');
 const log = require('../../src/lib/log');
 const { tokenize, UsageError } = require('../../src/lib/args');
 const mpps = require('../../src/lib/mpps');
 const dispatcher = require('../../src/commands/mpps');
 const common = require('../../src/commands/mpps/common');
 const update = require('../../src/commands/mpps/update');
+
+/** The Study Instance UID the generator gives its first study. */
+const STUDY_UID = fixtureUid(1);
+
+/**
+ * Writes a two-series study inside `dir` and hands back the path to it.
+ *
+ * Three of the dry runs below need a folder of DICOM on disk, and each one
+ * builds its own. They used to be handed a bare relative literal naming
+ * `fixtures/study-1`, which Node resolves against process.cwd() — the repo root
+ * under `npm test`, where .gitignore keeps that directory out of the tree
+ * precisely so that nobody commits DICOM. They passed on the machine that had
+ * generated it once and failed everywhere else.
+ *
+ * Two series, because one of those dry runs counts them. One instance each,
+ * because none of them counts instances, and 16x16 pixels because none of them
+ * looks at a pixel.
+ */
+async function studyIn(dir) {
+  const root = path.join(dir, 'source');
+  const manifest = await generate({
+    outDir: root,
+    quiet: true,
+    studies: 1,
+    seriesPerStudy: 2,
+    instancesPerSeries: 1,
+    rows: 16,
+    cols: 16,
+  });
+  assert.equal(manifest.studies[0].studyInstanceUid, STUDY_UID);
+  return path.join(root, 'study-1');
+}
 
 /**
  * The interim N-SET and the unscheduled step.
@@ -429,14 +464,17 @@ test('a single --study-uid still produces one item, as it always did', () => {
 test('dcm mpps perform refuses a repeated --study-uid and says where it works', async () => {
   // One folder is one study, so the extra studies would be named by a step
   // whose images do not belong to them.
-  const err = await rejectsUsage(
-    () => dispatcher.run(tokenize([
-      'perform', './fixtures/study-1', '--dry-run',
-      '--study-uid', '1.2.3', '--study-uid', '1.2.4',
-    ]))
-  );
-  assert.match(err.message, /one folder is one study/);
-  assert.match(err.message, /dcm mpps start/);
+  await withTempDir('dcm-mpps-update', async (dir) => {
+    const source = await studyIn(dir);
+    const err = await rejectsUsage(
+      () => dispatcher.run(tokenize([
+        'perform', source, '--dry-run',
+        '--study-uid', '1.2.3', '--study-uid', '1.2.4',
+      ]))
+    );
+    assert.match(err.message, /one folder is one study/);
+    assert.match(err.message, /dcm mpps start/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -497,22 +535,29 @@ test('--json emits exactly one JSON document, and it names both absences', async
 });
 
 test('--no-status --series-from emits the status-absent shape', async () => {
-  const sink = log.beginCapture();
-  try {
-    await dispatcher.run(tokenize([
-      'update', STEP_UID, '--dry-run', '--json', '--no-status',
-      '--series-from', './fixtures/study-1',
-    ]));
-  } finally {
-    log.endCapture();
-  }
+  await withTempDir('dcm-mpps-update', async (dir) => {
+    const source = await studyIn(dir);
 
-  const parsed = JSON.parse(sink.out);
-  assert.equal(parsed.statusSent, false);
-  assert.equal(parsed.performedSeriesSent, true);
-  assert.equal(parsed.assertedFromDisk, true, 'a folder scan is never presented as acknowledged');
-  assert.ok(!('PerformedProcedureStepStatus' in parsed.dataset));
-  assert.equal(parsed.dataset.PerformedSeriesSequence.length, 2, 'the fixture holds two series');
+    const sink = log.beginCapture();
+    try {
+      await dispatcher.run(tokenize([
+        'update', STEP_UID, '--dry-run', '--json', '--no-status',
+        '--series-from', source,
+      ]));
+    } finally {
+      log.endCapture();
+    }
+
+    const parsed = JSON.parse(sink.out);
+    assert.equal(parsed.statusSent, false);
+    assert.equal(parsed.performedSeriesSent, true);
+    assert.equal(parsed.assertedFromDisk, true, 'a folder scan is never presented as acknowledged');
+    assert.ok(!('PerformedProcedureStepStatus' in parsed.dataset));
+    assert.equal(
+      parsed.dataset.PerformedSeriesSequence.length, 2,
+      'two series were generated, and the scan found both'
+    );
+  });
 });
 
 test('a start dry-run reports the unscheduled shape in its JSON', async () => {
@@ -532,24 +577,28 @@ test('a start dry-run reports the unscheduled shape in its JSON', async () => {
 });
 
 test('a perform dry-run says the two identities diverge under --unscheduled', async () => {
-  const sink = log.beginCapture();
-  try {
-    await dispatcher.run(tokenize([
-      'perform', './fixtures/study-1', '--dry-run', '--json',
-      '--unscheduled', '--modality', 'DX', '--step-id', 'W1',
-    ]));
-  } finally {
-    log.endCapture();
-  }
+  await withTempDir('dcm-mpps-update', async (dir) => {
+    const source = await studyIn(dir);
 
-  const parsed = JSON.parse(sink.out);
-  assert.equal(parsed.unscheduled, true);
-  assert.equal(
-    parsed.studyInstanceUid, '1.2.826.0.1.3680043.10.1337.1',
-    'the images keep the study they carry, because that is what the archive files them by'
-  );
-  assert.equal(parsed.stepStudyInstanceUid, null, 'and the step names none');
-  assert.deepEqual(parsed.dataset.ScheduledStepAttributesSequence, [{}]);
+    const sink = log.beginCapture();
+    try {
+      await dispatcher.run(tokenize([
+        'perform', source, '--dry-run', '--json',
+        '--unscheduled', '--modality', 'DX', '--step-id', 'W1',
+      ]));
+    } finally {
+      log.endCapture();
+    }
+
+    const parsed = JSON.parse(sink.out);
+    assert.equal(parsed.unscheduled, true);
+    assert.equal(
+      parsed.studyInstanceUid, STUDY_UID,
+      'the images keep the study they carry, because that is what the archive files them by'
+    );
+    assert.equal(parsed.stepStudyInstanceUid, null, 'and the step names none');
+    assert.deepEqual(parsed.dataset.ScheduledStepAttributesSequence, [{}]);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 const log = require('../lib/log');
 const args = require('../lib/args');
 const statusLib = require('../lib/status');
+const json = require('../lib/json');
 const vr = require('../lib/vr');
 const { runAssociation, resolveTimeouts, dcmjsDimse } = require('../lib/dimse');
 const { formatOutcome } = require('../lib/reject');
@@ -13,6 +14,7 @@ const FLAGS = [
   'json-raw', 'check-vr', 'set',
   'host', 'port', 'called-ae', 'calling-ae', 'study', 'series', 'image', 'mwl',
   'timeout', 'connect-timeout', 'association-timeout', 'limit',
+  'expect-count', 'expect-empty', 'expect-nonempty',
 ];
 
 const USAGE = `
@@ -51,6 +53,11 @@ Options:
                          with no client-side validation at all. Repeatable.
                          See below.
   --verbose              Log the full association negotiation.
+
+  --expect-count <n>     Assert the peer returns exactly n matches.
+  --expect-empty         Assert it returns none.
+  --expect-nonempty      Assert it returns at least one.
+                         See "Stating an expectation" below.
 
 Examples:
   dcm find --host pacs.example.org --port 11112 --called-ae ARCHIVE PatientID=12345
@@ -148,6 +155,47 @@ Note: the built identifier is read back and compared against what was asked
   here for that reason. LO and PN are carried at any length, and every other
   kind of malformed value — lowercase, non-enumerated, non-numeric, embedded
   backslash — goes out exactly as typed.
+
+Stating an expectation (--expect-count / --expect-empty / --expect-nonempty):
+  Without one of these, exit 1 means any of: the peer returned zero matches, the
+  association was refused, the peer aborted mid-stream, the host was
+  unreachable, or a VR gate failed. A CI job asserting "after the MPPS N-CREATE
+  the worklist entry is gone" cannot tell the first of those — the answer it
+  wants — from the rest.
+
+  With one of them the caller states what it believes and the exit code answers
+  THAT question: 0 when the expectation held, 1 when it did not. A run that
+  never reached the peer does NOT satisfy --expect-empty; it is reported as
+  "evaluated": false in the JSON envelope and exits 1, because a query that was
+  refused has not shown that anything is gone.
+
+  They are mutually exclusive, and they do not override a --check-vr failure:
+  a gate a passing count could suppress is not a gate.
+
+    dcm find --mwl --called-ae WORKLIST AccessionNumber=A1 --expect-empty
+    dcm find --called-ae ARCHIVE PatientID=12345 --expect-count 3
+
+Machine-readable output (--json / --json-raw):
+  Exactly one JSON object on stdout on EVERY terminal path — including a
+  refused association, an abort, a timeout, a network error and a usage error.
+  It carries "schema": "dcm.result/1" and an "outcome" of matched, empty,
+  rejected, aborted, timeout, network, usage or error, so "correctly returned
+  zero" is a different value from "never got to ask". "detail" carries the
+  A-ASSOCIATE-RJ result/source/reason, the abort source/reason, the timeout
+  phase, the transport error code, or the DIMSE status — whichever applies.
+
+The calling-AE asymmetry (--mwl):
+  A worklist SCP typically keys tenancy on the CALLED AE and does not validate
+  the calling AE at all, while MPPS attribution is keyed on the PERFORMED
+  STATION AE — which is the calling AE of the step that follows. So a worklist
+  query run with the wrong --calling-ae succeeds and returns rows, and the MPPS
+  step afterwards is silently attributed to nobody.
+
+  When a returned row's ScheduledStationAETitle differs from --calling-ae this
+  command warns on stderr. It never refuses: the mismatch is perfectly
+  legitimate when the tool is not running on the station. The three AE Titles
+  that decide attribution — called, calling, and each row's scheduled station —
+  are in the JSON envelope under "attribution" so CI can assert on them.
 
 Note: a peer that accepted your images may still return zero matches for them.
 Storing and indexing are different operations, and store-and-forward receivers
@@ -526,12 +574,17 @@ function display(value) {
  * @returns {Promise<number>}
  */
 async function run(parsed) {
-  const { flags, pairs } = parsed;
+  const { flags } = parsed;
 
-  if (flags.has('help')) {
-    log.out(USAGE);
-    return 0;
-  }
+  if (flags.has('help')) return json.help('find', flags, USAGE);
+
+  // Every terminal path below leaves through here, so a usage error thrown
+  // before the first line of output still produces a document under --json.
+  return json.guard('find', flags, () => execute(parsed));
+}
+
+async function execute(parsed) {
+  const { flags, pairs } = parsed;
 
   args.rejectUnknown(flags, FLAGS);
 
@@ -564,6 +617,7 @@ async function run(parsed) {
     throw new args.UsageError('--json and --json-raw ask for two different shapes; choose one.');
   }
 
+  const declared = json.readExpectation(flags, args);
   const injections = parseInjections(flags);
 
   // Only when something will read them: re-reading every dataset costs a parse
@@ -598,6 +652,8 @@ async function run(parsed) {
   };
   const request = builders[level](identifier);
   if (injections.length) verifyInjections(request, injections);
+
+  const peer = json.peerOf({ host, port, calledAe, callingAe });
 
   log.info(`C-FIND (${level}) ${callingAe} -> ${calledAe} at ${host}:${port}`);
   if (pairs.length) {
@@ -649,7 +705,25 @@ async function run(parsed) {
 
   if (outcome.kind !== 'completed') {
     log.error('C-FIND failed');
+    if (asJson || asRawJson) {
+      const mapped = json.fromAssociationOutcome(outcome);
+      // actual is null: the query never ran, so nothing was counted and an
+      // --expect-empty cannot be satisfied by this.
+      const expectation = json.evaluateExpectation(declared, null);
+      if (expectation) log.error(json.describeExpectation(expectation));
+      return json.result({
+        command: 'find', peer,
+        outcome: mapped.outcome,
+        message: mapped.message,
+        detail: mapped.detail,
+        expectation,
+        payload: { level, count: null, matches: [] },
+      });
+    }
     for (const line of formatOutcome(outcome)) log.out(line);
+    if (declared) {
+      log.error(json.describeExpectation(json.evaluateExpectation(declared, null)));
+    }
     return 1;
   }
 
@@ -657,14 +731,51 @@ async function run(parsed) {
   if (finalStatus !== undefined && statusLib.classify(finalStatus) === statusLib.Class.FAILURE) {
     const d = statusLib.describe(finalStatus, finalComment);
     log.error(`the peer refused the query: ${d.code} ${d.label}`);
+    if (asJson || asRawJson) {
+      const mapped = json.fromStatus(d);
+      const expectation = json.evaluateExpectation(declared, null);
+      if (expectation) log.error(json.describeExpectation(expectation));
+      return json.result({
+        command: 'find', peer,
+        outcome: mapped.outcome,
+        message: mapped.message,
+        detail: mapped.detail,
+        expectation,
+        payload: { level, count: null, matches: [] },
+      });
+    }
     log.out(d.plain);
     if (d.hint) log.out(`  ${d.hint}`);
+    if (declared) {
+      log.error(json.describeExpectation(json.evaluateExpectation(declared, null)));
+    }
     return 1;
   }
 
   // The conformance report is built before anything is printed, because in
   // JSON mode it has to go inside the single document rather than beside it.
   const conformance = checkVr ? buildConformance(views) : undefined;
+  const gateFailed = Boolean(conformance && (conformance.violations.length || conformance.unreadable.length));
+
+  // The query completed, so the count is a real answer and the expectation can
+  // actually be judged against it.
+  const expectation = json.evaluateExpectation(declared, matches.length);
+  // Named apart from the association `outcome` above: this one is the answer
+  // to the query, that one is what happened to the association.
+  const queryOutcome = matches.length > 0 ? json.Outcome.MATCHED : json.Outcome.EMPTY;
+  const exitCode = json.resolveExitCode({ outcome: queryOutcome, expectation, gateFailed });
+  if (expectation) {
+    if (expectation.held) log.info(json.describeExpectation(expectation));
+    else log.error(json.describeExpectation(expectation));
+  }
+
+  // The worklist tenancy / MPPS attribution asymmetry. Warned about, never
+  // refused: the mismatch is legitimate whenever this tool is not running on
+  // the station itself.
+  const attribution = level === 'mwl'
+    ? attributionOf(matches, { callingAe, calledAe })
+    : undefined;
+  if (attribution) warnAttribution(attribution);
 
   const injected = injections.map((i) => ({
     tag: i.tag, attribute: i.label, value: i.value,
@@ -687,14 +798,21 @@ async function run(parsed) {
     // reading a table; it turns a sequence into a string and an empty
     // sequence into '', which silently destroys the very attributes an MPPS
     // N-CREATE must echo back for the RIS to correlate the step.
-    log.out(JSON.stringify({
-      level, host, port, calledAe, raw: true,
-      count: matches.length,
-      ...(injected.length ? { injected } : {}),
-      ...(conformance ? conformanceJson(conformance) : {}),
-      matches: matches.map((m, i) => withSidecar(stripPrivateKeys(m), views[i])),
-    }, null, 2));
-    return conformance?.violations.length ? 1 : (matches.length > 0 ? 0 : 1);
+    return json.result({
+      command: 'find', peer,
+      outcome: queryOutcome,
+      exitCode,
+      expectation,
+      message: messageFor(queryOutcome, matches.length, expectation, conformance),
+      payload: {
+        level, raw: true,
+        count: matches.length,
+        ...(attribution ? { attribution } : {}),
+        ...(injected.length ? { injected } : {}),
+        ...(conformance ? conformanceJson(conformance) : {}),
+        matches: matches.map((m, i) => withSidecar(stripPrivateKeys(m), views[i])),
+      },
+    });
   }
 
   if (asJson) {
@@ -706,14 +824,21 @@ async function run(parsed) {
       }
       return row;
     });
-    log.out(JSON.stringify({
-      level, host, port, calledAe,
-      count: plain.length,
-      ...(injected.length ? { injected } : {}),
-      ...(conformance ? conformanceJson(conformance) : {}),
-      matches: plain,
-    }, null, 2));
-    return conformance?.violations.length ? 1 : (matches.length > 0 ? 0 : 1);
+    return json.result({
+      command: 'find', peer,
+      outcome: queryOutcome,
+      exitCode,
+      expectation,
+      message: messageFor(queryOutcome, plain.length, expectation, conformance),
+      payload: {
+        level,
+        count: plain.length,
+        ...(attribution ? { attribution } : {}),
+        ...(injected.length ? { injected } : {}),
+        ...(conformance ? conformanceJson(conformance) : {}),
+        matches: plain,
+      },
+    });
   }
 
   if (matches.length === 0) {
@@ -732,7 +857,7 @@ async function run(parsed) {
           'confirm this AE Title is permitted to query as well as to store.'
       )
     );
-    return 1;
+    return exitCode;
   }
 
   const columns = COLUMNS[level];
@@ -750,12 +875,85 @@ async function run(parsed) {
   log.out('');
   log.out(`${matches.length} match${matches.length === 1 ? '' : 'es'}.`);
 
-  if (conformance) {
-    reportConformance(conformance);
-    if (conformance.violations.length || conformance.unreadable.length) return 1;
-  }
+  if (conformance) reportConformance(conformance);
 
-  return 0;
+  return exitCode;
+}
+
+/**
+ * The three AE Titles that decide where a worklist row came from and who the
+ * MPPS step that follows it will be attributed to.
+ *
+ * A worklist SCP typically keys tenancy on the CALLED AE and does not validate
+ * the calling AE at all, while MPPS attribution is keyed on the PERFORMED
+ * STATION AE — which is the calling AE of the N-CREATE that follows. The two
+ * halves of one workflow are therefore keyed on different things, and the
+ * asymmetry is invisible: the worklist query succeeds and returns rows, and
+ * only the MPPS step afterwards is silently unattributed.
+ *
+ * Recording all three in the envelope is what lets CI assert on the
+ * relationship rather than on a sentence describing it.
+ *
+ * @param {Array<Record<string, unknown>>} matches
+ * @param {{callingAe: string, calledAe: string}} aes
+ * @returns {object}
+ */
+function attributionOf(matches, { callingAe, calledAe }) {
+  const stations = [...new Set(
+    matches.map((m) => display(m.ScheduledStationAETitle)).filter(Boolean)
+  )].sort();
+  const mismatched = stations.filter((station) => station !== callingAe);
+
+  return {
+    // The tenancy key: which worklist the peer decided to answer from.
+    calledAe,
+    // The attribution key: what a following MPPS N-CREATE will claim as its
+    // Performed Station AE Title.
+    callingAe,
+    // What the schedule says the station should be, per returned row.
+    scheduledStationAeTitles: stations,
+    mismatchedStationAeTitles: mismatched,
+    // Null rather than false when no row named a station: "they disagree" and
+    // "nothing said" are different facts and a test should be able to tell.
+    callingAeMatchesScheduledStation: stations.length === 0 ? null : mismatched.length === 0,
+  };
+}
+
+/** Warns about a calling-AE / scheduled-station mismatch. Never a refusal. */
+function warnAttribution(attribution) {
+  const { mismatchedStationAeTitles: mismatched, callingAe } = attribution;
+  if (mismatched.length === 0) return;
+
+  log.warn(
+    `--calling-ae is ${callingAe}, but ${mismatched.length === 1 ? 'the returned row schedules' : 'returned rows schedule'} ` +
+      `${mismatched.join(', ')}.`
+  );
+  log.warn(
+    [
+      '        A worklist SCP usually keys tenancy on the CALLED AE and does not check the',
+      '        calling AE at all, so this query succeeded. MPPS attribution is keyed on the',
+      '        PERFORMED STATION AE — the calling AE of the step you send next — so an MPPS',
+      '        N-CREATE run this way is accepted and attributed to nobody. That is',
+      '        legitimate when this tool is not running on the station; if it is meant to',
+      `        be, pass --calling-ae ${mismatched[0]}.`,
+    ].join('\n')
+  );
+}
+
+/**
+ * The one-sentence `message`. Prose: assert on `outcome` and `expectation`,
+ * never on this.
+ */
+function messageFor(outcome, count, expectation, conformance) {
+  if (expectation && !expectation.held) return json.describeExpectation(expectation);
+  if (conformance?.violations.length) {
+    return `${count} match(es); ${conformance.violations.length} VR conformance violation(s).`;
+  }
+  if (outcome === json.Outcome.EMPTY) {
+    return 'The query completed and the peer returned no matches. This is an answer, ' +
+      'not a failure to reach the peer.';
+  }
+  return `${count} match(es).`;
 }
 
 /**
@@ -871,4 +1069,4 @@ function stripPrivateKeys(value) {
 module.exports = {
   stripPrivateKeys, run, USAGE, buildIdentifier, display, flattenWorklistMatch, MWL_SPS_KEYS,
   parseInjections, applyInjections, verifyInjections, injectionBanner, rawView,
-  buildConformance, withSidecar };
+  buildConformance, withSidecar, attributionOf };
