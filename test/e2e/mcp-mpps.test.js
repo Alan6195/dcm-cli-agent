@@ -1,6 +1,6 @@
 'use strict';
 
-const test = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -39,6 +39,33 @@ const path = require('node:path');
  *
  * The MCP SDK is ESM; it is loaded with dynamic import from these CommonJS
  * tests.
+ *
+ * WHAT IS SHARED, AND WHY. Three costs dominate this file and none of them is
+ * the assertions:
+ *
+ *   Spawning `node bin/dcm.js mcp` and shaking hands with it, ~0.7-1.7s. This
+ *   file used to pay that 23 times, once per test. It pays it once now.
+ *
+ *   Spawning a receiver child inside that server, ~0.3-0.55s, plus the fixture
+ *   generator, ~0.4s. One study of four instances and one default receiver are
+ *   built in before() and reused by every test whose subject is not the
+ *   receiver itself.
+ *
+ *   The linger every DIMSE association pays before A-RELEASE-RQ. tools/run-tests.js
+ *   sets DCM_LINGER=50 for the suite, but StdioClientTransport hands the server
+ *   child a SAFE SUBSET of the environment (see DEFAULT_INHERITED_ENV_VARS), so
+ *   the variable never reached the process that actually opens the associations
+ *   and every one of them cost the full second. It is passed through explicitly
+ *   below. That is worth more here than anywhere else in the suite, because the
+ *   MCP server is the SCU for every call these tests make.
+ *
+ * WHAT IS DELIBERATELY NOT SHARED is called out at each test that starts its
+ * own receiver, and it is always one of two reasons. Either the test's subject
+ * IS the receiver's behaviour — a fault armed at start, or the withholding of a
+ * worklist row whose step completed — or the test reads a persist directory and
+ * needs to be the only writer into it. The shared receiver runs with
+ * keepPerformed so that a step completed by one test cannot empty another
+ * test's worklist, which is the one way its state could leak.
  */
 
 const BIN = path.join(__dirname, '..', '..', 'bin', 'dcm.js');
@@ -163,22 +190,6 @@ function handoffArgs(scheduled) {
   return stepArgs;
 }
 
-async function withClient(fn) {
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
-  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, 'mcp'] });
-  const client = new Client({ name: 'dcm-mpps-test', version: '1.0.0' });
-  await client.connect(transport);
-  try {
-    return await fn({
-      client,
-      call: (name, args) => client.callTool({ name, arguments: args }),
-    });
-  } finally {
-    await client.close();
-  }
-}
-
 /** The text half of a tool result. */
 function textOf(res) {
   return (res.content || []).map((c) => c.text || '').join('\n');
@@ -221,52 +232,162 @@ function fillFolder(from, into, count) {
   return Math.min(count, files.length);
 }
 
+// ---- The one MCP server, the one fixture, the one default receiver --------
+
+/**
+ * Everything built once for the whole file.
+ *
+ *  - fixture:  one 4-instance study. Every test that needs images uses it, and
+ *              none of them modifies it — the adoption test asserts that in
+ *              bytes, over this very folder.
+ *  - dir:      holds the shared worklist file, and nothing else ever.
+ *  - worklist: one worklist file describing the fixture study.
+ *  - persist:  the shared receiver's store. NO test reads it; the tests that
+ *              count what a receiver wrote all keep their own.
+ *  - peer:     the shared receiver, running for the whole file with
+ *              keepPerformed so a completed step cannot empty its worklist.
+ *  - tools:    the tool list, read once. It is static for the life of the
+ *              server, so nine advertisement tests need not ask nine times.
+ */
+const shared = {};
+let client;
+
+/** Calls a tool on the shared server. */
+function call(name, args) {
+  return client.callTool({ name, arguments: args });
+}
+
+/**
+ * Starts a receiver of its own and runs `fn` against it, stopping it afterwards.
+ *
+ * Used by every test that cannot use the shared receiver: the ones whose
+ * subject is a worklist row being withheld once its step finished, the one
+ * armed to refuse a calling AE Title, and the ones that count what landed in a
+ * persist directory nobody else writes into.
+ *
+ * @param {object} args  dcm_receiver_start arguments.
+ * @param {(peerAndServer: object) => Promise<void>} fn
+ */
+async function withReceiver(args, fn) {
+  const started = await call('dcm_receiver_start', { ae: 'WORKLIST', ...args });
+  assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
+  const { serverId, port, host } = started.structuredContent;
+  try {
+    return await fn({
+      started,
+      serverId,
+      peer: { host, port, calledAe: args.ae ?? 'WORKLIST' },
+    });
+  } finally {
+    await call('dcm_server_stop', { serverId });
+  }
+}
+
+before(async () => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StdioClientTransport, getDefaultEnvironment } =
+    await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+  // DCM_LINGER, explicitly. The transport's default environment is a fixed
+  // allow-list that cannot include it, so without this the server child opens
+  // every association at the 1000 ms default while the suite believes it asked
+  // for 50 — see the note at the top of this file and tools/run-tests.js.
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [BIN, 'mcp'],
+    env: {
+      ...getDefaultEnvironment(),
+      ...(process.env.DCM_LINGER ? { DCM_LINGER: process.env.DCM_LINGER } : {}),
+    },
+  });
+  client = new Client({ name: 'dcm-mpps-test', version: '1.0.0' });
+  await client.connect(transport);
+
+  shared.tools = (await client.listTools()).tools;
+
+  shared.fixture = makeStudy(4);
+  shared.dir = tempDir('dcm-mcp-mpps-');
+  shared.persist = tempDir('dcm-mcp-mpps-store-');
+  shared.worklist = makeWorklist(shared.dir);
+
+  // keepPerformed, because this receiver has steps opened and closed against it
+  // by several tests and the worklist row would otherwise be withheld from
+  // every later query. That withholding is real behaviour and it has its own
+  // coverage below, on receivers of its own; here it would only be a way for
+  // one test to empty another test's worklist.
+  shared.started = await call('dcm_receiver_start', {
+    ae: 'WORKLIST',
+    worklist: shared.worklist,
+    persist: shared.persist,
+    keepPerformed: true,
+  });
+  assert.ok(!shared.started.isError, `receiver failed to start: ${textOf(shared.started)}`);
+  const { serverId, host, port } = shared.started.structuredContent;
+  shared.serverId = serverId;
+  shared.peer = { host, port, calledAe: 'WORKLIST' };
+});
+
+after(async () => {
+  try {
+    if (client) {
+      if (shared.serverId) await call('dcm_server_stop', { serverId: shared.serverId });
+      await client.close();
+    }
+  } finally {
+    for (const d of [shared.fixture && shared.fixture.root, shared.dir, shared.persist]) {
+      if (d) fs.rmSync(d, { recursive: true, force: true });
+    }
+  }
+});
+
+/** The tool list read once in before(). */
+function toolsByName() {
+  return new Map(shared.tools.map((t) => [t.name, t]));
+}
+
 // ---- Advertisement --------------------------------------------------------
 
 test('the MPPS tools are advertised with the honesty rules in their descriptions', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    const byName = new Map(tools.map((t) => [t.name, t]));
+  const byName = toolsByName();
 
-    for (const name of [
-      'dcm_mpps_start', 'dcm_mpps_perform', 'dcm_mpps_complete', 'dcm_mpps_discontinue',
-    ]) {
-      assert.ok(byName.has(name), `missing tool ${name}; got ${[...byName.keys()].join(', ')}`);
-    }
-    assert.equal(byName.has('dcm_mpps_list'), false, 'nothing records steps, so nothing lists them');
+  for (const name of [
+    'dcm_mpps_start', 'dcm_mpps_perform', 'dcm_mpps_complete', 'dcm_mpps_discontinue',
+  ]) {
+    assert.ok(byName.has(name), `missing tool ${name}; got ${[...byName.keys()].join(', ')}`);
+  }
+  assert.equal(byName.has('dcm_mpps_list'), false, 'nothing records steps, so nothing lists them');
 
-    const perform = byName.get('dcm_mpps_perform');
-    // Rule 1: COMPLETED only when everything was acknowledged, and no override.
-    assert.match(perform.description, /ONLY IF EVERY INSTANCE FOUND ON DISK WAS ACKNOWLEDGED/);
-    assert.match(perform.description, /no override/i);
-    assert.match(perform.description, /DISCONTINUED/);
-    assert.match(perform.description, /error result/i);
-    // Rule 2: the performed series comes from acknowledgements, not a folder.
-    assert.match(perform.description, /only from instances the archive positively acknowledged/i);
-    assert.match(perform.description, /never from a folder listing/i);
-    // Rule 4: a worklist that changed is correlation, not proof.
-    assert.match(perform.description, /not proof/i);
-    // The local loop this makes possible.
-    assert.match(perform.description, /dcm_receiver_start/);
+  const perform = byName.get('dcm_mpps_perform');
+  // Rule 1: COMPLETED only when everything was acknowledged, and no override.
+  assert.match(perform.description, /ONLY IF EVERY INSTANCE FOUND ON DISK WAS ACKNOWLEDGED/);
+  assert.match(perform.description, /no override/i);
+  assert.match(perform.description, /DISCONTINUED/);
+  assert.match(perform.description, /error result/i);
+  // Rule 2: the performed series comes from acknowledgements, not a folder.
+  assert.match(perform.description, /only from instances the archive positively acknowledged/i);
+  assert.match(perform.description, /never from a folder listing/i);
+  // Rule 4: a worklist that changed is correlation, not proof.
+  assert.match(perform.description, /not proof/i);
+  // The local loop this makes possible.
+  assert.match(perform.description, /dcm_receiver_start/);
 
-    // Rule 2 again, from the other side: the folder-scan source has to carry
-    // its own warning, because it is the one that can fabricate a record.
-    const complete = byName.get('dcm_mpps_complete');
-    assert.match(
-      complete.inputSchema.properties.seriesFrom.description,
-      /ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS/
-    );
-    assert.match(complete.description, /correlation rather than as proof/);
+  // Rule 2 again, from the other side: the folder-scan source has to carry
+  // its own warning, because it is the one that can fabricate a record.
+  const complete = byName.get('dcm_mpps_complete');
+  assert.match(
+    complete.inputSchema.properties.seriesFrom.description,
+    /ASSERTS WHAT IS ON YOUR DISK, NOT WHAT THE ARCHIVE HOLDS/
+  );
+  assert.match(complete.description, /correlation rather than as proof/);
 
-    // Rule 3: the Type 1 check is local and refuses by name.
-    assert.match(byName.get('dcm_mpps_start').description, /Type 1/);
-    assert.match(byName.get('dcm_mpps_start').description, /before anything goes on the wire/i);
+  // Rule 3: the Type 1 check is local and refuses by name.
+  assert.match(byName.get('dcm_mpps_start').description, /Type 1/);
+  assert.match(byName.get('dcm_mpps_start').description, /before anything goes on the wire/i);
 
-    // The coded-reason judgement call, stated where it is read.
-    const discontinue = byName.get('dcm_mpps_discontinue');
-    assert.match(discontinue.description, /NOT sent/);
-    assert.match(discontinue.inputSchema.properties.reasonCode.description, /CODE\^SCHEME\^MEANING/);
-  });
+  // The coded-reason judgement call, stated where it is read.
+  const discontinue = byName.get('dcm_mpps_discontinue');
+  assert.match(discontinue.description, /NOT sent/);
+  assert.match(discontinue.inputSchema.properties.reasonCode.description, /CODE\^SCHEME\^MEANING/);
 });
 
 test('no MPPS tool takes a parameter that would write or read a file of steps', async () => {
@@ -274,676 +395,601 @@ test('no MPPS tool takes a parameter that would write or read a file of steps', 
   // files, no local database. A parameter that survived the removal would be a
   // trap — it would name machinery that is gone.
   const banned = new Set(['recordDir', 'record', 'select', 'writeAcknowledged', 'acknowledged', 'out']);
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    for (const tool of tools.filter((t) => t.name.startsWith('dcm_mpps_'))) {
-      for (const key of Object.keys(tool.inputSchema.properties || {})) {
-        assert.equal(banned.has(key), false, `${tool.name}.${key} names machinery that is gone`);
-      }
-      // And no description may still promise it.
-      assert.doesNotMatch(tool.description, /recordDir|dcm_mpps_list|writeAcknowledged/);
+  for (const tool of shared.tools.filter((t) => t.name.startsWith('dcm_mpps_'))) {
+    for (const key of Object.keys(tool.inputSchema.properties || {})) {
+      assert.equal(banned.has(key), false, `${tool.name}.${key} names machinery that is gone`);
     }
-  });
+    // And no description may still promise it.
+    assert.doesNotMatch(tool.description, /recordDir|dcm_mpps_list|writeAcknowledged/);
+  }
 });
 
 test('dcm_mpps_start says the returned UID is the only handle there will ever be', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    const start = tools.find((t) => t.name === 'dcm_mpps_start');
-    assert.match(start.description, /ONLY handle on the step/);
-    assert.match(start.description, /KEEP IT/);
-    assert.match(start.description, /no query service/);
+  const start = shared.tools.find((t) => t.name === 'dcm_mpps_start');
+  assert.match(start.description, /ONLY handle on the step/);
+  assert.match(start.description, /KEEP IT/);
+  assert.match(start.description, /no query service/);
 
-    // And the closing verbs say the UID is the only way in, so an assistant
-    // does not go looking for a listing that no longer exists.
-    for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
-      const tool = tools.find((t) => t.name === name);
-      assert.match(tool.description, /named by its UID and by nothing else/);
-      assert.ok(
-        (tool.inputSchema.required || []).includes('mppsUid'),
-        `${name} must require mppsUid — there is nowhere else to get it`
-      );
-    }
-  });
+  // And the closing verbs say the UID is the only way in, so an assistant
+  // does not go looking for a listing that no longer exists.
+  for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
+    const tool = shared.tools.find((t) => t.name === name);
+    assert.match(tool.description, /named by its UID and by nothing else/);
+    assert.ok(
+      (tool.inputSchema.required || []).includes('mppsUid'),
+      `${name} must require mppsUid — there is nowhere else to get it`
+    );
+  }
 });
 
 test('no MPPS tool offers a way to force a COMPLETED', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    for (const tool of tools.filter((t) => t.name.startsWith('dcm_mpps_'))) {
-      for (const key of Object.keys(tool.inputSchema.properties || {})) {
-        assert.doesNotMatch(key, /^force$/i, `${tool.name}.${key} would defeat rule 1`);
-      }
+  for (const tool of shared.tools.filter((t) => t.name.startsWith('dcm_mpps_'))) {
+    for (const key of Object.keys(tool.inputSchema.properties || {})) {
+      assert.doesNotMatch(key, /^force$/i, `${tool.name}.${key} would defeat rule 1`);
     }
-  });
+  }
 });
 
 test('dcm_mpps_perform takes the worklist keys as named parameters', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    const perform = tools.find((t) => t.name === 'dcm_mpps_perform');
-    const properties = perform.inputSchema.properties;
+  const perform = shared.tools.find((t) => t.name === 'dcm_mpps_perform');
+  const properties = perform.inputSchema.properties;
 
-    // The handoff is these parameters. If one disappears, a worklist row can no
-    // longer be turned into a performed step without a file.
-    for (const expected of [
-      'studyUid', 'accessionNumber', 'scheduledStepId', 'modality',
-      'patientId', 'patientName', 'patientBirthDate', 'patientSex',
-      'requestedProcedureId', 'requestedProcedureDescription',
-      'storeHost', 'storePort', 'storeCalledAe', 'dryRun',
-    ]) {
-      assert.ok(properties[expected], `dcm_mpps_perform is missing the ${expected} parameter`);
-    }
-    assert.deepEqual((perform.inputSchema.required || []).includes('folder'), true);
+  // The handoff is these parameters. If one disappears, a worklist row can no
+  // longer be turned into a performed step without a file.
+  for (const expected of [
+    'studyUid', 'accessionNumber', 'scheduledStepId', 'modality',
+    'patientId', 'patientName', 'patientBirthDate', 'patientSex',
+    'requestedProcedureId', 'requestedProcedureDescription',
+    'storeHost', 'storePort', 'storeCalledAe', 'dryRun',
+  ]) {
+    assert.ok(properties[expected], `dcm_mpps_perform is missing the ${expected} parameter`);
+  }
+  assert.deepEqual((perform.inputSchema.required || []).includes('folder'), true);
 
-    // The trap the CLI names by hand: rendered worklist JSON is not raw.
-    assert.match(properties.fromWorklist.description, /json-raw/);
-    assert.match(properties.fromWorklist.description, /NOT the output of dcm_worklist/);
-  });
+  // The trap the CLI names by hand: rendered worklist JSON is not raw.
+  assert.match(properties.fromWorklist.description, /json-raw/);
+  assert.match(properties.fromWorklist.description, /NOT the output of dcm_worklist/);
 });
 
 // ---- The loop -------------------------------------------------------------
 
 test('worklist to MPPS: query, perform, and the item leaves the worklist', async (t) => {
-  const fixture = makeStudy(4);
-  const dir = tempDir('dcm-mcp-mpps-');
-  const persist = tempDir('dcm-mcp-mpps-store-');
+  // ISOLATED ON PURPOSE, and this is the test the shared receiver's
+  // keepPerformed exists to protect: the subject here is the row DISAPPEARING
+  // once its step completed, so this receiver must be one that withholds, and
+  // it must be the only writer into a persist directory it then counts.
+  const dir = tempDir('dcm-mcp-mpps-loop-');
+  const persist = tempDir('dcm-mcp-mpps-loop-store-');
   t.after(() => {
-    for (const d of [fixture.root, dir, persist]) fs.rmSync(d, { recursive: true, force: true });
+    for (const d of [dir, persist]) fs.rmSync(d, { recursive: true, force: true });
   });
   const worklistFile = makeWorklist(dir);
+  const fixture = shared.fixture;
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', {
-      ae: 'WORKLIST', worklist: worklistFile, persist,
-    });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'WORKLIST' };
+  await withReceiver({ worklist: worklistFile, persist }, async ({ peer }) => {
+    // --- 1. What is scheduled? ---------------------------------------
+    const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
+    assert.equal(scheduled.structuredContent.count, 1);
 
-    try {
-      // --- 1. What is scheduled? ---------------------------------------
-      const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
-      assert.equal(scheduled.structuredContent.count, 1);
+    const row = scheduled.structuredContent.matches[0];
+    assert.equal(row.StudyInstanceUID, STUDY_UID);
+    assert.equal(row.PatientID, PATIENT_ID);
 
-      const row = scheduled.structuredContent.matches[0];
-      assert.equal(row.StudyInstanceUID, STUDY_UID);
-      assert.equal(row.PatientID, PATIENT_ID);
+    // The handoff has to be usable without guessing, so the perform call is
+    // built mechanically from the mapping the tool published rather than
+    // from field names written out here.
+    const handoff = scheduled.structuredContent.mppsHandoff;
+    assert.ok(handoff, 'dcm_worklist did not publish the MPPS handoff mapping');
+    assert.equal(handoff.tool, 'dcm_mpps_perform');
+    assert.equal(handoff.correlationKeys[0], 'StudyInstanceUID');
 
-      // The handoff has to be usable without guessing, so the perform call is
-      // built mechanically from the mapping the tool published rather than
-      // from field names written out here.
-      const handoff = scheduled.structuredContent.mppsHandoff;
-      assert.ok(handoff, 'dcm_worklist did not publish the MPPS handoff mapping');
-      assert.equal(handoff.tool, 'dcm_mpps_perform');
-      assert.equal(handoff.correlationKeys[0], 'StudyInstanceUID');
-
-      const stepArgs = {};
-      for (const [key, parameter] of Object.entries(handoff.parameters)) {
-        if (row[key] !== undefined && row[key] !== '') stepArgs[parameter] = row[key];
-      }
-      assert.equal(stepArgs.studyUid, STUDY_UID);
-      assert.equal(stepArgs.scheduledStepId, 'SPS001');
-
-      // --- 2. Perform it ------------------------------------------------
-      const performed = await call('dcm_mpps_perform', {
-        folder: fixture.study,
-        ...peer,
-        ...stepArgs,
-      });
-      assert.ok(!performed.isError, `perform failed: ${textOf(performed)}`);
-
-      const p = performed.structuredContent;
-      assert.equal(p.performedProcedureStepStatus, 'COMPLETED');
-      assert.equal(p.studyInstanceUid, STUDY_UID);
-      assert.equal(p.found, fixture.count);
-      assert.equal(p.acknowledged, fixture.count, 'acknowledged must equal found for a COMPLETED step');
-      assert.equal(p.referencedInMpps, fixture.count);
-      assert.equal(p.notReferenced, 0);
-      assert.ok(!p.shortfall, `expected no shortfall, got ${p.shortfall}`);
-      assert.equal(p.explanation, null);
-      assert.equal(p.performedSeries.length, 1);
-      assert.equal(p.performedSeries[0].instances, fixture.count);
-      assert.ok(p.mppsSopInstanceUid, 'the step UID is the only handle on the step');
-
-      // The images really went: the receiver wrote them.
-      assert.equal(countDicomFiles(persist), fixture.count);
-
-      // Nothing was written anywhere: the whole transaction lived in one call,
-      // which is the reason no persistence is needed for the common case.
-      assert.deepEqual(
-        fs.readdirSync(dir).filter((f) => f.endsWith('.json') && f !== path.basename(worklistFile)),
-        [],
-        'a perform must leave no step file behind'
-      );
-
-      // Rule 4 is in the answer even on the happy path.
-      assert.match(textOf(performed), /not visible from here/);
-      assert.match(textOf(performed), /correlating the two, not proof/);
-
-      // --- 3. It is gone from the worklist ------------------------------
-      const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.ok(!after.isError, `second worklist query failed: ${textOf(after)}`);
-      assert.equal(
-        after.structuredContent.count, 0,
-        'the receiver should withhold an item whose performed step completed'
-      );
-      assert.match(textOf(after), /legitimate answer/);
-    } finally {
-      await call('dcm_server_stop', { serverId });
+    const stepArgs = {};
+    for (const [key, parameter] of Object.entries(handoff.parameters)) {
+      if (row[key] !== undefined && row[key] !== '') stepArgs[parameter] = row[key];
     }
+    assert.equal(stepArgs.studyUid, STUDY_UID);
+    assert.equal(stepArgs.scheduledStepId, 'SPS001');
+
+    // --- 2. Perform it ------------------------------------------------
+    const performed = await call('dcm_mpps_perform', {
+      folder: fixture.study,
+      ...peer,
+      ...stepArgs,
+    });
+    assert.ok(!performed.isError, `perform failed: ${textOf(performed)}`);
+
+    const p = performed.structuredContent;
+    assert.equal(p.performedProcedureStepStatus, 'COMPLETED');
+    assert.equal(p.studyInstanceUid, STUDY_UID);
+    assert.equal(p.found, fixture.count);
+    assert.equal(p.acknowledged, fixture.count, 'acknowledged must equal found for a COMPLETED step');
+    assert.equal(p.referencedInMpps, fixture.count);
+    assert.equal(p.notReferenced, 0);
+    assert.ok(!p.shortfall, `expected no shortfall, got ${p.shortfall}`);
+    assert.equal(p.explanation, null);
+    assert.equal(p.performedSeries.length, 1);
+    assert.equal(p.performedSeries[0].instances, fixture.count);
+    assert.ok(p.mppsSopInstanceUid, 'the step UID is the only handle on the step');
+
+    // The images really went: the receiver wrote them.
+    assert.equal(countDicomFiles(persist), fixture.count);
+
+    // Nothing was written anywhere: the whole transaction lived in one call,
+    // which is the reason no persistence is needed for the common case.
+    assert.deepEqual(
+      fs.readdirSync(dir).filter((f) => f.endsWith('.json') && f !== path.basename(worklistFile)),
+      [],
+      'a perform must leave no step file behind'
+    );
+
+    // Rule 4 is in the answer even on the happy path.
+    assert.match(textOf(performed), /not visible from here/);
+    assert.match(textOf(performed), /correlating the two, not proof/);
+
+    // --- 3. It is gone from the worklist ------------------------------
+    const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.ok(!after.isError, `second worklist query failed: ${textOf(after)}`);
+    assert.equal(
+      after.structuredContent.count, 0,
+      'the receiver should withhold an item whose performed step completed'
+    );
+    assert.match(textOf(after), /legitimate answer/);
   });
 });
 
 // ---- The shortfall --------------------------------------------------------
 
-test('a partial transfer ends DISCONTINUED and is surfaced as an error result', async (t) => {
-  const fixture = makeStudy(4);
-  const dir = tempDir('dcm-mcp-mpps-short-');
-  t.after(() => {
-    for (const d of [fixture.root, dir]) fs.rmSync(d, { recursive: true, force: true });
-  });
-  const worklistFile = makeWorklist(dir);
+test('a partial transfer ends DISCONTINUED and is surfaced as an error result', async () => {
+  // dcm_receiver_start does not expose `dcm scp --reject-after`, which is how
+  // the CLI tests induce a partial store. The shortfall is produced instead
+  // by splitting the transaction across two receivers and having the storage
+  // one refuse our calling AE Title: the step opens on the first, no instance
+  // is ever acknowledged by the second, and the reconcile fails for real
+  // rather than through a test hook.
+  //
+  // The MPPS half is the shared receiver — the step it holds is this test's
+  // own, and the row it withholds is guarded by keepPerformed. Only the ARCHIVE
+  // is isolated, because it is armed with acceptCallingAe and would refuse
+  // every other test's C-STORE too.
+  const fixture = shared.fixture;
 
-  await withClient(async ({ call }) => {
-    // dcm_receiver_start does not expose `dcm scp --reject-after`, which is how
-    // the CLI tests induce a partial store. The shortfall is produced instead
-    // by splitting the transaction across two receivers and having the storage
-    // one refuse our calling AE Title: the step opens on the first, no instance
-    // is ever acknowledged by the second, and the reconcile fails for real
-    // rather than through a test hook.
-    const mppsPeer = await call('dcm_receiver_start', { ae: 'MPPSSCP', worklist: worklistFile });
-    assert.ok(!mppsPeer.isError, `MPPS receiver failed to start: ${textOf(mppsPeer)}`);
-    const archive = await call('dcm_receiver_start', {
-      ae: 'ARCHIVE', acceptCallingAe: ['OTHER-AE'],
+  await withReceiver({ ae: 'ARCHIVE', acceptCallingAe: ['OTHER-AE'] }, async ({ peer: archive }) => {
+    const performed = await call('dcm_mpps_perform', {
+      folder: fixture.study,
+      ...shared.peer,
+      storeHost: archive.host,
+      storePort: archive.port,
+      storeCalledAe: 'ARCHIVE',
+      studyUid: STUDY_UID,
+      scheduledStepId: 'SPS001',
+      // A Performed Procedure Step ID of this test's own. The MPPS SOP
+      // Instance UID is DERIVED from the study, the performed step ID, the
+      // station AE and the start date/time (mpps.newMppsUid), so two tests
+      // opening "SPS001" against the same receiver in the same second would
+      // collide on 0x0111 Duplicate SOP Instance. Distinct performed step IDs
+      // are also what really happens: one scheduled step, several performed
+      // ones. Do not fold these back to SPS001.
+      stepId: 'SHORTFALL-1',
+      modality: 'CT',
+      patientId: PATIENT_ID,
     });
-    assert.ok(!archive.isError, `archive receiver failed to start: ${textOf(archive)}`);
 
-    try {
-      const performed = await call('dcm_mpps_perform', {
-        folder: fixture.study,
-        host: mppsPeer.structuredContent.host,
-        port: mppsPeer.structuredContent.port,
-        calledAe: 'MPPSSCP',
-        storeHost: archive.structuredContent.host,
-        storePort: archive.structuredContent.port,
-        storeCalledAe: 'ARCHIVE',
-        studyUid: STUDY_UID,
-        scheduledStepId: 'SPS001',
-        modality: 'CT',
-        patientId: PATIENT_ID,
-      });
+    assert.equal(performed.isError, true, 'a shortfall must not read as success');
 
-      assert.equal(performed.isError, true, 'a shortfall must not read as success');
+    const p = performed.structuredContent;
+    assert.ok(p, 'the numbers must survive the error result — they are the answer');
+    assert.equal(p.ok, false);
+    assert.equal(p.performedProcedureStepStatus, 'DISCONTINUED');
+    assert.equal(p.found, fixture.count);
+    assert.equal(p.acknowledged, 0);
+    assert.ok(p.acknowledged < p.found, 'the shortfall is the point of this test');
 
-      const p = performed.structuredContent;
-      assert.ok(p, 'the numbers must survive the error result — they are the answer');
-      assert.equal(p.ok, false);
-      assert.equal(p.performedProcedureStepStatus, 'DISCONTINUED');
-      assert.equal(p.found, fixture.count);
-      assert.equal(p.acknowledged, 0);
-      assert.ok(p.acknowledged < p.found, 'the shortfall is the point of this test');
+    // Rule 2: nothing was acknowledged, so nothing may be named, even though
+    // every one of those instances is sitting on disk.
+    assert.equal(p.referencedInMpps, 0);
+    assert.deepEqual(p.performedSeries, []);
 
-      // Rule 2: nothing was acknowledged, so nothing may be named, even though
-      // every one of those instances is sitting on disk.
-      assert.equal(p.referencedInMpps, 0);
-      assert.deepEqual(p.performedSeries, []);
-
-      // Rule 1: said in numbers, in one sentence, and with no way out.
-      assert.match(p.explanation, /0 of 4 instances were acknowledged/);
-      assert.match(p.explanation, /DISCONTINUED, not COMPLETED/);
-      assert.match(p.explanation, /4 instances are unaccounted for/);
-      assert.match(textOf(performed), /no override for this/);
-    } finally {
-      await call('dcm_server_stop', { serverId: mppsPeer.structuredContent.serverId });
-      await call('dcm_server_stop', { serverId: archive.structuredContent.serverId });
-    }
+    // Rule 1: said in numbers, in one sentence, and with no way out.
+    assert.match(p.explanation, /0 of 4 instances were acknowledged/);
+    assert.match(p.explanation, /DISCONTINUED, not COMPLETED/);
+    assert.match(p.explanation, /4 instances are unaccounted for/);
+    assert.match(textOf(performed), /no override for this/);
   });
 });
 
 // ---- start / complete, and the folder-scan disclaimer ---------------------
 
 test('start then complete, with the performed series asserted from disk', async (t) => {
-  const fixture = makeStudy(2);
+  // The shared receiver: nothing here is about what a receiver does with a
+  // worklist, only about a step being opened and then closed on one.
   const dir = tempDir('dcm-mcp-mpps-two-step-');
-  t.after(() => {
-    for (const d of [fixture.root, dir]) fs.rmSync(d, { recursive: true, force: true });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fixture = shared.fixture;
+  const peer = shared.peer;
+
+  const opened = await call('dcm_mpps_start', {
+    ...peer,
+    studyUid: STUDY_UID,
+    modality: 'CT',
+    scheduledStepId: 'SPS001',
+    stepId: 'TWO-STEP-1', // Its own performed step; see the note in the shortfall test.
+    patientId: PATIENT_ID,
   });
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', { ae: 'MPPSSCP' });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'MPPSSCP' };
+  assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
+  assert.equal(opened.structuredContent.performedProcedureStepStatus, 'IN PROGRESS');
+  const mppsUid = opened.structuredContent.mppsSopInstanceUid;
+  assert.ok(mppsUid);
 
-    try {
-      const opened = await call('dcm_mpps_start', {
-        ...peer,
-        studyUid: STUDY_UID,
-        modality: 'CT',
-        scheduledStepId: 'SPS001',
-        patientId: PATIENT_ID,
-      });
-      assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
-      assert.equal(opened.structuredContent.performedProcedureStepStatus, 'IN PROGRESS');
-      const mppsUid = opened.structuredContent.mppsSopInstanceUid;
-      assert.ok(mppsUid);
+  // Nothing about the worklist may be claimed by opening a step.
+  assert.match(textOf(opened), /not visible from here/);
 
-      // Nothing about the worklist may be claimed by opening a step.
-      assert.match(textOf(opened), /not visible from here/);
+  // Nothing was written down: the UID in the result is the whole handoff.
+  assert.deepEqual(fs.readdirSync(dir), [], 'start must leave no file behind');
 
-      // Nothing was written down: the UID in the result is the whole handoff.
-      assert.deepEqual(fs.readdirSync(dir), [], 'start must leave no file behind');
-
-      // --series-from is the only performed-series source a standalone close
-      // has, and it says out loud what it is asserting.
-      const completed = await call('dcm_mpps_complete', {
-        ...peer, mppsUid, seriesFrom: fixture.study,
-      });
-      assert.ok(!completed.isError, `complete failed: ${textOf(completed)}`);
-      assert.equal(completed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
-      assert.equal(completed.structuredContent.assertedFromDisk, true);
-      assert.equal(completed.structuredContent.instancesReferenced, fixture.count);
-      assert.match(textOf(completed), /scanning a local folder/);
-      assert.match(textOf(completed), /Nothing here\s+confirms|Nothing here confirms/);
-
-      // A terminal step is terminal: the SCP refuses a second N-SET.
-      const again = await call('dcm_mpps_complete', { ...peer, mppsUid });
-      assert.equal(again.isError, true, 'a completed step must not be completable twice');
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+  // --series-from is the only performed-series source a standalone close
+  // has, and it says out loud what it is asserting.
+  const completed = await call('dcm_mpps_complete', {
+    ...peer, mppsUid, seriesFrom: fixture.study,
   });
+  assert.ok(!completed.isError, `complete failed: ${textOf(completed)}`);
+  assert.equal(completed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
+  assert.equal(completed.structuredContent.assertedFromDisk, true);
+  assert.equal(completed.structuredContent.instancesReferenced, fixture.count);
+  assert.match(textOf(completed), /scanning a local folder/);
+  assert.match(textOf(completed), /Nothing here\s+confirms|Nothing here confirms/);
+
+  // A terminal step is terminal: the SCP refuses a second N-SET.
+  const again = await call('dcm_mpps_complete', { ...peer, mppsUid });
+  assert.equal(again.isError, true, 'a completed step must not be completable twice');
 });
 
 // ---- Refusals that happen before anything is sent -------------------------
 
-test('a missing Type 1 attribute is refused locally, by name, with no connection', async (t) => {
-  const fixture = makeStudy(1);
-  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
-
-  await withClient(async ({ call }) => {
-    // No stepId and no scheduledStepId, so PerformedProcedureStepID is empty.
-    // The peer is not there; if this ever tried to connect, it would fail with
-    // a connection error instead of the message asserted below.
-    const res = await call('dcm_mpps_perform', {
-      folder: fixture.study, ...DEAD_PEER, studyUid: STUDY_UID, modality: 'CT',
-    });
-
-    assert.equal(res.isError, true);
-    const text = textOf(res);
-    assert.match(text, /PerformedProcedureStepID/);
-    assert.match(text, /Type 1/);
-    assert.doesNotMatch(text, /ECONNREFUSED|connection refused/i);
+test('a missing Type 1 attribute is refused locally, by name, with no connection', async () => {
+  // No stepId and no scheduledStepId, so PerformedProcedureStepID is empty.
+  // The peer is not there; if this ever tried to connect, it would fail with
+  // a connection error instead of the message asserted below.
+  const res = await call('dcm_mpps_perform', {
+    folder: shared.fixture.study, ...DEAD_PEER, studyUid: STUDY_UID, modality: 'CT',
   });
+
+  assert.equal(res.isError, true);
+  const text = textOf(res);
+  assert.match(text, /PerformedProcedureStepID/);
+  assert.match(text, /Type 1/);
+  assert.doesNotMatch(text, /ECONNREFUSED|connection refused/i);
 });
 
-test('a study UID that disagrees with the folder is refused rather than sent', async (t) => {
-  const fixture = makeStudy(1);
-  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
-
-  await withClient(async ({ call }) => {
-    const res = await call('dcm_mpps_perform', {
-      folder: fixture.study,
-      ...DEAD_PEER,
-      studyUid: '1.2.826.0.1.3680043.10.1337.999',
-      modality: 'CT',
-      stepId: 'STEP1',
-    });
-
-    assert.equal(res.isError, true);
-    assert.match(textOf(res), /the folder holds 1\.2\.826\.0\.1\.3680043\.10\.1337\.1/);
+test('a study UID that disagrees with the folder is refused rather than sent', async () => {
+  const res = await call('dcm_mpps_perform', {
+    folder: shared.fixture.study,
+    ...DEAD_PEER,
+    studyUid: '1.2.826.0.1.3680043.10.1337.999',
+    modality: 'CT',
+    stepId: 'STEP1',
   });
+
+  assert.equal(res.isError, true);
+  assert.match(textOf(res), /the folder holds 1\.2\.826\.0\.1\.3680043\.10\.1337\.1/);
 });
 
-test('a dry run reports what would be sent without claiming an SCP answered', async (t) => {
-  const fixture = makeStudy(3);
-  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
-
-  await withClient(async ({ call }) => {
-    const res = await call('dcm_mpps_perform', {
-      folder: fixture.study,
-      ...DEAD_PEER,
-      studyUid: STUDY_UID,
-      modality: 'CT',
-      stepId: 'STEP1',
-      dryRun: true,
-    });
-
-    assert.ok(!res.isError, textOf(res));
-    const p = res.structuredContent;
-    assert.equal(p.dryRun, true);
-    assert.equal(p.found, 3);
-    assert.equal(p.dataset.PerformedProcedureStepStatus, 'IN PROGRESS');
-    assert.equal(p.dataset.ScheduledStepAttributesSequence[0].StudyInstanceUID, STUDY_UID);
-
-    const text = textOf(res);
-    assert.match(text, /no connection was opened/);
-    assert.match(text, /cannot be previewed/);
-    // ok is true here, but nobody answered, and the note must not pretend one did.
-    assert.doesNotMatch(text, /The SCP answered success/);
+test('a dry run reports what would be sent without claiming an SCP answered', async () => {
+  const res = await call('dcm_mpps_perform', {
+    folder: shared.fixture.study,
+    ...DEAD_PEER,
+    studyUid: STUDY_UID,
+    modality: 'CT',
+    stepId: 'STEP1',
+    dryRun: true,
   });
+
+  assert.ok(!res.isError, textOf(res));
+  const p = res.structuredContent;
+  assert.equal(p.dryRun, true);
+  assert.equal(p.found, shared.fixture.count);
+  assert.equal(p.dataset.PerformedProcedureStepStatus, 'IN PROGRESS');
+  assert.equal(p.dataset.ScheduledStepAttributesSequence[0].StudyInstanceUID, STUDY_UID);
+
+  const text = textOf(res);
+  assert.match(text, /no connection was opened/);
+  assert.match(text, /cannot be previewed/);
+  // ok is true here, but nobody answered, and the note must not pretend one did.
+  assert.doesNotMatch(text, /The SCP answered success/);
 });
 
-test('a free-text discontinuation reason is recorded and not sent; a coded one is sent', async (t) => {
-  await withClient(async ({ call }) => {
-    const uid = '2.25.31415926535897932384626433832795028841';
+test('a free-text discontinuation reason is recorded and not sent; a coded one is sent', async () => {
+  const uid = '2.25.31415926535897932384626433832795028841';
 
-    const freeText = await call('dcm_mpps_discontinue', {
-      ...DEAD_PEER, mppsUid: uid, reason: 'patient could not tolerate the scan', dryRun: true,
-    });
-    assert.ok(!freeText.isError, textOf(freeText));
-    assert.equal(freeText.structuredContent.reasonRecordedLocally, 'patient could not tolerate the scan');
-    // Absent, not empty: the attribute is only written when a real code exists.
-    assert.equal(
-      freeText.structuredContent.dataset.PerformedProcedureStepDiscontinuationReasonCodeSequence,
-      undefined
-    );
-    assert.match(textOf(freeText), /recorded in this result and NOT sent/);
-
-    const coded = await call('dcm_mpps_discontinue', {
-      ...DEAD_PEER,
-      mppsUid: uid,
-      reasonCode: '110513^DCM^Discontinued for equipment failure',
-      dryRun: true,
-    });
-    assert.ok(!coded.isError, textOf(coded));
-    const sequence = coded.structuredContent.dataset
-      .PerformedProcedureStepDiscontinuationReasonCodeSequence;
-    assert.equal(sequence.length, 1);
-    assert.equal(sequence[0].CodeValue, '110513');
-    assert.equal(sequence[0].CodingSchemeDesignator, 'DCM');
-    assert.doesNotMatch(textOf(coded), /NOT sent/);
+  const freeText = await call('dcm_mpps_discontinue', {
+    ...DEAD_PEER, mppsUid: uid, reason: 'patient could not tolerate the scan', dryRun: true,
   });
+  assert.ok(!freeText.isError, textOf(freeText));
+  assert.equal(freeText.structuredContent.reasonRecordedLocally, 'patient could not tolerate the scan');
+  // Absent, not empty: the attribute is only written when a real code exists.
+  assert.equal(
+    freeText.structuredContent.dataset.PerformedProcedureStepDiscontinuationReasonCodeSequence,
+    undefined
+  );
+  assert.match(textOf(freeText), /recorded in this result and NOT sent/);
+
+  const coded = await call('dcm_mpps_discontinue', {
+    ...DEAD_PEER,
+    mppsUid: uid,
+    reasonCode: '110513^DCM^Discontinued for equipment failure',
+    dryRun: true,
+  });
+  assert.ok(!coded.isError, textOf(coded));
+  const sequence = coded.structuredContent.dataset
+    .PerformedProcedureStepDiscontinuationReasonCodeSequence;
+  assert.equal(sequence.length, 1);
+  assert.equal(sequence[0].CodeValue, '110513');
+  assert.equal(sequence[0].CodingSchemeDesignator, 'DCM');
+  assert.doesNotMatch(textOf(coded), /NOT sent/);
 });
 
 // ---- Adopting the worklist identity ---------------------------------------
 
 test('the two ways past a study-UID mismatch are advertised with their consequences', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    const properties = tools.find((t) => t.name === 'dcm_mpps_perform').inputSchema.properties;
+  const properties = shared.tools
+    .find((t) => t.name === 'dcm_mpps_perform').inputSchema.properties;
 
-    for (const expected of [
-      'adoptWorklistIdentity', 'studyUidOnly', 'staging', 'keepStaging', 'allowStudyMismatch',
-    ]) {
-      assert.ok(properties[expected], `dcm_mpps_perform is missing the ${expected} parameter`);
-    }
+  for (const expected of [
+    'adoptWorklistIdentity', 'studyUidOnly', 'staging', 'keepStaging', 'allowStudyMismatch',
+  ]) {
+    assert.ok(properties[expected], `dcm_mpps_perform is missing the ${expected} parameter`);
+  }
 
-    // The reasoning, not the mechanics: an assistant choosing between these two
-    // has to know that one is what a modality does and the other is a decision
-    // to leave the archive unable to reconcile anything.
-    const adopt = properties.adoptWorklistIdentity.description;
-    assert.match(adopt, /WHAT A REAL MODALITY DOES/i);
-    assert.match(adopt, /before the patient is on the table/);
-    assert.match(adopt, /rehears/i);
-    assert.match(adopt, /SOURCE FOLDER IS NEVER MODIFIED/);
-    assert.match(adopt, /Series and SOP Instance UIDs are deliberately never re-stamped/);
-    assert.match(adopt, /private tags/);
+  // The reasoning, not the mechanics: an assistant choosing between these two
+  // has to know that one is what a modality does and the other is a decision
+  // to leave the archive unable to reconcile anything.
+  const adopt = properties.adoptWorklistIdentity.description;
+  assert.match(adopt, /WHAT A REAL MODALITY DOES/i);
+  assert.match(adopt, /before the patient is on the table/);
+  assert.match(adopt, /rehears/i);
+  assert.match(adopt, /SOURCE FOLDER IS NEVER MODIFIED/);
+  assert.match(adopt, /Series and SOP Instance UIDs are deliberately never re-stamped/);
+  assert.match(adopt, /private tags/);
 
-    const allow = properties.allowStudyMismatch.description;
-    assert.match(allow, /NEVER RECONCILE/i);
-    assert.match(allow, /original bytes/i);
+  const allow = properties.allowStudyMismatch.description;
+  assert.match(allow, /NEVER RECONCILE/i);
+  assert.match(allow, /original bytes/i);
 
-    // Neither may be implied by another argument, and both say so where the
-    // choice is being made.
-    assert.match(adopt, /Nothing else turns this on/);
-    assert.match(allow, /not implied by any other parameter/);
-    assert.match(properties.studyUid.description, /Neither is chosen for you/);
+  // Neither may be implied by another argument, and both say so where the
+  // choice is being made.
+  assert.match(adopt, /Nothing else turns this on/);
+  assert.match(allow, /not implied by any other parameter/);
+  assert.match(properties.studyUid.description, /Neither is chosen for you/);
 
-    // seriesFrom is now the only performed-series source the closing verbs
-    // have, and it has to say so rather than point at a source that is gone.
-    for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
-      const tool = tools.find((t) => t.name === name);
-      const seriesFrom = tool.inputSchema.properties.seriesFrom.description;
-      assert.match(seriesFrom, /ONLY source this tool has/);
-      assert.match(seriesFrom, /ASSERTS WHAT IS ON YOUR DISK/);
-      assert.match(seriesFrom, /dcm_mpps_perform/);
-    }
-  });
+  // seriesFrom is now the only performed-series source the closing verbs
+  // have, and it has to say so rather than point at a source that is gone.
+  for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
+    const tool = shared.tools.find((t) => t.name === name);
+    const seriesFrom = tool.inputSchema.properties.seriesFrom.description;
+    assert.match(seriesFrom, /ONLY source this tool has/);
+    assert.match(seriesFrom, /ASSERTS WHAT IS ON YOUR DISK/);
+    assert.match(seriesFrom, /dcm_mpps_perform/);
+  }
 });
 
 test('stock images against a made-up worklist: refused, then re-stamped and reconciled', async (t) => {
-  const fixture = makeStudy(4);
+  // ISOLATED ON PURPOSE, for both reasons at once: this receiver holds a
+  // worklist naming a study no image carries, and the test counts what landed
+  // in its store — first that a refused run sent nothing, then that the
+  // re-stamped copy arrived under the ORDER's study. A shared store would make
+  // both counts assertions about test order.
   const dir = tempDir('dcm-mcp-mpps-adopt-');
   const persist = tempDir('dcm-mcp-mpps-adopt-store-');
   const staging = tempDir('dcm-mcp-mpps-adopt-stage-');
   t.after(() => {
-    for (const d of [fixture.root, dir, persist, staging]) {
-      fs.rmSync(d, { recursive: true, force: true });
-    }
+    for (const d of [dir, persist, staging]) fs.rmSync(d, { recursive: true, force: true });
   });
+  const fixture = shared.fixture;
 
   // The order names a study these images cannot possibly carry.
   const worklistFile = makeWorklist(dir, { StudyInstanceUID: RIS_STUDY_UID });
   const sourceBefore = hashTree(fixture.study);
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', {
-      ae: 'WORKLIST', worklist: worklistFile, persist,
+  await withReceiver({ worklist: worklistFile, persist }, async ({ peer }) => {
+    const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
+    const stepArgs = handoffArgs(scheduled);
+    assert.equal(stepArgs.studyUid, RIS_STUDY_UID);
+    assert.notEqual(stepArgs.studyUid, STUDY_UID, 'the whole point is that they differ');
+
+    // --- 1. Refused, before anything is opened or sent -----------------
+    const refused = await call('dcm_mpps_perform', {
+      folder: fixture.study, ...peer, ...stepArgs,
     });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'WORKLIST' };
+    assert.equal(refused.isError, true, 'the mismatch must not be sent by default');
 
-    try {
-      const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
-      const stepArgs = handoffArgs(scheduled);
-      assert.equal(stepArgs.studyUid, RIS_STUDY_UID);
-      assert.notEqual(stepArgs.studyUid, STUDY_UID, 'the whole point is that they differ');
+    const refusal = textOf(refused);
+    assert.match(refusal, /would never reconcile them/);
+    assert.match(refusal, new RegExp(RIS_STUDY_UID.replace(/\./g, '\\.')));
+    assert.match(refusal, /the folder holds 1\.2\.826\.0\.1\.3680043\.10\.1337\.1/);
+    // A refusal with no way forward is what the owner ran into.
+    assert.match(refusal, /--adopt-worklist-identity/);
+    assert.match(refusal, /--allow-study-mismatch/);
+    assert.equal(countDicomFiles(persist), 0, 'nothing may be sent by a refused run');
 
-      // --- 1. Refused, before anything is opened or sent -----------------
-      const refused = await call('dcm_mpps_perform', {
-        folder: fixture.study, ...peer, ...stepArgs,
-      });
-      assert.equal(refused.isError, true, 'the mismatch must not be sent by default');
+    // --- 2. Adopt the identity, the way a modality would ---------------
+    const performed = await call('dcm_mpps_perform', {
+      folder: fixture.study,
+      ...peer,
+      ...stepArgs,
+      adoptWorklistIdentity: true,
+      staging,
+    });
+    assert.ok(!performed.isError, `perform with adoption failed: ${textOf(performed)}`);
 
-      const refusal = textOf(refused);
-      assert.match(refusal, /would never reconcile them/);
-      assert.match(refusal, new RegExp(RIS_STUDY_UID.replace(/\./g, '\\.')));
-      assert.match(refusal, /the folder holds 1\.2\.826\.0\.1\.3680043\.10\.1337\.1/);
-      // A refusal with no way forward is what the owner ran into.
-      assert.match(refusal, /--adopt-worklist-identity/);
-      assert.match(refusal, /--allow-study-mismatch/);
-      assert.equal(countDicomFiles(persist), 0, 'nothing may be sent by a refused run');
+    const p = performed.structuredContent;
+    assert.equal(p.performedProcedureStepStatus, 'COMPLETED');
+    assert.equal(p.studyInstanceUid, RIS_STUDY_UID, 'the step names the study the order named');
+    assert.equal(p.found, fixture.count);
+    assert.equal(p.acknowledged, fixture.count);
+    assert.equal(p.referencedInMpps, fixture.count);
 
-      // --- 2. Adopt the identity, the way a modality would ---------------
-      const performed = await call('dcm_mpps_perform', {
-        folder: fixture.study,
-        ...peer,
-        ...stepArgs,
-        adoptWorklistIdentity: true,
-        staging,
-      });
-      assert.ok(!performed.isError, `perform with adoption failed: ${textOf(performed)}`);
+    // The re-stamp is reported rather than done quietly.
+    assert.ok(p.restamp, 're-stamping must be visible in the result');
+    assert.equal(p.restamp.source, path.resolve(fixture.study));
+    assert.equal(p.restamp.sourceModified, false);
+    assert.equal(p.restamp.instances, fixture.count);
+    assert.ok(p.restamp.attributes.includes('StudyInstanceUID'));
+    assert.deepEqual(p.restamp.unchangedByDesign, ['SeriesInstanceUID', 'SOPInstanceUID']);
+    assert.ok(
+      p.restamp.stagingDir.startsWith(path.resolve(staging)),
+      `the copy went to ${p.restamp.stagingDir}, not under the staging directory given`
+    );
+    assert.equal(p.restamp.stagingKept, false);
+    assert.deepEqual(
+      fs.readdirSync(staging), [],
+      'a COMPLETED run should leave no staged copy behind'
+    );
 
-      const p = performed.structuredContent;
-      assert.equal(p.performedProcedureStepStatus, 'COMPLETED');
-      assert.equal(p.studyInstanceUid, RIS_STUDY_UID, 'the step names the study the order named');
-      assert.equal(p.found, fixture.count);
-      assert.equal(p.acknowledged, fixture.count);
-      assert.equal(p.referencedInMpps, fixture.count);
+    // The claim that matters most: the images on disk are untouched.
+    assert.deepEqual(hashTree(fixture.study), sourceBefore);
 
-      // The re-stamp is reported rather than done quietly.
-      assert.ok(p.restamp, 're-stamping must be visible in the result');
-      assert.equal(p.restamp.source, path.resolve(fixture.study));
-      assert.equal(p.restamp.sourceModified, false);
-      assert.equal(p.restamp.instances, fixture.count);
-      assert.ok(p.restamp.attributes.includes('StudyInstanceUID'));
-      assert.deepEqual(p.restamp.unchangedByDesign, ['SeriesInstanceUID', 'SOPInstanceUID']);
-      assert.ok(
-        p.restamp.stagingDir.startsWith(path.resolve(staging)),
-        `the copy went to ${p.restamp.stagingDir}, not under the staging directory given`
-      );
-      assert.equal(p.restamp.stagingKept, false);
-      assert.deepEqual(
-        fs.readdirSync(staging), [],
-        'a COMPLETED run should leave no staged copy behind'
-      );
+    // And the result says in words what it did, not only in JSON fields.
+    const said = textOf(performed);
+    assert.match(said, /re-stamped COPY/);
+    assert.match(said, /source folder at .* is not modified/);
+    assert.match(said, /SeriesInstanceUID and SOPInstanceUID are left exactly as/);
 
-      // The claim that matters most: the images on disk are untouched.
-      assert.deepEqual(hashTree(fixture.study), sourceBefore);
+    // What the archive holds is the study the ORDER named, not the fixture's.
+    assert.equal(countDicomFiles(persist), fixture.count);
+    const inventory = await call('dcm_inventory', { path: persist });
+    assert.ok(!inventory.isError, textOf(inventory));
+    assert.deepEqual(
+      inventory.structuredContent.studies.map((s) => s.studyInstanceUid),
+      [RIS_STUDY_UID]
+    );
 
-      // And the result says in words what it did, not only in JSON fields.
-      const said = textOf(performed);
-      assert.match(said, /re-stamped COPY/);
-      assert.match(said, /source folder at .* is not modified/);
-      assert.match(said, /SeriesInstanceUID and SOPInstanceUID are left exactly as/);
-
-      // What the archive holds is the study the ORDER named, not the fixture's.
-      assert.equal(countDicomFiles(persist), fixture.count);
-      const inventory = await call('dcm_inventory', { path: persist });
-      assert.ok(!inventory.isError, textOf(inventory));
-      assert.deepEqual(
-        inventory.structuredContent.studies.map((s) => s.studyInstanceUid),
-        [RIS_STUDY_UID]
-      );
-
-      // And so the step and the images reconcile: the item leaves the worklist.
-      const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.equal(
-        after.structuredContent.count, 0,
-        'the receiver should correlate the completed step with the scheduled item'
-      );
-
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+    // And so the step and the images reconcile: the item leaves the worklist.
+    const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.equal(
+      after.structuredContent.count, 0,
+      'the receiver should correlate the completed step with the scheduled item'
+    );
   });
 });
 
 test('allowStudyMismatch sends the images unchanged, and nothing reconciles', async (t) => {
-  const fixture = makeStudy(2);
+  // ISOLATED ON PURPOSE: the closing assertion is an inventory of everything
+  // this receiver stored, and it must hold exactly one study — the fixture's
+  // own, which is the damage. Any other test storing into the same directory
+  // would satisfy or break that by accident.
   const dir = tempDir('dcm-mcp-mpps-mismatch-');
   const persist = tempDir('dcm-mcp-mpps-mismatch-store-');
   t.after(() => {
-    for (const d of [fixture.root, dir, persist]) fs.rmSync(d, { recursive: true, force: true });
+    for (const d of [dir, persist]) fs.rmSync(d, { recursive: true, force: true });
   });
   const worklistFile = makeWorklist(dir, { StudyInstanceUID: RIS_STUDY_UID });
+  const fixture = shared.fixture;
+  const step = { studyUid: RIS_STUDY_UID, modality: 'CT', stepId: 'STEP1' };
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', {
-      ae: 'WORKLIST', worklist: worklistFile, persist,
+  await withReceiver({ worklist: worklistFile, persist }, async ({ peer }) => {
+    // Asking for both is refused: they want opposite things.
+    const both = await call('dcm_mpps_perform', {
+      folder: fixture.study,
+      ...peer,
+      ...step,
+      adoptWorklistIdentity: true,
+      allowStudyMismatch: true,
     });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'WORKLIST' };
-    const step = { studyUid: RIS_STUDY_UID, modality: 'CT', stepId: 'STEP1' };
+    assert.equal(both.isError, true);
+    assert.match(textOf(both), /opposite things/);
 
-    try {
-      // Asking for both is refused: they want opposite things.
-      const both = await call('dcm_mpps_perform', {
-        folder: fixture.study,
-        ...peer,
-        ...step,
-        adoptWorklistIdentity: true,
-        allowStudyMismatch: true,
-      });
-      assert.equal(both.isError, true);
-      assert.match(textOf(both), /opposite things/);
+    // Neither is implied by the staging parameters.
+    const stagingAlone = await call('dcm_mpps_perform', {
+      folder: fixture.study, ...peer, ...step, keepStaging: true,
+    });
+    assert.equal(stagingAlone.isError, true, 'keepStaging must not turn adoption on');
+    assert.match(textOf(stagingAlone), /no copy would be made/);
 
-      // Neither is implied by the staging parameters.
-      const stagingAlone = await call('dcm_mpps_perform', {
-        folder: fixture.study, ...peer, ...step, keepStaging: true,
-      });
-      assert.equal(stagingAlone.isError, true, 'keepStaging must not turn adoption on');
-      assert.match(textOf(stagingAlone), /no copy would be made/);
+    const sent = await call('dcm_mpps_perform', {
+      folder: fixture.study, ...peer, ...step, allowStudyMismatch: true,
+    });
+    assert.ok(!sent.isError, `perform with allowStudyMismatch failed: ${textOf(sent)}`);
 
-      const sent = await call('dcm_mpps_perform', {
-        folder: fixture.study, ...peer, ...step, allowStudyMismatch: true,
-      });
-      assert.ok(!sent.isError, `perform with allowStudyMismatch failed: ${textOf(sent)}`);
+    const p = sent.structuredContent;
+    assert.equal(p.allowStudyMismatch, true);
+    assert.equal(p.restamp, null, 'nothing may be re-stamped on this path');
+    assert.deepEqual(p.studyUidMismatch, { declared: RIS_STUDY_UID, onDisk: STUDY_UID });
 
-      const p = sent.structuredContent;
-      assert.equal(p.allowStudyMismatch, true);
-      assert.equal(p.restamp, null, 'nothing may be re-stamped on this path');
-      assert.deepEqual(p.studyUidMismatch, { declared: RIS_STUDY_UID, onDisk: STUDY_UID });
+    // The consequence has to be in words in the result, not only in a pair of
+    // JSON fields: this is the one path where a success means the archive
+    // ends up unable to join the step to the images.
+    const text = textOf(sent);
+    assert.match(text, /UNDER A STUDY THE STEP DOES NOT NAME/);
+    assert.match(text, /never be reconciled/);
+    assert.match(text, /adoptWorklistIdentity is the parameter that makes them agree/);
 
-      // The consequence has to be in words in the result, not only in a pair of
-      // JSON fields: this is the one path where a success means the archive
-      // ends up unable to join the step to the images.
-      const text = textOf(sent);
-      assert.match(text, /UNDER A STUDY THE STEP DOES NOT NAME/);
-      assert.match(text, /never be reconciled/);
-      assert.match(text, /adoptWorklistIdentity is the parameter that makes them agree/);
-
-      // The images went as they are, under their own study — which is exactly
-      // the damage. The step and the ORDER still correlate, because the step
-      // names the study the order named; it is the IMAGES that are orphaned,
-      // filed under a study no step describes.
-      const inventory = await call('dcm_inventory', { path: persist });
-      assert.deepEqual(
-        inventory.structuredContent.studies.map((s) => s.studyInstanceUid),
-        [STUDY_UID],
-        'the images must be stored exactly as they were, under their own study'
-      );
-      assert.notEqual(
-        inventory.structuredContent.studies[0].studyInstanceUid,
-        p.studyInstanceUid,
-        'the archive holds a study the completed step does not name — nothing joins them'
-      );
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+    // The images went as they are, under their own study — which is exactly
+    // the damage. The step and the ORDER still correlate, because the step
+    // names the study the order named; it is the IMAGES that are orphaned,
+    // filed under a study no step describes.
+    const inventory = await call('dcm_inventory', { path: persist });
+    assert.deepEqual(
+      inventory.structuredContent.studies.map((s) => s.studyInstanceUid),
+      [STUDY_UID],
+      'the images must be stored exactly as they were, under their own study'
+    );
+    assert.notEqual(
+      inventory.structuredContent.studies[0].studyInstanceUid,
+      p.studyInstanceUid,
+      'the archive holds a study the completed step does not name — nothing joins them'
+    );
   });
 });
 
 // ---- Closing a step with the UID, because there is nothing else -----------
 
 test('a step opened by start is closed by its UID and by nothing else', async (t) => {
+  // The shared receiver: the subject is the UID being the only handle, which
+  // is a claim about the client and about a step, not about a worklist.
   const dir = tempDir('dcm-mcp-mpps-uid-');
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const peer = shared.peer;
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', { ae: 'MPPSSCP' });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'MPPSSCP' };
-
-    try {
-      const opened = await call('dcm_mpps_start', {
-        ...peer,
-        studyUid: STUDY_UID,
-        modality: 'CT',
-        scheduledStepId: 'SPS001',
-        accessionNumber: 'ACC0000001',
-        patientId: PATIENT_ID,
-        patientName: 'SYNTHETIC^PATIENT1',
-      });
-      assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
-
-      // The UID is the whole handoff, so it has to be in the structured result
-      // and not only somewhere in the prose.
-      const mppsUid = opened.structuredContent.mppsSopInstanceUid;
-      assert.ok(mppsUid, 'the step UID is the only handle on the step');
-      assert.doesNotMatch(textOf(opened), /Filed as |recordDir/);
-
-      // Nothing was written: not into the working directory, not anywhere the
-      // caller named, because there is nowhere for it to go.
-      assert.deepEqual(fs.readdirSync(dir), [], 'start must leave no file behind');
-
-      const closed = await call('dcm_mpps_complete', { ...peer, mppsUid });
-      assert.ok(!closed.isError, `complete failed: ${textOf(closed)}`);
-      assert.equal(closed.structuredContent.mppsSopInstanceUid, mppsUid);
-      assert.equal(closed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
-
-      // Closed with no performed series at all, which is legal and warned about
-      // rather than quietly filled in from a folder nobody named.
-      assert.equal(closed.structuredContent.seriesCount, 0);
-
-      // A terminal step is terminal: the SCP refuses the second N-SET.
-      const again = await call('dcm_mpps_complete', { ...peer, mppsUid });
-      assert.equal(again.isError, true, 'a completed step must not be completable twice');
-
-      // And with no UID there is nothing to fall back on — the call is refused
-      // rather than reaching for a listing or asking the peer.
-      const noUid = await call('dcm_mpps_complete', { ...peer });
-      assert.equal(noUid.isError, true, 'mppsUid is the only way to name a step');
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+  const opened = await call('dcm_mpps_start', {
+    ...peer,
+    studyUid: STUDY_UID,
+    modality: 'CT',
+    scheduledStepId: 'SPS001',
+    stepId: 'BY-UID-1', // Its own performed step; see the note in the shortfall test.
+    accessionNumber: 'ACC0000001',
+    patientId: PATIENT_ID,
+    patientName: 'SYNTHETIC^PATIENT1',
   });
+  assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
+
+  // The UID is the whole handoff, so it has to be in the structured result
+  // and not only somewhere in the prose.
+  const mppsUid = opened.structuredContent.mppsSopInstanceUid;
+  assert.ok(mppsUid, 'the step UID is the only handle on the step');
+  assert.doesNotMatch(textOf(opened), /Filed as |recordDir/);
+
+  // Nothing was written: not into the working directory, not anywhere the
+  // caller named, because there is nowhere for it to go.
+  assert.deepEqual(fs.readdirSync(dir), [], 'start must leave no file behind');
+
+  const closed = await call('dcm_mpps_complete', { ...peer, mppsUid });
+  assert.ok(!closed.isError, `complete failed: ${textOf(closed)}`);
+  assert.equal(closed.structuredContent.mppsSopInstanceUid, mppsUid);
+  assert.equal(closed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
+
+  // Closed with no performed series at all, which is legal and warned about
+  // rather than quietly filled in from a folder nobody named.
+  assert.equal(closed.structuredContent.seriesCount, 0);
+
+  // A terminal step is terminal: the SCP refuses the second N-SET.
+  const again = await call('dcm_mpps_complete', { ...peer, mppsUid });
+  assert.equal(again.isError, true, 'a completed step must not be completable twice');
+
+  // And with no UID there is nothing to fall back on — the call is refused
+  // rather than reaching for a listing or asking the peer.
+  const noUid = await call('dcm_mpps_complete', { ...peer });
+  assert.equal(noUid.isError, true, 'mppsUid is the only way to name a step');
 });
 
 // ---- The interim N-SET ----------------------------------------------------
@@ -985,442 +1031,407 @@ function referencedInStep(step) {
 }
 
 test('the interim update tool is advertised with the replace rule and both wire shapes', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    const byName = new Map(tools.map((t) => [t.name, t]));
+  const byName = toolsByName();
 
-    const update = byName.get('dcm_mpps_update');
-    assert.ok(update, `missing dcm_mpps_update; got ${[...byName.keys()].join(', ')}`);
+  const update = byName.get('dcm_mpps_update');
+  assert.ok(update, `missing dcm_mpps_update; got ${[...byName.keys()].join(', ')}`);
 
-    // What it is for. Both halves, because a tool that only says "interim
-    // N-SET" tells an assistant nothing about when to reach for it.
-    assert.match(update.description, /still running/i);
-    assert.match(update.description, /WITHOUT closing it/i);
-    assert.match(update.description, /GROWING PerformedSeriesSequence/);
+  // What it is for. Both halves, because a tool that only says "interim
+  // N-SET" tells an assistant nothing about when to reach for it.
+  assert.match(update.description, /still running/i);
+  assert.match(update.description, /WITHOUT closing it/i);
+  assert.match(update.description, /GROWING PerformedSeriesSequence/);
 
-    // The rule that makes the sequence dangerous, and the rule that makes
-    // omitting it safe. These are opposites and both have to be said.
-    assert.match(update.description, /REPLACE, THEY DO NOT APPEND/);
-    assert.match(update.description, /CUMULATIVE/);
-    assert.match(update.description, /MUST NOT BE READ AS ERASING ANYTHING/);
-    assert.match(update.inputSchema.properties.seriesFrom.description, /erases nothing/i);
+  // The rule that makes the sequence dangerous, and the rule that makes
+  // omitting it safe. These are opposites and both have to be said.
+  assert.match(update.description, /REPLACE, THEY DO NOT APPEND/);
+  assert.match(update.description, /CUMULATIVE/);
+  assert.match(update.description, /MUST NOT BE READ AS ERASING ANYTHING/);
+  assert.match(update.inputSchema.properties.seriesFrom.description, /erases nothing/i);
 
-    // Both shapes reachable, and distinguished by absence rather than emptiness.
-    assert.ok(update.inputSchema.properties.omitStatus, 'the status-absent shape must be reachable');
-    assert.match(update.description, /IN PROGRESS/);
-    assert.match(update.inputSchema.properties.omitStatus.description, /ABSENT from the dataset/);
-    assert.match(
-      update.inputSchema.properties.omitStatus.description,
-      /not the same as present-and-empty/
+  // Both shapes reachable, and distinguished by absence rather than emptiness.
+  assert.ok(update.inputSchema.properties.omitStatus, 'the status-absent shape must be reachable');
+  assert.match(update.description, /IN PROGRESS/);
+  assert.match(update.inputSchema.properties.omitStatus.description, /ABSENT from the dataset/);
+  assert.match(
+    update.inputSchema.properties.omitStatus.description,
+    /not the same as present-and-empty/
+  );
+
+  // It closes nothing, and no end date/time may be offered — an end time on a
+  // running step is the contradiction the CLI refuses outright.
+  assert.equal(update.inputSchema.properties.endDate, undefined);
+  assert.equal(update.inputSchema.properties.endTime, undefined);
+  assert.match(update.description, /cannot|Use dcm_mpps_complete or dcm_mpps_discontinue/);
+  // And it may not carry what an N-SET cannot change.
+  for (const banned of ['studyUid', 'modality', 'stepId', 'stationAe', 'patientId', 'startDate']) {
+    assert.equal(
+      update.inputSchema.properties[banned], undefined,
+      `${banned} is N-CREATE-only; offering it here would promise something PS3.4 forbids`
     );
-
-    // It closes nothing, and no end date/time may be offered — an end time on a
-    // running step is the contradiction the CLI refuses outright.
-    assert.equal(update.inputSchema.properties.endDate, undefined);
-    assert.equal(update.inputSchema.properties.endTime, undefined);
-    assert.match(update.description, /cannot|Use dcm_mpps_complete or dcm_mpps_discontinue/);
-    // And it may not carry what an N-SET cannot change.
-    for (const banned of ['studyUid', 'modality', 'stepId', 'stationAe', 'patientId', 'startDate']) {
-      assert.equal(
-        update.inputSchema.properties[banned], undefined,
-        `${banned} is N-CREATE-only; offering it here would promise something PS3.4 forbids`
-      );
-    }
-    assert.ok((update.inputSchema.required || []).includes('mppsUid'));
-  });
+  }
+  assert.ok((update.inputSchema.required || []).includes('mppsUid'));
 });
 
 test('an interim update grows the performed series; a keep-alive leaves it alone', async (t) => {
-  const fixture = makeStudy(4);
+  // ISOLATED ON PURPOSE, for both reasons at once: every assertion below reads
+  // this receiver's own recorded copy of the step, including its update count,
+  // and the last one is the worklist row leaving once the step is COMPLETED —
+  // so this receiver has to be one that withholds, and it has to be the only
+  // writer into its store.
   const dir = tempDir('dcm-mcp-mpps-interim-');
   const persist = tempDir('dcm-mcp-mpps-interim-store-');
   const growing = path.join(dir, 'acquired-so-far');
   t.after(() => {
-    for (const d of [fixture.root, dir, persist]) fs.rmSync(d, { recursive: true, force: true });
+    for (const d of [dir, persist]) fs.rmSync(d, { recursive: true, force: true });
   });
   const worklistFile = makeWorklist(dir);
+  const fixture = shared.fixture;
 
   // Two of the four instances have been acquired when the first update goes out.
   assert.equal(fillFolder(fixture.study, growing, 2), 2);
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', {
-      ae: 'WORKLIST', worklist: worklistFile, persist,
+  await withReceiver({ worklist: worklistFile, persist }, async ({ peer }) => {
+    // --- The scheduled row, so this is the real loop and not a fixture ---
+    const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
+    const stepArgs = handoffArgs(scheduled);
+    assert.equal(stepArgs.studyUid, STUDY_UID);
+
+    // --- 1. Open the step ---------------------------------------------
+    const opened = await call('dcm_mpps_start', { ...peer, ...stepArgs });
+    assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
+    const mppsUid = opened.structuredContent.mppsSopInstanceUid;
+    const atCreate = receiverStep(persist, mppsUid);
+    assert.equal(atCreate.status, 'IN PROGRESS');
+    // The N-CREATE carries PerformedSeriesSequence as a present, empty Type 2
+    // attribute, so the receiver already holds a zero-length one. Every
+    // "erased nothing" assertion below is against this baseline rather than
+    // against absence.
+    assert.equal(referencedInStep(atCreate), 0);
+
+    // --- 2. The status-bearing shape, which is a keep-alive ------------
+    //
+    // This receiver used to answer it 0x0106. That was a bug — PS3.4 F.7.2-1
+    // lists PerformedProcedureStepStatus among the attributes an N-SET may
+    // carry — and it is the receiver behaviour that makes a real modality
+    // abandon the session. Accepted now, and what has to hold with it is
+    // that a message carrying only a status deposits only a status.
+    const keepAlive = await call('dcm_mpps_update', { ...peer, mppsUid });
+    assert.ok(!keepAlive.isError, `keep-alive failed: ${textOf(keepAlive)}`);
+    const alive = keepAlive.structuredContent;
+    assert.equal(alive.ok, true);
+    assert.equal(alive.status.code, '0x0000', 'the receiver has to have accepted it');
+    assert.equal(alive.statusSent, true);
+    assert.equal(alive.statusValue, 'IN PROGRESS');
+    assert.equal(alive.performedSeriesSent, false);
+    assert.equal(alive.endDateTimeSent, false, 'a keep-alive never ends the step');
+    assert.match(textOf(keepAlive), /re-asserting that the step is running/);
+    assert.match(textOf(keepAlive), /must not be read as erasing anything/);
+    // It reached the far end, and it deposited nothing but the status.
+    const afterKeepAlive = receiverStep(persist, mppsUid);
+    assert.equal(afterKeepAlive.status, 'IN PROGRESS', 'a keep-alive does not close the step');
+    assert.equal(afterKeepAlive.updates, atCreate.updates + 1, 'the receiver took it');
+    assert.equal(
+      referencedInStep(afterKeepAlive), 0,
+      'no sequence was sent, so none may appear'
+    );
+
+    // --- 3. The status-absent shape, which it accepts ------------------
+    const first = await call('dcm_mpps_update', {
+      ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
     });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'WORKLIST' };
+    assert.ok(!first.isError, `interim update failed: ${textOf(first)}`);
+    const u1 = first.structuredContent;
+    assert.equal(u1.ok, true);
+    assert.equal(u1.status.code, '0x0000', 'the receiver has to have accepted it');
+    assert.equal(u1.statusSent, false, 'omitStatus means the attribute is not in the dataset');
+    assert.equal(u1.statusValue, null);
+    assert.equal(u1.endDateTimeSent, false, 'an interim update never ends the step');
+    assert.equal(u1.performedSeriesSent, true);
+    assert.equal(u1.seriesCount, 1);
+    assert.equal(u1.instancesReferenced, 2);
+    assert.equal(u1.assertedFromDisk, true);
 
-    try {
-      // --- The scheduled row, so this is the real loop and not a fixture ---
-      const scheduled = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.ok(!scheduled.isError, `worklist query failed: ${textOf(scheduled)}`);
-      const stepArgs = handoffArgs(scheduled);
-      assert.equal(stepArgs.studyUid, STUDY_UID);
+    // The receiver holds what was sent, and the step is still open.
+    const held1 = receiverStep(persist, mppsUid);
+    assert.equal(held1.status, 'IN PROGRESS', 'an interim update must not close the step');
+    assert.equal(referencedInStep(held1), 2);
 
-      // --- 1. Open the step ---------------------------------------------
-      const opened = await call('dcm_mpps_start', { ...peer, ...stepArgs });
-      assert.ok(!opened.isError, `start failed: ${textOf(opened)}`);
-      const mppsUid = opened.structuredContent.mppsSopInstanceUid;
-      const atCreate = receiverStep(persist, mppsUid);
-      assert.equal(atCreate.status, 'IN PROGRESS');
-      // The N-CREATE carries PerformedSeriesSequence as a present, empty Type 2
-      // attribute, so the receiver already holds a zero-length one. Every
-      // "erased nothing" assertion below is against this baseline rather than
-      // against absence.
-      assert.equal(referencedInStep(atCreate), 0);
+    // The two claims that only exist in prose under --json.
+    assert.match(textOf(first), /NO PerformedProcedureStepStatus/);
+    assert.match(textOf(first), /REPLACED the one the step\s+held/);
+    assert.match(textOf(first), /scanning a local folder/);
 
-      // --- 2. The status-bearing shape, which is a keep-alive ------------
-      //
-      // This receiver used to answer it 0x0106. That was a bug — PS3.4 F.7.2-1
-      // lists PerformedProcedureStepStatus among the attributes an N-SET may
-      // carry — and it is the receiver behaviour that makes a real modality
-      // abandon the session. Accepted now, and what has to hold with it is
-      // that a message carrying only a status deposits only a status.
-      const keepAlive = await call('dcm_mpps_update', { ...peer, mppsUid });
-      assert.ok(!keepAlive.isError, `keep-alive failed: ${textOf(keepAlive)}`);
-      const alive = keepAlive.structuredContent;
-      assert.equal(alive.ok, true);
-      assert.equal(alive.status.code, '0x0000', 'the receiver has to have accepted it');
-      assert.equal(alive.statusSent, true);
-      assert.equal(alive.statusValue, 'IN PROGRESS');
-      assert.equal(alive.performedSeriesSent, false);
-      assert.equal(alive.endDateTimeSent, false, 'a keep-alive never ends the step');
-      assert.match(textOf(keepAlive), /re-asserting that the step is running/);
-      assert.match(textOf(keepAlive), /must not be read as erasing anything/);
-      // It reached the far end, and it deposited nothing but the status.
-      const afterKeepAlive = receiverStep(persist, mppsUid);
-      assert.equal(afterKeepAlive.status, 'IN PROGRESS', 'a keep-alive does not close the step');
-      assert.equal(afterKeepAlive.updates, atCreate.updates + 1, 'the receiver took it');
-      assert.equal(
-        referencedInStep(afterKeepAlive), 0,
-        'no sequence was sent, so none may appear'
-      );
+    // --- 4. Two more instances arrive; the sequence grows --------------
+    assert.equal(fillFolder(fixture.study, growing, 4), 4);
+    const second = await call('dcm_mpps_update', {
+      ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
+    });
+    assert.ok(!second.isError, `second interim update failed: ${textOf(second)}`);
+    assert.equal(second.structuredContent.instancesReferenced, 4);
+    const held2 = receiverStep(persist, mppsUid);
+    assert.equal(held2.status, 'IN PROGRESS');
+    assert.equal(
+      referencedInStep(held2), 4,
+      'a cumulative folder scan is what makes replacement behave like growth'
+    );
 
-      // --- 3. The status-absent shape, which it accepts ------------------
-      const first = await call('dcm_mpps_update', {
-        ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
-      });
-      assert.ok(!first.isError, `interim update failed: ${textOf(first)}`);
-      const u1 = first.structuredContent;
-      assert.equal(u1.ok, true);
-      assert.equal(u1.status.code, '0x0000', 'the receiver has to have accepted it');
-      assert.equal(u1.statusSent, false, 'omitStatus means the attribute is not in the dataset');
-      assert.equal(u1.statusValue, null);
-      assert.equal(u1.endDateTimeSent, false, 'an interim update never ends the step');
-      assert.equal(u1.performedSeriesSent, true);
-      assert.equal(u1.seriesCount, 1);
-      assert.equal(u1.instancesReferenced, 2);
-      assert.equal(u1.assertedFromDisk, true);
+    // --- 5. A keep-alive over a step that now holds four ---------------
+    //
+    // The claim the description makes in capitals, tested where it can
+    // actually be observed and where it can actually fail: this one goes on
+    // the wire, and the receiver's own copy still holds all four afterwards.
+    const stillAlive = await call('dcm_mpps_update', { ...peer, mppsUid });
+    assert.ok(!stillAlive.isError, `keep-alive failed: ${textOf(stillAlive)}`);
+    const held3 = receiverStep(persist, mppsUid);
+    assert.equal(held3.status, 'IN PROGRESS');
+    assert.equal(held3.updates, held2.updates + 1, 'it reached the receiver');
+    assert.equal(
+      referencedInStep(held3), 4,
+      'an absent PerformedSeriesSequence is not an empty one and erases nothing'
+    );
 
-      // The receiver holds what was sent, and the step is still open.
-      const held1 = receiverStep(persist, mppsUid);
-      assert.equal(held1.status, 'IN PROGRESS', 'an interim update must not close the step');
-      assert.equal(referencedInStep(held1), 2);
+    // --- 6. And one that would carry nothing at all never leaves -------
+    const quiet = await call('dcm_mpps_update', { ...peer, mppsUid, omitStatus: true });
+    assert.equal(quiet.isError, true, 'an N-SET carrying nothing at all is refused, not sent');
+    assert.match(textOf(quiet), /keep-alive|status-absent/);
 
-      // The two claims that only exist in prose under --json.
-      assert.match(textOf(first), /NO PerformedProcedureStepStatus/);
-      assert.match(textOf(first), /REPLACED the one the step\s+held/);
-      assert.match(textOf(first), /scanning a local folder/);
+    const held4 = receiverStep(persist, mppsUid);
+    assert.equal(referencedInStep(held4), 4, 'nothing may have touched the sequence');
+    assert.equal(held4.updates, held3.updates, 'a refused update is not an update');
 
-      // --- 4. Two more instances arrive; the sequence grows --------------
-      assert.equal(fillFolder(fixture.study, growing, 4), 4);
-      const second = await call('dcm_mpps_update', {
-        ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
-      });
-      assert.ok(!second.isError, `second interim update failed: ${textOf(second)}`);
-      assert.equal(second.structuredContent.instancesReferenced, 4);
-      const held2 = receiverStep(persist, mppsUid);
-      assert.equal(held2.status, 'IN PROGRESS');
-      assert.equal(
-        referencedInStep(held2), 4,
-        'a cumulative folder scan is what makes replacement behave like growth'
-      );
+    // --- 7. Close it ---------------------------------------------------
+    const closed = await call('dcm_mpps_complete', { ...peer, mppsUid, seriesFrom: growing });
+    assert.ok(!closed.isError, `complete failed: ${textOf(closed)}`);
+    assert.equal(closed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
+    assert.equal(closed.structuredContent.instancesReferenced, 4);
+    assert.equal(receiverStep(persist, mppsUid).status, 'COMPLETED');
 
-      // --- 5. A keep-alive over a step that now holds four ---------------
-      //
-      // The claim the description makes in capitals, tested where it can
-      // actually be observed and where it can actually fail: this one goes on
-      // the wire, and the receiver's own copy still holds all four afterwards.
-      const stillAlive = await call('dcm_mpps_update', { ...peer, mppsUid });
-      assert.ok(!stillAlive.isError, `keep-alive failed: ${textOf(stillAlive)}`);
-      const held3 = receiverStep(persist, mppsUid);
-      assert.equal(held3.status, 'IN PROGRESS');
-      assert.equal(held3.updates, held2.updates + 1, 'it reached the receiver');
-      assert.equal(
-        referencedInStep(held3), 4,
-        'an absent PerformedSeriesSequence is not an empty one and erases nothing'
-      );
+    // A closed step is closed: the interim verb cannot reopen it.
+    const late = await call('dcm_mpps_update', {
+      ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
+    });
+    assert.equal(late.isError, true, 'a terminal step may no longer be updated');
+    assert.equal(late.structuredContent.status.code, '0x0110');
 
-      // --- 6. And one that would carry nothing at all never leaves -------
-      const quiet = await call('dcm_mpps_update', { ...peer, mppsUid, omitStatus: true });
-      assert.equal(quiet.isError, true, 'an N-SET carrying nothing at all is refused, not sent');
-      assert.match(textOf(quiet), /keep-alive|status-absent/);
-
-      const held4 = receiverStep(persist, mppsUid);
-      assert.equal(referencedInStep(held4), 4, 'nothing may have touched the sequence');
-      assert.equal(held4.updates, held3.updates, 'a refused update is not an update');
-
-      // --- 7. Close it ---------------------------------------------------
-      const closed = await call('dcm_mpps_complete', { ...peer, mppsUid, seriesFrom: growing });
-      assert.ok(!closed.isError, `complete failed: ${textOf(closed)}`);
-      assert.equal(closed.structuredContent.performedProcedureStepStatus, 'COMPLETED');
-      assert.equal(closed.structuredContent.instancesReferenced, 4);
-      assert.equal(receiverStep(persist, mppsUid).status, 'COMPLETED');
-
-      // A closed step is closed: the interim verb cannot reopen it.
-      const late = await call('dcm_mpps_update', {
-        ...peer, mppsUid, omitStatus: true, seriesFrom: growing,
-      });
-      assert.equal(late.isError, true, 'a terminal step may no longer be updated');
-      assert.equal(late.structuredContent.status.code, '0x0110');
-
-      // And the loop still closes: the item leaves the worklist on the
-      // COMPLETED, never on an update.
-      const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
-      assert.equal(after.structuredContent.count, 0);
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+    // And the loop still closes: the item leaves the worklist on the
+    // COMPLETED, never on an update.
+    const after = await call('dcm_worklist', { ...peer, scheduledDate: 'today' });
+    assert.equal(after.structuredContent.count, 0);
   });
 });
 
 test('an interim update that would carry nothing is refused before any connection', async () => {
-  await withClient(async ({ call }) => {
-    const res = await call('dcm_mpps_update', {
-      ...DEAD_PEER,
-      mppsUid: '2.25.31415926535897932384626433832795028841',
-      omitStatus: true,
-    });
-    assert.equal(res.isError, true);
-    const text = textOf(res);
-    // Both branches named, so the refusal is actionable rather than a dead end.
-    assert.match(text, /keep-alive/);
-    assert.match(text, /status-absent/);
-    assert.doesNotMatch(text, /ECONNREFUSED|connection refused/i);
+  const res = await call('dcm_mpps_update', {
+    ...DEAD_PEER,
+    mppsUid: '2.25.31415926535897932384626433832795028841',
+    omitStatus: true,
   });
+  assert.equal(res.isError, true);
+  const text = textOf(res);
+  // Both branches named, so the refusal is actionable rather than a dead end.
+  assert.match(text, /keep-alive/);
+  assert.match(text, /status-absent/);
+  assert.doesNotMatch(text, /ECONNREFUSED|connection refused/i);
 });
 
 // ---- Unscheduled steps ----------------------------------------------------
 
-test('an unscheduled step is one zero-length item, and our own receiver cannot read it', async (t) => {
-  const fixture = makeStudy(2);
-  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+test('an unscheduled step is one zero-length item, and our own receiver cannot read it', async () => {
+  const byName = toolsByName();
+  const fixture = shared.fixture;
 
-  await withClient(async ({ client, call }) => {
-    const { tools } = await client.listTools();
-    const byName = new Map(tools.map((t) => [t.name, t]));
+  // The shape, said where the choice is made, on both tools that offer it.
+  for (const name of ['dcm_mpps_start', 'dcm_mpps_perform']) {
+    const described = byName.get(name).inputSchema.properties.unscheduled;
+    assert.ok(described, `${name} does not offer unscheduled`);
+    assert.match(described.description, /ONE ZERO-LENGTH item/);
+    assert.match(described.description, /PRESENT/);
+    // The three wrong shapes, so an assistant does not invent one of them.
+    assert.match(described.description, /omitting the sequence/);
+    assert.match(described.description, /never reconcile/);
+  }
+  // And on perform, the divergence that only exists there.
+  const onPerform = byName.get('dcm_mpps_perform').inputSchema.properties.unscheduled.description;
+  assert.match(onPerform, /C-STORE STILL USES THE FOLDER'S OWN STUDY INSTANCE UID/);
 
-    // The shape, said where the choice is made, on both tools that offer it.
-    for (const name of ['dcm_mpps_start', 'dcm_mpps_perform']) {
-      const described = byName.get(name).inputSchema.properties.unscheduled;
-      assert.ok(described, `${name} does not offer unscheduled`);
-      assert.match(described.description, /ONE ZERO-LENGTH item/);
-      assert.match(described.description, /PRESENT/);
-      // The three wrong shapes, so an assistant does not invent one of them.
-      assert.match(described.description, /omitting the sequence/);
-      assert.match(described.description, /never reconcile/);
-    }
-    // And on perform, the divergence that only exists there.
-    const onPerform = byName.get('dcm_mpps_perform').inputSchema.properties.unscheduled.description;
-    assert.match(onPerform, /C-STORE STILL USES THE FOLDER'S OWN STUDY INSTANCE UID/);
-
-    // --- The dataset that goes on the wire ----------------------------
-    const planned = await call('dcm_mpps_start', {
-      ...DEAD_PEER, unscheduled: true, modality: 'DX', stepId: 'WALKIN-014', dryRun: true,
-    });
-    assert.ok(!planned.isError, textOf(planned));
-    const sequence = planned.structuredContent.dataset.ScheduledStepAttributesSequence;
-    assert.equal(Array.isArray(sequence), true, 'the sequence is present, not omitted');
-    assert.equal(sequence.length, 1, 'exactly one item');
-    assert.deepEqual(Object.keys(sequence[0]), [], 'and that item is zero-length, not blank-filled');
-    assert.equal(planned.structuredContent.unscheduled, true);
-
-    // On perform the two identities diverge, and the result has to print both
-    // — a run where they differ silently is the run nobody can debug.
-    const plannedPerform = await call('dcm_mpps_perform', {
-      folder: fixture.study,
-      ...DEAD_PEER,
-      unscheduled: true,
-      modality: 'CT',
-      stepId: 'WALKIN-015',
-      dryRun: true,
-    });
-    assert.ok(!plannedPerform.isError, textOf(plannedPerform));
-    const pp = plannedPerform.structuredContent;
-    assert.equal(pp.unscheduled, true);
-    // The dry-run document names the folder's study `studyInstanceUid`; the
-    // live one names the same value `imagesStudyInstanceUid`. Both are read,
-    // because a consumer that knows only one of the two names breaks on the
-    // other run — see the note to the integrator.
-    assert.equal(
-      pp.imagesStudyInstanceUid ?? pp.studyInstanceUid, STUDY_UID,
-      'the C-STORE keeps the folder\'s study'
-    );
-    assert.equal(pp.stepStudyInstanceUid, null, 'the step names none');
-    assert.deepEqual(pp.dataset.ScheduledStepAttributesSequence, [{}]);
-    assert.match(textOf(plannedPerform), /UNSCHEDULED/);
-    assert.match(
-      textOf(plannedPerform),
-      new RegExp(`would be filed under ${STUDY_UID.replace(/\./g, '\\.')}`)
-    );
-
-    // And it is refused alongside a study UID, which says the opposite.
-    const contradiction = await call('dcm_mpps_start', {
-      ...DEAD_PEER, unscheduled: true, studyUid: STUDY_UID, modality: 'DX', stepId: 'W1',
-    });
-    assert.equal(contradiction.isError, true);
-
-    // --- What our own receiver does with it ---------------------------
-    //
-    // Nothing good, and the reason is below this tool: dcmjs's naturalising
-    // parser reads a sequence holding one zero-length item back as [], so
-    // dcm scp is handed an empty Type 1 and answers 0x0120 Missing Attribute
-    // — correctly, about something it was never given. The SCU half is still
-    // worth shipping, because the receivers this gets pointed at in the field
-    // are not dcmjs, but --unscheduled cannot be rehearsed against
-    // dcm_receiver_start today and a demo that pretends otherwise would be
-    // the silent gap this whole exercise is about. Pinned so that the day the
-    // library carries the item, this fails and the note gets rewritten.
-    const started = await call('dcm_receiver_start', { ae: 'MPPSSCP' });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    try {
-      const sent = await call('dcm_mpps_start', {
-        host, port, calledAe: 'MPPSSCP',
-        unscheduled: true, modality: 'DX', stepId: 'WALKIN-014',
-      });
-      assert.equal(
-        sent.isError, true,
-        'if this now succeeds, dcmjs carries the zero-length item and the note above is stale'
-      );
-      assert.equal(sent.structuredContent.status.code, '0x0120');
-      assert.match(textOf(sent), /ScheduledStepAttributesSequence/);
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+  // --- The dataset that goes on the wire ----------------------------
+  const planned = await call('dcm_mpps_start', {
+    ...DEAD_PEER, unscheduled: true, modality: 'DX', stepId: 'WALKIN-014', dryRun: true,
   });
+  assert.ok(!planned.isError, textOf(planned));
+  const sequence = planned.structuredContent.dataset.ScheduledStepAttributesSequence;
+  assert.equal(Array.isArray(sequence), true, 'the sequence is present, not omitted');
+  assert.equal(sequence.length, 1, 'exactly one item');
+  assert.deepEqual(Object.keys(sequence[0]), [], 'and that item is zero-length, not blank-filled');
+  assert.equal(planned.structuredContent.unscheduled, true);
+
+  // On perform the two identities diverge, and the result has to print both
+  // — a run where they differ silently is the run nobody can debug.
+  const plannedPerform = await call('dcm_mpps_perform', {
+    folder: fixture.study,
+    ...DEAD_PEER,
+    unscheduled: true,
+    modality: 'CT',
+    stepId: 'WALKIN-015',
+    dryRun: true,
+  });
+  assert.ok(!plannedPerform.isError, textOf(plannedPerform));
+  const pp = plannedPerform.structuredContent;
+  assert.equal(pp.unscheduled, true);
+  // The dry-run document names the folder's study `studyInstanceUid`; the
+  // live one names the same value `imagesStudyInstanceUid`. Both are read,
+  // because a consumer that knows only one of the two names breaks on the
+  // other run — see the note to the integrator.
+  assert.equal(
+    pp.imagesStudyInstanceUid ?? pp.studyInstanceUid, STUDY_UID,
+    'the C-STORE keeps the folder\'s study'
+  );
+  assert.equal(pp.stepStudyInstanceUid, null, 'the step names none');
+  assert.deepEqual(pp.dataset.ScheduledStepAttributesSequence, [{}]);
+  assert.match(textOf(plannedPerform), /UNSCHEDULED/);
+  assert.match(
+    textOf(plannedPerform),
+    new RegExp(`would be filed under ${STUDY_UID.replace(/\./g, '\\.')}`)
+  );
+
+  // And it is refused alongside a study UID, which says the opposite.
+  const contradiction = await call('dcm_mpps_start', {
+    ...DEAD_PEER, unscheduled: true, studyUid: STUDY_UID, modality: 'DX', stepId: 'W1',
+  });
+  assert.equal(contradiction.isError, true);
+
+  // --- What our own receiver does with it ---------------------------
+  //
+  // Nothing good, and the reason is below this tool: dcmjs's naturalising
+  // parser reads a sequence holding one zero-length item back as [], so
+  // dcm scp is handed an empty Type 1 and answers 0x0120 Missing Attribute
+  // — correctly, about something it was never given. The SCU half is still
+  // worth shipping, because the receivers this gets pointed at in the field
+  // are not dcmjs, but --unscheduled cannot be rehearsed against
+  // dcm_receiver_start today and a demo that pretends otherwise would be
+  // the silent gap this whole exercise is about. Pinned so that the day the
+  // library carries the item, this fails and the note gets rewritten.
+  //
+  // The shared receiver serves: the N-CREATE is refused, so this leaves no
+  // step behind and touches nothing another test reads.
+  const sent = await call('dcm_mpps_start', {
+    ...shared.peer,
+    unscheduled: true, modality: 'DX', stepId: 'WALKIN-014',
+  });
+  assert.equal(
+    sent.isError, true,
+    'if this now succeeds, dcmjs carries the zero-length item and the note above is stale'
+  );
+  assert.equal(sent.structuredContent.status.code, '0x0120');
+  assert.match(textOf(sent), /ScheduledStepAttributesSequence/);
 });
 
 // ---- Scoping a close to one study of several ------------------------------
 
 test('the closing verbs take studyUid to scope a folder that holds two studies', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
-      const properties = tools.find((t) => t.name === name).inputSchema.properties;
-      const studyUid = properties.studyUid;
-      assert.ok(studyUid, `${name} cannot scope seriesFrom without studyUid`);
-      // It narrows the scan. It does not restamp, and it does not change what
-      // the step names — an assistant that believed either would use it to
-      // paper over a mismatch that ought to be refused.
-      assert.match(studyUid.description, /SCOPES; it does not re-stamp/);
-      assert.match(studyUid.description, /SINGLE study/);
-      // And the refusal it exists for is named on the parameter it applies to.
-      assert.match(properties.seriesFrom.description, /REFUSED rather than merged/);
-    }
-  });
+  for (const name of ['dcm_mpps_complete', 'dcm_mpps_discontinue']) {
+    const properties = shared.tools.find((t) => t.name === name).inputSchema.properties;
+    const studyUid = properties.studyUid;
+    assert.ok(studyUid, `${name} cannot scope seriesFrom without studyUid`);
+    // It narrows the scan. It does not restamp, and it does not change what
+    // the step names — an assistant that believed either would use it to
+    // paper over a mismatch that ought to be refused.
+    assert.match(studyUid.description, /SCOPES; it does not re-stamp/);
+    assert.match(studyUid.description, /SINGLE study/);
+    // And the refusal it exists for is named on the parameter it applies to.
+    assert.match(properties.seriesFrom.description, /REFUSED rather than merged/);
+  }
 });
 
 // ---- Conformance testing on the query side --------------------------------
 
 test('the query tools expose the fidelity and injection paths, unmistakably', async () => {
-  await withClient(async ({ client }) => {
-    const { tools } = await client.listTools();
-    for (const name of ['dcm_query', 'dcm_worklist']) {
-      const properties = tools.find((t) => t.name === name).inputSchema.properties;
+  for (const name of ['dcm_query', 'dcm_worklist']) {
+    const properties = shared.tools.find((t) => t.name === name).inputSchema.properties;
 
-      // Raw, and the two shape changes that bite.
-      assert.match(properties.raw.description, /exactly as they came off the wire/);
-      assert.match(properties.raw.description, /_elements/);
-      assert.match(properties.raw.description, /must NOT be copied straight into an MPPS/);
+    // Raw, and the two shape changes that bite.
+    assert.match(properties.raw.description, /exactly as they came off the wire/);
+    assert.match(properties.raw.description, /_elements/);
+    assert.match(properties.raw.description, /must NOT be copied straight into an MPPS/);
 
-      // The conformance gate, and that it judges the PEER.
-      assert.match(properties.checkVr.description, /VR conformance violations/);
-      assert.match(properties.checkVr.description, /audit of the PEER/);
-      assert.match(properties.checkVr.description, /vrElementsExamined/);
+    // The conformance gate, and that it judges the PEER.
+    assert.match(properties.checkVr.description, /VR conformance violations/);
+    assert.match(properties.checkVr.description, /audit of the PEER/);
+    assert.match(properties.checkVr.description, /vrElementsExamined/);
 
-      // Injection. This one sends something deliberately wrong, so the
-      // description has to make that impossible to miss, has to say what it is
-      // NOT for, and has to say it cannot write anything.
-      const inject = properties.injectVerbatim;
-      assert.ok(inject, `${name} does not expose the injection path`);
-      assert.match(inject.description, /CONFORMANCE TEST INSTRUMENT/);
-      assert.match(inject.description, /SEND SOMETHING WRONG ON PURPOSE/);
-      assert.match(inject.description, /never the way to make a query work/);
-      assert.match(inject.description, /changes nothing on the peer and writes no file/);
-      assert.match(inject.description, /REFUSED if any injected value did not survive/);
-      assert.match(inject.description, /"injected"/);
+    // Injection. This one sends something deliberately wrong, so the
+    // description has to make that impossible to miss, has to say what it is
+    // NOT for, and has to say it cannot write anything.
+    const inject = properties.injectVerbatim;
+    assert.ok(inject, `${name} does not expose the injection path`);
+    assert.match(inject.description, /CONFORMANCE TEST INSTRUMENT/);
+    assert.match(inject.description, /SEND SOMETHING WRONG ON PURPOSE/);
+    assert.match(inject.description, /never the way to make a query work/);
+    assert.match(inject.description, /changes nothing on the peer and writes no file/);
+    assert.match(inject.description, /REFUSED if any injected value did not survive/);
+    assert.match(inject.description, /"injected"/);
 
-      // It is not offered where it would write. A "verbatim, unchecked" value
-      // stamped into a C-FIND is a query; stamped into a file or a C-STORE it
-      // is a corrupted record.
-      assert.equal(properties.set, undefined, 'the find-side injection must not be named `set`');
-    }
+    // It is not offered where it would write. A "verbatim, unchecked" value
+    // stamped into a C-FIND is a query; stamped into a file or a C-STORE it
+    // is a corrupted record.
+    assert.equal(properties.set, undefined, 'the find-side injection must not be named `set`');
+  }
 
-    for (const name of ['dcm_send', 'dcm_edit', 'dcm_anon']) {
-      const properties = tools.find((t) => t.name === name).inputSchema.properties;
-      assert.equal(
-        properties.injectVerbatim, undefined,
-        `${name} writes; unchecked verbatim values have no business there`
-      );
-    }
-  });
+  for (const name of ['dcm_send', 'dcm_edit', 'dcm_anon']) {
+    const properties = shared.tools.find((t) => t.name === name).inputSchema.properties;
+    assert.equal(
+      properties.injectVerbatim, undefined,
+      `${name} writes; unchecked verbatim values have no business there`
+    );
+  }
 });
 
-test('a worklist query can report VR conformance about what the peer returned', async (t) => {
-  const dir = tempDir('dcm-mcp-mpps-vr-');
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const worklistFile = makeWorklist(dir);
+test('a worklist query can report VR conformance about what the peer returned', async () => {
+  // The shared receiver: this test only ever queries, so it neither changes
+  // that receiver's state nor depends on anything but the row it was started
+  // with — which keepPerformed guarantees is still answerable however many
+  // steps the tests above closed against it.
+  const peer = shared.peer;
 
-  await withClient(async ({ call }) => {
-    const started = await call('dcm_receiver_start', { ae: 'WORKLIST', worklist: worklistFile });
-    assert.ok(!started.isError, `receiver failed to start: ${textOf(started)}`);
-    const { serverId, port, host } = started.structuredContent;
-    const peer = { host, port, calledAe: 'WORKLIST' };
+  // A clean worklist audits clean, and says over how many elements — the
+  // distinction between "no violations" and "nothing examined" is the
+  // false pass the flag exists to stop.
+  const audited = await call('dcm_worklist', { ...peer, scheduledDate: 'today', checkVr: true });
+  assert.ok(!audited.isError, `a clean audit must not read as a failure: ${textOf(audited)}`);
+  assert.deepEqual(audited.structuredContent.vrViolations, []);
+  assert.ok(audited.structuredContent.vrElementsExamined > 0);
+  assert.match(textOf(audited), /no violations over \d+ element/);
 
-    try {
-      // A clean worklist audits clean, and says over how many elements — the
-      // distinction between "no violations" and "nothing examined" is the
-      // false pass the flag exists to stop.
-      const audited = await call('dcm_worklist', { ...peer, scheduledDate: 'today', checkVr: true });
-      assert.ok(!audited.isError, `a clean audit must not read as a failure: ${textOf(audited)}`);
-      assert.deepEqual(audited.structuredContent.vrViolations, []);
-      assert.ok(audited.structuredContent.vrElementsExamined > 0);
-      assert.match(textOf(audited), /no violations over \d+ element/);
+  // Raw carries the per-element sidecar, and the handoff still works
+  // because the flat keys survive — but PatientName does not, and the note
+  // has to say so before an assistant copies it into an MPPS call.
+  const raw = await call('dcm_worklist', { ...peer, scheduledDate: 'today', raw: true });
+  assert.ok(!raw.isError, textOf(raw));
+  assert.equal(raw.structuredContent.raw, true);
+  const match = raw.structuredContent.matches[0];
+  assert.equal(match.StudyInstanceUID, STUDY_UID);
+  assert.equal(match._elements['(0020,000D)'].vr, 'UI');
+  assert.equal(match._elements['(0020,000D)'].value, STUDY_UID);
+  assert.equal(typeof match.PatientName, 'object', 'a raw PN is not a string');
+  assert.match(textOf(raw), /Do not\s+copy a raw PatientName/);
 
-      // Raw carries the per-element sidecar, and the handoff still works
-      // because the flat keys survive — but PatientName does not, and the note
-      // has to say so before an assistant copies it into an MPPS call.
-      const raw = await call('dcm_worklist', { ...peer, scheduledDate: 'today', raw: true });
-      assert.ok(!raw.isError, textOf(raw));
-      assert.equal(raw.structuredContent.raw, true);
-      const match = raw.structuredContent.matches[0];
-      assert.equal(match.StudyInstanceUID, STUDY_UID);
-      assert.equal(match._elements['(0020,000D)'].vr, 'UI');
-      assert.equal(match._elements['(0020,000D)'].value, STUDY_UID);
-      assert.equal(typeof match.PatientName, 'object', 'a raw PN is not a string');
-      assert.match(textOf(raw), /Do not\s+copy a raw PatientName/);
-
-      // An injected value goes out as typed, and the answer says so in the
-      // document itself rather than only on a stderr banner nothing here reads.
-      const injected = await call('dcm_worklist', {
-        ...peer, scheduledDate: 'today', injectVerbatim: { PatientSex: 'male' },
-      });
-      assert.deepEqual(
-        injected.structuredContent.injected,
-        [{ tag: '(0010,0040)', attribute: 'PatientSex', value: 'male' }]
-      );
-      assert.match(textOf(injected), /INJECTED, VERBATIM AND UNCHECKED/);
-      assert.match(textOf(injected), /answering exactly what it was asked/);
-
-      // A tag the encoder would silently drop is refused rather than injected.
-      const dropped = await call('dcm_worklist', {
-        ...peer, scheduledDate: 'today', injectVerbatim: { '(0009,0010)': 'PRIVATE' },
-      });
-      assert.equal(dropped.isError, true, 'a private tag must not be quietly lost');
-    } finally {
-      await call('dcm_server_stop', { serverId });
-    }
+  // An injected value goes out as typed, and the answer says so in the
+  // document itself rather than only on a stderr banner nothing here reads.
+  const injected = await call('dcm_worklist', {
+    ...peer, scheduledDate: 'today', injectVerbatim: { PatientSex: 'male' },
   });
+  assert.deepEqual(
+    injected.structuredContent.injected,
+    [{ tag: '(0010,0040)', attribute: 'PatientSex', value: 'male' }]
+  );
+  assert.match(textOf(injected), /INJECTED, VERBATIM AND UNCHECKED/);
+  assert.match(textOf(injected), /answering exactly what it was asked/);
+
+  // A tag the encoder would silently drop is refused rather than injected.
+  const dropped = await call('dcm_worklist', {
+    ...peer, scheduledDate: 'today', injectVerbatim: { '(0009,0010)': 'PRIVATE' },
+  });
+  assert.equal(dropped.isError, true, 'a private tag must not be quietly lost');
 });

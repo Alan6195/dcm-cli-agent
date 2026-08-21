@@ -218,8 +218,17 @@ async function withReceiver(args, fn) {
 
 before(async () => {
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
-  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, 'mcp'] });
+  const { StdioClientTransport , getDefaultEnvironment } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, 'mcp'],
+      // StdioClientTransport does not inherit this process's environment: it
+      // builds one from getDefaultEnvironment(), a fixed allow-list that cannot
+      // include DCM_LINGER. Without this the server child opens every association
+      // at the 1000 ms default while the suite believes it asked for 50.
+      env: {
+        ...getDefaultEnvironment(),
+        ...(process.env.DCM_LINGER ? { DCM_LINGER: process.env.DCM_LINGER } : {}),
+      },
+    });
   client = new Client({ name: 'dcm-handle-test', version: '1.0.0' });
   await client.connect(transport);
 
