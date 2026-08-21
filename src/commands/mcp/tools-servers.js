@@ -395,6 +395,61 @@ function renderTail(rec, tailLines) {
 }
 
 /**
+ * What `<status>` means on every fault-injection flag that takes one.
+ *
+ * Said once because the four flags spell it identically and `dcm scp` derives
+ * the accepted names from the dcmjs-dimse constants, so a list written out here
+ * twice would be two lists that rot at different rates.
+ */
+const STATUS_VALUE =
+  'A hex code such as 0x0106, or a status name such as invalid-attribute-value, processing-failure, ' +
+  'missing-attribute, no-such-object-instance, not-authorized, resource-limitation. ' +
+  'BARE DIGITS ARE REFUSED on purpose — "110" could be read as decimal 0x006E or as the 0x0110 that was meant, ' +
+  'and guessing would arm the receiver with a code nobody asked for. A Success, Pending or Cancel code is refused ' +
+  'too: a fault knob that refuses nothing would report as armed while doing nothing.';
+
+/**
+ * Summarises which fault-injection knobs a receiver was started with.
+ *
+ * This exists so an injected refusal can never read as a finding. The receiver
+ * itself prints a banner and names the flag in every Error Comment it sends,
+ * but neither reaches an assistant that only ever sees this tool's result — so
+ * the arming is restated here, in the answer that hands over the address.
+ *
+ * @param {object} a  Tool arguments.
+ * @returns {{armed: string[], detail: object}}
+ */
+function faultsArmed(a) {
+  const armed = [];
+  const detail = {};
+
+  if (a.rejectAfter !== undefined) {
+    armed.push(`--reject-after ${a.rejectAfter} (C-STORE goes quiet after ${a.rejectAfter} instances per association)`);
+    detail.rejectAfter = a.rejectAfter;
+  }
+  if (a.refuseNCreate) {
+    armed.push(`--refuse-ncreate ${a.refuseNCreate} (no MPPS step can be opened)`);
+    detail.refuseNCreate = a.refuseNCreate;
+  }
+  if (a.refuseNSet) {
+    const scope = a.refuseNSetScope || 'interim';
+    armed.push(`--refuse-nset ${a.refuseNSet} --refuse-nset-scope ${scope}`);
+    detail.refuseNSet = a.refuseNSet;
+    detail.refuseNSetScope = scope;
+  }
+  if (a.findStatus) {
+    armed.push(`--find-status ${a.findStatus} (every C-FIND, worklist included, answers this failure)`);
+    detail.findStatus = a.findStatus;
+  }
+  if (a.abortFindAfter !== undefined) {
+    armed.push(`--abort-find-after ${a.abortFindAfter} (A-ABORT after ${a.abortFindAfter} Pending responses, no final status)`);
+    detail.abortFindAfter = a.abortFindAfter;
+  }
+
+  return { armed, detail };
+}
+
+/**
  * Register the server-lifecycle tools on an MCP server.
  *
  * @param {object} server  The McpServer to register on.
@@ -415,7 +470,12 @@ function register(server, z, rt) {
         'It accepts every SOP Class and transfer syntax offered, so it proves what a sender emits — not what a real PACS would accept. ' +
         'It stores but does not index: C-FIND against it returns zero matches, exactly like many store-and-forward systems — ' +
         'unless you pass worklist, which makes it answer Modality Worklist queries from a file so dcm_worklist can be tested against something real. ' +
+        'It also speaks MPPS: N-CREATE opens a step, N-SET updates and closes it, and completing a step retires the matching worklist item, ' +
+        'so the whole scheduled-to-performed loop can be rehearsed here with no RIS. keepPerformed leaves the item in place while the query itself is what is being tested. ' +
         'Without persist it acknowledges and discards the bytes. Omit port to have a free one picked for you. ' +
+        'FAULT INJECTION: refuseNCreate, refuseNSet, findStatus, abortFindAfter and rejectAfter make it fail on purpose, which is how a client is tested against ' +
+        'the answers a real peer gives on a bad day. Every one is off by default, every injected refusal is counted separately and names the flag in its Error Comment, ' +
+        'and this tool repeats what was armed in its own answer — because an injected refusal must never be read as a finding about the client. ' +
         'It listens on this machine until you stop it with dcm_server_stop, and is stopped for you if this MCP session ends. Stop it when you are finished.',
       inputSchema: {
         port: z.number().int().optional().describe('Port to listen on. Omit to get a free one.'),
@@ -423,10 +483,41 @@ function register(server, z, rt) {
         persist: z.string().optional().describe('Folder to write received instances into, as <dir>/<StudyUID>/<SeriesUID>/<SOPUID>.dcm. Default: acknowledge and discard.'),
         acceptCallingAe: z.array(z.string()).optional().describe('Allowlist of calling AE Titles; anything else is rejected. Default: accept any.'),
         worklist: z.string().optional().describe(
-          'Path to a JSON file of Modality Worklist items (an array of flat DICOM keyword objects: PatientName, PatientID, ' +
-          'AccessionNumber, Modality, ScheduledStationAETitle, ScheduledProcedureStepStartDate/Time, ...). The receiver then ' +
-          'answers worklist C-FIND queries from it, so a worklist integration can be exercised locally. Without it, every C-FIND returns zero matches.'
+          'Path to a JSON file of Modality Worklist items. Three shapes are read: an array of flat DICOM keyword objects (PatientName, PatientID, ' +
+          'AccessionNumber, Modality, ScheduledStationAETitle, ScheduledProcedureStepStartDate/Time, StudyInstanceUID, ...), an object with an "items" array, ' +
+          'and a CAPTURED QUERY — the document `dcm find --mwl --json-raw` writes, whose "matches" array is read directly. ' +
+          'That last one is capture and replay with no editing in between: record a real worklist SCP once, serve those exact rows back offline forever. ' +
+          'The scheduled-step keys are written flat and the receiver nests them into ScheduledProcedureStepSequence in its answer, which is where an MWL SCU reads them. ' +
+          'Without this, every C-FIND returns zero matches. ' +
+          'Note that a capture of a query that was REFUSED is a well-formed document with an empty matches array; the receiver warns with the recorded outcome rather than serving it as an empty schedule.'
         ),
+        keepPerformed: z.boolean().optional().describe(
+          'Keep a worklist item visible after its performed step completes. By default completing a step retires the item — which is the behaviour that makes the loop realistic, ' +
+          'and the reason a query that returned a patient a minute ago returns nothing afterwards. Turn this on when the QUERY is what is under test and the retirement is getting in the way.'),
+        rejectAfter: z.number().int().optional().describe(
+          'FAULT INJECTION. Stop acknowledging C-STOREs after n instances in an association, answering 0xA700 Refused: out of resources — a receiver that goes quiet mid-transfer. ' +
+          'C-STORE only; it does not touch MPPS or C-FIND. This is how a genuine shortfall is produced, so dcm_mpps_perform can be seen to end DISCONTINUED for a real reason.'),
+        refuseNCreate: z.string().optional().describe(
+          `FAULT INJECTION. Answer every MPPS N-CREATE with this failure status, so a client that cannot even open a step can be tested. ${STATUS_VALUE} ` +
+          'No step is created, so any N-SET that follows honestly fails with 0x0112 No Such Object Instance — that is the situation, not a second fault.'),
+        refuseNSet: z.string().optional().describe(
+          `FAULT INJECTION. Answer MPPS N-SET requests with this failure status instead of acting on them. ${STATUS_VALUE} ` +
+          'Scoped by refuseNSetScope, which defaults to interim — see that parameter, because the scope is the point of this flag rather than a detail of it. ' +
+          'The refusal is decided before the step is looked up, so the injected answer never depends on what this receiver happens to be holding, and a refused N-SET leaves the step byte-identical: ' +
+          'nothing merges, no update is counted, no worklist item retires. Only the MPPS SOP Class is affected.'),
+        refuseNSetScope: z.enum(['interim', 'terminal', 'all']).optional().describe(
+          'Which N-SETs refuseNSet applies to. "interim" (the default) refuses only the progress reports that carry no terminal status, and lets the closing COMPLETED or DISCONTINUED through — ' +
+          'which is the only way to ask the question worth asking: does a client survive a refused progress report, or does it give up on a run that was going fine? ' +
+          '"terminal" refuses only the closing message, leaving a client holding a step it cannot finish. "all" refuses both, which cannot answer the interim question because it refuses the close as well. ' +
+          'Refused without refuseNSet, since on its own it scopes nothing.'),
+        findStatus: z.string().optional().describe(
+          `FAULT INJECTION. Answer every C-FIND with this failure status and no matches, worklist queries included. ${STATUS_VALUE} ` +
+          '0x0122 SOP Class Not Supported is the interesting one: it is what a store-and-forward gateway returns AFTER accepting the presentation context, and it is the failure that looks most like an empty worklist — ' +
+          'which is exactly the confusion dcm_worklist\'s expectEmpty exists to catch. Mutually exclusive with abortFindAfter.'),
+        abortFindAfter: z.number().int().optional().describe(
+          'FAULT INJECTION. Send n Pending C-FIND responses and then A-ABORT the association, never sending the final Success status. 0 aborts before the first match. ' +
+          'A client reading that must not report n matches as a complete answer. If the query matches fewer than n items the abort never fires and the receiver SAYS SO in its log, ' +
+          'so a test cannot quietly pass on a worklist too small to trip it. Mutually exclusive with findStatus.'),
       },
     },
     async (a) => {
@@ -436,18 +527,38 @@ function register(server, z, rt) {
       opt(argv, '--persist', a.persist ? path.resolve(a.persist) : undefined);
       for (const ae of a.acceptCallingAe || []) argv.push('--accept-calling-ae', ae);
       opt(argv, '--worklist', a.worklist ? path.resolve(a.worklist) : undefined);
+      if (a.keepPerformed) argv.push('--keep-performed');
+
+      // Passed straight through, never normalised: `dcm scp` refuses a bare
+      // decimal status, a success status, a scope without its flag and the two
+      // C-FIND knobs together, and each of those refusals explains itself far
+      // better than a schema error could. Re-deciding any of them here would
+      // put a second, quieter opinion in front of the loud one.
+      opt(argv, '--reject-after', a.rejectAfter);
+      opt(argv, '--refuse-ncreate', a.refuseNCreate);
+      opt(argv, '--refuse-nset', a.refuseNSet);
+      opt(argv, '--refuse-nset-scope', a.refuseNSetScope);
+      opt(argv, '--find-status', a.findStatus);
+      opt(argv, '--abort-find-after', a.abortFindAfter);
 
       const address = `127.0.0.1:${port}`;
       const started = await launch({ kind: 'receiver', argv, port, address });
       if (!started.ok) return failure(started.text);
 
       const { rec } = started;
+      const faults = faultsArmed(a);
       return result(
         `Receiver ${rec.id} is listening on ${address}` +
           `${a.ae ? ` as called AE ${a.ae}` : ''}.\n` +
           `Send to it with dcm_send { host: "127.0.0.1", port: ${port}, calledAe: "${a.ae || 'ANY'}" }, ` +
           `then read what arrived with dcm_server_status { serverId: "${rec.id}" }.\n` +
-          `It runs on this machine until dcm_server_stop { serverId: "${rec.id}" }.`,
+          `It runs on this machine until dcm_server_stop { serverId: "${rec.id}" }.` +
+          (faults.armed.length
+            ? `\n\nFAULT INJECTION IS ON: ${faults.armed.join('; ')}.\n` +
+              'Every refusal this receiver now sends because of those flags is INJECTED, not a finding about ' +
+              'whatever is talking to it. It names the flag in its Error Comment and counts them separately in ' +
+              'its own log, which dcm_server_status will show.'
+            : ''),
         {
           serverId: rec.id,
           kind: rec.kind,
@@ -456,6 +567,9 @@ function register(server, z, rt) {
           host: '127.0.0.1',
           calledAe: a.ae ?? null,
           persist: a.persist ? path.resolve(a.persist) : null,
+          worklist: a.worklist ? path.resolve(a.worklist) : null,
+          keepPerformed: Boolean(a.keepPerformed),
+          faultInjection: faults.armed.length ? faults.detail : null,
         }
       );
     }

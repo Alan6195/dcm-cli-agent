@@ -10,6 +10,10 @@
  * does not prove, because that is the part an assistant gets wrong.
  */
 
+const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
+const { resolveCliCommand } = require('./tools-servers');
+
 /**
  * Transfer syntax names `dcm send --transfer-syntax` accepts, for the schema
  * description. A UID is accepted too, which is why the parameter is a string
@@ -72,14 +76,30 @@ const INJECT_DESCRIPTION =
 /**
  * How a dcm_worklist row becomes a dcm_mpps_perform call.
  *
- * The CLI hands a worklist item to MPPS through a file: `dcm find --mwl
- * --json-raw > wl.json`, then `dcm mpps perform --from-worklist wl.json`.
- * Across the MCP boundary there is no file — dcm_worklist's answer lands in the
- * conversation, and nothing here writes it to disk — so the handoff is made of
- * named parameters instead, one per row key, and this table is the mapping. It
- * is emitted once per worklist result rather than once per row: the values are
- * already in `matches`, and copying them a second time would be a second thing
- * to keep in step with the first.
+ * The CLI hands a worklist item to MPPS through a file or a pipe: `dcm find
+ * --mwl --json-raw > wl.json`, then `dcm mpps perform --from-worklist wl.json`.
+ * Across the MCP boundary there is neither — dcm_worklist's answer lands in the
+ * conversation, and nothing here writes anything to disk — so there are two
+ * ways across, and they are not equivalent:
+ *
+ *   worklistRow  an opaque handle minted per row by dcm_worklist and resolved
+ *                inside this process back to the attributes that row arrived
+ *                with. Nothing is transcribed, and nothing is lost: the four
+ *                sequence-valued attributes an N-CREATE echoes back
+ *                (ReferencedStudySequence, ScheduledProtocolCodeSequence,
+ *                ProcedureCodeSequence, ReferencedPatientSequence) have no
+ *                named parameter here and can only travel this way. This is
+ *                the one to use.
+ *
+ *   the table     below: one named parameter per row key, for the case where
+ *                 the values are being composed or corrected rather than
+ *                 carried, and for a step whose attributes did not come from a
+ *                 worklist at all. Lossy by construction — it carries the ten
+ *                 scalars and nothing else — which is why the handle exists.
+ *
+ * The table is emitted once per worklist result rather than once per row: the
+ * values are already in `matches`, and copying them a second time would be a
+ * second thing to keep in step with the first.
  *
  * ScheduledStationAETitle is deliberately absent. It names the station the work
  * was BOOKED on; PerformedStationAETitle names the AE the images actually
@@ -92,6 +112,8 @@ const MPPS_HANDOFF = {
   // In the order an MPPS SCP tries them: the first key that matches anything
   // decides, so a correct Study Instance UID is worth more than the rest.
   correlationKeys: ['StudyInstanceUID', 'AccessionNumber', 'ScheduledProcedureStepID'],
+  // The whole row, without transcription. Preferred over `parameters`.
+  handleParameter: 'worklistRow',
   parameters: {
     StudyInstanceUID: 'studyUid',
     AccessionNumber: 'accessionNumber',
@@ -105,6 +127,173 @@ const MPPS_HANDOFF = {
     RequestedProcedureDescription: 'requestedProcedureDescription',
   },
 };
+
+// ---- The worklist row store ----------------------------------------------
+
+/**
+ * THE WORKLIST ROW HANDLE.
+ *
+ * The problem it solves: `--from-worklist` takes the raw export
+ * (`dcm find --mwl --json-raw`), and refuses the rendered one by name, because
+ * rendering turns a sequence into a string and an empty sequence into ''. Over
+ * MCP there was no way to produce the accepted form — dcm_worklist's answer is
+ * JSON in a conversation, not a file — so an assistant had to retype up to ten
+ * scalars per row into the named parameters, and the sequences were simply not
+ * reachable at all.
+ *
+ * So dcm_worklist mints an opaque handle per row and keeps the row here, in
+ * memory. dcm_mpps_start and dcm_mpps_perform take the handle back and this
+ * module resolves it, in this process, to the attributes that row arrived with.
+ *
+ * NOTHING IS WRITTEN TO DISK. That is not an implementation detail, it is the
+ * rule this tool is built on: no records, single process, in memory. A handle
+ * is therefore worth nothing outside this server process, and saying so is part
+ * of the contract rather than a caveat.
+ *
+ * Bounded, because a long session querying a busy worklist would otherwise
+ * accumulate every row it ever saw. Eviction is oldest-first, which makes
+ * "expired" a real state an assistant can hit — hence resolveWorklistHandle()'s
+ * message, which tells it to re-query rather than reconstruct a row from
+ * memory of an earlier answer. A reconstructed row is precisely the
+ * transcription this whole mechanism exists to remove.
+ */
+const MAX_WORKLIST_ROWS = 200;
+
+/** handle -> {row, peer, index, of, label, mintedAt}. Insertion-ordered. */
+const worklistRows = new Map();
+
+/**
+ * A handle refusal. Carried as its own type so the tool handlers can answer
+ * with a plain error result instead of letting it reach the command layer,
+ * which would report it as a failure of a step that was never attempted.
+ */
+class HandleError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'HandleError';
+  }
+}
+
+/**
+ * Drops the sidecar keys, so what is stored is attributes and nothing else.
+ *
+ * `_elements` rides along on a raw match and is bookkeeping about the octets,
+ * not an attribute. src/lib/mpps.js would strip it anyway on the way in — every
+ * underscore-prefixed key is dropped there — but storing it would mean holding
+ * a per-element sidecar for every row of every query for the life of the
+ * process, which is most of the memory for none of the meaning.
+ *
+ * @param {Record<string, unknown>} row
+ * @returns {Record<string, unknown>}
+ */
+function attributesOf(row) {
+  const out = {};
+  for (const [key, value] of Object.entries(row || {})) {
+    if (key.startsWith('_')) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Mints a handle for one worklist row.
+ *
+ * Opaque on purpose: an assistant that could read a Study Instance UID out of
+ * the handle would start composing them, and a composed handle names a row
+ * nobody queried.
+ *
+ * @param {Record<string, unknown>} row  The raw attributes, sidecar removed.
+ * @param {object} provenance  {peer, index, of, label}
+ * @returns {string}
+ */
+function mintWorklistHandle(row, provenance) {
+  const handle = `wlrow_${crypto.randomBytes(9).toString('hex')}`;
+  worklistRows.set(handle, { row, ...provenance, mintedAt: new Date().toISOString() });
+  // Map iterates in insertion order, so the first key is the oldest.
+  while (worklistRows.size > MAX_WORKLIST_ROWS) {
+    worklistRows.delete(worklistRows.keys().next().value);
+  }
+  return handle;
+}
+
+/**
+ * Resolves a handle, or refuses in a way that says what to do instead.
+ *
+ * An unknown handle and an evicted one are indistinguishable from here, and
+ * saying so is better than picking one: what matters is that both have the same
+ * fix and that the fix is NOT to guess at the row's attributes.
+ *
+ * @param {string} handle
+ * @returns {object} The stored record.
+ */
+function resolveWorklistHandle(handle) {
+  const record = worklistRows.get(handle);
+  if (record) return record;
+
+  throw new HandleError(
+    `worklistRow "${handle}" is not a row this server is holding. Either it was never minted ` +
+      'here, or it came from a previous session, or it has aged out — only the last ' +
+      `${MAX_WORKLIST_ROWS} rows are kept, and nothing is written to disk, so a handle is ` +
+      'worth nothing outside the process that made it.\n\n' +
+      'RE-RUN dcm_worklist AND USE A HANDLE FROM THAT ANSWER. Do not rebuild the row from an ' +
+      'earlier answer in this conversation: a row reassembled from what was displayed has lost ' +
+      'its sequences, and a step built from it would name an order the RIS cannot reconcile. ' +
+      'If the row is genuinely gone from the worklist, that is itself the finding.' +
+      (worklistRows.size
+        ? ` (${worklistRows.size} row handle(s) are currently held.)`
+        : ' (No row handles are currently held.)')
+  );
+}
+
+/**
+ * Runs the CLI as a child process with a document on its standard input.
+ *
+ * This is the one place the MCP layer does not run a command in-process, and
+ * the reason is narrow: `--from-worklist -` reads file descriptor 0, and in
+ * this process descriptor 0 is the JSON-RPC channel the MCP client is talking
+ * over. Reading it would consume protocol bytes and hang the session. A child
+ * has its own descriptor 0, which we write the row into and close.
+ *
+ * The alternative — a temporary file — is the one thing this tool does not do.
+ * The row exists in this process's memory, in the pipe, and in the child's
+ * memory; it never touches a disk.
+ *
+ * The result shape is runCommand's, so everything downstream is unchanged.
+ * There is no serialisation around it: the capture stack runCommand serialises
+ * for is this process's, and a child writes to neither end of it.
+ *
+ * @param {string[]} argv  Full CLI arguments, e.g. ['mpps', 'perform', ...].
+ * @param {string} input  Written to the child's stdin, which is then closed.
+ * @returns {Promise<{code:number, out:string, err:string}>}
+ */
+function runCliWithStdin(argv, input) {
+  return new Promise((resolve) => {
+    const [command, ...commandArgs] = resolveCliCommand(argv);
+    const child = spawn(command, commandArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: { ...process.env, NO_COLOR: '1' },
+    });
+
+    let out = '';
+    let err = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.stderr.on('data', (chunk) => { err += chunk; });
+
+    child.on('error', (e) => {
+      resolve({ code: 1, out, err: `${err}\nCould not run the CLI: ${e.message}`.trim() });
+    });
+    child.on('close', (code) => resolve({ code: code ?? 1, out, err }));
+
+    // A verb that refuses before reading the worklist closes descriptor 0 while
+    // we are still writing to it. That EPIPE is not the failure — the refusal
+    // on stderr is — so it must not become an unhandled error event.
+    child.stdin.on('error', () => {});
+    child.stdin.end(input);
+  });
+}
 
 /**
  * Today's date in DICOM DA form, offset by whole days.
@@ -219,6 +408,120 @@ function register(server, z, rt) {
   });
 
   /**
+   * The three assertion parameters both query tools take.
+   *
+   * They are on the query tools and nowhere else, and that is a decision worth
+   * stating: the whole value of an expectation is that a query which never
+   * reached the peer CANNOT satisfy it. A refused association, an A-ABORT and a
+   * dead host all produce zero rows locally, and only one of the four
+   * zero-row cases is a passing test. A local-file tool has no association to
+   * fail, and its answer is an array this conversation can count, so the same
+   * flags on dcm_inventory or dcm_tags would be ceremony rather than a guard.
+   *
+   * @returns {Record<string, object>}
+   */
+  const expectationSchema = () => ({
+    expectCount: z.number().int().optional().describe(
+      'ASSERT that the peer returns exactly this many matches, and report a failure if it does not (`dcm find --expect-count`). ' +
+      'The result still says what actually happened in "outcome"; the expectation is judged separately and appears in "expectation".'),
+    expectEmpty: z.boolean().optional().describe(
+      'ASSERT that the peer returns NO matches (`dcm find --expect-empty`). ' +
+      'THE POINT OF THIS RATHER THAN READING count YOURSELF: a query that never reached the peer does not satisfy it. ' +
+      'A refused association, a wrong Called AE Title, an A-ABORT mid-C-FIND and a peer answering 0x0122 all produce zero rows at this end, ' +
+      'and "the worklist entry is correctly gone" is a pass while "the tenant lookup failed" is not. ' +
+      'When the query did not complete, expectation.evaluated is false, expectation.held is false, and this reports an error — never a satisfied assertion.'),
+    expectNonempty: z.boolean().optional().describe(
+      'ASSERT that the peer returns at least one match (`dcm find --expect-nonempty`). The natural preflight: prove the query works before drawing a conclusion from a later empty one.'),
+  });
+
+  /**
+   * Pushes the assertion half of a find argument vector.
+   *
+   * The three are mutually exclusive and the command refuses two of them with a
+   * message naming both, which is better than anything a schema could say, so
+   * nothing is resolved here.
+   *
+   * @param {string[]} argv  Argument vector being built, mutated in place.
+   * @param {object} a  Tool arguments.
+   */
+  const expectationArgv = (argv, a) => {
+    opt(argv, '--expect-count', a.expectCount);
+    if (a.expectEmpty) argv.push('--expect-empty');
+    if (a.expectNonempty) argv.push('--expect-nonempty');
+  };
+
+  /**
+   * Says what an expectation verdict means, from the fields the command emitted.
+   *
+   * `evaluated` is the field that matters and the one an assistant will not
+   * think to look at, so the unevaluated case gets its own sentence saying it
+   * is a failure rather than an empty result.
+   *
+   * @param {object} p  The parsed document.
+   * @returns {string|null}
+   */
+  /**
+   * True when this is a `dcm.result/N` envelope rather than some other JSON.
+   *
+   * @param {*} parsed
+   * @returns {boolean}
+   */
+  function isEnvelope(parsed) {
+    return Boolean(parsed) && typeof parsed === 'object' &&
+      typeof parsed.schema === 'string' && parsed.schema.startsWith('dcm.result/');
+  }
+
+  /**
+   * Presents a query envelope that never got to count anything.
+   *
+   * The association was refused, the peer aborted, the host was unreachable, or
+   * the command line was wrong. jsonResult would throw the document away and
+   * hand back the stderr text, which is exactly backwards: `outcome`,
+   * `detail.associate`, `detail.transport` and above all
+   * `expectation.evaluated` are the fields that tell a refusal apart from an
+   * empty answer, and they live nowhere else.
+   *
+   * @param {object} parsed  The envelope.
+   * @param {string} err  Whatever the command said on stderr.
+   * @returns {object}  MCP tool result.
+   */
+  function incompleteQueryResult(parsed, err) {
+    const notes = [
+      `The query did not complete: outcome "${parsed.outcome}". NOTHING WAS COUNTED, so this is ` +
+        'not an empty result and must not be reported as one — a peer that refused the ' +
+        'association never answered the question that was asked.',
+    ];
+    const verdict = expectationNote(parsed);
+    if (verdict) notes.push(verdict);
+    if (err && err.trim()) notes.push(err.trim());
+
+    return {
+      content: [{ type: 'text', text: `${JSON.stringify(parsed, null, 2)}\n\n${notes.join('\n\n')}` }],
+      structuredContent: parsed,
+      isError: true,
+    };
+  }
+
+  function expectationNote(p) {
+    const e = p.expectation;
+    if (!e) return null;
+
+    const want = e.kind === 'nonempty'
+      ? 'at least one match'
+      : `exactly ${e.expected} match${e.expected === 1 ? '' : 'es'}`;
+
+    if (!e.evaluated) {
+      return `EXPECTATION NOT TESTED: ${e.flag} wanted ${want}, but the query never completed, so ` +
+        `nothing was counted. This is a FAILURE, not an empty result — outcome "${p.outcome}" says ` +
+        'what actually happened, and a query that was refused cannot prove the peer holds nothing.';
+    }
+    return e.held
+      ? `Expectation held: ${e.flag} wanted ${want} and the peer returned ${e.actual}.`
+      : `EXPECTATION FAILED: ${e.flag} wanted ${want}; the peer returned ${e.actual}. ` +
+        'The query itself completed, so this is a statement about what the peer holds.';
+  }
+
+  /**
    * Pushes the fidelity/injection half of a find argument vector, and returns
    * the output flag the caller has to append last.
    *
@@ -298,13 +601,14 @@ function register(server, z, rt) {
       title: 'DICOM C-FIND',
       description:
         'Query a peer for stored studies, series or instances (C-FIND). Note: a peer can accept images and still return zero matches — storing and indexing are separate operations, so zero matches is not proof a transfer failed. For Modality Worklist (what is scheduled, not what is stored) use dcm_worklist instead: the matching keys are a different vocabulary and level "mwl" here gives you no help with them. ' +
-        'For testing the peer rather than consuming its data: raw returns values as the octets carried them instead of repaired for reading, checkVr audits what came back for VR conformance violations, and injectVerbatim sends a deliberately non-conformant identifier to see how the peer handles it.',
+        'For testing the peer rather than consuming its data: raw returns values as the octets carried them instead of repaired for reading, checkVr audits what came back for VR conformance violations, injectVerbatim sends a deliberately non-conformant identifier to see how the peer handles it, and expectCount / expectEmpty / expectNonempty turn the query into an assertion that a query which never reached the peer cannot satisfy.',
       inputSchema: {
         ...peerSchema(),
-        level: z.enum(['study', 'series', 'image', 'mwl']).optional().describe('Query level (default study). "series" requires StudyInstanceUID; "image" requires StudyInstanceUID and SeriesInstanceUID. "mwl" works but prefer dcm_worklist.'),
+        level: z.enum(['study', 'series', 'image', 'mwl']).optional().describe('Query level (default study). "series" requires StudyInstanceUID; "image" requires StudyInstanceUID and SeriesInstanceUID. "mwl" works but prefer dcm_worklist — it is the one that mints worklist row handles.'),
         keys: z.record(z.string(), z.string()).optional().describe('Matching keys as DICOM keyword→value, e.g. {"PatientID":"12345"}. Values take * and ? wildcards and hyphenated date ranges. An empty value requests the key without matching on it.'),
         limit: z.number().int().optional().describe('Stop after this many matches.'),
         ...inspectionSchema(),
+        ...expectationSchema(),
       },
     },
     async (a) => {
@@ -312,6 +616,7 @@ function register(server, z, rt) {
       if (a.level && a.level !== 'study') argv.push(`--${a.level}`);
       opt(argv, '--limit', a.limit);
       const output = inspectionArgv(argv, a);
+      expectationArgv(argv, a);
       for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
       argv.push(output);
       return queryResult(await runCommand('find', argv));
@@ -338,7 +643,8 @@ function register(server, z, rt) {
     } catch {
       return jsonResult(result);
     }
-    if (!parsed || typeof parsed.count !== 'number') return jsonResult(result);
+    if (!isEnvelope(parsed)) return jsonResult(result);
+    if (typeof parsed.count !== 'number') return incompleteQueryResult(parsed, result.err);
 
     const notes = inspectionNotes(parsed);
     if (parsed.count === 0) {
@@ -348,6 +654,8 @@ function register(server, z, rt) {
           'proof that a transfer failed.'
       );
     }
+    const verdict = expectationNote(parsed);
+    if (verdict) notes.push(verdict);
 
     return {
       content: [{
@@ -364,7 +672,10 @@ function register(server, z, rt) {
     {
       title: 'Modality Worklist (C-FIND MWL)',
       description:
-        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all. Each row carries the keys the MPPS tools need — StudyInstanceUID above all — and structuredContent.mppsHandoff names which parameter of dcm_mpps_perform each one goes to, so going from a scheduled row to a performed step needs no guessing. When the worklist SCP is the thing UNDER TEST rather than the thing being consumed, checkVr audits what it returned for VR conformance violations and fails on any, raw returns the values as the octets carried them, and injectVerbatim sends a deliberately non-conformant identifier to see how it copes.',
+        'Ask a worklist SCP what is SCHEDULED — which patients and procedures are booked on a modality, and when. This is scheduling data, not stored images: a study appearing here has not necessarily been acquired, and one that has been acquired may already have left the worklist. Matching keys are a different vocabulary from a study query (ScheduledProcedureStepStartDate, ScheduledStationAETitle, Modality, ScheduledPerformingPhysicianName, RequestedProcedureDescription, AccessionNumber, PatientID, PatientName) and the scheduling ones belong inside the Scheduled Procedure Step Sequence — the engine places them there for you and flattens them back out in the answer, which is why a hand-built flat worklist query usually returns nothing. An empty worklist is a legitimate answer, not a fault: nothing may be booked for that date, station or modality. Before concluding the SCP is broken, retry with scheduledDate "any" and no other filters to see whether it returns anything at all — or state expectEmpty, which fails rather than passes when the query never reached the peer. ' +
+        'EVERY ROW CARRIES A HANDLE, matches[i]._handle, and the handles are listed in order in rowHandles.handles. Pass one as worklistRow to dcm_mpps_perform or dcm_mpps_start and that row becomes the performed step: the handle is resolved inside this server back to the full set of attributes the row arrived with, so nothing is retyped and nothing is dropped — including ReferencedStudySequence, ScheduledProtocolCodeSequence, ProcedureCodeSequence and ReferencedPatientSequence, which no named parameter can carry. Handles live in this server process only and are never written to disk. THIS IS THE WAY TO GO FROM A SCHEDULED ROW TO A PERFORMED STEP. The named parameters still work, still win over the handle when both are given, and are the right tool for correcting a value rather than carrying one; structuredContent.mppsHandoff.parameters is that mapping. ' +
+        'When the worklist SCP is the thing UNDER TEST rather than the thing being consumed, checkVr audits what it returned for VR conformance violations and fails on any, raw returns the values as the octets carried them along with the per-element sidecar, injectVerbatim sends a deliberately non-conformant identifier to see how it copes, and the expect parameters turn the query into an assertion. ' +
+        'Note that this tool always asks for the octets and renders them for reading unless raw is set, so a value the peer sent malformed is shown as it arrived rather than as a parser would repair it — for a conformant value the two are the same text.',
       inputSchema: {
         ...peerSchema(),
         modality: z.string().optional().describe('Modality the procedure is scheduled on, e.g. CT, MR, CR, US.'),
@@ -376,6 +687,7 @@ function register(server, z, rt) {
         keys: z.record(z.string(), z.string()).optional().describe(`Any other matching key as DICOM keyword→value, for what the named parameters do not cover: ${EXTRA_MWL_KEYS}. A named parameter wins if it sets the same key.`),
         limit: z.number().int().optional().describe('Stop after this many scheduled procedures.'),
         ...inspectionSchema(),
+        ...expectationSchema(),
       },
     },
     async (a) => {
@@ -415,11 +727,22 @@ function register(server, z, rt) {
       const argv = peerArgv(a);
       argv.push('--mwl');
       opt(argv, '--limit', a.limit);
-      const output = inspectionArgv(argv, a);
+      // ALWAYS --json-raw, whatever `raw` says, because the handle has to hold
+      // the row as it arrived. The rendered form is the one --from-worklist
+      // refuses by name: it stringifies a sequence and blanks an empty one, so
+      // a handle minted from it would carry exactly the attributes an N-CREATE
+      // has to echo back, as text a dataset writer cannot encode.
+      //
+      // What the caller asked for still decides what it is SHOWN — see
+      // worklistResult, which renders these same values through find's own
+      // display() when raw was not asked for. One query, one association, both
+      // answers.
+      const output = inspectionArgv(argv, { ...a, raw: true });
+      expectationArgv(argv, a);
       for (const [k, v] of pairs) argv.push(`${k}=${v}`);
       argv.push(output);
 
-      return worklistResult(await runCommand('find', argv));
+      return worklistResult(await runCommand('find', argv), a);
     }
   );
 
@@ -439,41 +762,134 @@ function register(server, z, rt) {
    * violations as a plain success would turn the one parameter meant to be a
    * gate into a parameter that reports and shrugs.
    *
+   * A stated expectation is the other exception, and for the same reason:
+   * expectEmpty is asked for precisely so that "nothing is scheduled" and "the
+   * query never reached the peer" stop being the same result, and reporting a
+   * failed expectation as a success would make the parameter decorative.
+   *
    * @param {{code:number, out:string, err:string}} result  From runCommand.
+   * @param {object} a  Tool arguments, for what the caller asked to be shown.
    * @returns {object}  MCP tool result.
    */
-  function worklistResult(result) {
+  function worklistResult(result, a) {
     let parsed;
     try {
       parsed = JSON.parse(result.out);
     } catch {
       return jsonResult(result);
     }
-    if (!parsed || typeof parsed.count !== 'number') return jsonResult(result);
+    if (!isEnvelope(parsed)) return jsonResult(result);
+    // The leniency below is for an empty ANSWER. A query that never reached the
+    // peer counted nothing at all, and presenting that as a legitimate empty
+    // worklist is the single most expensive mistake this tool could make.
+    if (typeof parsed.count !== 'number') return incompleteQueryResult(parsed, result.err);
 
-    const notes = inspectionNotes(parsed);
+    const rawMatches = Array.isArray(parsed.matches) ? parsed.matches : [];
+    const shown = presentRows(rawMatches, parsed.peer, Boolean(a && a.raw));
+
+    const notes = inspectionNotes({ ...parsed, raw: Boolean(a && a.raw) });
     notes.push(parsed.count === 0
       ? 'No scheduled procedures matched. That is a legitimate answer — nothing may be ' +
         'booked for this date, station or modality. Re-run with scheduledDate "any" and no ' +
-        'other filters before concluding the worklist SCP is at fault.'
-      : 'To report what was performed against one of these rows, pass its keys to ' +
-        'dcm_mpps_perform as named parameters: StudyInstanceUID as studyUid, ' +
-        'AccessionNumber as accessionNumber, ScheduledProcedureStepID as scheduledStepId, ' +
-        'Modality as modality, and the patient keys likewise. The full mapping is in ' +
-        'structuredContent.mppsHandoff. Do not write these rows to a file and pass them as ' +
-        'fromWorklist: this JSON is rendered for reading, and the MPPS commands refuse it ' +
-        'by name.');
+        'other filters before concluding the worklist SCP is at fault. If you need "the ' +
+        'schedule really is empty" to be distinguishable from "the query never reached the ' +
+        'peer", state expectEmpty: a refused association does not satisfy it.'
+      : 'To report what was performed against one of these rows, pass its handle: ' +
+        `dcm_mpps_perform { worklistRow: "${shown.handles[0] ?? 'matches[i]._handle'}", folder: ..., host, port, calledAe }. ` +
+        'The handle is resolved here, in memory, to every attribute that row arrived with — ' +
+        'including the sequences that have no named parameter — so nothing has to be restated ' +
+        'and nothing is lost. Handles are valid for the life of this server process only and ' +
+        'are written nowhere; if one is refused, re-run this query rather than rebuilding the ' +
+        'row by hand. The named parameters (structuredContent.mppsHandoff.parameters) still ' +
+        'work and override the handle, which is how a value the worklist got wrong is ' +
+        'corrected.');
+
+    const verdict = expectationNote(parsed);
+    if (verdict) notes.push(verdict);
 
     // Additive: `count` and `matches` keep the shape every existing consumer
-    // reads. The handoff table rides along so the mapping is machine-readable
-    // and not only prose in the note above.
-    const structured = parsed.count === 0 ? parsed : { ...parsed, mppsHandoff: MPPS_HANDOFF };
+    // reads. `raw` is reported as what the caller is looking at rather than as
+    // what went on the wire — the query is always raw now, and a document
+    // claiming raw values while showing rendered ones would be the more
+    // misleading of the two.
+    const structured = {
+      ...parsed,
+      raw: Boolean(a && a.raw),
+      matches: shown.rows,
+      ...(rawMatches.length ? { rowHandles: shown.block, mppsHandoff: MPPS_HANDOFF } : {}),
+    };
 
     const violations = Array.isArray(parsed.vrViolations) ? parsed.vrViolations.length : 0;
+    const expectationFailed = Boolean(parsed.expectation) && parsed.expectation.held !== true;
     return {
       content: [{ type: 'text', text: JSON.stringify(structured, null, 2) + `\n\n${notes.join('\n\n')}` }],
       structuredContent: structured,
-      isError: violations > 0,
+      isError: violations > 0 || expectationFailed,
+    };
+  }
+
+  /**
+   * Mints a handle per row and produces the rows to show.
+   *
+   * The rendering is find's own: `display()` is required from the command
+   * rather than reimplemented, and the loop is the one find's own `--json`
+   * branch runs, so the two cannot drift into two different ideas of what a
+   * Person Name looks like.
+   *
+   * One consequence worth knowing, and it is an improvement rather than a
+   * surprise: these values are rendered from the OCTETS. Where a peer sent
+   * something a parser would quietly repair — PatientWeight as "12.5 kg" —
+   * the repair no longer happens on the way to a rendered row, so what is shown
+   * is what arrived. For a conformant value the two are identical.
+   *
+   * @param {Array<object>} rawMatches  Rows exactly as --json-raw produced them.
+   * @param {object|undefined} peer  The envelope's peer block, for provenance.
+   * @param {boolean} wantsRaw
+   * @returns {{rows: Array<object>, handles: string[], block: object}}
+   */
+  function presentRows(rawMatches, peer, wantsRaw) {
+    const { display } = require('../find');
+
+    const rows = [];
+    const handles = [];
+
+    rawMatches.forEach((raw, i) => {
+      const attributes = attributesOf(raw);
+      const rendered = {};
+      for (const [key, value] of Object.entries(attributes)) rendered[key] = display(value);
+
+      const handle = mintWorklistHandle(attributes, {
+        peer: peer ?? null,
+        index: i + 1,
+        of: rawMatches.length,
+        label:
+          `${rendered.PatientName || '(no name)'} · Accession ${rendered.AccessionNumber || '(none)'} · ` +
+          `Study ${rendered.StudyInstanceUID || '(none)'}`,
+      });
+      handles.push(handle);
+
+      // On the row itself, where an assistant is already looking, and
+      // underscore-prefixed like `_elements` because it is not an attribute.
+      // That prefix is load-bearing rather than cosmetic: every consumer of a
+      // worklist item in this repo — src/lib/mpps.js, src/lib/worklist.js,
+      // find's own renderer — drops underscore keys, so a handle cannot be
+      // re-encoded as a DICOM element even if the whole row is fed back in.
+      rows.push({ ...(wantsRaw ? raw : rendered), _handle: handle });
+    });
+
+    return {
+      rows,
+      handles,
+      block: {
+        parameter: 'worklistRow',
+        acceptedBy: ['dcm_mpps_perform', 'dcm_mpps_start'],
+        handles,
+        resolvedServerSide: true,
+        lifetime:
+          'this MCP server process only. Nothing is written to disk, and the last ' +
+          `${MAX_WORKLIST_ROWS} rows minted are kept; older ones are refused with a message ` +
+          'saying to re-query.',
+      },
     };
   }
 
@@ -628,6 +1044,50 @@ function register(server, z, rt) {
 
   // ---- Modality Performed Procedure Step ---------------------------------
 
+  /**
+   * The injection parameter on the two N-CREATE verbs.
+   *
+   * Whether an assistant should be able to send a deliberately non-conformant
+   * MPPS at all is the one real judgement call in this module, so the reasoning
+   * is here rather than only in a report:
+   *
+   * FOR. Coercion is a property only the peer can answer, and it cannot be
+   * asked any other way. Does the SCP truncate a 20-character
+   * PerformedStationAETitle or refuse it? Does it accept a lowercase Code
+   * String? Does it accept an EMPTY Type 1 and then never reconcile the step —
+   * the exact silent failure this whole command group exists to make visible?
+   * Every one of those is a question about a system NewLumen's CI points at,
+   * and the CLI can already ask them. Withholding it over MCP would not make
+   * the malformed N-CREATE unsendable; it would only make it unaskable by the
+   * one participant that is going to be asked to test the server.
+   *
+   * AGAINST, and it is not small. Unlike the C-FIND injection, THIS WRITES. An
+   * N-CREATE puts a record into a RIS, and an assistant that reached for this
+   * to get past a refusal would write a deliberately malformed clinical record
+   * into a live system while believing it had fixed something.
+   *
+   * SO: offered on dcm_mpps_start and dcm_mpps_perform, where it reaches the
+   * N-CREATE, and NOT on dcm_mpps_update, dcm_mpps_complete or
+   * dcm_mpps_discontinue, where it would reach the N-SET. That line is not
+   * squeamishness about the N-SET; it is that PerformedProcedureStepStatus
+   * lives there, and a parameter that can stamp COMPLETED into the closing
+   * message is a way to assert that work is fully accounted for when the tool
+   * knows it is not. dcm_mpps_perform refusing to say COMPLETED on a shortfall
+   * is the rule this group is built on, and no parameter here may offer a way
+   * round it. On perform the injection reaches the N-CREATE only, so that rule
+   * is untouched. The CLI still has --set on all five verbs for someone who has
+   * read what it does.
+   */
+  const MPPS_INJECT_DESCRIPTION =
+    'A CONFORMANCE TEST INSTRUMENT, AND IT WRITES: stamp values into the outgoing N-CREATE dataset VERBATIM, with no client-side checking of any kind — ' +
+    'not the length, not the VR\'s character repertoire, not an enumeration, not whether a UID is a UID (`dcm mpps --set`). Given as {"PerformedStationAETitle": "STATION-NAME-FAR-TOO-LONG"} or {"ScheduledStepAttributesSequence/StudyInstanceUID": "not-a-uid"}. ' +
+    'IT EXISTS TO SEND SOMETHING WRONG ON PURPOSE AND SEE HOW THE SERVER COERCES IT — does it truncate an over-long AE Title or refuse it, does it take a lowercase Code String, does it accept an EMPTY Type 1 and then never reconcile the step. That last one is the silent failure this whole tool group exists to expose, and it cannot be asked any other way. ' +
+    'IT IS NEVER THE WAY TO MAKE A REFUSED STEP GO THROUGH. A refusal is a real answer about the peer or about the attributes; stamping a value past it replaces a finding with a fabricated record in someone\'s RIS. Unlike a query, this MESSAGE CREATES A CLINICAL RECORD ON THE FAR END — one that a person will later see attached to a patient. ' +
+    'Applied last, so it overwrites what the named parameters and the worklist row produced, and NOT routed into ScheduledStepAttributesSequence the way a scheduled-step attribute is — name the path if that is where it belongs. An unknown or private tag is refused rather than injected, because the encoder would drop it without saying so. ' +
+    'THE LOCAL TYPE 1 CHECK IS LIFTED FOR EXACTLY THE ATTRIBUTES NAMED HERE, and for no others: {"Modality": ""} really does go out present-and-empty, while every attribute you did not name is still checked, so an accidental empty Type 1 stays impossible. ' +
+    'The dataset is encoded and read back BEFORE any association is opened, including on a dry run, and the call is REFUSED if an injected value did not survive byte for byte — the writer silently shortens an over-long value, so an over-long AE Title would otherwise leave as a perfectly legal 16-character one and a test written to prove the server rejects it would pass without ever having asked. ' +
+    'Every injection is named in the result under "injected". Reaches the N-CREATE only; the closing N-SET is deliberately out of reach, because a parameter that could stamp PerformedProcedureStepStatus into it would be a way to claim COMPLETED for work this tool knows was not fully acknowledged.';
+
   // `dcm mpps` is not in the runtime's default command table. The table is the
   // set the first tool modules needed, not a closed list, so a module that
   // drives a command missing from it registers that command here rather than
@@ -666,21 +1126,70 @@ function register(server, z, rt) {
     startDate: z.string().optional().describe('YYYYMMDD the step started. Default: today, local time on this machine.'),
     startTime: z.string().optional().describe('HHMMSS the step started. Default: now, local time on this machine.'),
     mppsUid: z.string().optional().describe('Use this MPPS SOP Instance UID rather than generating one. Either way the UID is returned, and it remains the only handle on the step: nothing here writes it down and MPPS has no query service, so keep it if the step will be updated or closed by a later call.'),
+    worklistRow: z.string().optional().describe(
+      'AN OPAQUE ROW HANDLE FROM dcm_worklist — matches[i]._handle, also listed in order in rowHandles.handles. THIS IS THE WAY TO TURN A SCHEDULED ROW INTO A PERFORMED STEP. ' +
+      'The handle is resolved inside this MCP server back to every attribute that row arrived with and handed to the command as the worklist item, so nothing is transcribed and nothing is guessed. ' +
+      'It carries what the named parameters above CANNOT: ReferencedStudySequence, ScheduledProtocolCodeSequence, ProcedureCodeSequence and ReferencedPatientSequence have no parameter here, and an N-CREATE that drops them is a step the RIS has less to reconcile on than it should. ' +
+      'The named parameters still win over it, attribute by attribute, which is how a value the worklist got wrong is corrected without abandoning the rest of the row. ' +
+      `Handles live in THIS SERVER PROCESS ONLY — nothing about them is written to disk, and the last ${MAX_WORKLIST_ROWS} minted are kept. ` +
+      'An unknown or aged-out handle is refused with a message telling you to re-run dcm_worklist; do NOT rebuild the row from an earlier answer in the conversation, because a row reassembled from what was displayed has lost exactly the sequences the handle exists to carry. ' +
+      'Cannot be combined with fromWorklist, which names a different worklist.'),
     fromWorklist: z.string().optional().describe(
-      'Path to a JSON file of worklist attributes, as written by `dcm find --mwl --json-raw`. It is NOT the output of dcm_worklist or `dcm find --mwl --json`: that form is rendered for people to read, which turns sequences into strings, and it is refused by name rather than sent malformed. Over MCP prefer the named parameters above — they carry the same values with no file involved. Named parameters win over anything in the file.'),
+      'Path to a JSON file of worklist attributes on this machine, as written by `dcm find --mwl --json-raw` (its "matches" array is read directly), or a bare array, or an object with an "items" array. ' +
+      'It is NOT the output of dcm_worklist or `dcm find --mwl --json`: that form is rendered for people to read, which turns sequences into strings, and it is refused by name rather than sent malformed. ' +
+      'Over MCP prefer worklistRow, which carries the same attributes from a query you just ran with no file involved. Use this one for a fixture file that already exists on disk. ' +
+      'Named parameters win over anything in the file. A file holding several rows must be narrowed — by studyUid, accessionNumber, worklistIndex or worklistFirst — because a performed procedure step describes exactly one.'),
+    worklistIndex: z.number().int().optional().describe(
+      'Which row of fromWorklist to take, numbered from 1 as the refusal that lists them numbers them. It counts the rows LEFT AFTER studyUid and accessionNumber have filtered, not the rows in the file. Refused without fromWorklist, and refused alongside worklistFirst — which is worklistIndex 1.'),
+    worklistFirst: z.boolean().optional().describe(
+      'Take the first row of fromWorklist, for a query written to return exactly one. Refused without fromWorklist. Note that the default refusal when a file holds several rows is deliberate: a step quietly attributed to the wrong order looks identical to a correct one.'),
+    injectVerbatim: z.record(z.string(), z.string()).optional().describe(MPPS_INJECT_DESCRIPTION),
   });
 
   /**
-   * Builds the attribute half of an mpps argument vector.
+   * Builds the attribute half of an mpps argument vector, and the standard
+   * input the command will need if a row handle was given.
    *
    * @param {object} a  Tool arguments.
-   * @returns {string[]}
+   * @returns {{argv: string[], stdin: string|undefined, row: object|undefined}}
+   * @throws {HandleError} When the handle is unknown, or contradicts fromWorklist.
    */
-  const stepArgv = (a) => {
+  const stepPlan = (a) => {
     const argv = [];
-    // First, so the explicit parameters below override what the file carries —
-    // the same precedence the CLI has.
-    opt(argv, '--from-worklist', a.fromWorklist);
+    let stdin;
+    let row;
+    let handle;
+
+    // First, so the explicit parameters below override what the worklist
+    // carries — the same precedence the CLI has.
+    if (a.worklistRow !== undefined && a.worklistRow !== '') {
+      if (a.fromWorklist) {
+        throw new HandleError(
+          'worklistRow and fromWorklist name two different worklists, and a performed procedure ' +
+            'step describes one scheduled step. Give one: worklistRow for a row from a ' +
+            'dcm_worklist answer, fromWorklist for a file on this machine.'
+        );
+      }
+      if (a.worklistIndex !== undefined || a.worklistFirst) {
+        throw new HandleError(
+          'worklistRow already names one row, so there is nothing for worklistIndex or ' +
+            'worklistFirst to pick from. Those two select a row out of a fromWorklist FILE; ' +
+            'to perform a different scheduled row, pass that row\'s own handle.'
+        );
+      }
+      handle = a.worklistRow;
+      row = resolveWorklistHandle(handle);
+      // The shape `dcm find --mwl --json-raw` writes, which is what
+      // --from-worklist reads, so the handle path and the shell pipeline
+      // NewLumen's CI uses are the same code on the far side.
+      stdin = JSON.stringify({ matches: [row.row] });
+      argv.push('--from-worklist', '-');
+    } else {
+      opt(argv, '--from-worklist', a.fromWorklist);
+      opt(argv, '--index', a.worklistIndex);
+      if (a.worklistFirst) argv.push('--first');
+    }
+
     opt(argv, '--study-uid', a.studyUid);
     opt(argv, '--accession', a.accessionNumber);
     opt(argv, '--scheduled-step-id', a.scheduledStepId);
@@ -705,8 +1214,44 @@ function register(server, z, rt) {
     // behalf. Described separately on each tool, because what it does to the
     // C-STORE differs between them.
     if (a.unscheduled) argv.push('--unscheduled');
-    return argv;
+
+    // Last, which is also where the command applies them: --set overwrites
+    // whatever the flags and the worklist produced. Two tokens rather than the
+    // attached form, because `set` is pair-valued in the tokenizer and the
+    // token after it is taken as its value.
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+
+    return { argv, stdin, row, handle };
   };
+
+  /**
+   * Turns a HandleError into a tool result, and lets anything else through.
+   *
+   * A refused handle is a mistake in the call, not a failure of a procedure
+   * step: nothing was sent, no step was opened, and reporting it through
+   * mppsResult would produce a document describing a transaction that never
+   * started.
+   *
+   * @param {Error} err
+   * @returns {object|null} A tool result, or null if this is not ours.
+   */
+  function handleFailure(err) {
+    if (!(err instanceof HandleError)) return null;
+    return { content: [{ type: 'text', text: err.message }], isError: true };
+  }
+
+  /**
+   * Runs an mpps verb, through a child process when a row has to reach it on
+   * standard input.
+   *
+   * @param {string[]} argv  Arguments after `mpps`, e.g. ['perform', folder, ...].
+   * @param {string|undefined} stdin
+   * @returns {Promise<{code:number, out:string, err:string}>}
+   */
+  function runMpps(argv, stdin) {
+    if (stdin === undefined) return runCommand('mpps', argv);
+    return runCliWithStdin(['mpps', ...argv], stdin);
+  }
 
   /**
    * What --unscheduled means, for the half of the description both tools share.
@@ -927,9 +1472,10 @@ function register(server, z, rt) {
    * the moment it needs them.
    *
    * @param {{code:number, out:string, err:string}} result  From runCommand.
+   * @param {object} [plan]  From stepPlan(), when a worklist row was resolved.
    * @returns {object}  MCP tool result.
    */
-  function mppsResult(result) {
+  function mppsResult(result, plan) {
     let parsed;
     try {
       parsed = JSON.parse(result.out);
@@ -939,11 +1485,55 @@ function register(server, z, rt) {
       return textResult(result);
     }
 
+    const notes = [];
+    // Which row became this step, first, because it is the first thing anyone
+    // asks when a step is attributed to the wrong order — and with a handle
+    // there is no file left anywhere to go back and look at. The command's own
+    // document records the source as "standard input", which is true and says
+    // nothing about which row that was.
+    const structured = plan && plan.row
+      ? { ...parsed, worklistRow: rowProvenance(plan) }
+      : parsed;
+    if (plan && plan.row) {
+      notes.push(
+        `Step attributes came from worklist row ${plan.row.index} of ${plan.row.of} — ` +
+          `${plan.row.label} — queried at ${plan.row.mintedAt}` +
+          (plan.row.peer ? ` from ${plan.row.peer.calledAe} at ${plan.row.peer.host}:${plan.row.peer.port}` : '') +
+          '. The handle was resolved in this server and the whole row was handed to the command, ' +
+          'so nothing was retyped and the sequence-valued attributes travelled with it.'
+      );
+    }
+
     const note = mppsNote(parsed);
+    if (note) notes.push(note);
+
     return {
-      content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) + (note ? `\n\n${note}` : '') }],
-      structuredContent: parsed,
+      content: [{ type: 'text', text: JSON.stringify(structured, null, 2) + (notes.length ? `\n\n${notes.join('\n\n')}` : '') }],
+      structuredContent: structured,
       isError: parsed.ok !== true,
+    };
+  }
+
+  /**
+   * The provenance block for a step built from a row handle.
+   *
+   * The row itself is deliberately not copied in: it is already the step's
+   * attributes, and a second copy would be a second thing to keep in step with
+   * the first.
+   *
+   * @param {object} plan  From stepPlan().
+   * @returns {object}
+   */
+  function rowProvenance(plan) {
+    return {
+      handle: plan.handle,
+      index: plan.row.index,
+      of: plan.row.of,
+      label: plan.row.label,
+      queriedAt: plan.row.mintedAt,
+      queriedFrom: plan.row.peer,
+      resolvedServerSide: true,
+      writtenToDisk: false,
     };
   }
 
@@ -957,7 +1547,8 @@ function register(server, z, rt) {
         'PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing, because naming a SOP Instance UID the archive does not hold is a fabricated clinical record that everything downstream believes. Instances stored with a warning status are referenced (the archive holds them) but do not count as acknowledged, so a run with warnings still ends DISCONTINUED. ' +
         'What this tool reports is what the MPPS SCP answered. It cannot see the worklist: if the item stops appearing in dcm_worklist afterwards, that is the SCP correlating the step to the order, not proof that this call changed anything. ' +
         'WHEN THE IMAGES DO NOT CARRY THE WORKLIST\'S STUDY INSTANCE UID this is refused by default, because the step would name one study and the images would belong to another and the archive would never reconcile them. That is the normal state of affairs when rehearsing a worklist against stock or phantom images, and adoptWorklistIdentity is the answer to it: it stamps the worklist\'s identity onto a COPY of the images, which is exactly what a real modality does with a UID the RIS invented before the patient was on the table. allowStudyMismatch is the other way past the refusal and means something quite different — send them as they are and accept that nothing reconciles. Neither is implied by any other parameter. ' +
-        'Take the step attributes from a dcm_worklist row — StudyInstanceUID as studyUid above all. To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it. Use dryRun to see the N-CREATE without connecting, including the re-stamp that would be applied. ' +
+        'TAKE THE STEP ATTRIBUTES FROM A dcm_worklist ROW BY PASSING ITS HANDLE as worklistRow (matches[i]._handle). The handle is resolved inside this server to every attribute the row arrived with, sequences included, so nothing is retyped; the named parameters below still work, still override it, and are the way to correct a value rather than carry one. ' +
+        'To exercise the whole loop locally with no PACS, start dcm_receiver_start with a worklist file and point both the MPPS and the storage side at it — and to see what this does when the far end misbehaves, arm that receiver with refuseNCreate, refuseNSet or rejectAfter, which is how a genuine shortfall and a genuine refusal are produced rather than imagined. Use dryRun to see the N-CREATE without connecting, including the re-stamp that would be applied. ' +
         'Two paths worth knowing about: updateEachChunk sends an interim N-SET at each chunk boundary carrying only what the archive has acknowledged so far, and unscheduled reports work no order lies behind, where the step names no study but the C-STORE still uses the folder\'s own.',
       inputSchema: {
         folder: z.string().describe('Folder of DICOM files that were produced. Must hold exactly one study: a performed procedure step describes one study, and Study Instance UID is what the RIS reconciles on. adoptWorklistIdentity does not relax this — stamping one identity onto two studies would merge them into a study that never existed, so a folder holding several is refused and has to be split.'),
@@ -994,7 +1585,16 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = ['perform', a.folder, ...peerArgv(a), ...stepArgv(a)];
+      let plan;
+      try {
+        plan = stepPlan(a);
+      } catch (err) {
+        const refused = handleFailure(err);
+        if (refused) return refused;
+        throw err;
+      }
+
+      const argv = ['perform', a.folder, ...peerArgv(a), ...plan.argv];
       opt(argv, '--store-host', a.storeHost);
       opt(argv, '--store-port', a.storePort);
       opt(argv, '--store-called-ae', a.storeCalledAe);
@@ -1021,7 +1621,7 @@ function register(server, z, rt) {
       if (a.recurse === false) argv.push('--no-recurse');
       argv.push('--json');
 
-      return mppsResult(await runCommand('mpps', argv));
+      return mppsResult(await runMpps(argv, plan.stdin), plan);
     }
   );
 
@@ -1034,6 +1634,7 @@ function register(server, z, rt) {
         'Use this only when the images are sent by something else, or when the step has to stay open while other work happens; dcm_mpps_perform does start, store and close as one transaction and is the usual choice. ' +
         'Every Type 1 attribute is checked here before anything goes on the wire, and a missing one is refused by name. That is not belt and braces: many SCPs accept an N-CREATE carrying an empty Type 1, answer success, and then never reconcile the step against the order, so from this end it looks like it worked and days later the order is still open. ' +
         'A step opened here can be refreshed while it runs with dcm_mpps_update (an interim N-SET, which leaves it open) and must eventually be closed with dcm_mpps_complete or dcm_mpps_discontinue. Two shapes are reachable from here that a scheduled study does not need: unscheduled, for work no order lies behind, and studyUids, for one step that fulfils several scheduled steps. ' +
+        'To open a step against a scheduled row, pass that row\'s handle as worklistRow: it is resolved inside this server to every attribute the row arrived with, including the sequences no named parameter here can carry. ' +
         'Opening a step says nothing about the worklist entry — whether the SCP moves the scheduled step to ARRIVED or STARTED is its business and is not visible from here.',
       inputSchema: {
         ...peerSchema(),
@@ -1049,16 +1650,25 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = ['start', ...peerArgv(a), ...stepArgv(a)];
-      // After stepArgv, so an explicit studyUid stays item 1 and the order here
-      // is the order the sequence comes out in. The CLI accumulates repeated
-      // --study-uid into one item each; nothing needs deduplicating, because
-      // two identical UIDs would be two identical orders and the operator is
-      // the one who can say whether that was meant.
+      let plan;
+      try {
+        plan = stepPlan(a);
+      } catch (err) {
+        const refused = handleFailure(err);
+        if (refused) return refused;
+        throw err;
+      }
+
+      const argv = ['start', ...peerArgv(a), ...plan.argv];
+      // After the step arguments, so an explicit studyUid stays item 1 and the
+      // order here is the order the sequence comes out in. The CLI accumulates
+      // repeated --study-uid into one item each; nothing needs deduplicating,
+      // because two identical UIDs would be two identical orders and the
+      // operator is the one who can say whether that was meant.
       for (const uid of a.studyUids || []) opt(argv, '--study-uid', uid);
       if (a.dryRun) argv.push('--dry-run');
       argv.push('--json');
-      return mppsResult(await runCommand('mpps', argv));
+      return mppsResult(await runMpps(argv, plan.stdin), plan);
     }
   );
 
@@ -1072,7 +1682,7 @@ function register(server, z, rt) {
         'PERFORMED SERIES REPLACE, THEY DO NOT APPEND. N-SET is attribute-level replacement (PS3.4 F.7.2), so an update naming only the series acquired since the last one does not add them — it ERASES the earlier ones. Every update has to carry the CUMULATIVE sequence, which is what pointing seriesFrom at a growing folder does for you. ' +
         'OMITTING seriesFrom IS NOT THE SAME AS SENDING AN EMPTY ONE AND MUST NOT BE READ AS ERASING ANYTHING. With seriesFrom left off, PerformedSeriesSequence is absent from the dataset entirely and whatever the step already holds survives untouched — that is the default, and it is what "report progress, do not restate the performed series" means. A seriesFrom folder that scans to nothing is the opposite: a PRESENT, EMPTY sequence, which wipes what the step holds. That case is warned about loudly in the result. ' +
         'TWO WIRE SHAPES, BOTH LEGAL AND BOTH COMMON, and a receiver that handles one and not the other fails in production rather than in testing — which is why both are reachable here. By default the update carries PerformedProcedureStepStatus IN PROGRESS, re-asserting the step is running. With omitStatus the attribute is ABSENT from the dataset entirely, which tells the receiver "these attributes changed, the step is still running" and leaves its own status alone. ' +
-        'BOTH SHAPES ARE REHEARSABLE against dcm_receiver_start, which accepts the status-bearing update and the status-absent one. Against a real peer, try both: this is exactly the message receivers are least likely to have been tested against, and a 0x0106 on the status-bearing shape is a real finding — PS3.4 F.7.2-1 lists PerformedProcedureStepStatus among the attributes an N-SET may carry, and a receiver that refuses it is why modalities give up mid-exam and leave a worklist entry uncleared. ' +
+        'BOTH SHAPES ARE REHEARSABLE against dcm_receiver_start, which accepts the status-bearing update and the status-absent one — and dcm_receiver_start { refuseNSet: "0x0106" } makes it REFUSE the interim while still allowing the close, so the failure below can be driven against a real association instead of imagined. Against a real peer, try both: this is exactly the message receivers are least likely to have been tested against, and a 0x0106 on the status-bearing shape is a real finding — PS3.4 F.7.2-1 lists PerformedProcedureStepStatus among the attributes an N-SET may carry, and a receiver that refuses it is why modalities give up mid-exam and leave a worklist entry uncleared. ' +
         'An update cannot change what the step IS. Patient identity, the scheduled step and its Study Instance UID, PerformedProcedureStepID, the station AE, the start date and time and the modality are all N-CREATE-only; the parameters that would carry them are not offered here, and an end date or time is refused because an end time on a step still reporting IN PROGRESS is a contradiction some receivers resolve by closing the step under you. ' +
         'As with every verb here, what the SCP then does with the scheduled procedure step is not visible from this end.',
       inputSchema: {
