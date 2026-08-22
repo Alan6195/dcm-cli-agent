@@ -383,6 +383,31 @@ async function runSmoke(win, app) {
       s.cmds.forEach((c) => process.stdout.write(`sweep run: ${c}\n`));
       process.stdout.write(`sweep hint: ${s.hint}\n`);
       fs.writeFileSync(path.join(outDir, 'speed-sweep-cmds.txt'), s.cmds.join('\n') + '\n');
+      fs.writeFileSync(path.join(outDir, 'speed-parallel-hint.txt'), s.hint + '\n');
+
+      // The line that tells the operator how to read the sweep afterwards.
+      //
+      // It used to promise that a preset the receiver will not accept "still
+      // acknowledges every instance and comes back narrow rather than short or
+      // slow", and send the reader away from the Ack column on the strength of
+      // it. The retry has no backoff, so the other ending — attempts exhausted
+      // in milliseconds, instances never acknowledged, exit 1 — is reachable
+      // and was measured. A screen may not promise either ending, and may not
+      // point away from the column that shows the one it did not mention.
+      for (const banned of [
+        /not the\s+Ack column/i,
+        /still\s+acknowledges every instance/i,
+        /comes back narrow rather than short or slow/i,
+      ]) {
+        if (banned.test(s.hint)) {
+          throw new Error(`the ceiling hint still promises every instance is acknowledged: ${s.hint}`);
+        }
+      }
+      for (const needed of [/Width column/, /Ack column/, /no\s+backoff/, /never acknowledged/]) {
+        if (!needed.test(s.hint)) {
+          throw new Error(`the ceiling hint is missing ${needed}: ${s.hint}`);
+        }
+      }
       for (const preset of ['normal', 'fast', 'very-fast', 'insane']) {
         if (!s.cmds.some((c) => c.includes(`--speed ${preset}`))) {
           throw new Error(`the sweep does not run ${preset}: ${JSON.stringify(s.cmds)}`);
@@ -523,6 +548,175 @@ async function runSmoke(win, app) {
       // run further down expects to find.
       await win.webContents.executeJavaScript(`(() => {
         document.querySelector('#speed-mode .chip[data-mode="syntax"]').click();
+        return true;
+      })()`);
+    }
+
+    // ---------------------------------------------------------------------
+    // A sweep with a failed run in it, rendered from known JSON.
+    //
+    // The live sweep further down needs a receiver, and a receiver the harness
+    // starts accepts everything, so the case that matters most on this screen
+    // is the one a live run cannot produce: a run that lost instances sitting
+    // in the table beside a run that did not. It is fed in the exact shape
+    // `dcm send --json` emits, the same way the worklist section feeds
+    // renderWorklist its matches.
+    //
+    // The numbers are the ones that make the defect visible. The Fast run dies
+    // partway — 60 of 100 acknowledged — and because it died early its MB/s is
+    // the HIGHEST in the sweep: 11.9 against 6.3 for the run that actually
+    // finished. That is not a corner case invented for the test, it is the
+    // normal shape of the reading, and it is why a rate is not printed for it
+    // and why it may not be badged.
+    {
+      const SYN = [{ name: 'Implicit VR Little Endian' }];
+      const mk = (o) => Object.assign({
+        negotiatedTransferSyntaxes: SYN, found: 100, acknowledged: 100, sent: 100,
+      }, o);
+      const fixture = [
+        { run: { title: 'normal · 1 association', callingAe: 'BENCH-1' }, code: 0,
+          data: mk({ ok: true, parallel: 1, parallelAchieved: 1, elapsedMs: 8180,
+            megabytesPerSecond: 4.1, instancesPerSecond: 12.22, bytesSent: 35127296,
+            studies: [{ instances: 100, chunks: 1 }] }) },
+        // The one the table used to render as an ordinary row.
+        { run: { title: 'fast · 4 associations', callingAe: 'BENCH-2' }, code: 1,
+          data: mk({ ok: false, acknowledged: 60, parallel: 4, parallelAchieved: 3,
+            elapsedMs: 2110, megabytesPerSecond: 11.9, instancesPerSecond: 28.44,
+            bytesSent: 21076377, studies: [{ instances: 100, chunks: 4 }] }) },
+        { run: { title: 'very-fast · 8 associations', callingAe: 'BENCH-3' }, code: 0,
+          data: mk({ ok: true, parallel: 8, parallelAchieved: 4, elapsedMs: 5320,
+            megabytesPerSecond: 6.3, instancesPerSecond: 18.79, bytesSent: 35127296,
+            studies: [{ instances: 100, chunks: 4 }] }) },
+        // No parseable JSON at all: the other way a run can fail.
+        { run: { title: 'insane · 16 associations', callingAe: 'BENCH-4' }, code: 1, data: null },
+      ];
+
+      const mixed = await win.webContents.executeJavaScript(`(() => {
+        showView('speed');
+        const results = ${JSON.stringify(fixture)};
+        const outcome = speedOutcome(results, false);
+        setStatus('speed', outcome.kind, outcome.label);
+        renderSpeedResults(results);
+        const rows = Array.from(document.querySelectorAll('#view-speed [data-result] tbody tr'));
+        const chip = document.querySelector('#view-speed [data-status]');
+        return JSON.stringify({
+          outcome,
+          chip: { text: chip.textContent, cls: chip.className },
+          headers: Array.from(document.querySelectorAll('#view-speed [data-result] thead th')).map((e) => e.textContent),
+          rows: rows.map((tr) => ({
+            cls: tr.className,
+            cells: Array.from(tr.children).map((td) => td.textContent.trim()),
+            badge: (tr.querySelector('.badge-best') || {}).textContent || '',
+            incompleteBadge: (tr.querySelector('.badge-incomplete') || {}).textContent || '',
+            ackWarned: !!tr.querySelector('td.ack .warn-inline'),
+          })),
+          notes: Array.from(document.querySelectorAll('#view-speed [data-result] .local-note')).map((e) => e.textContent),
+        });
+      })()`);
+      await wait(250);
+      // The chip is at the top of the screen and the table is below the fold,
+      // so the two halves of this get a frame each. The chip is the half that
+      // used to read a green "Done" over exactly this table.
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#view-speed .view-head').scrollIntoView({ block: 'start' }); true`
+      );
+      await wait(250);
+      await shot(win, outDir, 'speed-mixed-chip');
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#view-speed [data-result]').scrollIntoView({ block: 'center' }); true`
+      );
+      await wait(250);
+      await shot(win, outDir, 'speed-mixed-failure');
+      const m = JSON.parse(mixed);
+      fs.writeFileSync(path.join(outDir, 'speed-mixed-table.json'), JSON.stringify(m, null, 2));
+      m.rows.forEach((r) => process.stdout.write(`mixed row [${r.cls}]: ${JSON.stringify(r.cells)}\n`));
+      m.notes.forEach((n) => process.stdout.write(`mixed note: ${n}\n`));
+      process.stdout.write(`mixed chip: ${JSON.stringify(m.chip)}\n`);
+
+      const iMB = m.headers.indexOf('MB/s');
+      const iInst = m.headers.indexOf('Inst/s');
+      const iAck = m.headers.indexOf('Ack');
+      const [ordinary, failed, fastest, noJson] = m.rows;
+
+      // 1. The failed row is not an ordinary row.
+      if (!/incomplete/.test(failed.cls)) {
+        throw new Error(`a run that lost 40 instances has no failure class: ${failed.cls}`);
+      }
+      if (!failed.incompleteBadge) {
+        throw new Error('the failed row carries no badge naming the failure');
+      }
+      if (ordinary.cls.includes('incomplete') || ordinary.incompleteBadge) {
+        throw new Error('a run that acknowledged everything is marked as incomplete');
+      }
+      // 2. The Ack cell is not styled like the one beside it.
+      if (!failed.ackWarned || !/60\/100/.test(failed.cells[iAck])) {
+        throw new Error(`the Ack cell does not mark the shortfall: ${JSON.stringify(failed.cells[iAck])}`);
+      }
+      if (!/40 missing/.test(failed.cells[iAck])) {
+        throw new Error(`the Ack cell does not say how many are missing: ${failed.cells[iAck]}`);
+      }
+      if (ordinary.ackWarned) {
+        throw new Error(`100/100 is styled as a shortfall: ${ordinary.cells[iAck]}`);
+      }
+      // 3. No throughput figure for a transfer that did not complete. The rate
+      //    is the whole reason to read this table, and this run's is the
+      //    highest in the sweep precisely because it stopped early.
+      for (const [name, i] of [['MB/s', iMB], ['Inst/s', iInst]]) {
+        if (failed.cells[i] !== '—') {
+          throw new Error(`the failed run still reports ${name}: ${failed.cells[i]}`);
+        }
+        if (ordinary.cells[i] === '—') {
+          throw new Error(`a completed run lost its ${name} figure: ${JSON.stringify(ordinary.cells)}`);
+        }
+      }
+      if (/11\.9/.test(JSON.stringify(failed.cells))) {
+        throw new Error(`the incomplete run's rate is still on screen: ${JSON.stringify(failed.cells)}`);
+      }
+      // 4. FASTEST goes to a run that finished, never to the one that died
+      //    early with the best-looking number.
+      if (failed.badge) {
+        throw new Error(`the incomplete run was badged ${failed.badge}`);
+      }
+      if (!/FASTEST/.test(fastest.badge)) {
+        throw new Error(`no completed run was badged fastest: ${JSON.stringify(m.rows.map((r) => r.badge))}`);
+      }
+      // 5. A run with no JSON at all is marked the same way.
+      if (!/incomplete/.test(noJson.cls) || !noJson.incompleteBadge) {
+        throw new Error(`a run that produced no result is not marked: ${noJson.cls}`);
+      }
+      // 6. The sweep's own chip does not read as a success.
+      if (m.outcome.kind === 'ok' || /^Done$/.test(m.chip.text)) {
+        throw new Error(`the sweep chip reads as success with 2 of 4 runs incomplete: ${m.chip.text}`);
+      }
+      if (!/2 of 4/.test(m.chip.text) || !/incomplete/i.test(m.chip.text)) {
+        throw new Error(`the sweep chip does not count the failures: ${m.chip.text}`);
+      }
+      if (!m.chip.cls.includes('warn')) {
+        throw new Error(`the sweep chip is not the warning colour: ${m.chip.cls}`);
+      }
+      // 7. The table says in words what the blank cells mean.
+      if (!m.notes.some((n) => /did not finish/.test(n) && /40 instances/.test(n))) {
+        throw new Error(`no note names the lost instances: ${JSON.stringify(m.notes)}`);
+      }
+
+      // Every run incomplete is red, not amber, and still not "Done".
+      const allBad = await win.webContents.executeJavaScript(`(() => {
+        const results = ${JSON.stringify(fixture)}.map((r) => (
+          r.data ? { ...r, data: { ...r.data, ok: false, acknowledged: 10 } } : r
+        ));
+        return JSON.stringify(speedOutcome(results, false));
+      })()`);
+      process.stdout.write(`all-incomplete chip: ${allBad}\n`);
+      if (JSON.parse(allBad).kind !== 'fail') {
+        throw new Error(`a sweep with nothing completed is not marked failed: ${allBad}`);
+      }
+
+      // Put the screen back the way the live run further down expects it.
+      await win.webContents.executeJavaScript(`(() => {
+        const box = document.querySelector('#view-speed [data-result]');
+        box.hidden = true;
+        box.innerHTML = '';
+        setStatus('speed', null, '');
         return true;
       })()`);
     }

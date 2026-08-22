@@ -204,12 +204,19 @@ function deriveChunkSize(instances, parallel) {
  * @param {number} params.chunkSize         --chunk, or its default.
  * @param {boolean} params.explicitParallel --parallel was typed.
  * @param {boolean} params.explicitChunk    --chunk was typed.
+ * @param {boolean} [params.memoryBound]    This run will hold parsed datasets
+ *                                          (--rewrite-series-uid or
+ *                                          --transfer-syntax), so a size the
+ *                                          preset derived would have been capped
+ *                                          at MEMORY_CHUNK_CAP while a typed one
+ *                                          is not. Only affects whether the
+ *                                          --chunk override displaced anything.
  * @returns {{speed: string|undefined, parallel: number, parallelSource: string,
  *            chunkSize: number|null, chunkSource: string, chunkCap: number,
  *            warnings: string[]}}
  */
 function resolveSpeedPlan(params) {
-  const { speed, parallel, chunkSize, explicitParallel, explicitChunk } = params;
+  const { speed, parallel, chunkSize, explicitParallel, explicitChunk, memoryBound } = params;
   const preset = speed === undefined ? undefined : SPEED_PRESETS[speed];
   const warnings = [];
 
@@ -235,16 +242,38 @@ function resolveSpeedPlan(params) {
 
   if (speed !== undefined) {
     if (explicitChunk) {
-      warnings.push(
-        `--chunk ${chunkSize} was given alongside --speed ${speed}; --chunk wins, so the preset ` +
-          `does not get to size associations for ${resolvedParallel}-wide sending.` +
-          // At one association a shortfall is arithmetically impossible —
-          // min(1, chunks) is 1 for any chunk count — so asking someone to
-          // check for one is asking them to check nothing.
-          (resolvedParallel > 1
-            ? ` Check the association count below actually reaches ${resolvedParallel}.`
-            : '')
-      );
+      // Only worth saying when the number typed actually displaced one, for the
+      // same reason "--parallel 1 wins, not the preset's 1" reads as a bug.
+      //
+      // Whether it displaced anything is a per-study question — the preset
+      // derives a size from each study's instance count — and no study has been
+      // scanned yet. So it is only decidable here where it is decidable for
+      // every study at once, and there is exactly one such case: at one
+      // association deriveChunkSize returns DEFAULT_CHUNK whatever the study
+      // holds, so typing that number changes nothing for any study that could
+      // turn up. Above one association the derived size depends on the study
+      // and equality for this run is genuinely unknown at this point, so the
+      // warning stands rather than being guessed at.
+      //
+      // memoryBound is the exception inside the exception: when parsed datasets
+      // have to be held, a derived size is capped at MEMORY_CHUNK_CAP and a
+      // typed one deliberately is not, so typing DEFAULT_CHUNK does displace
+      // something there.
+      const displacesNothing =
+        resolvedParallel <= 1 && chunkSize === DEFAULT_CHUNK && !memoryBound;
+
+      if (!displacesNothing) {
+        warnings.push(
+          `--chunk ${chunkSize} was given alongside --speed ${speed}; --chunk wins, so the preset ` +
+            `does not get to size associations for ${resolvedParallel}-wide sending.` +
+            // At one association a shortfall is arithmetically impossible —
+            // min(1, chunks) is 1 for any chunk count — so asking someone to
+            // check for one is asking them to check nothing.
+            (resolvedParallel > 1
+              ? ` Check the association count below actually reaches ${resolvedParallel}.`
+              : '')
+        );
+      }
     } else {
       // No number here. The size is a per-study question and is answered per
       // study; see chunkSizeForStudy.
@@ -396,6 +425,14 @@ function planJson(plan, parallelAchieved, studies = []) {
  * @returns {number}
  */
 function runParallelAchieved(studies, parallel) {
+  // No study ran, so no width was achieved. Without this the seed survives
+  // untouched and the one input that measured nothing at all is the one that
+  // reports the full request as an achievement — the exact shape of claim this
+  // function exists to prevent. run() returns before here when nothing was
+  // found, so this is a guard rather than a live path; it costs one comparison
+  // to make the function true on its own terms rather than on its caller's.
+  if (studies.length === 0) return 0;
+
   let achieved = parallel;
   for (const study of studies) {
     if (study.peakAssociations < achieved) achieved = study.peakAssociations;
@@ -422,9 +459,12 @@ Options:
                           Default: DCM-CLI
   --chunk <n>             Instances per association. Default: 200.
                           Large studies are split across several associations so
-                          that memory stays flat regardless of study size. One
-                          number for the whole run: it overrides the per-study
-                          size a --speed preset would derive.
+                          that memory stays flat as a study grows. It does not
+                          stay flat as the parallelism grows: each association
+                          holds its own chunk, so what is held at once scales
+                          with how many run at once. One number for the whole
+                          run: it overrides the per-study size a --speed preset
+                          would derive.
   --retry <n>             Retry attempts for a chunk where fewer instances were
                           acknowledged than sent. Default: 1.
   --dry-run               Scan and report what would be sent. Opens no connection.
@@ -437,7 +477,8 @@ Options:
                           not just a proposal — the bytes on the wire are in the
                           syntax you asked for. Needs the codecs module for
                           compressed syntaxes, and holds datasets in memory, so
-                          the chunk size is reduced automatically.
+                          a chunk size this tool derived is capped. A size you
+                          typed is not: --chunk means what it says.
   --parallel <n>          Run n associations at once (1-16, default 1). C-STORE is
                           sequential inside one association, so this is the only
                           real way to go faster. Check what the receiver allows:
@@ -501,16 +542,38 @@ Speed presets:
   interleave instances — so running several associations at once is the only
   real lever on throughput. The ceiling is not ours to set. The receiver decides
   how many associations it will accept, and going past that limit gets
-  associations REJECTED. That does not surface as slowness, and usually not as
-  failure either. A receiver at its limit answers A-ASSOCIATE-RJ with reason 2,
-  'local limit exceeded', which is a TRANSIENT rejection: the chunk is retried,
-  the retry lands in a slot that has since freed, and every instance ends up
-  acknowledged. The run exits 0 having quietly done the work narrower than it
-  was told to, and the only sign is the per-study width warning on stderr and
-  parallelAchieved in --json. A shortfall and a non-zero exit are what a
-  PERMANENT rejection gives you — the loud case, and the rarer one. Ask what the
-  receiver allows before reaching past 'fast', and read the width, not just the
-  exit code.
+  associations REJECTED rather than queued or slowed.
+
+  What a rejection costs you is a race, and the timing is not in your favour. A
+  receiver at its limit answers A-ASSOCIATE-RJ with reason 2, 'local limit
+  exceeded', and its permanence is TRANSIENT — meaning retryable, so the chunk
+  is retried. But the retry carries no backoff: the next attempt opens
+  immediately, so every attempt --retry allows is spent within milliseconds of
+  the first rejection, while the associations holding the slots are still
+  working through their chunks. Two endings are reachable from there.
+
+    - A slot frees inside that window — some chunk finishes and releases — and
+      the retry is admitted. Every instance is acknowledged and the run exits 0,
+      having quietly done the work narrower than it was told to. The only signs
+      are the per-study width warning on stderr and parallelAchieved in --json.
+    - No slot frees in time. The attempts run out, those instances are never
+      acknowledged, and the run exits 1 naming the shortfall. Measured against a
+      peer capped at 3 associations: --parallel 4 --chunk 30 --retry 12 left 60
+      of 240 instances unacknowledged.
+
+  Which ending you get turns on whether a chunk happens to finish inside the few
+  milliseconds the retries occupy — so on chunk size, link speed and the peer's
+  own pace, none of which the run controls. Small chunks and a fast link shorten
+  the odds; nothing makes them good. Do not read 'transient' as 'recovered', and
+  do not expect much from a larger --retry: it buys more attempts inside the
+  same millisecond rather than more time.
+
+  One habit covers both endings. Ask what the receiver allows before reaching
+  past 'fast', and afterwards read two things rather than one: the width, and
+  the three counts — found, sent, acknowledged. The width says whether the run
+  was as wide as it was told to be; the counts say whether all of it arrived.
+  The exit code answers only the second question, and nothing about a clean exit
+  0 says the throughput figure beside it was measured at the width you asked for.
 
   The cost lands on the receiver and the link far more than on this machine.
   Sending is a socket and a few hundred bytes per queued request here; the
@@ -533,11 +596,22 @@ Speed presets:
   associations as they pick up chunks, a run whose tail drains early can
   measure one or two below the width it genuinely sustained; the error is
   always downward, never upward. And a single scalar cannot describe a
-  multi-study run — one study that ran 2 wide pulls the whole run's figure to
-  2, which is deliberate, because the throughput figure beside it covers the
-  whole run. For anything finer, read "studies": per study it carries the
-  instance count, the chunk size used, the chunk count, the workers dispatched
-  and the peak associations actually accepted.
+  multi-study run: the floor is taken across studies, so the narrowest study
+  sets the number reported for all of them.
+
+  That second one has a consequence worth knowing before it surprises you,
+  because a study can be narrow for a reason no setting can fix. A 3-instance
+  study is one chunk, one chunk is one association, and that holds at every
+  preset. So a folder with a 240-instance series that genuinely ran 4 wide and
+  a 3-instance dose SR beside it — the shape of most real folders — reports
+  parallelAchieved 1 and prints "parallelism 1 of the 4 requested", for a run
+  where 98.8% of the data moved 4 wide. That reads like a bug and is not one.
+  It is the conservative reading on purpose: the throughput figure printed next
+  to the width covers the whole run, so the width has to be one that no part of
+  the run fell below. When the number looks impossibly low, read "studies":
+  per study it carries the instance count, the chunk size used, the chunk
+  count, the workers dispatched and the peak associations actually accepted,
+  and the study that pinned the floor is usually obvious from its size.
 
   chunkSize is null when a preset derived it, because the size is then
   per-study and no single number is true of the run. It is a number only when
@@ -800,6 +874,20 @@ async function sendChunk(params) {
   }
 
   let accepted = false;
+  let slotReleased = false;
+
+  /**
+   * Gives the slot this association occupied back to the live count.
+   *
+   * Idempotent, and does nothing for an association the peer never accepted:
+   * a rejected association never took a slot, so it has none to give back.
+   */
+  const releaseSlot = () => {
+    if (slotReleased || !accepted) return;
+    slotReleased = true;
+    if (options && options.metrics) options.metrics.liveAssociations -= 1;
+  };
+
   const { outcome, statistics } = await runAssociation({
     host: connection.host,
     port: connection.port,
@@ -817,9 +905,12 @@ async function sendChunk(params) {
         // arithmetic — it is fixed before a socket is opened and says nothing
         // about what the receiver allowed. A receiver at its concurrent
         // association limit rejects the extras (A-ASSOCIATE-RJ), and with a
-        // transient rejection the retry usually lands in a freed slot, so the
-        // run can complete, exit 0, and report a width it never ran at unless
-        // acceptance is what is counted.
+        // transient rejection the retry may land in a slot that has since
+        // freed — the retry loop has no backoff, so whether it does is a matter
+        // of milliseconds and is not to be counted on. When it does, the run
+        // completes, exits 0, and reports a width it never ran at unless
+        // acceptance is what is counted. When it does not, the shortfall and
+        // the non-zero exit say so.
         const m = options.metrics;
         m.liveAssociations += 1;
         if (m.liveAssociations > m.peakAssociations) m.peakAssociations = m.liveAssociations;
@@ -829,11 +920,25 @@ async function sendChunk(params) {
         recordAcceptedSyntaxes(assoc, m);
       }
     },
+    // Counted down when the association ENDS, not when this call resolves.
+    //
+    // The two are different moments and the difference is the whole accuracy of
+    // the peak. runAssociation resolves once the socket has closed (or the close
+    // grace has expired, RELEASE_CLOSE_GRACE_MS in src/lib/dimse.js), which is
+    // after A-RELEASE-RP — and a peer at its concurrent-association limit frees
+    // its slot on the release and admits the replacement immediately. Decrement
+    // on resolution and the departing association and the one that took its
+    // place are both counted live here, so a run against a peer that grants 3
+    // reports a peak of 4: non-deterministically, in the flattering direction,
+    // and exactly on the value that suppresses the shortfall caveat.
+    onEnded: releaseSlot,
   });
 
-  // The slot is free the moment runAssociation resolves: the association has
-  // been released, aborted or rejected by then, so nothing is holding it open.
-  if (accepted && options && options.metrics) options.metrics.liveAssociations -= 1;
+  // Backstop, not the mechanism: onEnded fires before runAssociation resolves on
+  // every path it has. A slot left un-returned would not just lose one count, it
+  // would raise the floor of the peak for every study after it, so this is worth
+  // being sure about twice.
+  releaseSlot();
 
   // Bytes actually put on the wire, which is the number that matters when
   // comparing transfer syntaxes: a compressed one sends far fewer.
@@ -844,8 +949,16 @@ async function sendChunk(params) {
     } catch {
       /* statistics are decorative; never fail a transfer over them */
     }
-    options.metrics.associations += 1;
   }
+
+  // Associations that carried the transfer, which means the ones the peer
+  // accepted. A refused association carried nothing: counting it here put
+  // "sent on the wire 0 B in 2 association(s)" on screen for a run where the
+  // peer never let a single instance through, and made bytes-per-association
+  // read as poor efficiency rather than as a peer that said no. Counted
+  // outside the statistics guard above because acceptance, not a statistics
+  // object, is what makes an association real.
+  if (accepted && options && options.metrics) options.metrics.associations += 1;
 
   if (outcome && outcome.kind !== 'completed') {
     studyLedger.addEvent({
@@ -1083,6 +1196,9 @@ async function run(parsed) {
     chunkSize: chunkSizeRequested,
     explicitParallel,
     explicitChunk,
+    // Both of these force a parse, which caps a derived chunk size but not a
+    // typed one — so they decide whether a typed size displaced anything.
+    memoryBound: Boolean(rewriteSeriesUid || transferSyntax),
   });
   for (const warning of plan.warnings) log.warn(warning);
 
@@ -1278,11 +1394,19 @@ async function run(parsed) {
     // neither is asserted. Checked per study rather than run-wide, because
     // a run-wide minimum would let one narrow study hide a rejection in a wide
     // one. Worth saying even when the run succeeds: an A-ASSOCIATE-RJ with
-    // transient permanence is retryable, so the retry lands in a slot that has
-    // since freed and every instance ends up acknowledged — a clean exit 0
-    // whose throughput was measured on a link that never carried the width
-    // this study asked for. On stderr, so it reaches the --json path too.
-    if (metrics.peakAssociations < workerCount) {
+    // transient permanence is retryable, so a retry can land in a slot that has
+    // since freed, leaving a clean exit 0 whose throughput was measured on a
+    // link that never carried the width this study asked for. On stderr, so it
+    // reaches the --json path too.
+    //
+    // Only when more than one association was asked for. At one, there is no
+    // "rest" for the peer to refuse and nothing that could have overlapped, so
+    // the only way to reach here is a peer that accepted nothing at all — an
+    // unreachable or refusing PACS, which the accounting and the exit code
+    // already report correctly. Telling that operator to lower --parallel
+    // blames a concurrency limit that is not involved, on the default
+    // configuration, on the most common failure mode there is.
+    if (workerCount > 1 && metrics.peakAssociations < workerCount) {
       log.warn(
         `  ${workerCount} concurrent association(s) were opened for this study but the peer ` +
           `never had more than ${metrics.peakAssociations} accepted at once — any throughput ` +

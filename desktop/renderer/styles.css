@@ -264,6 +264,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
 .status-chip.running::before { animation: pulse 1s infinite; }
 .status-chip.ok { background: var(--green-soft); color: var(--green); }
 .status-chip.fail { background: var(--red-soft); color: var(--red); }
+/* Part of a multi-run job succeeded and part of it did not. Not green: the
+ * chip is the first thing read on the screen, and "Done" over a sweep that
+ * lost instances is the whole failure this class exists to prevent. */
+.status-chip.warn { background: var(--amber-soft); color: var(--amber); }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* ---------------- Console ---------------- */
@@ -491,6 +495,28 @@ tr.best td { background: var(--green-soft); }
  * between repeats of one configuration. Marked, not celebrated. */
 tr.best.tied td { background: var(--bg-3); }
 .badge-best.tied { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-2); }
+/* A run that did not deliver every instance it found.
+ *
+ * The amber idiom the rest of the app already uses for "this is not what it
+ * looks like" — the same tint as .local-note, .caution and .warn-inline — and
+ * the same pill shape as the FASTEST badge it sits in place of, because these
+ * two are answers to the same question and must be read side by side down the
+ * Run column. The tint covers the whole row rather than the Ack cell alone:
+ * with no MB/s in it, a row's failure has to be visible from the row's colour
+ * before any cell is read. The rail on the first cell survives horizontal
+ * scrolling of the table, which a border on the row would not. */
+tr.incomplete td { background: var(--amber-soft); }
+tr.incomplete td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+.badge-incomplete {
+  background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber);
+  border-radius: 20px; padding: 1px 9px; font-size: 10.5px; font-weight: 700; margin-left: 8px;
+  display: inline-block; white-space: nowrap;
+}
+/* The counts are the verdict on an incomplete row, so they are not allowed to
+ * shrink into a footnote the way an inline caveat elsewhere can. */
+td.ack .warn-inline { font-size: 12.5px; font-weight: 700; white-space: nowrap; }
+/* The same run, in the live list above, while the sweep is still going. */
+.speed-progress .run-line .rate.bad { color: var(--amber); }
 /* The caveats belong under the numbers they qualify, inside the same box. */
 .result-table .local-note { margin: 14px 0 0; }
 /* "12 of 16" is one reading and must not break across two lines, where the

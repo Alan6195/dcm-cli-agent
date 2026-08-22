@@ -58,6 +58,16 @@ this end gets to choose — the receiver decides how many it accepts and rejects
 the rest — and the cost of the ones it does accept lands on it and on the link,
 not here.
 
+What a rejection costs is worth knowing before you reach past Fast. A receiver
+at its limit rejects transiently, so the chunk is retried, but the retry has no
+backoff and burns every attempt within milliseconds while the accepted
+associations are still transferring. Sometimes a slot frees in time and the run
+finishes clean at a width it never ran at; sometimes none does and the run ends
+with instances the receiver never acknowledged. Which one you get is timing, not
+a setting. So read both columns after a sweep — Width for how wide it really
+went, and Ack for whether all of it arrived, since neither one answers the
+other's question.
+
 **Speed test** sweeps the four presets instead of asking the operator to type a
 list of association counts. That list was the same trap in a different screen:
 the widths went out as `--parallel`, which overrides the preset's sizing, so the
@@ -75,6 +85,14 @@ point of the feature:
   The engine's per-study shortfall warnings arrive on stderr even under `--json`,
   and now reach the console under the table instead of being dropped whenever
   the JSON parsed.
+
+  The floor is taken across studies too, and that is the part that looks like a
+  bug. Send a folder holding a 240-instance series and a 3-instance dose SR and
+  the column reads `1 of 4`, because 3 instances is one chunk and one chunk is
+  one association at every preset — even though 98.8% of the data moved 4 wide.
+  It is deliberate: the throughput figure in the next column covers the whole
+  run, so the width beside it has to be one no part of the run fell below. The
+  per-study detail is in the engine's `studies` array under `--json`.
 - **FASTEST goes to a transfer, not to a row.** At 100 instances, Fast,
   Very fast and Insane all clamp to the same chunk size and run the same width:
   three identical transfers. Badging whichever of them drew the best sample

@@ -330,15 +330,38 @@ told.
 
 **The ceiling isn't yours to set.** The receiver decides how many associations
 it will accept, and going past that limit gets the extras rejected rather than
-slowing anything down. A receiver at its limit answers A-ASSOCIATE-RJ with
-reason 2, "local limit exceeded", and that is a *transient* rejection: the chunk
-is retried, the retry lands in a slot that has since freed, and every instance
-ends up acknowledged. So the usual outcome is the quiet one — a clean exit 0
-whose throughput was measured at a width you never got. The loud outcome, a
-shortfall between instances found and acknowledged with a non-zero exit, is what
-a *permanent* rejection gives you, and it is the rarer case. Ask what the
-receiver allows before you reach past `fast`, and read the width rather than
-just the exit code.
+queued or slowed. A receiver at its limit answers A-ASSOCIATE-RJ with reason 2,
+"local limit exceeded", and its permanence is *transient* — meaning retryable,
+so the chunk is retried.
+
+What that costs you is a race, and the timing isn't in your favour. The retry
+has no backoff: the next attempt opens immediately, so every attempt `--retry`
+allows is spent within milliseconds of the first rejection, while the
+associations holding the slots are still working through their chunks. Two
+endings are reachable:
+
+- A slot frees inside that window, the retry is admitted, every instance is
+  acknowledged and the run exits 0 — having quietly done the work narrower than
+  you told it to. The only signs are the width warning on stderr and
+  `parallelAchieved` in `--json`.
+- No slot frees in time. The attempts run out, those instances are never
+  acknowledged, and the run exits 1 naming the shortfall. Measured against a
+  peer capped at 3 associations: `--parallel 4 --chunk 30 --retry 12` left 60 of
+  240 instances unacknowledged.
+
+Which one you get turns on whether some chunk happens to finish inside those few
+milliseconds — so on chunk size, link speed and the peer's own pace, none of
+which the run controls. Small chunks and a fast link shorten the odds; nothing
+makes them good. Don't read "transient" as "recovered", and don't expect much
+from a larger `--retry`: it buys more attempts inside the same millisecond, not
+more time.
+
+One habit covers both endings. Ask what the receiver allows before you reach
+past `fast`, and afterwards read two things rather than one — the width, and the
+three counts. The width tells you whether the run was as wide as you asked; the
+counts tell you whether all of it arrived. The exit code only answers the
+second, and nothing about a clean exit 0 says the throughput figure beside it
+was measured at the width you asked for.
 
 Which is what the line under the report is for. It reports the width that ran,
 not the one that was asked for:
@@ -351,6 +374,26 @@ That number is measured from associations the peer actually accepted, not
 workers dispatched, and it's a floor across the whole run — it can read one low
 when the tail drains early, and it never reads high. `--json` carries it as
 `parallelAchieved` alongside a per-study `studies` array.
+
+**A floor across studies means the narrowest study speaks for the run**, and
+that's the part most likely to look like a bug the first time you see it. A
+study can be narrow for a reason no setting can fix: 3 instances is one chunk,
+one chunk is one association, at every preset. So a folder holding a
+240-instance series that genuinely ran 4 wide plus a 3-instance dose SR — the
+shape of most real folders — reports `parallelAchieved: 1` and prints
+`parallelism 1 of the 4 requested`, for a run where 98.8% of the data moved 4
+wide. It's the conservative reading on purpose. The throughput figure sits next
+to that width and covers the whole run, so the width has to be one no part of
+the run fell below. When it looks impossibly low, read `studies` — per study it
+carries the instance count, chunk size, chunk count, workers dispatched and peak
+associations accepted, and the study that pinned the floor is usually obvious
+from its size.
+
+One `--json` shape note if you parse it: `chunkSize` is `null` whenever a preset
+derived the size, because it's then per-study and no single number is true of
+the run. It's a number only when one really did apply everywhere — an explicit
+`--chunk`, or the plain default. It was always a number before `--speed`
+existed, so anything dividing by it needs a null check.
 
 `dcm send --help` is the long version: the arithmetic worked through, what each
 JSON field does and doesn't mean, and what the concurrency costs the receiver

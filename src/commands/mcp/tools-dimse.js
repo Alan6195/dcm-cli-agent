@@ -958,9 +958,10 @@ function register(server, z, rt) {
       inputSchema: {
         path: z.string().describe('Folder of DICOM files to send.'),
         ...peerSchema(),
-        chunk: z.number().int().optional().describe('Instances per association (default 200; automatically reduced when converting or rewriting, which hold datasets in memory).'),
-        retry: z.number().int().optional().describe('Retry attempts for a chunk where fewer instances came back acknowledged than were sent (default 1).'),
-        parallel: z.number().int().optional().describe('Associations to run at once, 1-16 (default 1). C-STORE is sequential inside one association, so this is the only real way to go faster — but check what the receiver allows: exceeding its limit gets associations rejected rather than speeding anything up.'),
+        chunk: z.number().int().optional().describe('Instances per association (default 200). One number for the whole run: it overrides the per-study size a speed preset would derive. Converting or rewriting holds parsed datasets in memory, which CAPS a size this tool derived — a size you typed is left as typed.'),
+        retry: z.number().int().optional().describe('Retry attempts for a chunk where fewer instances came back acknowledged than were sent (default 1). The retries carry no backoff, so they are spent within milliseconds of the first failure — a larger number buys more attempts, not more time.'),
+        parallel: z.number().int().optional().describe('Associations to run at once, 1-16 (default 1). C-STORE is sequential inside one association, so concurrency is the only real lever on throughput — but raising THIS alone does not widen the run: achieved width is min(parallel, chunks) and chunks is ceil(instances / chunk), so at the default chunk of 200 a 400-instance study runs 2 wide however high this goes. Prefer speed, which sizes the chunks to match. Either way, check what the receiver allows: exceeding its limit gets associations rejected rather than speeding anything up.'),
+        speed: z.enum(['normal', 'fast', 'very-fast', 'insane']).optional().describe('Preset that picks the parallelism AND a chunk size that can actually deliver it, which is the trap raising parallel alone falls into. normal is 1 association: ordinary clinical traffic, and the only setting that adds nothing to the receiver\'s association count. fast is 4: a backlog or a migration, to a receiver known to tolerate a handful at once. very-fast is 8: a bulk move on a link with the bandwidth for the concurrency to pay. insane is 16, a BENCHMARK setting for a receiver you own — not production traffic, and not a thing to point at someone else\'s archive. The ceiling is not ours to set: the receiver decides how many associations it accepts, and going past its limit gets them REJECTED rather than queued, which can leave instances unacknowledged rather than speed anything up. Ask what it allows before reaching past fast. An explicit parallel or chunk beats this preset, and the run warns when it does. Read parallelAchieved afterwards: it is MEASURED, and it is a floor across studies that errs downward, so one 3-instance study beside a large one pins it to 1 for the whole run.'),
         transferSyntax: z.string().optional().describe(`Convert every instance to this transfer syntax BEFORE sending it — a real conversion, not just a proposal, so the bytes on the wire are in the syntax you asked for. A name (${TRANSFER_SYNTAX_NAMES}) or a UID. The files on disk are not modified. If the peer refuses the converted syntax the transfer falls back to one it accepts, and the report names what was actually negotiated.`),
         label: z.string().optional().describe('Free-text tag for this run, carried into the result so several runs can be compared.'),
         dryRun: z.boolean().optional().describe('Scan and report the plan without opening a connection.'),
@@ -973,6 +974,12 @@ function register(server, z, rt) {
       opt(argv, '--chunk', a.chunk);
       opt(argv, '--retry', a.retry);
       opt(argv, '--parallel', a.parallel);
+      // Both are passed when both are given, rather than one being suppressed
+      // here: the command is where that contest is resolved, and it warns on
+      // stderr when a typed number displaces the preset's. Deciding it in this
+      // layer would swallow the warning, which is the only thing that tells a
+      // caller the run was not configured the way the preset name says.
+      opt(argv, '--speed', a.speed);
       opt(argv, '--transfer-syntax', a.transferSyntax);
       // Attached form rather than two tokens: a label is free text, and one
       // shaped like `run=2` would be read as a C-FIND matching key by the

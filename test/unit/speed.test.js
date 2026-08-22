@@ -7,7 +7,8 @@ const path = require('node:path');
 
 const log = require('../../src/lib/log');
 const { UsageError } = require('../../src/lib/args');
-const { runCommand, withTempDir, startScp } = require('../helpers/harness');
+const dimse = require('../../src/lib/dimse');
+const { runCommand, withTempDir, startScp, freePort } = require('../helpers/harness');
 const { generate } = require('../../tools/make-fixtures');
 const send = require('../../src/commands/send');
 
@@ -449,6 +450,81 @@ test('the --chunk warning does not ask for a check that cannot fail', () => {
   assert.doesNotMatch(plan.warnings[0], /Check the association count/);
 });
 
+test('typing the size the preset would have derived is not reported as an override', () => {
+  // The other half of "--parallel 1 wins, not the preset's 1": a warning that
+  // says --chunk displaced the preset when the preset would have chosen the
+  // same number describes something that did not happen. At one association
+  // deriveChunkSize returns DEFAULT_CHUNK for every study there could be, so
+  // this is decidable for the whole run before a single file is scanned.
+  const same = resolveSpeedPlan({
+    speed: 'normal',
+    parallel: 1,
+    chunkSize: 200,
+    explicitParallel: false,
+    explicitChunk: true,
+  });
+  assert.deepEqual(same.warnings, [], '--speed normal --chunk 200 displaces nothing');
+  assert.equal(same.chunkSize, 200, 'and the size is still the one that was typed');
+  assert.equal(same.chunkSource, 'flag');
+  // The claim under the claim: the preset really would have chosen 200, for
+  // any study the folder could hold.
+  const derived = resolveSpeedPlan({
+    speed: 'normal',
+    parallel: 1,
+    chunkSize: 200,
+    explicitParallel: false,
+    explicitChunk: false,
+  });
+  for (const instances of [1, 30, 400, 2508, 20000]) {
+    assert.equal(chunkSizeForStudy(derived, instances), 200, `${instances} instances`);
+  }
+
+  // An explicit --parallel of 1 alongside a wider preset is the same case: the
+  // resolved width is what the derivation uses.
+  assert.deepEqual(
+    resolveSpeedPlan({
+      speed: 'insane',
+      parallel: 1,
+      chunkSize: 200,
+      explicitParallel: true,
+      explicitChunk: true,
+    }).warnings.filter((w) => w.includes('--chunk')),
+    [],
+    'the width was overridden to 1, and at 1 the preset would have derived 200'
+  );
+
+  // Above one association the derived size depends on the study, so nothing
+  // here can know whether 200 displaced it. The warning stands rather than
+  // being guessed at.
+  assert.equal(
+    resolveSpeedPlan({
+      speed: 'fast',
+      parallel: 1,
+      chunkSize: 200,
+      explicitParallel: false,
+      explicitChunk: true,
+    }).warnings.length,
+    1,
+    '--speed fast derives per study, so equality is not knowable here'
+  );
+
+  // And the one case where typing DEFAULT_CHUNK at one association really does
+  // displace something: a run that has to hold parsed datasets caps a derived
+  // size at 50 and leaves a typed one alone.
+  assert.equal(
+    resolveSpeedPlan({
+      speed: 'normal',
+      parallel: 1,
+      chunkSize: 200,
+      explicitParallel: false,
+      explicitChunk: true,
+      memoryBound: true,
+    }).warnings.length,
+    1,
+    'a typed 200 beats the memory cap the preset would have been held to'
+  );
+});
+
 test('without --speed, nothing about the old defaults moves', () => {
   const plan = resolveSpeedPlan({
     speed: undefined,
@@ -568,6 +644,17 @@ test('the run-level width is a floor, so no study can hide behind another', () =
   assert.deepEqual(records.map((s) => s.workers), [16, 2]);
   assert.deepEqual(records.map((s) => s.peakAssociations), [4, 2]);
   assert.equal(runParallelAchieved(records, plan.parallel), 2);
+});
+
+test('no study means no width, not the width that was asked for', () => {
+  // The reduction seeds from the requested width so that the first study can
+  // only lower it. With no studies at all the seed is the answer, and the one
+  // input that measured nothing would report the full request as an
+  // achievement — the exact claim this number exists to prevent. run() returns
+  // before this on an empty folder, so the guard is for the next caller.
+  for (const parallel of [1, 4, 16]) {
+    assert.equal(runParallelAchieved([], parallel), 0, `--parallel ${parallel}`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -730,6 +817,30 @@ test('a dry run reports the resolution and warns about a width it cannot reach',
       assert.doesNotMatch(stderr, /derived per study/, 'a typed size is one size for the run');
     });
 
+    await t.test('an explicit --chunk that displaces nothing says nothing', async () => {
+      // --speed normal is 1 association wide, and at one association the preset
+      // derives 200 whatever the study holds. Warning that --chunk 200 stopped
+      // the preset from sizing associations describes a displacement that did
+      // not happen, and the desktop hits it by default: Chunk size sits under
+      // Advanced with Normal already selected.
+      const { code, stderr } = await runCommand(send, [
+        outDir, '--dry-run', '--speed', 'normal', '--chunk', '200',
+      ]);
+      assert.equal(code, 0);
+      assert.doesNotMatch(stderr, /was given alongside/);
+      assert.match(stderr, /up to 200 instance\(s\) each/, 'the size itself is still stated');
+    });
+
+    await t.test('the same flags do warn when the preset would have been capped', async () => {
+      // Rewriting forces a parse, which holds a derived size at 50 and leaves a
+      // typed one alone — so here the typed 200 really did displace something.
+      const { code, stderr } = await runCommand(send, [
+        outDir, '--dry-run', '--speed', 'normal', '--chunk', '200', '--rewrite-series-uid',
+      ]);
+      assert.equal(code, 0);
+      assert.match(stderr, /--chunk 200 was given alongside --speed normal/);
+    });
+
     await t.test('typing the preset\'s own number is not reported as an override', async () => {
       const { code, stderr } = await runCommand(send, [
         outDir, '--dry-run', '--speed', 'fast', '--parallel', '4',
@@ -836,6 +947,12 @@ test('the reported width comes from what the receiver accepted', async (t) => {
         assert.equal(payload.parallelAchieved, 0, 'so the run reports 0');
         assert.match(stderr, /never had more than 0 accepted at once/);
 
+        // And nothing counts as an association that the peer refused. Two were
+        // attempted and two were turned away, so the count of associations the
+        // transfer was carried in is zero: "0 B in 2 association(s)" describes
+        // a run that never happened.
+        assert.equal(payload.associations, 0, 'a refused association carried nothing');
+
         // The transfer accounting is separately true, and says the same thing
         // in its own terms: nothing was sent, and that is a failure.
         assert.equal(code, 1);
@@ -863,11 +980,263 @@ test('the reported width comes from what the receiver accepted', async (t) => {
           `peak ${payload.studies[0].peakAssociations} outside 1..${payload.studies[0].workers}`
         );
         assert.equal(payload.parallelAchieved, payload.studies[0].peakAssociations);
-        assert.doesNotMatch(stderr, /never had more than/);
+
+        // The warning has to agree with the measurement, whichever way the
+        // measurement went, and this assertion has to allow the same range the
+        // one above does. The engine warns on exactly `peak < workers`, so
+        // "there is no warning" while a peak of 1 against 2 workers is
+        // permitted asserts the absence of a warning the engine is required to
+        // print — the test would fail because the engine had been honest, and
+        // it would fail on the slow runner rather than here, where a failed
+        // build blocks every binary. What is actually required is that the two
+        // statements match.
+        const { peakAssociations, workers } = payload.studies[0];
+        if (peakAssociations < workers) {
+          assert.match(
+            stderr,
+            new RegExp(`never had more than ${peakAssociations} accepted at once`),
+            'a measured shortfall must be said out loud'
+          );
+        } else {
+          assert.doesNotMatch(stderr, /never had more than/, 'nothing fell short, so nothing to warn about');
+        }
+        // Whichever branch ran, this is not the refused run: a peer that
+        // acknowledged all ten instances accepted something.
+        assert.doesNotMatch(stderr, /never had more than 0 accepted at once/);
       });
     } finally {
       scp.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// When the sender gives a slot back
+// ---------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A stand-in peer that grants a fixed number of concurrent associations and
+ * QUEUES the rest instead of refusing them.
+ *
+ * That is the receiver shape the width was wrong against, and it is a common
+ * one: an archive at its limit that makes the next association wait rather than
+ * rejecting it, so the run is clean — everything acknowledged, exit 0, no
+ * rejection to notice — and the only thing that can be wrong about it is the
+ * width printed beside the throughput.
+ *
+ * It stands in for runAssociation because the defect is a question of WHEN, and
+ * the two moments it sits between are a millisecond apart against a real
+ * loopback receiver: a test that raced them would be a coin toss on a slow
+ * runner. Here every association has two phases that are deliberately far
+ * apart — it carries the transfer and then it ENDS (A-RELEASE-RP, `onEnded`,
+ * the peer's slot free, the next association admitted), and only `settleMs`
+ * later does the call resolve with its byte statistics. A sender that counts
+ * the slot down when the association ends measures the cap the peer really
+ * enforced; one that waits for the resolution counts the departing association
+ * and its replacement at the same time and reports a width the peer never
+ * granted, in the flattering direction.
+ *
+ * `observed` is the peer's own count, kept independently of anything the sender
+ * reports, so the two can be compared rather than assumed equal.
+ */
+function queueingPeer({ cap, transferMs = 25, settleMs = 150 }) {
+  const observed = { accepted: 0, live: 0, peak: 0 };
+  const waiting = [];
+  let free = cap;
+
+  const pump = () => {
+    while (free > 0 && waiting.length > 0) {
+      free -= 1;
+      waiting.shift()();
+    }
+  };
+
+  const runAssociation = async (params) => {
+    // Queued, not refused: the caller waits for a slot.
+    await new Promise((admit) => {
+      waiting.push(admit);
+      pump();
+    });
+
+    observed.accepted += 1;
+    observed.live += 1;
+    if (observed.live > observed.peak) observed.peak = observed.live;
+
+    // A-ASSOCIATE-AC, then every instance acknowledged. recordAcceptedSyntaxes
+    // reads the association object inside a try/catch, so an empty one will do.
+    if (params.onAccepted) params.onAccepted({});
+    for (const request of params.requests) {
+      request.emit('response', { getStatus: () => 0x0000, getErrorComment: () => undefined });
+    }
+
+    await sleep(transferMs);
+
+    // A-RELEASE-RP. The association is over: the peer's slot is free and the
+    // next association is admitted into it here, not `settleMs` from now.
+    observed.live -= 1;
+    if (params.onEnded) params.onEnded();
+    free += 1;
+    pump();
+
+    // Released, but not yet resolved — the window the miscount lived in.
+    await sleep(settleMs);
+
+    return {
+      outcome: {
+        kind: 'completed',
+        label: 'Association completed',
+        headline: 'The association was released normally.',
+        retryable: false,
+        raw: 'A-RELEASE-RP',
+      },
+      association: {},
+      statistics: undefined,
+    };
+  };
+
+  return { observed, runAssociation };
+}
+
+/**
+ * Runs the command against a stand-in runAssociation.
+ *
+ * send.js destructures runAssociation at load, so the stand-in has to be in the
+ * dimse module before send.js is required. The original module object is put
+ * back afterwards, which leaves the copy every other test in this file uses
+ * untouched — it captured the real function when it was first loaded.
+ */
+async function withStubbedAssociations(runAssociation, fn) {
+  const dimsePath = require.resolve('../../src/lib/dimse');
+  const sendPath = require.resolve('../../src/commands/send');
+  const dimseModule = require.cache[dimsePath];
+  const sendModule = require.cache[sendPath];
+  const realExports = dimseModule.exports;
+
+  dimseModule.exports = { ...realExports, runAssociation };
+  delete require.cache[sendPath];
+
+  try {
+    return await fn(require(sendPath));
+  } finally {
+    dimseModule.exports = realExports;
+    require.cache[sendPath] = sendModule;
+  }
+}
+
+test('a slot is given back when the association ends, not when its statistics settle', async (t) => {
+  await t.test('runAssociation announces the end before it resolves, on every path', async () => {
+    // The contract the accounting rests on. runAssociation resolves once the
+    // socket has closed or the close grace has expired, which is after
+    // A-RELEASE-RP — by which point the peer has freed the slot and may have
+    // admitted somebody else. So the end has to be announced separately, and it
+    // has to be announced whatever ended the association: a path that forgot to
+    // would leak a live association and raise the floor of every peak after it.
+    const scp = await startScp({ acceptCallingAe: ['ALLOWED'] });
+    const deadPort = await freePort();
+
+    try {
+      const scenarios = [
+        { name: 'released', port: scp.port, callingAe: 'ALLOWED', kind: 'completed' },
+        { name: 'rejected', port: scp.port, callingAe: 'DENIED', kind: 'rejected' },
+        { name: 'no peer at all', port: deadPort, callingAe: 'ALLOWED', kind: 'transport' },
+      ];
+
+      for (const scenario of scenarios) {
+        const order = [];
+        let ends = 0;
+
+        const { outcome } = await dimse.runAssociation({
+          host: '127.0.0.1',
+          port: scenario.port,
+          callingAe: scenario.callingAe,
+          calledAe: 'ANY',
+          requests: [new dimse.dcmjsDimse.requests.CEchoRequest()],
+          timeouts: dimse.resolveTimeouts({ connectTimeout: 5000 }),
+          onEnded: () => {
+            ends += 1;
+            order.push('ended');
+          },
+        });
+        order.push('resolved');
+
+        assert.equal(outcome.kind, scenario.kind, scenario.name);
+        assert.equal(ends, 1, `${scenario.name}: announced exactly once`);
+        assert.deepEqual(order, ['ended', 'resolved'], `${scenario.name}: announced before it resolved`);
+      }
+    } finally {
+      scp.close();
+    }
+  });
+
+  await t.test('a peer that grants one association at a time is reported as one', async () => {
+    await withTempDir('dcm-speed-slot', async (dir) => {
+      const outDir = path.join(dir, 'study');
+      await generate({ outDir, studies: 1, seriesPerStudy: 1, instancesPerSeries: 40, quiet: true });
+
+      const peer = queueingPeer({ cap: 1 });
+      const { code, stdout, stderr } = await withStubbedAssociations(
+        peer.runAssociation,
+        (stubbedSend) => runCommand(stubbedSend, [
+          outDir,
+          '--host', '127.0.0.1', '--port', '104', '--called-ae', 'ANY',
+          '--parallel', '2', '--chunk', '10', '--retry', '0', '--json',
+        ])
+      );
+      const payload = firstJsonDocument(stdout);
+
+      // Nothing went wrong with the transfer: this is the quiet case, where the
+      // width is the only thing that could be false.
+      assert.equal(code, 0);
+      assert.equal(payload.found, 40);
+      assert.equal(payload.sent, 40);
+      assert.equal(payload.acknowledged, 40);
+      assert.equal(payload.studies[0].chunks, 4);
+      assert.equal(payload.studies[0].workers, 2, 'two workers really were dispatched');
+
+      assert.equal(peer.observed.accepted, 4, 'every chunk got its association');
+      assert.equal(peer.observed.peak, 1, 'and the peer never ran more than one at a time');
+      assert.equal(
+        payload.studies[0].peakAssociations,
+        peer.observed.peak,
+        'the sender must not count a released association and its replacement together'
+      );
+      assert.equal(payload.parallelAchieved, 1, 'so the run reports the width it actually got');
+      assert.equal(payload.associations, 4);
+      assert.match(stderr, /never had more than 1 accepted at once/, 'and says the width fell short');
+    });
+  });
+
+  await t.test('a peer that grants two is reported as two', async () => {
+    // The other direction, so the number above is a measurement rather than a
+    // reflex: the same run against a peer with room for both workers reports 2
+    // and has nothing to warn about.
+    await withTempDir('dcm-speed-slot-wide', async (dir) => {
+      const outDir = path.join(dir, 'study');
+      await generate({ outDir, studies: 1, seriesPerStudy: 1, instancesPerSeries: 40, quiet: true });
+
+      // A transfer phase long enough that a stalled runner cannot make the two
+      // workers miss each other: they are admitted in the same microtask drain,
+      // and this is the window they then share.
+      const peer = queueingPeer({ cap: 2, transferMs: 100 });
+      const { code, stdout, stderr } = await withStubbedAssociations(
+        peer.runAssociation,
+        (stubbedSend) => runCommand(stubbedSend, [
+          outDir,
+          '--host', '127.0.0.1', '--port', '104', '--called-ae', 'ANY',
+          '--parallel', '2', '--chunk', '10', '--retry', '0', '--json',
+        ])
+      );
+      const payload = firstJsonDocument(stdout);
+
+      assert.equal(code, 0);
+      assert.equal(payload.acknowledged, 40);
+      assert.equal(peer.observed.peak, 2);
+      assert.equal(payload.studies[0].peakAssociations, 2);
+      assert.equal(payload.parallelAchieved, 2);
+      assert.doesNotMatch(stderr, /never had more than/);
+    });
   });
 });
 
@@ -878,4 +1247,35 @@ test('--speed is documented, including what it costs the receiver', () => {
   }
   assert.match(usage, /REJECTED/, 'the ceiling is the receiver, and rejection is how exceeding it shows up');
   assert.match(usage, /benchmark/, "'insane' should read as a benchmark setting, not a default");
+});
+
+test('a one-association run never blames a concurrency limit', async (t) => {
+  // v0.14.0 shipped this warning ungated, so the tool's DEFAULT configuration
+  // — one association, no --speed, no --parallel — greeted an unreachable PACS
+  // by telling the operator to lower --parallel. At one association there is no
+  // "rest" for the peer to refuse and nothing that could have overlapped, so
+  // the only way to reach the check is a peer that accepted nothing at all,
+  // which the shortfall and the exit code already report correctly. Pointing at
+  // a concurrency limit that is not involved sends the reader looking in the
+  // wrong place on the most common failure mode there is.
+  await withTempDir('dcm-speed-oneassoc', async (dir) => {
+    await generate({ outDir: dir, studies: 1, seriesPerStudy: 1, instancesPerSeries: 6, quiet: true });
+    // A port nothing is listening on: freePort reserves and releases one.
+    const dead = await freePort();
+    const peer = ['--host', '127.0.0.1', '--port', String(dead), '--called-ae', 'NOPE',
+      '--connect-timeout', '800', '--retry', '0'];
+
+    await t.test('one association: absent, and the failure is still reported', async () => {
+      const { code, stderr } = await runCommand(send, [dir, ...peer]);
+      assert.equal(code, 1, 'an unreachable peer is a failed transfer');
+      assert.doesNotMatch(stderr, /never had more than/);
+      assert.doesNotMatch(stderr, /lower --parallel or --speed/);
+    });
+
+    await t.test('several associations: still fires, because there the reading is real', async () => {
+      const { code, stderr } = await runCommand(send, [dir, ...peer, '--parallel', '4', '--chunk', '2']);
+      assert.equal(code, 1);
+      assert.match(stderr, /never had more than 0 accepted at once/);
+    });
+  });
 });

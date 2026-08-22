@@ -134,6 +134,12 @@ function resolveTimeouts(opts = {}) {
  *                                          should already be attached by the caller.
  * @param {object} [params.timeouts]        From {@link resolveTimeouts}.
  * @param {function} [params.onAccepted]    Called with the negotiated Association.
+ * @param {function} [params.onEnded]       Called once, the moment the association
+ *                                          is over — released, rejected, aborted,
+ *                                          failed or closed. Always before the
+ *                                          promise resolves, and usually earlier;
+ *                                          see the `end` helper below for why the
+ *                                          two moments are not the same one.
  * @param {function} [params.onProgress]    Called on any inbound response, to
  *                                          feed the caller's own idle detection.
  * @param {object} [params.securityOptions] TLS options, passed through.
@@ -148,12 +154,14 @@ function runAssociation(params) {
     requests,
     timeouts = resolveTimeouts(),
     onAccepted,
+    onEnded,
     onProgress,
     securityOptions,
   } = params;
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let ended = false;
     let phase = Phase.CONNECTING;
     let association;
     let client;
@@ -163,12 +171,43 @@ function runAssociation(params) {
     let lastActivity = Date.now();
 
     /**
+     * Announces the end of the association, exactly once.
+     *
+     * Deliberately separate from settle(), because the association ending and
+     * this promise resolving are not the same moment. settle() waits for the
+     * socket to close (or for the close grace to expire) so that byte
+     * statistics are final — and by then the peer has long since seen
+     * A-RELEASE-RQ, freed the slot the association occupied and quite possibly
+     * accepted somebody else into it. A caller counting how many associations
+     * a peer is carrying has to be told at the earlier moment; told at the
+     * later one, its count stays high after the peer has moved on, and two
+     * associations that never overlapped at the receiver look concurrent at
+     * the sender.
+     *
+     * Called from settle() as well as from each terminal handler so that it
+     * can never be skipped, whatever path ends the association. An early
+     * notification costs nothing; a missed one would leak whatever the caller
+     * is tracking, and a leaked count is a lie that outlives the association.
+     */
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      if (!onEnded) return;
+      try {
+        onEnded();
+      } catch (err) {
+        log.debug(`onEnded handler threw: ${err.message}`);
+      }
+    };
+
+    /**
      * Settles exactly once. Anything arriving afterwards is noise from a
      * socket that is already being torn down.
      */
     const settle = (outcome) => {
       if (settled) return;
       settled = true;
+      end();
       clearInterval(watchdog);
       clearTimeout(releaseTimer);
       let statistics;
@@ -224,16 +263,23 @@ function runAssociation(params) {
 
       client.on('associationRejected', (rj) => {
         touch();
+        end();
         settle(describeRejection(rj));
       });
 
       client.on('abort', (ab) => {
         touch();
+        end();
         settle(describeAbort(ab));
       });
 
       client.on('associationReleased', () => {
         touch();
+        // A-RELEASE-RP: the association is over here, whatever the socket does
+        // next. This is the moment the peer's slot is free, so it is the moment
+        // the caller is told — not the settle() below, which waits for the
+        // statistics.
+        end();
         releaseOutcome = {
           kind: 'completed',
           label: 'Association completed',
@@ -250,6 +296,8 @@ function runAssociation(params) {
       });
 
       client.on('networkError', (err) => {
+        end();
+
         // The library aborts and emits a network error on its own association
         // and PDU timeouts. Attribute those as timeouts rather than transport
         // failures, so a stalled receiver never reads as a broken network.
@@ -268,6 +316,11 @@ function runAssociation(params) {
 
       // The library exposes both; either can be the last thing we hear.
       const onClosed = () => {
+        // A close ends the association too. On the ordinary path the release
+        // has already said so and this is a no-op; it matters for the socket
+        // that dies without a release, a rejection, an abort or an error.
+        end();
+
         // The ordinary path: released, then closed. Settle with the completion
         // recorded at release, now that the statistics are final.
         if (releaseOutcome) {

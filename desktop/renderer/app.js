@@ -2456,14 +2456,30 @@ function renderSpeedParallelHint() {
     el.classList.add('live');
     return;
   }
-  // Not the Ack column. A refused association is retried, and the retry lands
-  // in a slot that has since freed, so every instance still gets acknowledged
-  // and the run still exits 0 — the ceiling shows up only as a width the run
-  // never reached. Sending people to the Ack column pointed them at the one
-  // column that structurally cannot show this.
-  el.textContent = 'This is how you find the receiver\'s ceiling — read the Width column afterwards, not the '
-    + 'Ack column: a refused association is retried, so a preset the receiver will not accept still '
-    + 'acknowledges every instance and comes back narrow rather than short or slow.';
+  // Both columns, because a rejection has two endings and neither column can
+  // report the other's.
+  //
+  // This line used to send the operator to the Width column and away from the
+  // Ack column, on the claim that a refused association is always retried into
+  // a freed slot, so every instance is acknowledged and only the width comes
+  // back short. That is one of two endings, and it was written as if it were
+  // the only one. sendChunkWithRetry re-enters sendChunk immediately — there is
+  // no backoff — so every attempt --retry allows is spent within milliseconds
+  // of the first A-ASSOCIATE-RJ, while the associations holding the slots are
+  // still working through their chunks. If no slot frees inside that window the
+  // instances are never acknowledged and the run exits 1: measured against a
+  // peer capped at 3, --parallel 4 --chunk 30 --retry 12 over 240 instances
+  // came back short in 4 of 4 runs, 150 unacknowledged.
+  //
+  // Which ending arrives is timing, not a setting, so the line promises
+  // neither. It names both and points at the column that answers each. This
+  // wording tracks desktop/README.md and `dcm send --help`; the three say the
+  // same thing on purpose.
+  el.textContent = 'This is how you find the receiver\'s ceiling — read the Width column and the Ack column '
+    + 'afterwards, because neither answers the other\'s question: a refused association is retried with no '
+    + 'backoff, so the attempts burn out in milliseconds, and the run either finishes clean at a width it '
+    + 'never reached or ends with instances the receiver never acknowledged. Width says whether it ran as '
+    + 'wide as asked; the counts say whether all of it arrived.';
   el.classList.remove('live');
 }
 
@@ -2508,8 +2524,11 @@ function renderSpeedPlan(runs) {
  * simultaneously *accepted* associations any single study in the run reached
  * (see planJson in src/commands/send.js). The two come apart when a study does
  * not split into enough chunks to fill the pool, and again when the receiver
- * refuses the extra associations; a rejected association is retried, so that
- * second case ends with every instance acknowledged and only the width short.
+ * refuses the extra associations. That second case has two endings — the retry
+ * is admitted into a freed slot and only the width is short, or the retries
+ * burn out unbacked-off and instances go unacknowledged — so a short width is
+ * not on its own evidence that everything arrived. The Ack column answers that,
+ * and this one does not.
  *
  * The reason is per-study and this row is not, so the row states the measured
  * fact and nothing more — the engine's per-study warning names the cause, and
@@ -2553,6 +2572,30 @@ function effectiveRun(d) {
 }
 
 /**
+ * Whether a run delivered everything it found, from the run's own JSON.
+ *
+ * `found` is files on disk, `acknowledged` is instances the peer confirmed it
+ * stored. Any gap between them is a failure — the engine exits non-zero on it
+ * (see "Any shortfall between them is a failure" in `dcm send --help`) — and
+ * `ok` carries that same verdict. Both are read: `ok` covers a run that failed
+ * for a reason the counts do not show, and the counts name what was lost.
+ *
+ * This is the one column a rejected-association shortfall can show up in. A
+ * width can come back short with everything acknowledged; a short Ack means
+ * instances are not on the peer.
+ *
+ * @returns {{acknowledged:number|null, found:number|null, missing:number|null}|null}
+ *   null when the run delivered everything, an object when it did not.
+ */
+function ackShortfall(d) {
+  const found = typeof d.found === 'number' ? d.found : null;
+  const acknowledged = typeof d.acknowledged === 'number' ? d.acknowledged : null;
+  const missing = found !== null && acknowledged !== null ? found - acknowledged : null;
+  const bad = d.ok === false || (missing !== null && missing > 0);
+  return bad ? { acknowledged, found, missing } : null;
+}
+
+/**
  * Renders the comparison table once runs have results.
  *
  * Two things this table is not allowed to do, because they are the whole reason
@@ -2563,33 +2606,61 @@ function effectiveRun(d) {
  * that was requested, and the badge goes to every row that resolved to the same
  * effective transfer as the fastest one rather than to whichever of them drew
  * the best sample.
+ *
+ * A third, added here: a run that did not deliver every instance must not sit
+ * in this table looking like a result. It is not a slow row to be ranked below
+ * the others — there is nothing to rank. Its rate is computed over a transfer
+ * that stopped early, which is fewer bytes over less time, so it lands wherever
+ * the run happened to die and often lands high. See the rate cells below.
  */
 function renderSpeedResults(results) {
   const box = $('#view-speed [data-result]');
   box.hidden = false;
-  const ok = results.filter((r) => r.data && r.data.ok);
-
-  if (!ok.length) {
-    box.innerHTML = '<div class="empty-note">No run completed successfully. The output below says why.</div>';
+  // Cancelled before the first run returned. There is nothing to tabulate, and
+  // an empty table would read as a sweep that found nothing rather than as one
+  // that never happened.
+  if (!results.length) {
+    box.innerHTML = '<div class="empty-note">No run produced a result. The output below says why.</div>';
     return;
   }
+  // A run that fell short of its own instance count is not in this set, so it
+  // cannot set the best rate and cannot be tied with the row that did.
+  const ok = results.filter((r) => r.data && r.data.ok && !ackShortfall(r.data));
 
-  const bestRate = Math.max(...ok.map((r) => r.data.megabytesPerSecond || 0));
-  const winner = ok.find((r) => (r.data.megabytesPerSecond || 0) === bestRate);
-  const winningRun = effectiveRun(winner.data);
-  // Every successful run that did the same work as the fastest one. Usually
-  // just the fastest one; more than that means the sweep found no difference.
-  const tied = ok.filter((r) => effectiveRun(r.data) === winningRun);
-  const isTie = tied.length > 1;
+  // FASTEST is computed over completed runs only, and the badge is only ever
+  // put on a row drawn from that set. An incomplete run is not eligible: its
+  // MB/s is not a measurement of anything the sweep is comparing, and a
+  // shortfall that ended a run early is exactly the way to *win* on a figure
+  // like that. Nothing here falls back to results[] when `ok` is empty — a
+  // sweep in which every run fell short declares no winner at all.
+  let winningRun = null;
+  let tied = [];
+  let isTie = false;
+  if (ok.length) {
+    const bestRate = Math.max(...ok.map((r) => r.data.megabytesPerSecond || 0));
+    const winner = ok.find((r) => (r.data.megabytesPerSecond || 0) === bestRate);
+    winningRun = effectiveRun(winner.data);
+    // Every completed run that did the same work as the fastest one. Usually
+    // just the fastest one; more than that means the sweep found no difference.
+    tied = ok.filter((r) => effectiveRun(r.data) === winningRun);
+    isTie = tied.length > 1;
+  }
   const badge = isTie ? 'TIED FASTEST' : 'FASTEST';
   const short = results.filter((r) => r.data && (achievedWidth(r.data) || {}).short);
+  // Both kinds of failure, in run order: a run whose JSON says it lost
+  // instances, and a run that produced no parseable JSON at all.
+  const lost = results.filter((r) => r.data && ackShortfall(r.data));
+  const incomplete = results.filter((r) => !r.data || ackShortfall(r.data));
 
   const rows = results.map((r) => {
     if (!r.data) {
-      return `<tr><td>${esc(r.run.title)}</td><td colspan="8" class="dim">failed — see output</td></tr>`;
+      return `<tr class="incomplete"><td>${esc(r.run.title)}`
+        + '<span class="badge-incomplete">INCOMPLETE</span></td>'
+        + '<td colspan="8" class="dim">failed — see output</td></tr>';
     }
     const d = r.data;
-    const isBest = d.ok && effectiveRun(d) === winningRun;
+    const miss = ackShortfall(d);
+    const isBest = !miss && d.ok && winningRun !== null && effectiveRun(d) === winningRun;
     const w = achievedWidth(d);
     const width = !w
       ? '—'
@@ -2597,24 +2668,67 @@ function renderSpeedResults(results) {
         ? `<span class="warn-inline">${w.got} of ${w.asked}</span>`
         : String(w.got);
     const negotiated = (d.negotiatedTransferSyntaxes || []).map((t) => t.name).join(', ') || '—';
-    return `<tr class="${isBest ? (isTie ? 'best tied' : 'best') : ''}">
-      <td>${esc(r.run.title)}${isBest ? `<span class="badge-best${isTie ? ' tied' : ''}">${badge}</span>` : ''}</td>
+    // What an incomplete run's throughput cells show, and why they show it.
+    //
+    // Not the number. MB/s and instances/s are bytes and instances over the
+    // elapsed time of a run that gave up partway: the denominator shrank with
+    // the numerator, and neither one covers the transfer that was asked for. It
+    // is not a slow reading of this configuration, it is not a reading of this
+    // configuration at all, and because a run that dies early is a *short* run
+    // it frequently prints faster than the runs that finished. Printing it
+    // greyed, or struck through, or with a footnote still leaves a figure in a
+    // column whose only purpose is to be compared down a page.
+    //
+    // So the cells read "—", and the note under the table says what is missing
+    // and why it is not here. Elapsed and On the wire stay: those are facts
+    // about what happened, not rates attributed to a transfer that did not.
+    const rate = miss
+      ? '<td class="num dim">—</td><td class="num dim">—</td>'
+      : `<td class="num">${d.megabytesPerSecond}</td><td class="num">${d.instancesPerSecond}</td>`;
+    // The counts are the row's verdict, so they are amber and they carry the
+    // gap in words — "60/100" and "100/100" differ by one character otherwise.
+    const ack = miss && miss.missing > 0
+      ? `<span class="warn-inline">${d.acknowledged}/${d.found} · ${miss.missing} missing</span>`
+      : `${d.acknowledged}/${d.found}`;
+    const cls = miss ? 'incomplete' : (isBest ? (isTie ? 'best tied' : 'best') : '');
+    return `<tr class="${cls}">
+      <td>${esc(r.run.title)}${miss ? '<span class="badge-incomplete">INCOMPLETE</span>' : ''}${
+        isBest ? `<span class="badge-best${isTie ? ' tied' : ''}">${badge}</span>` : ''}</td>
       <td class="num width">${width}</td>
       <td class="mono">${esc(r.run.callingAe)}</td>
       <td>${esc(negotiated)}</td>
       <td class="num">${(d.elapsedMs / 1000).toFixed(2)}s</td>
-      <td class="num">${d.megabytesPerSecond}</td>
-      <td class="num">${d.instancesPerSecond}</td>
+      ${rate}
       <td class="num">${humanBytes(d.bytesSent)}</td>
-      <td class="num">${d.acknowledged}/${d.found}</td>
+      <td class="num ack">${ack}</td>
     </tr>`;
   }).join('');
 
   const notes = [];
+  // First note in the box, above the width caveat: a shortfall outranks
+  // everything else the table has to say about the sweep.
+  if (incomplete.length) {
+    const missing = lost.reduce((n, r) => n + Math.max(0, (ackShortfall(r.data) || {}).missing || 0), 0);
+    const lostPhrase = missing
+      ? `, leaving ${missing} instance${missing === 1 ? '' : 's'} the receiver never acknowledged`
+      : '';
+    notes.push(
+      `<div class="local-note"><b>${incomplete.length} of ${results.length} run` +
+      `${results.length === 1 ? '' : 's'} did not finish${lostPhrase}.</b> ` +
+      'Those rows carry no MB/s and no instances/s, and that is deliberate: a rate over a transfer ' +
+      'that stopped early is fewer bytes over less time, so it is not a slower reading of that ' +
+      'setting — it is not a reading of it, and it often prints faster than the runs that ' +
+      'completed. They are also not eligible for FASTEST. Elapsed and On the wire are what did ' +
+      'happen; Ack is what did not. The engine\'s own report is in the output below. A receiver at ' +
+      'its association limit rejects transiently and the chunk is retried with no backoff, so every ' +
+      'attempt is spent within milliseconds while the accepted associations are still transferring; ' +
+      'when no slot frees inside that window, this is the ending you get.</div>'
+    );
+  }
   if (short.length) {
     notes.push(
       `<div class="local-note"><b>${short.length} run${short.length === 1 ? '' : 's'} did not reach the ` +
-      `width ${short.length === 1 ? 'it' : 'they'} asked for.</b> Where Width reads "N of M", the MB/s ` +
+      `width ${short.length === 1 ? 'it' : 'they'} asked for.</b> Where Width reads "N of M", any MB/s ` +
       'beside it is the rate for N concurrent associations, not for M — it is not a measurement of M ' +
       'and cannot be compared to one. The engine warned per study in the output below, and that warning ' +
       'names the reason: either the study did not split into enough chunks to fill the pool, or the peer ' +
@@ -2640,6 +2754,35 @@ function renderSpeedResults(results) {
     '<th class="num">On the wire</th><th class="num">Ack</th></tr></thead>' +
     `<tbody>${rows}</tbody></table>` +
     notes.join('');
+}
+
+/**
+ * The sweep's one-line verdict, for the status chip at the top of the screen.
+ *
+ * The chip used to read a green "Done" whenever *any* single run came back ok,
+ * so a sweep in which three of four runs lost instances announced itself as a
+ * success from the top of the screen — above a table the operator then had to
+ * read closely to find out otherwise. A sweep is one benchmark made of several
+ * runs; it has not succeeded while any part of it is missing instances.
+ *
+ * Three outcomes, and the middle one is the point: every run complete is green,
+ * nothing complete is red, and a mixture is amber and counted. Amber rather
+ * than red because the completed runs in that sweep are real measurements and
+ * the table below them is worth reading; counted rather than a bare "Incomplete"
+ * because the number is what tells the operator whether to trust any of it.
+ *
+ * @param {Array<{data:object|null}>} results Runs that returned, in order.
+ * @param {boolean} cancelled Whether the operator stopped the sweep.
+ * @returns {{kind:string, label:string}} A setStatus kind and its label.
+ */
+function speedOutcome(results, cancelled) {
+  // Stopped before anything returned: no runs, so nothing succeeded either.
+  if (!results.length) return { kind: 'fail', label: cancelled ? 'Stopped' : 'Failed' };
+  const bad = results.filter((r) => !r.data || ackShortfall(r.data)).length;
+  const stopped = cancelled ? 'Stopped · ' : '';
+  if (!bad) return { kind: 'ok', label: cancelled ? 'Stopped' : 'Done' };
+  const kind = bad === results.length ? 'fail' : 'warn';
+  return { kind, label: `${stopped}${bad} of ${results.length} incomplete` };
 }
 
 /**
@@ -2756,12 +2899,23 @@ async function runSpeedTest() {
 
       if (line) {
         const w = data ? achievedWidth(data) : null;
+        const miss = data ? ackShortfall(data) : null;
         // The line's own label says how many associations were asked for, so a
-        // rate written beside it has to carry what was reached.
-        line.textContent = data
-          ? `${data.megabytesPerSecond} MB/s · ${(data.elapsedMs / 1000).toFixed(2)}s`
-            + (w && w.short ? ` · ran ${w.got} of ${w.asked} wide` : '')
-          : `failed (exit ${code})`;
+        // rate written beside it has to carry what was reached — and a run that
+        // lost instances gets no rate at all, for the same reason its row in the
+        // table below gets none. This list is read while the sweep is still
+        // going, so it is the first place the shortfall can be seen.
+        if (!data) {
+          line.textContent = `failed (exit ${code})`;
+        } else if (miss) {
+          line.textContent = miss.missing > 0
+            ? `incomplete · ${data.acknowledged} of ${data.found} acknowledged`
+            : `incomplete · exit ${code}`;
+        } else {
+          line.textContent = `${data.megabytesPerSecond} MB/s · ${(data.elapsedMs / 1000).toFixed(2)}s`
+            + (w && w.short ? ` · ran ${w.got} of ${w.asked} wide` : '');
+        }
+        line.classList.toggle('bad', !data || !!miss);
       }
       const parent = $(`#speed-line-${i}`);
       if (parent) parent.classList.add('done');
@@ -2773,8 +2927,8 @@ async function runSpeedTest() {
 
   $('#view-speed [data-run]').disabled = false;
   $('#view-speed [data-cancel]').hidden = true;
-  const anyOk = results.some((r) => r.data && r.data.ok);
-  setStatus('speed', anyOk ? 'ok' : 'fail', speedCancelled ? 'Stopped' : (anyOk ? 'Done' : 'Failed'));
+  const outcome = speedOutcome(results, speedCancelled);
+  setStatus('speed', outcome.kind, outcome.label);
   renderSpeedResults(results);
 }
 

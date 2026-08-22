@@ -31,6 +31,9 @@ const path = require('node:path');
 const BIN = path.join(__dirname, '..', '..', 'bin', 'dcm.js');
 const FIXTURE_SCRIPT = path.join(__dirname, '..', '..', 'tools', 'make-fixtures.js');
 
+/** The engine's own preset table, so the schema cannot drift away from it. */
+const { SPEED_PRESETS } = require('../../src/commands/send.js');
+
 /** A port nothing listens on, so a connection attempt fails immediately. */
 const DEAD_PEER = { host: '127.0.0.1', port: 1, calledAe: 'NOPE' };
 
@@ -156,16 +159,51 @@ test('dcm_query points at dcm_worklist rather than hiding MWL as a level', async
   assert.ok(query.inputSchema.properties.timeout, 'dcm_query should expose timeout');
 });
 
-test('dcm_send advertises the transfer syntax, parallel and label options', async () => {
+test('dcm_send advertises the transfer syntax, speed, parallel and label options', async () => {
   const { tools } = await client.listTools();
   const send = tools.find((t) => t.name === 'dcm_send');
   const properties = send.inputSchema.properties;
-  for (const expected of ['transferSyntax', 'parallel', 'label', 'recurse']) {
+  for (const expected of ['transferSyntax', 'speed', 'parallel', 'label', 'recurse']) {
     assert.ok(properties[expected], `dcm_send is missing the ${expected} parameter`);
   }
   // The v0.5 headline: it converts, it does not merely propose.
   assert.match(properties.transferSyntax.description, /BEFORE sending/i);
   assert.match(properties.transferSyntax.description, /jpeg2000/);
+
+  // The preset names are the tool owner's and are what people type and say to
+  // each other, so they are asserted against the engine's own table rather than
+  // retyped here: a renamed or added preset that never reached this schema is a
+  // feature an assistant cannot use, which is exactly how --speed shipped in
+  // v0.14.0 unreachable from MCP.
+  assert.deepEqual(properties.speed.enum, Object.keys(SPEED_PRESETS));
+});
+
+test('the speed parameter carries the caveats an assistant has to weigh before choosing one', async () => {
+  const { tools } = await client.listTools();
+  const speed = tools.find((t) => t.name === 'dcm_send').inputSchema.properties.speed;
+
+  // This description is the only thing read before a value is picked, and a
+  // model picking the top of a list is the failure mode: "insane" has to arrive
+  // labelled as a benchmark against a receiver you own, not as "the fast one".
+  assert.match(speed.description, /BENCHMARK/);
+  assert.match(speed.description, /receiver you own/i);
+  assert.match(speed.description, /someone else's archive/i);
+
+  // Whose limit decides the width, and what exceeding it costs. "Rejected"
+  // rather than "queued" is the whole difference between a slow run and an
+  // incomplete one.
+  assert.match(speed.description, /the receiver decides how many associations it accepts/i);
+  assert.match(speed.description, /REJECTED/);
+
+  // And what the number in the report does and does not mean. A floor read as
+  // an average is a run believed wider than it was.
+  assert.match(speed.description, /parallelAchieved/);
+  assert.match(speed.description, /floor/i);
+
+  // The trap the preset exists to close, said on the flag that walks into it.
+  const parallel = tools.find((t) => t.name === 'dcm_send').inputSchema.properties.parallel;
+  assert.match(parallel.description, /min\(parallel, chunks\)/);
+  assert.match(parallel.description, /Prefer speed/);
 });
 
 test('the tools that write data say so in their description', async () => {
@@ -490,6 +528,80 @@ test('dcm_send accepts parallel, label, retry, chunk and recurse', async () => {
   // An explicit --chunk survives even when rewriting would otherwise shrink it.
   assert.match(textOf(res), /chunk size 4/);
   assert.match(textOf(res), /series UIDs would be rewritten/);
+});
+
+test('dcm_send speed reaches the command and sizes the associations', async () => {
+  // A preset is only itself if it sets BOTH numbers, so the proof is the chunk
+  // size: the plain run keeps the fixed default of 200 and the preset derives
+  // one from the study, clamped up to the 25-instance floor. No peer required —
+  // the dry run reports the plan.
+  const plain = await call('dcm_send', {
+    path: fixture.dir,
+    host: 'nonexistent.invalid',
+    port: 104,
+    calledAe: 'ARCHIVE',
+    dryRun: true,
+  });
+  assert.ok(!plain.isError, textOf(plain));
+  assert.match(textOf(plain), /chunk size 200/);
+
+  const fast = await call('dcm_send', {
+    path: fixture.dir,
+    host: 'nonexistent.invalid',
+    port: 104,
+    calledAe: 'ARCHIVE',
+    speed: 'fast',
+    dryRun: true,
+  });
+  assertNoUnknownOption(fast);
+  assert.ok(!fast.isError, textOf(fast));
+  const text = textOf(fast);
+  assert.match(text, /up to 4 association\(s\) at a time/);
+  assert.match(text, /--speed fast/);
+  assert.match(text, /chunk size 25/);
+
+  // A six-instance fixture is one chunk however it is sized, so the preset
+  // cannot be delivered here — and the shortfall warning reaching an MCP caller
+  // is the point. A width an assistant reads as 4 when the run will be 1 is the
+  // misattribution this release exists to end.
+  assert.match(text, /it will run 1 wide, not 4/);
+});
+
+test('dcm_send passes speed and parallel together rather than resolving the contest itself', async () => {
+  // The engine decides which wins and warns when a typed number displaces the
+  // preset's. Suppressing either flag here would swallow that warning, leaving
+  // an assistant holding a run configured differently from the preset it named.
+  const res = await call('dcm_send', {
+    path: fixture.dir,
+    host: 'nonexistent.invalid',
+    port: 104,
+    calledAe: 'ARCHIVE',
+    speed: 'fast',
+    parallel: 2,
+    dryRun: true,
+  });
+  assertNoUnknownOption(res);
+  assert.ok(!res.isError, textOf(res));
+  const text = textOf(res);
+  assert.match(text, /--parallel 2 was given alongside --speed fast/);
+  assert.match(text, /--parallel wins/);
+  assert.match(text, /not the preset's 4/);
+  assert.match(text, /up to 2 association\(s\) at a time/);
+});
+
+test('dcm_send rejects a speed that is not a preset', async () => {
+  const res = await call('dcm_send', {
+    path: fixture.dir,
+    host: 'nonexistent.invalid',
+    port: 104,
+    calledAe: 'ARCHIVE',
+    speed: 'ludicrous',
+    dryRun: true,
+  });
+  assert.equal(res.isError, true);
+  // Whether the enum or the engine refuses it, what comes back has to name the
+  // presets that do exist — a bare "invalid value" leaves a caller guessing.
+  assert.match(textOf(res), /very-fast/);
 });
 
 test('dcm_send rejects a parallelism the engine will not allow', async () => {

@@ -1,5 +1,138 @@
 # Changelog
 
+## v0.14.1
+
+An independent recheck of the shipped v0.14.0 code landed after the tag. This
+entry is what it found, and the largest item is a sentence I wrote myself.
+
+**The help text, the README and the v0.14.0 entry below all describe a failure
+mode that does not reliably happen.** All three said that a receiver at its
+concurrent-association limit rejects transiently, that "the retry lands in a
+slot that has since freed, and every instance ends up acknowledged", and that
+the run therefore "exits 0 having quietly done the work narrower than it was
+told to" — with a shortfall and a non-zero exit filed as the rarer, permanent
+case. I wrote that while correcting the opposite overstatement, and I got there
+by reasoning from the DICOM meaning of *transient* — retryable — straight to "so
+it recovers", without reading the retry loop I was describing.
+
+`sendChunkWithRetry` has no backoff. The next attempt opens immediately, so
+every attempt `--retry` allows is spent within milliseconds of the first
+rejection, while the associations occupying the slots are still working through
+their chunks — which takes seconds. A slot can free inside that window, and then
+the run really does end clean and narrow. Often none does. Measured against a
+peer capped at 3 associations, `--parallel 4 --chunk 30 --retry 12` left 60 of
+240 instances unacknowledged and exited 1. The same measurement against the
+v0.13.4 engine gives the same result, so the behaviour is not new — only the
+claim about it was, which is the part that makes it worth an entry rather than a
+quiet edit. A correction that overshoots into a second wrong answer is not a
+correction.
+
+The honest version is that both endings are reachable, and which one you get
+turns on whether some chunk happens to finish inside the few milliseconds the
+retries occupy: on chunk size, link speed and the peer's own pace, none of which
+the run controls. "Transient" is not "recovered", and a larger `--retry` buys
+more attempts inside the same millisecond rather than more time. All three
+surfaces now say that, and they end on a takeaway that holds either way: read
+the width, and read found/sent/acknowledged. The width says whether the run was
+as wide as it was told to be, the counts say whether all of it arrived, and the
+exit code answers only the second question.
+
+The rest of what the recheck found in the code:
+
+- **`parallelAchieved` could read one higher than the peer ever granted.**
+  `liveAssociations` was decremented when `runAssociation` resolved, which is
+  after the socket closes or the 400 ms close grace expires — well after
+  A-RELEASE-RP. A peer at its limit frees its slot on the release and admits the
+  replacement immediately, so the departing association and the one that took
+  its place were both counted live at this end. Against a receiver granting 3, a
+  `--speed fast` run reported `parallelAchieved: 4` of 4 with no caveat and no
+  warning, in 2 of 5 runs. Non-deterministic, in the flattering direction, and
+  landing exactly on the value that suppresses the shortfall caveat — the defect
+  class this release exists to end, inside the fix for it. `runAssociation` now
+  takes an `onEnded` callback fired from every terminal handler the moment the
+  association is over, and the slot goes back there instead. The regression test
+  uses a receiver that queues past a cap; the existing coverage only exercised
+  refuse-all and accept-all, which is why this survived. One case remains and
+  cannot be closed from this end: a peer that puts the replacement's
+  A-ASSOCIATE-AC on the wire *before* the departing association's A-RELEASE-RP
+  has told the sender about the arrival before the departure, and the count
+  reads +1 again. Measured 5 of 5 against a receiver built to do exactly that.
+  The error still points the flattering way, which is why it is written down
+  here rather than left implied by "errs downward".
+- **The association count included associations that carried nothing.** A
+  refused association still incremented `metrics.associations`, so a run the
+  peer rejected outright reported `associations: 2` beside `sent: 0` and
+  `bytesSent: 0`, and bytes-per-association read as poor efficiency rather than
+  as a peer saying no. It is counted on acceptance now. This error pointed the
+  unflattering way, which is presumably why it lasted.
+- **With no studies at all, the width reducer returned the width that was
+  requested.** The seed survived untouched, so the one input that measured
+  nothing would have reported the full request as an achievement. Unreachable
+  today — the run returns before it when nothing was found — but it is the exact
+  shape of claim that function exists to prevent, and a length check costs one
+  comparison.
+- **A warning fired for an override that displaced nothing.** `--speed normal
+  --chunk 200` warned that `--chunk` had won and the preset "does not get to
+  size associations", when at one association the derivation returns 200 for
+  every study, so nothing was displaced. That is the same self-contradicting
+  warning v0.14.0 fixed on the `--parallel` side and left standing on the other
+  flag — and easy to hit from the desktop, where Chunk size sits under Advanced
+  with Normal selected by default. It is now suppressed in the one case where
+  equality is decidable for every study at once: one association, the default
+  size, and no `--rewrite-series-uid` or `--transfer-syntax`, since those cap a
+  derived size but deliberately not a typed one.
+
+- **An unreachable PACS was told it had a concurrency problem.** The width
+  warning was ungated, so the default configuration — one association, no
+  `--speed`, no `--parallel` — greeted a peer that accepted nothing with
+  "1 concurrent association(s) were opened ... the peer never had more than 0
+  accepted at once ... lower --parallel or --speed to what it allows". At one
+  association there is no rest for the peer to refuse and nothing that could
+  have overlapped; the only way to reach the check is a peer that accepted
+  nothing at all, which the shortfall and the exit code already state plainly.
+  A feature about concurrency had put itself in front of the most common
+  failure mode there is, on a setting nobody chose. It now requires more than
+  one association to fire, which is the only case where either of its two
+  readings is possible.
+- **`--speed` reached the MCP `dcm_send` tool.** v0.14.0 exposed `--chunk`,
+  `--parallel` and `--retry` there but not the preset, so an agent could set
+  either half of a benchmark and not the thing that sets both — the release's
+  headline feature was the one lever it could not pull.
+
+Two things that are working as intended and are documented rather than changed:
+
+- **`parallelAchieved` is a floor across studies, and it will read as a bug.**
+  One unavoidably narrow study pins the number for the whole run, and a study
+  can be narrow for a reason no setting can fix: 3 instances is one chunk, one
+  chunk is one association, at every preset. So a folder holding a 240-instance
+  series that genuinely ran 4 wide and a 3-instance dose SR beside it — the
+  shape of most real folders — reports `parallelAchieved: 1` and prints
+  `parallelism 1 of the 4 requested` for a run in which 98.8% of the data moved
+  4 wide. Nothing is overstated and nothing is wrong; it is the conservative
+  reading, because the throughput figure printed next to the width covers the
+  whole run, so the width has to be one that no part of the run fell below. The
+  alternative — an average, or the widest study — would put a number next to
+  that throughput figure which no single study is answerable for. It is now
+  spelled out everywhere the width is explained, with a pointer to the
+  per-study `studies` array, instead of being left for the first operator to
+  hit it.
+- **`--json`: `chunkSize` is `null` whenever a preset derived the size.** It was
+  always a number before v0.14.0. This shipped undocumented and should have been
+  called out then: nothing in the repo breaks, since the desktop reads
+  `parallelAchieved`, `parallel` and `studies`, and the MCP `dcm_send` tool
+  passes text through without parsing the envelope — but an external benchmark
+  script dividing by it gets `Infinity` or `NaN`. The size is per study once a
+  preset derives it, and no single number is true of the run; it is a number
+  only when one really did apply everywhere. `parallel` and `chunkSize` keep
+  their names, and `speed`, `parallelSource`, `parallelAchieved`, `chunkSource`
+  and `studies` are additive.
+
+Also corrected in `dcm send --help`, both stale rather than wrong when written:
+`--chunk` claimed memory stays flat, which is true as a study grows but not as
+the parallelism grows, since each association holds its own chunk; and
+`--transfer-syntax` said the chunk size is "reduced automatically" when it is a
+cap on a derived size, and a typed `--chunk` is left alone.
+
 ## v0.14.0
 
 `dcm send --speed <normal|fast|very-fast|insane>`, and the reason it is a
