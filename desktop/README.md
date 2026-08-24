@@ -145,10 +145,75 @@ the release. The tag itself is cut by CI: when a version bump lands on master,
 `.github/workflows/autotag.yml` tags it and starts the release builds, so a
 release is just "bump versions, update CHANGELOG, push".
 
-Like the CLI binaries, the installers are **not code-signed**. Windows
-SmartScreen will warn on first run (*More info → Run anyway*); macOS will need
-`xattr -d com.apple.quarantine` on the .app or a right-click → Open. Signing is a
-later step if this goes past the support team.
+The macOS `.app` is **ad-hoc signed** during the build; nothing else is signed.
+Windows SmartScreen still warns on first run (*More info → Run anyway*). What
+ad-hoc signing does and does not buy on macOS is in **Installing on macOS**
+below — read it before assuming the Mac builds are now "signed", because in the
+sense that matters to Gatekeeper they are not.
+
+The signing happens in `ad-hoc-sign-mac.js`, wired in as electron-builder's
+`afterPack` hook so it runs on the `.app` before the `.dmg` is built around it.
+It no-ops on Windows and Linux, stands aside if a real signing identity is ever
+configured, and throws — failing the build — if signing or verification fails.
+A real Developer ID is a later step if this goes past the support team.
+
+## Installing on macOS
+
+**First launch will show a warning, and that is expected.** macOS reports
+"Asteris DICOM App can't be opened because Apple cannot check it for malicious
+software", or names an unidentified developer. To get past it:
+
+- **right-click (or Control-click) the app → Open**, then click **Open** in the
+  dialog. Double-clicking will not offer that choice; the right-click menu is
+  what makes the Open button appear. You only do this once.
+- or, from Terminal, clear the quarantine flag the browser attached to the
+  download:
+
+  ```bash
+  xattr -cr "/Applications/Asteris DICOM App.app"
+  ```
+
+**If you downloaded v0.14.1 or earlier, you need one extra step.** Those builds
+say **"Asteris DICOM App is damaged and can't be opened. You should move it to
+the Trash"** on Apple Silicon (M1/M2/M3/M4) Macs. The download is not damaged
+and it is not malware. Those builds shipped with no code signature at all, and
+Apple Silicon refuses to run an unsigned arm64 binary — "damaged" is just the
+misleading wording macOS uses for it. Intel Macs were unaffected, which is why
+the Intel `.dmg` worked.
+
+The fix is to upgrade to a build newer than v0.14.1. To rescue a copy you
+already installed, sign it yourself — this is the same ad-hoc signature the
+build now applies, and it requires only the Xcode command line tools:
+
+```bash
+xattr -cr "/Applications/Asteris DICOM App.app"
+codesign --force --deep --sign - "/Applications/Asteris DICOM App.app"
+```
+
+(`--deep` is deprecated by Apple and the build itself signs inner-out instead,
+but for a one-off local rescue on a bundle you are not distributing it is the
+short command that works.)
+
+### What is and is not signed
+
+| | Status |
+|---|---|
+| macOS `.app` inside the `.dmg` | **Ad-hoc signed.** No certificate, no identity. |
+| Notarized by Apple | **No.** |
+| The `.dmg` itself | **Not signed.** |
+| Windows installers | **Not signed.** |
+
+Ad-hoc signing fixes exactly one thing: the app will now launch on Apple
+Silicon instead of being rejected as "damaged". It is **not** real code signing
+and it does **not** remove the Gatekeeper prompt — the right-click → Open step
+above is still required on first launch, on both Intel and Apple Silicon.
+
+Removing that prompt entirely requires a paid Apple Developer ID certificate
+plus notarization through Apple. That is a cost-and-ownership decision, and it
+needs signing secrets this repository does not hold, so it is deliberately not
+set up. If it ever is, the build already defers to it: set `CSC_LINK` /
+`CSC_KEY_PASSWORD` (or `CSC_NAME`) and the ad-hoc hook stands down and lets
+electron-builder sign for real.
 
 ## Updates
 
@@ -174,8 +239,11 @@ Two builds can't replace themselves, so they notify instead of updating:
 
 - the **portable exe** — there is no install to swap, so it shows the new
   version with a button that opens the releases page;
-- **macOS** — Squirrel.Mac refuses to swap an unsigned app, so same behavior.
-  If the app is ever signed, flipping macOS to full self-update is only a
+- **macOS** — Squirrel.Mac refuses to swap an app that is not properly signed,
+  so same behavior. Ad-hoc signing does **not** change this: Squirrel.Mac wants
+  a real identity it can match across the old and new copies, and an ad-hoc
+  signature has no identity to match. It stays notify-only until there is a
+  Developer ID. If that happens, flipping macOS to full self-update is only a
   matter of removing the platform guard in `main.js`.
 
 Installing a newer setup exe by hand always works too: the NSIS installer
@@ -193,5 +261,7 @@ preload.js         The only bridge the renderer gets (contextIsolation on)
 renderer/          The UI — index.html, styles.css, app.js (no framework, no build)
 renderer/splash.html  The launch splash (static HTML/CSS, no scripts)
 build/icon.png     App icon; electron-builder derives the .ico and .icns from it
+copy-engine.js     Vendors ../bin and ../src into engine/ before start and dist
+ad-hoc-sign-mac.js electron-builder afterPack hook: ad-hoc signs the macOS .app
 test/smoke.js      Headless screenshot/verification driver (env-guarded)
 ```

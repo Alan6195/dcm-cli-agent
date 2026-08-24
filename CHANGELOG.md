@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.14.2
+
+The macOS Apple Silicon app would not open. A user reported it against
+v0.14.1: "damaged and won't open" on Apple Silicon, while the Intel build ran
+fine.
+
+The download was not damaged. Every macOS build since the app existed shipped
+with a broken code signature, and Apple Silicon refuses to load an arm64
+binary whose signature does not verify — "damaged" is the wording macOS uses
+for that, which sends everyone looking for a corrupt download. Intel has no
+such requirement, which is exactly why the Intel `.dmg` worked and why this
+survived every release so far.
+
+Broken rather than absent, and the distinction is the fix. Electron's prebuilt
+binaries arrive ad-hoc signed already; packaging renames the main executable,
+rewrites `Info.plist` and injects `app.asar`, which breaks that seal. So the
+bundle was not unsigned, it was invalidly signed — `codesign` has to be told
+to replace what is there.
+
+`desktop/ad-hoc-sign-mac.js` now runs as electron-builder's `afterPack` hook,
+signing the `.app` before the `.dmg` is built around it. It signs inner-out —
+every nested Mach-O, then framework versions, then helper apps, then the outer
+bundle — rather than with `--deep`, which Apple deprecates and which is
+documented as able to leave a bundle that looks signed and is not. That is the
+failure mode this entry is about, so it was not the tool to fix it with.
+
+The CLI binaries never had this bug: `tools/build.js` has always ad-hoc signed
+them after the SEA injection, for the same reason — injection breaks the seal.
+The desktop build simply never got the equivalent.
+
+**What this does not fix.** Ad-hoc signing is not signing. There is no
+certificate, no Developer ID and no notarization, so Gatekeeper still reports
+an unidentified developer and first launch still needs right-click → Open or a
+cleared quarantine flag, on Intel and Apple Silicon alike. Removing that needs
+a paid Apple Developer ID and notarization credentials. `desktop/README.md`
+now states what is signed, what is not, and what a first launch actually looks
+like, along with the local `codesign` rescue for a copy already installed from
+v0.14.1 or earlier.
+
+The build also verifies its own output now and fails if the app is unsigned or
+if no `.app` is found. A hook that silently stops running — a renamed file, a
+mistyped config key — would otherwise leave a green build publishing an app
+that cannot open, which is precisely how this shipped: v0.14.1 published 14 of
+14 assets with four green workflows and was broken on every Apple Silicon Mac
+that downloaded it. Asset counts cannot catch that; only running the artifact
+can.
+
 ## v0.14.1
 
 An independent recheck of the shipped v0.14.0 code landed after the tag. This

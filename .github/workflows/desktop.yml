@@ -11,8 +11,24 @@ on:
         default: false
 
 # The engine is reused verbatim by the desktop app (file:.. dependency), so the
-# app is built straight from this repo. Installers are per-OS and unsigned, same
-# policy as the CLI binaries.
+# app is built straight from this repo. Installers are per-OS.
+#
+# Signing status, precisely — the Windows installers are unsigned, and the macOS
+# .app is AD-HOC signed (see desktop/ad-hoc-sign-mac.js) but not notarized:
+#
+#   * Ad-hoc is not real signing. There is no certificate, no Developer ID and
+#     no notarization ticket, so it buys exactly one thing — an arm64 binary
+#     that macOS is willing to execute at all. Apple Silicon refuses to load an
+#     arm64 Mach-O with no signature whatsoever and reports it to the user as
+#     "damaged and can't be opened", which is what v0.14.1 shipped.
+#   * It does NOT clear Gatekeeper. First launch on any Mac still shows the
+#     "unidentified developer" prompt and still needs right-click -> Open.
+#     Removing that needs a paid Apple Developer ID plus notarization secrets
+#     this repo does not have; that is an owner decision, not a build fix.
+#   * Windows is unchanged: SmartScreen still warns (More info -> Run anyway).
+#
+# desktop/README.md carries the user-facing version of all of this, including
+# the recovery steps for anyone who already downloaded v0.14.1 or earlier.
 jobs:
   build:
     name: build (${{ matrix.label }})
@@ -70,9 +86,43 @@ jobs:
         # that's the feed the in-app updater reads.
         run: npm run dist -- --publish never
         env:
-          # Never try to sign; there is no certificate and CSC_* being unset is
-          # enough on macOS, but make the intent explicit.
+          # Don't go hunting the runner's keychain for a certificate. This is a
+          # "stop searching" flag, not a "never sign" flag — with CSC_NAME or
+          # mac.identity set, electron-builder 25 still signs for real, so this
+          # does not block a future Developer ID setup.
+          #
+          # It also does not mean the app ships unsigned any more: the afterPack
+          # hook (desktop/ad-hoc-sign-mac.js) ad-hoc signs the .app before the
+          # .dmg is built around it, because Apple Silicon will not run an arm64
+          # binary carrying no signature at all. If that hook fails, it throws
+          # and this step fails — an arm64 .dmg that cannot open must never
+          # reach a release page again.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # The hook above verifies its own work, so this is here to catch the one
+      # thing it cannot: the hook not running at all. A renamed file, a typo in
+      # the `afterPack` key, or an electron-builder major that moves the hook
+      # would all leave a perfectly green build producing an unsigned .app —
+      # which is precisely how this bug shipped. Check the artifact itself.
+      - name: The macOS app must be signed
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r app; do
+            found=$((found + 1))
+            echo "== $app"
+            # --deep --strict applies the same checks the loader will.
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign --display --verbose=2 "$app" 2>&1 | grep -E 'Signature|Identifier' || true
+          done < <(find release -maxdepth 2 -name '*.app' -type d)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No .app found under desktop/release to verify. The macOS build produced nothing signable, or the layout changed."
+            exit 1
+          fi
+          echo "verified $found .app bundle(s)"
 
       - name: Collect artifacts
         shell: bash
