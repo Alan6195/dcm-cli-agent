@@ -11,12 +11,17 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
-/** runId -> { onChunk(stream, text), onExit(code, signal) } */
+/** runId -> { onChunk(stream, text, dropped), onExit(code, signal) } */
 const runHandlers = new Map();
 
-ipcRenderer.on('dcm:chunk', (_event, { runId, stream, text }) => {
+// `dropped` is how many lines the main process had to discard before this
+// chunk because the window was not taking them fast enough. It travels beside
+// the text rather than inside it: a notice written into the output would be
+// output, and the console trims output — including, sooner or later, the
+// notice saying that output went missing.
+ipcRenderer.on('dcm:chunk', (_event, { runId, stream, text, dropped }) => {
   const h = runHandlers.get(runId);
-  if (h && typeof h.onChunk === 'function') h.onChunk(stream, text);
+  if (h && typeof h.onChunk === 'function') h.onChunk(stream, text, dropped || 0);
 });
 
 ipcRenderer.on('dcm:exit', (_event, { runId, code, signal }) => {

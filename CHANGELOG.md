@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.14.3
+
+The app locked up mid-send and held the association open. Reported against a
+real CT: thousands of lines of dcmjs output, a frozen window, and a DICOM
+handshake left open on the receiver until the app was force-quit.
+
+Three things had to be true at once, and all three are fixed.
+
+**The flood.** Datasets carrying private tags — normal for real scanner data —
+make dcmjs log `Unknown name in dataset` once per tag per instance, and it
+passes the tag *value* to the logger, so each line dumps an object graph rather
+than a sentence. A second logger adds `Invalid vr type ox - using OW` per
+instance. At 1600 instances and 16 concurrent associations that is a torrent.
+`src/lib/dcmjs-noise.js` now withholds those two messages and reports one line
+at the end instead:
+
+    dcmjs: 400 datasets carried 3 tags dcmjs has no dictionary entry for — 1200 messages withheld; re-run with --verbose to see them
+
+Withheld and counted, not discarded. Two details decide whether that line is
+honest. It is an allowlist of exactly two message strings, not a log level:
+the same logger carries `Truncating value ... because it is longer than ...`,
+which is dcmjs saying it modified your data, and silencing that to fix a noise
+problem would be the worse bug. And `ox`/`xs` are counted but never named,
+because they are entries in dcmjs's own VR table — PixelData's dictionary VR
+literally is `ox`, so dcmjs logs an error every time it reads its own table
+correctly. A VR genuinely outside that set fell back to UN, which is a real
+observation, and is named. `--verbose` passes everything through and counts
+identically.
+
+**The lock-up, which was ours and not dcmjs's.** `appendConsole` appended a DOM
+node per chunk and then read `scrollHeight` immediately, forcing a synchronous
+layout on every chunk, with no cap on what it retained. Any high-volume stream
+would have done this; dcmjs merely got there first. Output is now buffered and
+written once per animation frame, retention is capped at 2000 lines trimmed
+from the front, and the number dropped is shown in a banner *outside* the
+scroll area — a console that quietly eats the start of a transfer report is its
+own kind of dishonesty. Main coalesces pipe reads into one message per 40 ms
+rather than one per read.
+
+Measured on the same harness, 200,000 lines: before, the window never answered
+and was killed at ten minutes, having served zero animation frames. After, it
+drains in 1.3–7.8 s with a worst round-trip of 137–157 ms and 22 DOM nodes.
+Dropped plus retained equals 200,000 exactly, every run.
+
+**The open association, which is the part that mattered to whoever runs the
+receiver.** Stop never reached its handler while the renderer was wedged, so
+the engine child was orphaned with its association open — the app had to be
+killed from outside, and the socket went with it rather than being released.
+Stop now waits for the child to actually be gone and escalates if it is not
+(`taskkill /t /f` on Windows, SIGKILL elsewhere), reporting what happened.
+Measured mid-flood: answered in 177–933 ms with the pid confirmed gone every
+run.
+
+Also: the smoke harness's three flood passes shared one completion flag, so a
+late callback from one pass could satisfy another and produce a failure message
+blaming the renderer for something the renderer did correctly. Each pass has
+its own flag now. And main's `__script__` spawn hook, which lets the harness
+run an arbitrary script, was gated only on an environment variable and
+therefore present in packaged builds; it is gated on `!app.isPackaged` as well,
+so an installed build cannot reach it however the environment is set.
+
+**Known, pre-existing, not fixed here.** After a successful Stop under sustained
+flooding, the view can keep showing "Sending…" for seconds after the engine is
+already dead, because main sends its exit on `'close'` — when the pipes drain —
+rather than on `'exit'`. The child is gone in under a second every time and the
+association is released, so this is a stale label rather than a stranded
+socket, but it is the next thing worth fixing.
+
 ## v0.14.2
 
 The macOS Apple Silicon app would not open. A user reported it against

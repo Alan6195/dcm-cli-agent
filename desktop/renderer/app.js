@@ -351,21 +351,318 @@ function revealConsole() {
   if (box) box.open = true;
 }
 
-function clearConsole(view) {
-  const c = consoleEl(view);
-  if (c) { c.textContent = ''; c.hidden = false; }
+// --------------------------------------------------------------------------
+// A console is a fixed-size window onto a stream that has no fixed size.
+//
+// Two things used to go wrong here at once, and both had to be fixed before
+// either helped. The DOM grew without limit — one <span> per chunk, never
+// removed — so a run that printed a few hundred thousand lines built a few
+// hundred thousand nodes. And every chunk read `scrollHeight` immediately
+// after appending to that same element, which forces a synchronous layout;
+// layout is the expensive part, and it was being paid once per pipe read
+// rather than once per frame. Together they wedged the renderer, and a wedged
+// renderer cannot run the Stop button, so whatever the engine was doing —
+// including holding an association open on somebody's clinical receiver —
+// simply carried on.
+//
+// So: arrival is cheap and touches no DOM at all, the frame does the work, and
+// what is retained is capped. Losing old output is much better than losing the
+// window, but it is still a loss, and it is announced. A console that quietly
+// drops the beginning of a transfer report is telling you a run went better
+// than it did, and that is the one thing this tool must never do.
+// --------------------------------------------------------------------------
+
+/**
+ * Lines of output a console keeps.
+ *
+ * This is the one number that sets the worst case, because the worst case is a
+ * flush that has to write the whole window at once — which is what happens the
+ * first time the console catches up after falling behind. Measured on a loaded
+ * machine, 5000 lines cost ~480ms in a single turn, and a turn is exactly what
+ * a click has to wait behind. 2000 is still far more scrollback than any of
+ * this tool's own reports produce, and it costs well under a fifth of that.
+ */
+const CONSOLE_MAX_LINES = 2000;
+
+/**
+ * Trim granularity. Output is cut into pieces of at most this many lines, and
+ * a piece is what gets dropped, so it is also the unit the drop count is
+ * counted in. Smaller means smoother trimming and more DOM nodes; this holds
+ * the console to at most ~20 spans and drops at most 100 lines at a time.
+ */
+const CONSOLE_PIECE_LINES = 100;
+
+/** How near the bottom counts as "at the bottom", in CSS pixels. */
+const CONSOLE_STICK_SLOP = 24;
+
+/**
+ * How long the console will wait for an animation frame before writing anyway.
+ *
+ * requestAnimationFrame is the right clock while the window is compositing —
+ * it is exactly once per painted frame, which is as often as a write could
+ * possibly be seen. But it does not fire *at all* for a window that is
+ * minimised, occluded, or on a display that has gone away, and a console that
+ * shows nothing at all until the window comes back is its own kind of missing
+ * output. So the frame is the fast path and this is the floor.
+ */
+const CONSOLE_FALLBACK_MS = 250;
+
+/** Per-console-element buffering, retention and drop accounting. */
+const consoleStates = new WeakMap();
+
+function consoleStateFor(c) {
+  let s = consoleStates.get(c);
+  if (s) return s;
+  s = {
+    pending: [], pendingLines: 0, frame: 0, timer: 0, scrollFrame: 0,
+    lines: 0, dropped: 0, droppedUpstream: 0, stick: true, owed: false, notice: null,
+  };
+  consoleStates.set(c, s);
+  // Stick-to-bottom is the operator's call, not ours. Someone who scrolled up
+  // to read a failure is not asking to be dragged back down every frame, so
+  // the flush only scrolls when they were already at the bottom. Read here,
+  // inside a scroll event, where layout is settled and the read is free.
+  c.addEventListener('scroll', () => {
+    // Where the console sits only says what the operator wants while the
+    // console is somewhere it could have been put on purpose.
+    //
+    // `owed` means the last write deliberately skipped its scroll because the
+    // window was not painting. The position is then knowingly stale, trimming
+    // still fires scroll events at it, and every one of those measures as a
+    // deliberate scroll away from the end — which would latch stick-to-bottom
+    // off, and the console would quietly stop following its own output from
+    // then on. That is what happened: a run left behind a minimised window
+    // came back parked 115,000px above its own last line.
+    //
+    // A console with no layout at all — a view switched away from — has no
+    // bottom to be at either, and reports clientHeight 0.
+    if (s.owed || !c.clientHeight) return;
+    s.stick = c.scrollHeight - c.scrollTop - c.clientHeight <= CONSOLE_STICK_SLOP;
+  }, { passive: true });
+  return s;
 }
 
-function appendConsole(view, text, stream) {
+/**
+ * Cuts text into line-aligned pieces of at most `max` lines.
+ *
+ * A piece that does not end at a newline is counted as carrying one more line
+ * than it has newlines, because on screen it is one. A line split across two
+ * pipe reads therefore counts as two if both halves are dropped. That
+ * over-counts by at most one per dropped piece, which is deliberate: a drop
+ * notice that overstates makes the run look messier than it was, and
+ * understating would make it look tidier.
+ */
+function splitConsoleText(text, max) {
+  const pieces = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = start;
+    let lines = 0;
+    while (lines < max) {
+      const nl = text.indexOf('\n', end);
+      if (nl === -1) { end = text.length; break; }
+      end = nl + 1;
+      lines++;
+    }
+    if (end === start) end = text.length;
+    const piece = text.slice(start, end);
+    pieces.push({ text: piece, lines: piece.endsWith('\n') ? lines : lines + 1 });
+    start = end;
+  }
+  return pieces;
+}
+
+/**
+ * Books the next write. Whichever of the two clocks arrives first does the
+ * work and cancels the other, so a compositing window pays one flush per
+ * frame and a window that is not compositing still pays one every 250ms.
+ */
+function scheduleConsoleFlush(c, s) {
+  if (s.frame || s.timer) return;
+  const run = (painting) => {
+    if (s.frame) { cancelAnimationFrame(s.frame); s.frame = 0; }
+    if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
+    flushConsole(c, painting);
+  };
+  s.frame = requestAnimationFrame(() => run(true));
+  s.timer = setTimeout(() => run(false), CONSOLE_FALLBACK_MS);
+}
+
+function clearConsole(view) {
   const c = consoleEl(view);
   if (!c) return;
+  resetConsole(c);
   c.hidden = false;
-  const clean = stripAnsi(text);
-  const span = document.createElement('span');
-  if (stream === 'stderr') span.className = 'err';
-  span.textContent = clean;
-  c.appendChild(span);
-  c.scrollTop = c.scrollHeight;
+}
+
+/** Empties a console and its accounting together, so neither outlives the other. */
+function resetConsole(c) {
+  const s = consoleStateFor(c);
+  if (s.frame) { cancelAnimationFrame(s.frame); s.frame = 0; }
+  if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
+  if (s.scrollFrame) { cancelAnimationFrame(s.scrollFrame); s.scrollFrame = 0; }
+  s.pending.length = 0;
+  s.pendingLines = 0;
+  s.lines = 0;
+  s.dropped = 0;
+  s.droppedUpstream = 0;
+  s.stick = true;
+  s.owed = false;
+  if (s.notice) { s.notice.remove(); s.notice = null; }
+  c.textContent = '';
+}
+
+/**
+ * @param {string} view
+ * @param {string} text
+ * @param {'stdout'|'stderr'} stream
+ * @param {number} [dropped]  lines the main process discarded before this
+ *   chunk, because the window was not taking them fast enough. Folded into the
+ *   same total as the console's own trimming, so there is one number to read
+ *   and it covers everything that went missing between the engine and the eye.
+ */
+function appendConsole(view, text, stream, dropped) {
+  const c = consoleEl(view);
+  if (!c) return;
+  const s = consoleStateFor(c);
+  if (dropped) {
+    s.dropped += dropped;
+    s.droppedUpstream += dropped;
+    scheduleConsoleFlush(c, s);
+  }
+  if (!text) return;
+  const err = stream === 'stderr';
+  for (const piece of splitConsoleText(stripAnsi(text), CONSOLE_PIECE_LINES)) {
+    s.pending.push({ text: piece.text, lines: piece.lines, err });
+    s.pendingLines += piece.lines;
+  }
+  // The buffer is trimmed too, not just the DOM. requestAnimationFrame does
+  // not fire for a minimised or hidden window, so without this a long receive
+  // behind a minimised window would queue every line it ever printed in
+  // memory and hand the whole backlog over on restore.
+  while (s.pendingLines > CONSOLE_MAX_LINES && s.pending.length > 1) {
+    const gone = s.pending.shift();
+    s.pendingLines -= gone.lines;
+    s.dropped += gone.lines;
+  }
+  // Nothing above touched the DOM: arrival stays cheap however fast it comes.
+  scheduleConsoleFlush(c, s);
+}
+
+/**
+ * @param {HTMLElement} c
+ * @param {boolean} painting  true when an animation frame woke this, i.e. the
+ *   window is compositing and the scroll below will actually be seen.
+ */
+function flushConsole(c, painting) {
+  const s = consoleStates.get(c);
+  if (!s) return;
+  // A flush booked by an upstream drop alone carries no text but still owes an
+  // updated notice.
+  if (!s.pending.length) {
+    if (s.dropped) renderConsoleNotice(c, s);
+    return;
+  }
+
+  // Taken before any mutation. The old code read scrollHeight straight after
+  // appendChild, which forces the layout it just invalidated — once per chunk.
+  //
+  // Reading it is still the single most expensive thing in this function, and
+  // on a window that is not compositing it is the *only* thing asking for
+  // layout, so every read pays for a full one of the whole retained block.
+  // Measured at 200,000 lines it was the difference between draining in 1.8s
+  // and in 9.2s. Nobody is looking at a scroll position on a window that is
+  // not painting, so the content is written and only the scroll waits — booked
+  // below for the next frame that actually arrives.
+  const stick = s.stick && painting;
+
+  const frag = document.createDocumentFragment();
+  let written = 0;
+  for (const piece of s.pending) {
+    const span = document.createElement('span');
+    if (piece.err) span.className = 'err';
+    span.textContent = piece.text;
+    // A plain property, not a data- attribute: an attribute write would
+    // invalidate style for every span we add.
+    span.consoleLines = piece.lines;
+    written += piece.lines;
+    s.lines += piece.lines;
+    frag.appendChild(span);
+  }
+  s.pending.length = 0;
+  s.pendingLines = 0;
+
+  c.hidden = false;
+  if (written >= CONSOLE_MAX_LINES) {
+    // Everything already on screen is doomed anyway — this one flush carries a
+    // full window on its own. Replacing in one operation beats appending and
+    // then unpicking the old content span by span.
+    for (const gone of c.childNodes) s.dropped += gone.consoleLines || 0;
+    s.lines = written;
+    c.replaceChildren(frag);
+  } else {
+    c.appendChild(frag);
+  }
+
+  while (s.lines > CONSOLE_MAX_LINES && c.firstChild && c.firstChild !== c.lastChild) {
+    const gone = c.firstChild;
+    s.lines -= gone.consoleLines || 0;
+    s.dropped += gone.consoleLines || 0;
+    gone.remove();
+  }
+
+  if (s.dropped) renderConsoleNotice(c, s);
+
+  if (stick) {
+    // One layout read and one scroll write per frame, instead of per chunk.
+    c.scrollTop = c.scrollHeight;
+    s.owed = false;
+  } else if (s.stick && !painting) {
+    // Skipped above because the window is not painting. Book it on the frame
+    // clock, which fires when the window is next composited — possibly on
+    // restore, long after the run ended. Without this a console filled behind
+    // a minimised window comes back parked where it was before, with the
+    // output the operator minimised it to collect sitting below the fold.
+    s.owed = true;
+    if (!s.scrollFrame) {
+      s.scrollFrame = requestAnimationFrame(() => {
+        s.scrollFrame = 0;
+        if (s.stick) c.scrollTop = c.scrollHeight;
+        // Cleared after the write, so the scroll event it causes is measured
+        // against a position we actually chose.
+        s.owed = false;
+      });
+    }
+  }
+}
+
+/**
+ * The banner saying what is missing from the top of this console.
+ *
+ * It sits above the scroll area rather than inside it, so it stays on screen
+ * while the operator reads: the fact that output was dropped is not something
+ * they should have to scroll to the top to discover.
+ */
+function renderConsoleNotice(c, s) {
+  if (!s.notice) {
+    s.notice = document.createElement('div');
+    s.notice.className = 'console-trim';
+    c.parentNode.insertBefore(s.notice, c);
+  }
+  const n = s.dropped;
+  const u = s.droppedUpstream;
+  s.notice.textContent =
+    `${n.toLocaleString()} ${n === 1 ? 'line' : 'lines'} of output dropped — this console keeps the `
+    + `last ${CONSOLE_MAX_LINES.toLocaleString()} so the window stays responsive`
+    // Trimming takes the oldest lines, a contiguous run from the start. An
+    // overflow upstream takes them from wherever the window fell behind, which
+    // is somewhere in the middle, and that is a different claim about what is
+    // missing — so it is said separately rather than folded into "earlier".
+    + (u
+      ? `, and ${u.toLocaleString()} of those came off mid-run, where output arrived `
+        + 'faster than the window could take it'
+      : '')
+    + `. The run itself was not affected, and the totals it reports are counted from all of it.`;
 }
 
 function setStatus(view, kind, label) {
@@ -380,37 +677,129 @@ function setStatus(view, kind, label) {
 // --------------------------------------------------------------------------
 // Running commands
 // --------------------------------------------------------------------------
+// A run's output is also held whole in memory, separately from the console,
+// because the callers parse it: parseTotals reads the report a send prints at
+// the end, and the --json screens JSON.parse the entirety of stdout. Those
+// strings were unbounded too, so the same flood that grew the DOM without
+// limit grew a pair of strings without limit beside it.
+//
+// The limits below sit far above any real run. They exist so a runaway stream
+// costs a bounded amount of memory, not to trim ordinary output — a study's
+// --json payload has to survive intact or the screens that read it break.
+const RUN_STDOUT_LIMIT = 24 * 1024 * 1024;
+const RUN_STDERR_LIMIT = 4 * 1024 * 1024;
+
+/**
+ * Accumulates a stream, keeping the head and the tail if it outgrows `limit`.
+ *
+ * The tail can never be the part that goes: the engine's closing report is at
+ * the end, and dropping it would leave a transfer with no accounting at all.
+ * The head is kept alongside it because the first thing printed is usually
+ * what the run was asked to do. What is lost from the middle gets a marker
+ * saying how much — the string is read by code, but it is also shown to people
+ * on the paths that fail to parse, and it must not look complete.
+ */
+function makeBounded(limit) {
+  const keep = Math.floor(limit / 2);
+  let head = '';
+  let tail = '';
+  let elided = 0;
+  return {
+    push(text) {
+      if (head.length < keep) {
+        const room = keep - head.length;
+        head += text.slice(0, room);
+        text = text.slice(room);
+        if (!text) return;
+      }
+      tail += text;
+      if (tail.length > keep) {
+        const cut = tail.length - keep;
+        tail = tail.slice(cut);
+        elided += cut;
+      }
+    },
+    get value() {
+      if (!elided) return head + tail;
+      return `${head}\n[app] ${elided.toLocaleString()} characters of output dropped from the `
+        + `middle of this run to stay within memory\n${tail}`;
+    },
+  };
+}
+
 /**
  * Run a command, streaming into the view's console.
  * @returns {Promise<{code:number, stdout:string, stderr:string}>}
  */
 function runStreaming(view, argv, { onExit } = {}) {
   return new Promise(async (resolve) => {
-    let stdout = '';
-    let stderr = '';
+    const out = makeBounded(RUN_STDOUT_LIMIT);
+    const err = makeBounded(RUN_STDERR_LIMIT);
     const runId = await window.dcm.start(argv, state.info.home || null, {
-      onChunk: (stream, text) => {
-        if (stream === 'stdout') stdout += text; else stderr += text;
-        appendConsole(view, text, stream);
+      onChunk: (stream, text, dropped) => {
+        if (stream === 'stdout') out.push(text); else err.push(text);
+        appendConsole(view, text, stream, dropped);
       },
       onExit: (code) => {
         delete state.activeRuns[view];
-        if (onExit) onExit({ code, stdout, stderr });
-        resolve({ code, stdout, stderr });
+        const result = { code, stdout: out.value, stderr: err.value };
+        if (onExit) onExit(result);
+        resolve(result);
       },
     });
     state.activeRuns[view] = runId;
   });
 }
 
+/**
+ * Stops the run a view owns, and says what actually happened.
+ *
+ * The old handlers fired cancel and forgot about it, so a child that ignored
+ * the request looked exactly like one that had stopped. That distinction is
+ * the whole point of the button: what we are trying to prevent is an engine
+ * still holding an association open on someone's receiver while the operator
+ * has been shown "Stopped" and moved on. If it does not take, say so, and say
+ * what to do about it.
+ *
+ * @param {string} view
+ * @param {HTMLElement|null} btn  the Stop button, relabelled while we wait.
+ */
+async function stopRun(view, btn) {
+  const id = state.activeRuns[view];
+  if (!id) return { stopped: false };
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  let result;
+  try {
+    result = await window.dcm.cancel(id);
+  } catch (err) {
+    result = { stopped: false, error: err && err.message ? err.message : String(err) };
+  }
+  if (btn) { btn.disabled = false; btn.textContent = label; }
+  // A run that had already finished on its own is not a failure to stop.
+  if (result && !result.stopped && result.reason !== 'not running') {
+    // VIEW_PARTS is exactly the screens whose console is the shared one folded
+    // inside a disclosure; the rest are already on screen.
+    if (VIEW_PARTS[view]) revealConsole();
+    appendConsole(view,
+      `\nStop did not take: ${result.error || 'the engine is still running'}. `
+      + `Anything it has open with the peer is still open — close the app window to release it.\n`,
+      'stderr');
+  }
+  return result;
+}
+
 /** Run a command capturing output silently (for --json views). */
 function runCapture(view, argv) {
   return new Promise(async (resolve) => {
-    let stdout = '';
-    let stderr = '';
+    const out = makeBounded(RUN_STDOUT_LIMIT);
+    const err = makeBounded(RUN_STDERR_LIMIT);
     const runId = await window.dcm.start(argv, state.info.home || null, {
-      onChunk: (stream, text) => { if (stream === 'stdout') stdout += text; else stderr += text; },
-      onExit: (code) => { delete state.activeRuns[view]; resolve({ code, stdout, stderr }); },
+      onChunk: (stream, text) => { if (stream === 'stdout') out.push(text); else err.push(text); },
+      onExit: (code) => {
+        delete state.activeRuns[view];
+        resolve({ code, stdout: out.value, stderr: err.value });
+      },
     });
     state.activeRuns[view] = runId;
   });
@@ -681,9 +1070,8 @@ function wireSend() {
     if (!dry) showTotals(parseTotals(stdout), ok);
   });
 
-  $('#view-send [data-cancel]').addEventListener('click', () => {
-    const id = state.activeRuns.send;
-    if (id) window.dcm.cancel(id);
+  $('#view-send [data-cancel]').addEventListener('click', (e) => {
+    stopRun('send', e.currentTarget);
   });
 }
 
@@ -721,9 +1109,8 @@ function wireReceive() {
     setStatus('receive', code === 0 ? 'ok' : 'fail', code === 0 ? 'Stopped' : 'Stopped');
   });
 
-  $('#view-receive [data-cancel]').addEventListener('click', () => {
-    const id = state.activeRuns.receive;
-    if (id) window.dcm.cancel(id);
+  $('#view-receive [data-cancel]').addEventListener('click', (e) => {
+    stopRun('receive', e.currentTarget);
   });
 }
 
@@ -1199,7 +1586,7 @@ function wireWorklist() {
     const miss = connMissing();
     $('#mwl-results').hidden = true;
     $('#mwl-foot').hidden = true;
-    const c = consoleEl('worklist'); c.hidden = true; c.textContent = '';
+    const c = consoleEl('worklist'); resetConsole(c); c.hidden = true;
     if (miss.length) {
       $('#mwl-peer').open = true;
       revealConsole();
@@ -1858,9 +2245,8 @@ function wireMpps() {
     $('#mpps-assert-toggle').textContent = grid.hidden ? 'Show all' : 'Hide';
   });
 
-  $('#mpps-cancel').addEventListener('click', () => {
-    const id = state.activeRuns.mpps;
-    if (id) window.dcm.cancel(id);
+  $('#mpps-cancel').addEventListener('click', (e) => {
+    stopRun('mpps', e.currentTarget);
   });
 
   // The inline "Close this step" the still-IN-PROGRESS outcome offers. It puts
@@ -2823,10 +3209,9 @@ function wireSpeed() {
   renderSpeedParallelHint();
   renderSpeedPlan();
 
-  $('#view-speed [data-cancel]').addEventListener('click', () => {
+  $('#view-speed [data-cancel]').addEventListener('click', (e) => {
     speedCancelled = true;
-    const id = state.activeRuns.speed;
-    if (id) window.dcm.cancel(id);
+    stopRun('speed', e.currentTarget);
   });
 
   $('#view-speed [data-run]').addEventListener('click', runSpeedTest);
@@ -2839,8 +3224,8 @@ async function runSpeedTest() {
   const box = $('#view-speed [data-result]');
   const c = consoleEl('speed');
   box.hidden = true;
+  resetConsole(c);
   c.hidden = true;
-  c.textContent = '';
 
   if (!folder) {
     appendConsole('speed', 'Choose a study folder to send.\n', 'stderr');
@@ -3127,9 +3512,8 @@ function wireWebhub() {
     setStatus('webhub', code === 0 ? 'ok' : 'fail', 'Stopped');
   });
 
-  $('#view-webhub [data-cancel]').addEventListener('click', () => {
-    const id = state.activeRuns.webhub;
-    if (id) window.dcm.cancel(id);
+  $('#view-webhub [data-cancel]').addEventListener('click', (e) => {
+    stopRun('webhub', e.currentTarget);
   });
 }
 
@@ -3199,7 +3583,7 @@ function wireInventory() {
   $('#view-inventory [data-run]').addEventListener('click', async () => {
     const t = $('#info-folder').value.trim();
     $('#view-inventory [data-result]').hidden = true;
-    const c = consoleEl('inventory'); c.hidden = true; c.textContent = '';
+    const c = consoleEl('inventory'); resetConsole(c); c.hidden = true;
     if (!t) { appendConsole('inventory', 'Choose a folder or file.\n', 'stderr'); return; }
     setStatus('inventory', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('inventory', [...BUILDERS.inventory(), '--json']);
@@ -3246,7 +3630,7 @@ function wireTags() {
   $('#view-tags [data-run]').addEventListener('click', async () => {
     const t = $('#tags-target').value.trim();
     $('#view-tags [data-result]').hidden = true;
-    const c = consoleEl('tags'); c.hidden = true; c.textContent = '';
+    const c = consoleEl('tags'); resetConsole(c); c.hidden = true;
     if (!t) { appendConsole('tags', 'Choose a file or folder.\n', 'stderr'); return; }
     setStatus('tags', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('tags', [...BUILDERS.tags(), '--json']);

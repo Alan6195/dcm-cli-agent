@@ -288,6 +288,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
 }
 .console-wrap.tall .console { max-height: 460px; }
 .console:empty::after { content: "Output will appear here."; color: #3f5570; }
+/* Sits above the scroll area, not inside it: that output was dropped is not
+   something an operator should have to scroll to the top to find out. */
+.console-trim {
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #1a1305;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
 .console .err { color: var(--red); }
 .console .ok { color: var(--green); }
 .console .warn { color: var(--amber); }

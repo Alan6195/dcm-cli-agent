@@ -2,6 +2,7 @@
 
 const log = require('./lib/log');
 const brand = require('./lib/brand');
+const dcmjsNoise = require('./lib/dcmjs-noise');
 const { tokenize, UsageError } = require('./lib/args');
 
 const { version } = require('../package.json');
@@ -125,6 +126,42 @@ async function main(argv) {
   // left visible under --verbose, where nothing should be filtered out.
   process.noDeprecation = !log.isVerbose();
 
+  // dcmjs reports an unnamed tag and an unresolvable VR once per occurrence,
+  // which on a study full of private tags is once or more per instance — a
+  // torrent large enough to wedge whatever has to render it, and one that
+  // takes a live association down with it when it does. The two messages are
+  // counted and withheld here and summarised in one line at the end of the
+  // run. Installed before any command is loaded, so it is in place before the
+  // first dataset is parsed. See lib/dcmjs-noise for why this is an allowlist
+  // of two messages rather than a level change.
+  const noise = dcmjsNoise.install({ passThrough: log.isVerbose() });
+  try {
+    return await dispatch(parsed, flags, positionals);
+  } finally {
+    // Restored rather than left installed, so the filter's lifetime is one CLI
+    // run and an embedder that calls main() twice gets a fresh count each time
+    // instead of a process-wide patch and a running total.
+    noise.restore();
+
+    // The summary goes to stderr like every other diagnostic here, which keeps
+    // it clear of the transfer report on stdout and clear of `--json | jq`.
+    // In a terminal that puts it directly under the report, where an operator
+    // reading the outcome will see it, without a line of parse trivia landing
+    // in the middle of the accounting. It says nothing when nothing was
+    // withheld, and it is an observation about the data rather than a warning,
+    // so it is logged at info and a `--quiet` run does not get it.
+    const summary = noise.summary();
+    if (summary) log.info(summary);
+  }
+}
+
+/**
+ * Routes one parsed command line. Split out of main() only so that the dcmjs
+ * noise filter installed there has a single body to wrap.
+ *
+ * @returns {Promise<number>} Exit code.
+ */
+async function dispatch(parsed, flags, positionals) {
   if (flags.has('version') && positionals.length === 0) {
     log.out(version);
     return EXIT.OK;

@@ -1449,6 +1449,415 @@ async function runSmoke(win, app) {
       process.stdout.write(`edit cmd: ${cmd}\n`);
     }
 
+    // ------------------------------------------------------------------
+    // Flood: no output volume, from any source, may wedge this window.
+    //
+    // The bug this guards against was a hang with a live socket behind it. A
+    // CT carrying private tags made dcmjs log per instance; the console grew a
+    // DOM node per pipe read and read scrollHeight straight after each append,
+    // forcing a layout every time; the renderer stopped answering; and because
+    // nothing could reach the Stop button the engine kept its association open
+    // on the peer until the app was force-closed. Removing the source of that
+    // particular flood does not make the window safe — the next high-volume
+    // stream would do it again.
+    //
+    // No `dcm` command emits at that rate on demand, so this drives the exact
+    // same path (spawn, pipe, IPC, console) with a child that does nothing
+    // else. main.js only honours the __script__ argv while DCM_SMOKE_DIR is set.
+    // ------------------------------------------------------------------
+    const floodScript = path.join(outDir, 'flood.js');
+    const floodPidFile = path.join(outDir, 'flood.pid');
+    fs.writeFileSync(floodScript, [
+      "'use strict';",
+      '// Emits to stderr as fast as the pipe will take it. argv[2] is the line',
+      '// count, or 0 for endless. The lines are long on purpose: the dcmjs',
+      '// message behind the original hang passes the tag value, so each one',
+      '// dumps an object graph rather than a word.',
+      "const fs = require('node:fs');",
+      'const total = Number(process.argv[2] || 0);',
+      'const pidFile = process.argv[3];',
+      'if (pidFile) fs.writeFileSync(pidFile, String(process.pid));',
+      "const line = 'Unknown name in dataset (5180,1001) : '",
+      "  + '[object ArrayBuffer] { byteLength: 512 } '.repeat(6) + '\\n';",
+      'let n = 0;',
+      'function pump() {',
+      '  for (;;) {',
+      '    // Returning rather than calling process.exit: exit can discard writes',
+      '    // still queued for a pipe, and a truncated flood is not the test.',
+      '    if (total && n >= total) return;',
+      '    n++;',
+      "    if (!process.stderr.write(line)) { process.stderr.once('drain', pump); return; }",
+      '  }',
+      '}',
+      'pump();',
+      '',
+    ].join('\n'));
+
+    // Overridable so the same harness can measure the pre-fix renderer, which
+    // cannot absorb the full flood in any bounded time — that being the point.
+    const FLOOD_LINES = Number(process.env.DCM_SMOKE_FLOOD_LINES || 200000);
+    const FLOOD_CAP = 2000; // CONSOLE_MAX_LINES in the renderer
+
+    /** Round-trip time to the renderer, sampled while the flood is running. */
+    const pingRenderer = (samples) => {
+      let live = true;
+      const loop = (async () => {
+        while (live) {
+          const t0 = Date.now();
+          // eslint-disable-next-line no-await-in-loop
+          await win.webContents.executeJavaScript('1').catch(() => {});
+          samples.push(Date.now() - t0);
+          // eslint-disable-next-line no-await-in-loop
+          await wait(150);
+        }
+      })();
+      return async () => { live = false; await loop; };
+    };
+
+    const READ_CONSOLE = `(() => {
+      const wrap = document.querySelector('#view-receive .console-wrap');
+      const c = wrap.querySelector('[data-console]');
+      const notice = wrap.querySelector('.console-trim');
+      const text = c.textContent;
+      return JSON.stringify({
+        spans: c.childNodes.length,
+        nodes: wrap.getElementsByTagName('*').length,
+        retainedLines: (text.match(/\\n/g) || []).length,
+        chars: text.length,
+        notice: notice ? notice.textContent : '',
+        lagMs: Math.round((window.__lag || {}).max || 0),
+        frames: (window.__lag || {}).frames || 0,
+        cost: window.__cost || null,
+        dropped: (consoleStates.get(c) || {}).dropped || 0,
+        droppedUpstream: (consoleStates.get(c) || {}).droppedUpstream || 0,
+      });
+    })()`;
+
+    await win.webContents.executeJavaScript(`
+      showView('receive');
+      clearConsole('receive');
+      document.querySelector('#view-receive [data-cancel]').hidden = false;
+      // A frame-gap probe. If the renderer wedges, frames stop and the gap is
+      // the length of the wedge — which is the number the user experienced.
+      window.__lag = { max: 0, frames: 0, last: 0 };
+      // What the console itself costs the main thread, as distinct from what
+      // the machine happened to be doing. Wall-clock on this box swings by 5x
+      // with its display state; this number does not, and it is the one that
+      // says whether the console is what would block a click.
+      window.__cost = { append: 0, flush: 0, appends: 0, flushes: 0 };
+      // Rest args, not a fixed list. Spelling the parameters out here once
+      // silently swallowed appendConsole's fourth argument — the count of
+      // lines the main process had dropped — and the harness then reported
+      // that nothing had been dropped upstream while 195,860 lines were
+      // missing. A wrapper that has to be kept in step with a signature is a
+      // wrapper that will not be.
+      const rawAppend = window.appendConsole;
+      window.appendConsole = (...a) => {
+        const t0 = performance.now();
+        rawAppend(...a);
+        window.__cost.append += performance.now() - t0;
+        window.__cost.appends++;
+      };
+      const rawFlush = window.flushConsole;
+      window.flushConsole = (...a) => {
+        const t0 = performance.now();
+        rawFlush(...a);
+        window.__cost.flush += performance.now() - t0;
+        window.__cost.flushes++;
+      };
+      (function probe() {
+        requestAnimationFrame((t) => {
+          if (window.__lag.last) {
+            const d = t - window.__lag.last;
+            if (d > window.__lag.max) window.__lag.max = d;
+          }
+          window.__lag.last = t;
+          window.__lag.frames++;
+          probe();
+        });
+      })();
+      true
+    `);
+    await wait(400);
+
+    // --- Pass 1: a finite flood, to measure what the console retains. -------
+    const pings = [];
+    const stopPing = pingRenderer(pings);
+    const floodStart = Date.now();
+    await win.webContents.executeJavaScript(`
+      window.__floodDone_drain = false;
+      runStreaming('receive', ['__script__', ${JSON.stringify(floodScript)}, '${FLOOD_LINES}'])
+        .then(() => { window.__floodDone_drain = true; });
+      true
+    `);
+    // Sampled while it is still arriving. A console that only behaves once the
+    // stream has stopped is not the thing being tested, and the round-trip time
+    // of this very read is what an operator's click would have queued behind.
+    await wait(600);
+    const midAt = Date.now();
+    const mid = JSON.parse(await win.webContents.executeJavaScript(READ_CONSOLE));
+    const midMs = Date.now() - midAt;
+    // Printed the moment it is taken. If the window never recovers, this is the
+    // only number that survives, and it is the one that says why.
+    const midLine = `flood: mid-flood the wrap held ${mid.nodes} nodes in ${mid.spans} spans; `
+      + `reading that took ${midMs}ms`;
+    process.stdout.write(`${midLine}
+`);
+
+    const finished = await waitFor(win, 'window.__floodDone_drain', 120000, `${FLOOD_LINES} lines to drain`);
+    const floodMs = Date.now() - floodStart;
+    await stopPing();
+    if (!finished) throw new Error('the flood never finished draining');
+    // Wait for the console to have actually written what it was given, rather
+    // than guessing at a delay. Chromium throttles setTimeout to about 1Hz for
+    // a window it considers hidden, so the fallback clock runs four times
+    // slower when minimised and a fixed wait either races it or is far longer
+    // than it needs to be everywhere else.
+    const DRAINED = `(() => {
+      const c = document.querySelector('#view-receive [data-console]');
+      const st = consoleStates.get(c);
+      return !st || st.pending.length === 0;
+    })()`;
+    if (!await waitFor(win, DRAINED, 15000, 'the console to write what it kept')) {
+      throw new Error('the console never wrote out its buffer');
+    }
+
+    const f = JSON.parse(await win.webContents.executeJavaScript(READ_CONSOLE));
+    const worstPing = pings.length ? Math.max(...pings) : -1;
+    [
+      `flood: ${FLOOD_LINES} lines delivered in ${floodMs}ms`,
+      midLine,
+      `flood: console retained ${f.retainedLines} lines in ${f.spans} spans, ${f.nodes} nodes in the wrap`,
+      `flood: worst renderer round-trip during the flood ${worstPing}ms over ${pings.length} samples`,
+      f.frames
+        ? `flood: worst frame gap ${f.lagMs}ms over ${f.frames} frames`
+        // A window that is not compositing (headless, occluded, no display) is
+        // given no frames at all, which is not the same thing as a wedge — the
+        // round-trip above is what says whether it was answering.
+        : 'flood: no animation frames were served at all (window not compositing)',
+      `flood: console cost ${Math.round(f.cost.append)}ms buffering over ${f.cost.appends} chunks `
+        + `and ${Math.round(f.cost.flush)}ms writing over ${f.cost.flushes} flushes, `
+        + `of ${floodMs}ms wall clock`,
+      `flood: of those, ${f.droppedUpstream} were dropped upstream by the main process`,
+      `flood: notice = ${f.notice || '(none)'}`,
+    ].forEach((l) => { process.stdout.write(`${l}\n`); measured.push(l); });
+    await shot(win, outDir, 'flood-console');
+
+    // The console is a window onto the stream, and it has to admit it.
+    if (!f.notice) {
+      throw new Error(`${FLOOD_LINES} lines went in and the console claims it dropped none of them`);
+    }
+    const dropped = Number((f.notice.match(/^([\d,]+)/) || [])[1].replace(/,/g, ''));
+    if (!(dropped > 0)) throw new Error(`the drop notice reports no drops: ${f.notice}`);
+    // The number on screen has to be the number the console actually holds.
+    if (dropped !== f.dropped) {
+      throw new Error(`the notice says ${dropped} lines dropped but the console counted ${f.dropped}`);
+    }
+    // Retained plus dropped is the whole stream, wherever along it the loss
+    // happened. It may exceed the line count by a little — a line split across
+    // two pipe reads is counted on both sides of the split, deliberately, so a
+    // notice can never understate. It may never fall short: that would mean
+    // output went missing with nothing anywhere admitting it, which is the
+    // failure this whole notice exists to prevent.
+    const accounted = dropped + f.retainedLines;
+    if (accounted < FLOOD_LINES) {
+      throw new Error(
+        `the console accounts for ${accounted} of ${FLOOD_LINES} lines, so it lost `
+        + `${FLOOD_LINES - accounted} without saying so`
+      );
+    }
+    // An upstream drop is a different claim about *where* the gap is, so it
+    // has to be said separately rather than folded into "earlier lines".
+    if (f.droppedUpstream && !/mid-run/.test(f.notice)) {
+      throw new Error(`${f.droppedUpstream} lines went missing mid-run and the notice does not say so`);
+    }
+    if (f.spans > 60) {
+      throw new Error(`the console kept ${f.spans} spans; the cap should hold it near 20`);
+    }
+    if (f.retainedLines > FLOOD_CAP + 300) {
+      throw new Error(`the console retained ${f.retainedLines} lines, past its ${FLOOD_CAP} cap`);
+    }
+    // The point of all of it: the window kept answering while that arrived.
+    //
+    // Asserted on the console's own CPU cost rather than on the round-trip.
+    // The round-trip is reported above and is what an operator would feel, but
+    // it moves by 5x with what else the machine is doing, and a threshold that
+    // has to tolerate that is too loose to catch a regression. What must stay
+    // true is that no single turn of the console is long enough to sit in
+    // front of a click: the whole flood costs it well under a second, spread
+    // over hundreds of turns.
+    const worstFlush = f.cost.flushes ? f.cost.flush / f.cost.flushes : 0;
+    if (f.cost.append + f.cost.flush > 3000) {
+      throw new Error(
+        `the console spent ${Math.round(f.cost.append + f.cost.flush)}ms of main thread on `
+        + `${FLOOD_LINES} lines`
+      );
+    }
+    if (worstFlush > 250) {
+      throw new Error(`the console averaged ${Math.round(worstFlush)}ms per write to the DOM`);
+    }
+    if (worstPing > 20000) {
+      throw new Error(`the renderer took ${worstPing}ms to answer during the flood`);
+    }
+
+    // --- Pass 2: an endless flood, stopped by the button. -------------------
+    // A finite flood that ends on its own proves nothing about the case that
+    // mattered, which is an operator trying to stop a transfer that is still
+    // going. This one only ends if the button works.
+    try { fs.unlinkSync(floodPidFile); } catch { /* first run */ }
+    await win.webContents.executeJavaScript(`
+      clearConsole('receive');
+      window.__floodDone_stop = false;
+      window.__stopResult = null;
+      runStreaming('receive', ['__script__', ${JSON.stringify(floodScript)}, '0', ${JSON.stringify(floodPidFile)}])
+        .then(() => { window.__floodDone_stop = true; });
+      true
+    `);
+    const started = await waitFor(
+      win,
+      "document.querySelector('#view-receive [data-console]').textContent.length > 0",
+      15000,
+      'the endless flood to start'
+    );
+    if (!started) throw new Error('the endless flood never produced output');
+    await wait(1500); // let it get properly ahead of the window
+    const floodPid = Number(fs.readFileSync(floodPidFile, 'utf8').trim());
+
+    // A real click through the DOM event path, on the button an operator uses.
+    // The button's handler does not hand its result anywhere the harness can
+    // see, so stopRun is wrapped first — app.js is a classic script, so the
+    // handler's reference to it resolves through the global object.
+    const clickAt = Date.now();
+    await win.webContents.executeJavaScript(`
+      const inner = window.stopRun;
+      window.stopRun = (v, b) => inner(v, b).then((r) => { window.__stopResult = r; return r; });
+      document.querySelector('#view-receive [data-cancel]').click();
+      true
+    `);
+    const answered = await waitFor(win, 'window.__stopResult', 20000, 'Stop to take effect');
+    const stopMs = Date.now() - clickAt;
+    const stopResult = JSON.parse(
+      await win.webContents.executeJavaScript('JSON.stringify(window.__stopResult || null)')
+    );
+    // 60s, not 10s: main sends dcm:exit on 'close' — after the pipes drain —
+    // and under a flood that backlog can take tens of seconds to cross IPC even
+    // though the child died in well under a second. The assertion below is the
+    // one that matters, and it checks the process itself rather than the
+    // report of it. A timeout here means the exit event is slow, not that
+    // anything is still holding the peer.
+    await waitFor(win, 'window.__floodDone_stop', 60000, 'the stopped run to report its exit');
+
+    // The engine process itself has to be gone, not merely reported gone. This
+    // is the whole point: a child left alive is a child still holding whatever
+    // it had open on the peer.
+    let alive = true;
+    try { process.kill(floodPid, 0); } catch { alive = false; }
+
+    [
+      `flood: Stop clicked mid-flood, answered in ${stopMs}ms: ${JSON.stringify(stopResult)}`,
+      `flood: engine pid ${floodPid} alive after Stop: ${alive}`,
+    ].forEach((l) => { process.stdout.write(`${l}\n`); measured.push(l); });
+    await shot(win, outDir, 'flood-stopped');
+
+    // Reality first, then the report — in that order, so a report that
+    // disagrees with the process table is named as the thing it is. Both
+    // directions matter: claiming a stop that did not happen leaves an
+    // association open behind a reassuring UI, and reporting a failure that
+    // did not happen sends an operator hunting a receiver that is already
+    // clear. The first version of this waited on the child's pipes draining
+    // rather than on the process exiting, and reported the second.
+    if (alive) {
+      throw new Error(`Stop returned but engine pid ${floodPid} is still running`);
+    }
+    if (!answered || !stopResult || stopResult.stopped !== true) {
+      throw new Error(
+        `Stop reported ${JSON.stringify(stopResult)} for an engine that is in fact gone`
+      );
+    }
+    if (stopMs > 5000) {
+      throw new Error(`Stop took ${stopMs}ms to reach the engine during a flood`);
+    }
+
+    // --- Pass 3: the same flood at a minimised window. ----------------------
+    // requestAnimationFrame is not served to a window that is not compositing,
+    // so a console that only writes on a frame would show nothing at all until
+    // the window came back — and would by then have thrown away everything but
+    // its last few thousand lines, with no note saying so. A receiver left
+    // running behind a minimised window is an ordinary thing to do, so this
+    // pins the fallback clock down rather than leaving it to whether the
+    // machine running the test happens to be compositing.
+    await win.webContents.executeJavaScript(`
+      clearConsole('receive');
+      window.__floodDone_min = false;
+      window.__lag = { max: 0, frames: 0, last: 0 };
+      true
+    `);
+    win.minimize();
+    await wait(500);
+    const minStart = Date.now();
+    await win.webContents.executeJavaScript(`
+      runStreaming('receive', ['__script__', ${JSON.stringify(floodScript)}, '${FLOOD_LINES}'])
+        .then(() => { window.__floodDone_min = true; });
+      true
+    `);
+    const minDone = await waitFor(win, 'window.__floodDone_min', 120000, `${FLOOD_LINES} lines at a minimised window`);
+    const minMs = Date.now() - minStart;
+    // Same wait as pass 1, and it matters more here: minimised is exactly when
+    // the fallback clock is throttled. Reading mid-backlog would count lines as
+    // missing that are merely not written yet.
+    if (!await waitFor(win, DRAINED, 20000, 'the minimised console to write what it kept')) {
+      throw new Error('a minimised console never wrote out its buffer');
+    }
+    const m = JSON.parse(await win.webContents.executeJavaScript(READ_CONSOLE));
+    win.restore();
+    await wait(600);
+    // The scroll was skipped while nothing was painting, so it has to catch up
+    // on the first frame after restore. This also covers the case that broke
+    // it: a console whose element has no layout reports clientHeight 0, and
+    // the trim's own scroll events used to latch stick-to-bottom off. Otherwise the operator comes back to a
+    // console parked where they left it, with everything they minimised the
+    // window to collect sitting below the fold.
+    const scrolled = JSON.parse(await win.webContents.executeJavaScript(`(() => {
+      const c = document.querySelector('#view-receive [data-console]');
+      return JSON.stringify({ top: c.scrollTop, height: c.scrollHeight, view: c.clientHeight });
+    })()`));
+    const fromBottom = scrolled.height - scrolled.top - scrolled.view;
+    process.stdout.write(`flood: minimised — after restore the console sits ${fromBottom}px from the bottom
+`);
+    measured.push(`flood: minimised — after restore the console sits ${fromBottom}px from the bottom`);
+
+    [
+      `flood: minimised — ${FLOOD_LINES} lines drained in ${minMs}ms over ${m.frames} frames`,
+      `flood: minimised — retained ${m.retainedLines} lines in ${m.spans} spans, ${m.nodes} nodes`,
+      `flood: minimised — ${m.dropped} dropped (${m.droppedUpstream} of them upstream), `
+        + `${m.dropped + m.retainedLines} of ${FLOOD_LINES} accounted for`,
+      `flood: minimised — notice = ${m.notice || '(none)'}`,
+    ].forEach((l) => { process.stdout.write(`${l}
+`); measured.push(l); });
+
+    if (!minDone) throw new Error('the flood never drained while the window was minimised');
+    if (!m.retainedLines) {
+      throw new Error('a minimised window received the whole flood and wrote none of it to the console');
+    }
+    if (!m.notice) {
+      throw new Error('a minimised window dropped output and said nothing about it');
+    }
+    if (m.retainedLines > FLOOD_CAP + 300) {
+      throw new Error(`a minimised console retained ${m.retainedLines} lines, past its ${FLOOD_CAP} cap`);
+    }
+    // The same total that pass 1 demands. A window nobody is looking at is
+    // exactly where output could go missing unnoticed, so it is held to the
+    // same standard rather than a softer one.
+    if (m.dropped + m.retainedLines < FLOOD_LINES) {
+      throw new Error(
+        `a minimised console accounts for ${m.dropped + m.retainedLines} of ${FLOOD_LINES} lines, `
+        + `so it lost ${FLOOD_LINES - m.dropped - m.retainedLines} without saying so`
+      );
+    }
+    if (fromBottom > 40) {
+      throw new Error(`after restore the console is ${fromBottom}px from the bottom, not following its output`);
+    }
+
     fs.writeFileSync(path.join(outDir, 'measurements.txt'), measured.join('\n') + '\n');
     process.stdout.write('smoke: OK\n');
     app.exit(0);
