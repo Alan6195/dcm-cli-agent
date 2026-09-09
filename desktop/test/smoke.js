@@ -408,7 +408,54 @@ function stopPeers() {
  * @param {import('electron').BrowserWindow} win
  * @param {import('electron').App} app
  */
-async function runSmoke(win, app) {
+
+// ---------------------------------------------------------------------------
+// The macOS update path.
+//
+// Fixtures, not guesses: these are the fourteen asset names of the real
+// v0.15.0 release and the real latest-mac.yml published with it. They are
+// checked in here rather than fetched so the harness stays offline and so a
+// release that changes shape has to change this file too.
+// ---------------------------------------------------------------------------
+const V15_ASSET_NAMES = [
+  'Asteris-DICOM-App-0.15.0-arm64.dmg',
+  'Asteris-DICOM-App-0.15.0-arm64.dmg.blockmap',
+  'Asteris-DICOM-App-0.15.0-x64-portable.exe',
+  'Asteris-DICOM-App-0.15.0-x64-setup.exe',
+  'Asteris-DICOM-App-0.15.0-x64-setup.exe.blockmap',
+  'Asteris-DICOM-App-0.15.0-x64.dmg',
+  'Asteris-DICOM-App-0.15.0-x64.dmg.blockmap',
+  'dcm-linux-x64',
+  'dcm-macos-arm64',
+  'dcm-macos-x64',
+  'dcm-windows-x64.exe',
+  'latest-mac.yml',
+  'latest.yml',
+  'SHA256SUMS.txt',
+];
+const V15_ARM = 'Asteris-DICOM-App-0.15.0-arm64.dmg';
+const V15_X64 = 'Asteris-DICOM-App-0.15.0-x64.dmg';
+const V15_ARM_SHA = 'dpXf+t1Z39zPFeaygmpjwRuwTD94BstSwhhP79jieS5EzRtzrg0tp/uTbJP9fp1XJgdeSzII3qfMUaImbfL5/A==';
+const V15_X64_SHA = 'l54v4/kfoWwVtEmyJCwBh1VT8QFVR6/jrZMTnOSeIOnFMzyeal1eDfrpxxZGoGzfrYr69/Aw5W8vL61ibH3j9w==';
+// Verbatim, including the two top-level keys after the list. Those are the
+// trap: the file repeats the DEFAULT image's sha512 at column 0 immediately
+// after the x64 entry, so a reader that ignored indentation would check an
+// Intel download against the Apple Silicon hash.
+const V15_MAC_FEED = [
+  'version: 0.15.0',
+  'files:',
+  '  - url: Asteris-DICOM-App-0.15.0-arm64.dmg',
+  `    sha512: ${V15_ARM_SHA}`,
+  '    size: 102407035',
+  '  - url: Asteris-DICOM-App-0.15.0-x64.dmg',
+  `    sha512: ${V15_X64_SHA}`,
+  '    size: 109497714',
+  'path: Asteris-DICOM-App-0.15.0-arm64.dmg',
+  `sha512: ${V15_ARM_SHA}`,
+  "releaseDate: '2026-09-09T02:46:32.709Z'",
+].join('\n');
+
+async function runSmoke(win, app, mainHelpers = {}) {
   WIN = win;
   OUT = process.env.DCM_SMOKE_DIR;
   const fixtures = process.env.DCM_SMOKE_FIXTURES || '';
@@ -2905,6 +2952,271 @@ async function runSmoke(win, app) {
     }
     if (fromBottom > 40) {
       bad(`after restore the console is ${fromBottom}px from the bottom, not following its output`);
+    }
+
+    // =====================================================================
+    // The macOS update path.
+    //
+    // Two halves, and this harness can reach both without a Mac.
+    //
+    //   1. Which file the app decides to fetch. That is a pure function over
+    //      the release's asset list, and it is the half that has already gone
+    //      wrong in front of an operator: the wrong architecture installs and
+    //      then reports itself as damaged. Run here against the real v0.15.0
+    //      asset names and the real latest-mac.yml.
+    //   2. What the banner says once it has. Driven by hand through every
+    //      state, because the wording is the other half of the promise —
+    //      an app that fetched an installer must not say it updated itself.
+    //
+    // What this does NOT do, and cannot from here: perform a real download,
+    // mount a disk image, or observe Gatekeeper. Nothing below should be read
+    // as evidence that a macOS install works.
+    // =====================================================================
+    const { pickMacAsset, macFeedEntry } = mainHelpers;
+    if (typeof pickMacAsset !== 'function' || typeof macFeedEntry !== 'function') {
+      bad('main did not hand the macOS update helpers to the harness');
+    } else {
+      const assets = V15_ASSET_NAMES.map((name) => ({ name, browser_download_url: `https://example/${name}` }));
+      const pick = (arch, list) => {
+        const a = pickMacAsset(list || assets, arch);
+        return a ? a.name : null;
+      };
+
+      const picks = { arm64: pick('arm64'), x64: pick('x64') };
+      record(`mac update: arm64 -> ${picks.arm64}, x64 -> ${picks.x64}`);
+      if (picks.arm64 !== V15_ARM) bad(`Apple Silicon would be given ${picks.arm64}, not ${V15_ARM}`);
+      if (picks.x64 !== V15_X64) bad(`Intel would be given ${picks.x64}, not ${V15_X64}`);
+
+      // The near misses in this very release. Each of these is a file whose
+      // name contains the architecture and which must never be handed to a Mac.
+      for (const wrong of ['.blockmap', 'portable', '.exe', 'dcm-macos']) {
+        if (picks.arm64.includes(wrong) || picks.x64.includes(wrong)) {
+          bad(`the asset picker matched a "${wrong}" file: ${JSON.stringify(picks)}`);
+        }
+      }
+
+      // No rule, no file. An architecture the app has never heard of, and a
+      // release that is missing the image, both fall back to the page — which
+      // is the whole reason the fallback exists.
+      for (const [label, got] of [
+        ['an unknown architecture', pick('ia32')],
+        ['no architecture at all', pick(undefined)],
+        ['a release with no assets', pickMacAsset(undefined, 'arm64')],
+        ['a release missing the arm64 image',
+          pick('arm64', assets.filter((a) => a.name !== V15_ARM))],
+      ]) {
+        if (got !== null) bad(`${label} produced ${JSON.stringify(got)} instead of falling back to the page`);
+      }
+      record('mac update: an unknown architecture, a missing image and an empty release all fall back to the page');
+
+      // The feed. The x64 case is the one that matters: it is the last entry
+      // in the list, and the top-level sha512 that follows it belongs to the
+      // arm64 image.
+      const armEntry = macFeedEntry(V15_MAC_FEED, V15_ARM);
+      const x64Entry = macFeedEntry(V15_MAC_FEED, V15_X64);
+      record(`mac update: latest-mac.yml gives arm64 ${armEntry && armEntry.sha512.slice(0, 12)}…, `
+        + `x64 ${x64Entry && x64Entry.sha512.slice(0, 12)}…`);
+      if (!armEntry || armEntry.sha512 !== V15_ARM_SHA || armEntry.size !== 102407035) {
+        bad(`the feed reader misread the arm64 entry: ${JSON.stringify(armEntry)}`);
+      }
+      if (!x64Entry || x64Entry.sha512 !== V15_X64_SHA || x64Entry.size !== 109497714) {
+        bad(`the feed reader misread the x64 entry: ${JSON.stringify(x64Entry)}`);
+      }
+      if (x64Entry && x64Entry.sha512 === V15_ARM_SHA) {
+        bad('the feed reader took the top-level sha512 for the x64 image; every Intel download would be rejected');
+      }
+      // A feed that cannot be read must produce nothing rather than something
+      // wrong — the caller then says it checked the size, not the checksum.
+      for (const [label, got] of [
+        ['a file the feed does not list', macFeedEntry(V15_MAC_FEED, 'nope.dmg')],
+        ['a feed that is not the expected shape', macFeedEntry('not yaml at all', V15_ARM)],
+        ['an empty feed', macFeedEntry('', V15_ARM)],
+      ]) {
+        if (got !== null) bad(`${label} produced ${JSON.stringify(got)} instead of null`);
+      }
+      record('mac update: an unlisted file, a malformed feed and an empty feed all read as "no checksum"');
+    }
+
+    // --- The banner, in every state ----------------------------------------
+    // renderUpdateState is a pure function of the state object, so the states
+    // main would send are sent by hand. What each one is allowed to say is the
+    // point: the download states must never read as an install.
+    const bannerState = async (updateState) => jsJSON(`(() => {
+      renderUpdateState(${JSON.stringify(updateState)});
+      const vis = (el) => (el && !el.hidden ? el.textContent.trim() : '');
+      return JSON.stringify({
+        hidden: document.querySelector('#update-banner').hidden,
+        text: document.querySelector('#update-text').textContent.trim(),
+        note: vis(document.querySelector('#update-note')),
+        action: vis(document.querySelector('#update-action')),
+        more: !document.querySelector('#update-more').hidden,
+        check: document.querySelector('#update-check').hidden,
+        // The link only ever appears on a packaged build, and this harness
+        // usually runs from a source checkout. Without this the assertions
+        // below would be testing the dev build's silence.
+        eligible: updateCheckEligible,
+      });
+    })()`);
+
+    const V = '0.15.0';
+    const banners = {
+      idle: await bannerState({ status: 'idle' }),
+      available: await bannerState({ status: 'available', version: V, download: null }),
+      availableMac: await bannerState({
+        status: 'available', version: V, download: { name: V15_ARM, size: 102407035, arch: 'arm64' },
+      }),
+      fetching: await bannerState({
+        status: 'fetching', version: V, name: V15_ARM, percent: 42, received: 1, total: 2,
+      }),
+      fetched: await bannerState({
+        status: 'fetched', version: V, name: V15_ARM, file: `/Users/x/Downloads/${V15_ARM}`, checked: 'sha512',
+      }),
+      fetchedUnverified: await bannerState({
+        status: 'fetched', version: V, name: V15_ARM, file: `/Users/x/Downloads/${V15_ARM}`, checked: 'size',
+      }),
+      failed: await bannerState({
+        status: 'error', version: V, name: V15_ARM, fallback: 'releases',
+        message: 'the file did not match the checksum published with the release',
+      }),
+      quietError: await bannerState({ status: 'error', message: 'offline' }),
+    };
+    artefact('update-banner.txt', Object.entries(banners)
+      .map(([k, b]) => `${k}:\n  ${JSON.stringify(b, null, 2).split('\n').join('\n  ')}`).join('\n\n'));
+    for (const [name, b] of Object.entries(banners)) {
+      record(`update banner: ${name} — ${b.hidden ? '(hidden)' : `"${b.text}" [${b.action || 'no button'}]`}`);
+    }
+
+    if (!banners.idle.hidden) bad('the banner shows itself with no update to report');
+    if (!banners.quietError.hidden) {
+      bad('a background check failure raised a banner; only a failure the operator asked for should');
+    }
+    if (banners.available.action !== 'Download') {
+      bad(`a build with no matched file lost its page button: ${JSON.stringify(banners.available)}`);
+    }
+    if (banners.availableMac.action !== 'Download for this Mac' || banners.availableMac.note !== V15_ARM) {
+      bad(`the banner does not name the file it is about to fetch: ${JSON.stringify(banners.availableMac)}`);
+    }
+    if (!/42%/.test(banners.fetching.text)) {
+      bad(`the download reports no progress: ${JSON.stringify(banners.fetching.text)}`);
+    }
+    if (banners.fetched.action !== 'Show in Finder' || !banners.fetched.more) {
+      bad(`a finished download offers no way to the file or to the explanation: ${JSON.stringify(banners.fetched)}`);
+    }
+    if (banners.failed.action !== 'Open the releases page') {
+      bad(`a failed download does not fall back to the page: ${JSON.stringify(banners.failed)}`);
+    }
+
+    // The wording, which is the part that can quietly become a lie. The app
+    // fetched an installer; it did not install anything, and it did not update
+    // itself. And the Gatekeeper line must not send anyone to right-click →
+    // Open, which macOS 15 removed.
+    for (const key of ['fetching', 'fetched', 'fetchedUnverified']) {
+      const said = `${banners[key].text} ${banners[key].note}`;
+      if (/\b(installed|installing|updated itself|up to date now)\b/i.test(said)) {
+        bad(`the ${key} banner claims an install the app did not perform: ${JSON.stringify(said)}`);
+      }
+      if (/right[- ]?click/i.test(said)) {
+        bad(`the ${key} banner offers right-click → Open, which macOS 15 removed: ${JSON.stringify(said)}`);
+      }
+    }
+    if (!/Privacy & Security/.test(banners.fetched.note) || !/Open Anyway/.test(banners.fetched.note)) {
+      bad(`the finished download does not give the Gatekeeper step: ${JSON.stringify(banners.fetched.note)}`);
+    }
+    if (banners.fetched.note !== banners.fetchedUnverified.note) {
+      bad('the Gatekeeper step is worded two different ways');
+    }
+    // A download that could only be size-checked must say so rather than
+    // borrowing the word "verified" from the run that did check the checksum.
+    if (/verified/i.test(banners.fetchedUnverified.text)) {
+      bad(`an unverified download calls itself verified: ${JSON.stringify(banners.fetchedUnverified.text)}`);
+    }
+    if (!/checksum/i.test(banners.fetchedUnverified.text)) {
+      bad(`an unverified download does not say what was missing: ${JSON.stringify(banners.fetchedUnverified.text)}`);
+    }
+    if (!/verified/i.test(banners.fetched.text)) {
+      bad(`a checksum-verified download does not say so: ${JSON.stringify(banners.fetched.text)}`);
+    }
+
+    // The banner and the "Check for updates" link are alternatives, and that
+    // has to hold for the new states too or the link stacks under the banner.
+    if (banners.idle.eligible) {
+      for (const key of ['available', 'availableMac', 'fetching', 'fetched', 'failed']) {
+        if (!banners[key].check) bad(`the check link is still showing under the ${key} banner`);
+      }
+      if (banners.idle.check) bad('the check link did not come back when the banner went away');
+    } else {
+      say('update banner: this build is unpackaged, so the check link stays hidden throughout');
+    }
+
+    await js(`renderUpdateState({ status: 'fetched', version: '${V}', name: ${JSON.stringify(V15_ARM)}, `
+      + `file: '/Users/x/Downloads/' + ${JSON.stringify(V15_ARM)}, checked: 'sha512' }); true`);
+    // capturePage can hand back the frame from before this render, and did:
+    // the screenshot was named for a banner it did not contain. The assertions
+    // above are the evidence either way, but an artefact that does not show
+    // what its name says is worse than no artefact.
+    await wait(250);
+    await shot('update-banner-fetched');
+    // Left as it was found: this banner is a fiction, and a screenshot is the
+    // only thing that should outlive it.
+    await js("renderUpdateState({ status: 'idle' }); true");
+
+    // The long version lives in Settings, behind the help affordance every
+    // other screen uses, and it is macOS-only — a Windows operator has no
+    // Gatekeeper to read about.
+    const macHelp = await jsJSON(`(() => {
+      const panel = document.querySelector('#mac-update-help');
+      showView('settings');
+      setHelp('mac-update-help', true);
+      panel.scrollIntoView({ block: 'center' });
+      const text = panel.textContent;
+      return JSON.stringify({
+        exists: !!panel,
+        sequoia: /Sequoia/.test(text),
+        openAnyway: /Open Anyway/.test(text),
+        xattr: /xattr -cr/.test(text),
+        rightClick: /right[- ]?click →/i.test(text) && !/removed/.test(text),
+        macOnlyHidden: Array.from(document.querySelectorAll('.mac-only')).every((el) => el.hidden),
+      });
+    })()`);
+    record(`mac update: the Settings explainer names Sequoia=${macHelp.sequoia}, `
+      + `Open Anyway=${macHelp.openAnyway}, xattr=${macHelp.xattr}`);
+    if (!macHelp.exists || !macHelp.openAnyway || !macHelp.xattr || !macHelp.sequoia) {
+      bad(`the macOS explainer is missing part of the escape route: ${JSON.stringify(macHelp)}`);
+    }
+    await wait(250);
+    await shot('update-mac-explainer');
+    // Read, then put away: the panel is opened here and nowhere else.
+    const closed = await js("setHelp('mac-update-help', false); document.querySelector('#mac-update-help').hidden");
+    if (!closed) bad('the macOS explainer would not close');
+
+    if (macHelp.rightClick) bad('the macOS explainer still recommends right-click → Open');
+    if (process.platform !== 'darwin' && !macHelp.macOnlyHidden) {
+      bad('the macOS-only Settings section is showing on a platform that has no Gatekeeper');
+    }
+
+    // wireUpdates' macOS branch, run for real on whatever machine this is.
+    // Everything above tests the branch's *effect* while standing outside it;
+    // this enters it. That matters because the branch is unreachable on
+    // Windows, so a mistake inside it ships unseen — and one did: the unhide
+    // was written with $ (querySelector, one Element, no forEach) instead of
+    // $$, and the throw landed before the onStatus subscription two lines
+    // below, leaving the update banner dead on the only platform the whole
+    // download path exists for. Nothing but entering the branch catches that.
+    const macWire = await jsJSON(`(async () => {
+      const was = state.info.platform;
+      state.info.platform = 'darwin';
+      let threw = null;
+      try { await wireUpdates(); } catch (e) { threw = String((e && e.message) || e); }
+      const shown = $$('.mac-only').filter((el) => !el.hidden).length;
+      state.info.platform = was;
+      // Put the screen back: this run is not on a Mac.
+      $$('.mac-only').forEach((el) => { el.hidden = true; });
+      return JSON.stringify({ threw, shown, total: $$('.mac-only').length });
+    })()`);
+    record(`mac update: on darwin, wireUpdates reveals ${macWire.shown} of ${macWire.total} macOS-only elements`);
+    if (macWire.threw) bad(`wireUpdates threw on macOS: ${macWire.threw}`);
+    if (!macWire.total || macWire.shown !== macWire.total) {
+      bad(`the macOS-only Settings section stays hidden on a Mac: ${JSON.stringify(macWire)}`);
     }
 
     // =====================================================================

@@ -4787,11 +4787,22 @@ function wireKeyboard() {
 // Updates
 // --------------------------------------------------------------------------
 /**
- * Renders the update banner in the sidebar footer. Self-updating builds go
- * idle -> downloading -> ready ("Restart & update"); builds that cannot swap
- * themselves (portable exe, unsigned macOS) go idle -> available ("Download",
- * which opens the releases page). Errors stay silent — a failed background
- * check is not worth a banner.
+ * Renders the update banner in the sidebar footer.
+ *
+ * Three shapes, because the builds differ in what they can actually do:
+ *
+ *   installed Windows  idle -> downloading -> ready       ("Restart & update")
+ *   macOS              idle -> available -> fetching -> fetched
+ *   portable Windows   idle -> available                  ("Download" -> page)
+ *
+ * The macOS states are deliberately not the Windows ones. "ready" means the
+ * app has an update it can apply to itself; "fetched" means a disk image is
+ * sitting in Downloads and the operator has to open it. Sharing a word
+ * between those would make the banner claim something the app cannot do.
+ *
+ * Errors stay silent except the one that follows a click — a failed
+ * background check is not worth a banner, but a download the operator asked
+ * for and did not get has to say so, and has to leave a way forward.
  */
 /** True on packaged builds, where the manual check link makes sense. */
 let updateCheckEligible = false;
@@ -4800,23 +4811,85 @@ function renderUpdateState(s) {
   const banner = $('#update-banner');
   const text = $('#update-text');
   const action = $('#update-action');
+  const note = $('#update-note');
+  const more = $('#update-more');
   if (!banner || !s) return;
 
   const label = s.version ? `v${s.version}` : 'update';
   let visible = true;
+  // Every state starts from nothing showing but the line of text, so no state
+  // can inherit a button or a note from the one before it.
+  action.hidden = true;
+  action.disabled = false;
+  action.onclick = null;
+  note.hidden = true;
+  note.textContent = '';
+  more.hidden = true;
+
   if (s.status === 'downloading') {
-    action.hidden = true;
     text.textContent = `Downloading ${label}… ${s.percent || 0}%`;
   } else if (s.status === 'ready') {
     text.textContent = `Update ${label} is ready.`;
     action.textContent = 'Restart & update';
     action.hidden = false;
     action.onclick = () => window.dcm.update.install();
+  } else if (s.status === 'fetching') {
+    // "Getting", not "Installing" and not "Updating". The app is fetching a
+    // file for you; that is the whole of what is happening.
+    text.textContent = `Getting ${label}… ${s.percent || 0}%`;
+    if (s.name) { note.textContent = s.name; note.hidden = false; }
+  } else if (s.status === 'fetched') {
+    // Two lines, and the second one is the Gatekeeper step — said here,
+    // once, at the only moment it is about to matter. Not right-click → Open:
+    // macOS 15 removed that, and sending someone to a menu item that is no
+    // longer there is worse than saying nothing.
+    text.textContent = s.checked === 'sha512'
+      ? `${label} downloaded and checksum-verified. Open it from Downloads to install it.`
+      : `${label} downloaded — the size matches, the release checksum was unavailable. Open it from Downloads to install it.`;
+    note.textContent = 'macOS will say it cannot verify the app: System Settings → Privacy & Security → Open Anyway.';
+    note.hidden = false;
+    action.textContent = 'Show in Finder';
+    action.hidden = false;
+    action.onclick = () => { if (s.file) window.dcm.reveal(s.file); };
+    more.hidden = false;
+    more.onclick = () => {
+      showView('settings');
+      setHelp('mac-update-help', true);
+      // Settings is a long screen and this panel sits near the bottom of it.
+      // Opening it out of sight would look like the link did nothing.
+      const panel = $('#mac-update-help');
+      if (panel) panel.scrollIntoView({ block: 'center' });
+    };
   } else if (s.status === 'available') {
     text.textContent = `${label} is available.`;
-    action.textContent = 'Download';
+    if (s.download) {
+      // The file is named on the banner before the click. Being able to see
+      // which of the two images is about to be fetched is the whole point of
+      // this path: it is the check nobody could make on the releases page.
+      action.textContent = 'Download for this Mac';
+      note.textContent = s.download.name;
+      note.hidden = false;
+      action.onclick = async () => {
+        action.disabled = true;
+        const r = await window.dcm.update.download();
+        // Main takes over the banner from here via update:status. It only
+        // comes back with no-asset if this banner is stale — a re-check that
+        // cleared the match — and then the page is still the way forward.
+        if (!r || (!r.ok && r.reason === 'no-asset')) {
+          action.disabled = false;
+          window.dcm.update.openReleases(s.version);
+        }
+      };
+    } else {
+      action.textContent = 'Download';
+      action.onclick = () => window.dcm.update.openReleases();
+    }
     action.hidden = false;
-    action.onclick = () => window.dcm.update.openReleases();
+  } else if (s.status === 'error' && s.fallback === 'releases') {
+    text.textContent = `Could not download ${label}: ${s.message || 'unknown error'}.`;
+    action.textContent = 'Open the releases page';
+    action.hidden = false;
+    action.onclick = () => window.dcm.update.openReleases(s.version);
   } else {
     visible = false;
   }
@@ -4837,6 +4910,13 @@ function renderUpdateState(s) {
 
 async function wireUpdates() {
   updateCheckEligible = Boolean(state.info.packaged);
+  if (state.info.platform === 'darwin') {
+    // $$ (querySelectorAll), not $ (querySelector). $ returns one Element,
+    // which has no forEach, so this threw on macOS and only on macOS — before
+    // the onStatus subscription two lines down, which left the update banner
+    // dead on the one platform this path exists for.
+    $$('.mac-only').forEach((el) => { el.hidden = false; });
+  }
   window.dcm.update.onStatus(renderUpdateState);
   renderUpdateState(await window.dcm.update.state());
 

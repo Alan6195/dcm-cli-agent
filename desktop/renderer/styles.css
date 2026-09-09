@@ -112,6 +112,17 @@ code { font-family: var(--mono); }
   line-height: 1.45;
 }
 .update-banner .update-btn { width: 100%; margin-top: 8px; padding: 7px 10px; font-size: 12px; }
+/* The second line of the banner: the file about to be fetched, or the
+   Gatekeeper step once it has been. A dmg name is longer than the 232px
+   sidebar, so it wraps mid-word rather than pushing the layout sideways. */
+.update-banner .update-note {
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.update-banner .update-more { display: block; margin: 8px 0 0; }
 .update-banner .banner-row { display: flex; gap: 6px; margin-top: 6px; }
 .update-banner .banner-row .btn { flex: 1; padding: 5px 8px; font-size: 11.5px; }
 

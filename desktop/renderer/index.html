@@ -53,7 +53,9 @@
       <div class="sidebar-footer">
         <div id="update-banner" class="update-banner" hidden>
           <div id="update-text"></div>
+          <div id="update-note" class="update-note" hidden></div>
           <button class="btn primary update-btn" id="update-action" hidden></button>
+          <button class="linklike update-more" id="update-more" hidden>Why macOS blocks it</button>
         </div>
         <div id="whatsnew-banner" class="update-banner" hidden>
           <div id="whatsnew-text"></div>
@@ -1077,6 +1079,27 @@
         <div class="section-title">Rehearsal</div>
         <div class="checks">
           <label><input type="checkbox" id="set-rehearsal" /> Rehearsal mode — every command that can take <code>--dry-run</code> gets it, and a banner says so</label>
+        </div>
+
+        <div class="section-title mac-only" hidden>Updates on this Mac</div>
+        <p class="mcp-note mac-only" hidden>This app cannot replace itself on macOS, so it downloads the disk image for
+          your Mac and shows it in Finder. You install it.
+          <button type="button" class="linklike" data-help="mac-update-help" aria-expanded="false" aria-controls="mac-update-help">Why macOS blocks it, and what to do</button>
+        </p>
+        <div class="help-panel" id="mac-update-help" hidden>
+          <div class="help-head"><b>Updates on macOS</b><button type="button" class="linklike" data-help-close>Close</button></div>
+
+          <h4>Why the app does not update itself</h4>
+          <p>Sparkle and Squirrel.Mac can only replace an app that carries a Developer ID signature from Apple. These builds are <b>ad-hoc signed</b> — signed by the build machine with no identity behind it — which is enough for macOS to run them at all, and not enough to swap them. An app that offered a one-click update here would fail at install time instead of failing honestly at download time, so it does not offer one.</p>
+
+          <h4>What it does instead</h4>
+          <p>It reads the release, picks the disk image matching the architecture this copy is running as — <code>-arm64.dmg</code> for Apple Silicon, <code>-x64.dmg</code> for Intel — downloads it to your Downloads folder, checks it against the <code>sha512</code> published with the release, and reveals it in Finder. Nothing is mounted or opened for you. If the architecture cannot be matched, or the file does not check out, it says so and sends you to the releases page rather than handing you a file it is not sure about. <b>Installing the image for the other architecture is what produces "the application is damaged"</b>, which is the mistake this exists to prevent.</p>
+
+          <h4>The warning you will get, and how to get past it</h4>
+          <p>Opening the app the first time, macOS says <b>"Apple could not verify … is free of malware"</b>. That is Gatekeeper reporting the missing Developer ID, not a claim about this build. Open <b>System Settings → Privacy &amp; Security</b>, scroll to the message naming the app, and click <b>Open Anyway</b>. macOS 15 Sequoia removed the old right-click → Open shortcut, so that is the only route through the interface.</p>
+          <p>From a terminal, the equivalent is to strip the quarantine attribute the download put on it:</p>
+          <p><code>xattr -cr "/Applications/Asteris DICOM App.app"</code></p>
+          <p>Both do the same thing: tell macOS you accept an app Apple has not notarised. You only do it once per installed copy — and once per update, since each update is a new copy.</p>
         </div>
 
         <div class="section-title">Engineer options</div>

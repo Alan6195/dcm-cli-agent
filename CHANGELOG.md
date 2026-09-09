@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.15.1
+
+On a Mac, an update now arrives as the right file rather than as a page with
+fourteen assets on it.
+
+macOS cannot install its own update here and still cannot: Squirrel.Mac swaps
+an app only when it can match a real Developer ID signature across both
+copies, and these builds are ad-hoc signed. So the app checked GitHub, said a
+newer version existed, and opened the releases page — leaving the person to
+work out which of two disk images was theirs. That is how you end up
+downloading the wrong architecture, which on Apple Silicon reports itself as
+"damaged" rather than as the wrong file.
+
+The check now matches `process.arch` against the release's assets by suffix —
+`-arm64.dmg` or `-x64.dmg` — and names the file in the banner before the
+click. Suffix, not substring: the same release carries a `.dmg.blockmap`
+beside each image, an `-x64-portable.exe`, an `-x64-setup.exe` and the bare
+`dcm-macos-arm64` CLI binary, every one of which a substring test would
+happily hand to a Mac. An architecture with no matching image falls back to
+the releases page rather than guessing.
+
+The download streams to `Downloads`, hashes as it goes, and is checked against
+the SHA-512 the release publishes in `latest-mac.yml` before it is renamed
+from `.part` to a real `.dmg` and revealed in Finder. Reading that feed has a
+trap worth recording: it repeats the default image's digest as a top-level
+key immediately after the x64 entry, so a reader that does not respect
+indentation checks every Intel download against the Apple Silicon hash and
+rejects good files. When the feed cannot be fetched the check degrades to the
+byte count the API reports, and the banner words that differently — nothing
+unverified is ever called verified. Every failure — no matching asset, a dead
+connection, a bad hash, an unwritable directory — deletes the partial file and
+puts the releases page back in front of you.
+
+The wording stays honest: "Getting v0.15.0… 42%", then "downloaded and
+checksum-verified. Open it from Downloads to install it." Never installed,
+never updated itself, because it did not. The Gatekeeper step appears once, at
+the moment it is needed, and says what actually works on Sequoia — System
+Settings → Privacy & Security → Open Anyway — because macOS 15 removed the
+right-click → Open bypass that every older set of instructions still
+recommends. The long version lives in a macOS-only Settings panel.
+
+Windows is untouched: an installed Windows app still updates itself through
+electron-updater. The portable exe keeps the notify-only page, because its
+release holds exactly one portable binary — there is no wrong choice to make —
+and the file a portable user would have to replace is the one they are running.
+
+**Two defects found reviewing this before it shipped**, both fixed here:
+
+- `$('.mac-only')` where `$` was meant. ` is `querySelector` and returns
+  one element, which has no `forEach`, so this threw inside `wireUpdates` on
+  macOS and only on macOS — two lines before the update banner subscribed to
+  its status channel. The entire feature was dead on the one platform it was
+  written for, and nothing caught it because the branch cannot run on Windows.
+  The smoke harness now enters that branch deliberately.
+- The download held the whole image in memory. Each `Promise.race` against a
+  rejection promise that never settles keeps a reaction alive on the promise
+  it raced, and for the read that is the one holding the chunk. Measured: a
+  300 MB download peaked 343 MB above baseline; it is flat at 69 MB now.
+
 ## v0.15.0
 
 The app is rebuilt around the worklist. It opens there, peers are configured

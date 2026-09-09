@@ -81,6 +81,12 @@ contextBridge.exposeInMainWorld('dcm', {
     check: () => ipcRenderer.invoke('update:check'),
     /** Quit and apply a downloaded update (self-updating builds only). */
     install: () => ipcRenderer.invoke('update:install'),
+    /**
+     * macOS: fetch the disk image for this Mac into Downloads and reveal it.
+     * Resolves {ok, file?} — {ok:false, reason:'no-asset'} anywhere the app has
+     * no file it can name, which is the caller's cue to open the page instead.
+     */
+    download: () => ipcRenderer.invoke('update:download'),
     /** Open the releases page, or a specific version's release notes. */
     openReleases: (version) => ipcRenderer.invoke('update:open-releases', version),
     /** The "you were just updated" notice, or null. */
