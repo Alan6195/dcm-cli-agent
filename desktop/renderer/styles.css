@@ -135,8 +135,13 @@ code { font-family: var(--mono); }
 .view.active { display: block; animation: fade 0.15s ease; }
 @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
-.view-head h1 { margin: 0 0 6px; font-size: 22px; font-weight: 650; }
-.view-head p { margin: 0 0 20px; color: var(--text-dim); line-height: 1.5; max-width: 680px; }
+/* Title, then the ? that opens this screen's help panel, and on the echo
+ * screen the way back to Settings. Nothing else: a screen's one-line
+ * description is a .pane-lede on the row below, where it keeps its own
+ * reading measure. */
+.view-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.view-head h1 { margin: 0; font-size: 22px; font-weight: 650; }
+.view-head .linklike { font-size: 12.5px; margin: 0; }
 
 /* ---------------- Forms ---------------- */
 .form-row { display: flex; gap: 14px; margin-bottom: 14px; }
@@ -442,16 +447,6 @@ input.mirrored { color: var(--text-dim); }
 .outcome.bad { background: var(--red-soft); border-color: var(--red); color: #f3bcbc; }
 .outcome.bad .outcome-head, .outcome.bad b { color: var(--red); }
 
-/* The re-query result is a correlation, never a proof, so it gets a neutral
- * card rather than a green "done" banner. */
-.correlation-note {
-  background: var(--bg-3); border: 1px solid var(--border-2); border-left: 3px solid var(--accent);
-  border-radius: 9px; padding: 12px 16px; margin-bottom: 16px;
-  color: var(--text-dim); font-size: 12.5px; line-height: 1.6;
-}
-.correlation-note b { color: var(--text); }
-.correlation-note code { color: var(--accent); user-select: text; word-break: break-all; }
-
 /* ---------------- Tag editor ---------------- */
 .tag-editor {
   border: 1px solid var(--border); border-radius: 9px; overflow: hidden;
@@ -645,49 +640,6 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
 .folder-check.ok { border-left-color: var(--green); }
 .folder-check.warn { border-left-color: var(--amber); color: var(--text); }
 
-.mismatch {
-  border: 1px solid var(--amber);
-  border-radius: 10px;
-  background: var(--amber-soft);
-  padding: 14px 16px;
-  margin-bottom: 18px;
-}
-.mismatch.bad { border-color: var(--red); background: var(--red-soft); }
-.mismatch-head { font-weight: 700; color: var(--amber); margin-bottom: 10px; font-size: 13.5px; }
-.mismatch.bad .mismatch-head { color: var(--red); }
-.mismatch-body { color: var(--text); font-size: 12.5px; line-height: 1.6; margin-top: 10px; }
-.mismatch-body b { color: var(--text); }
-
-.uid-pair { display: flex; flex-direction: column; gap: 5px; }
-.uid-line { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
-.uid-line .uid-k { color: var(--text-dim); min-width: 96px; }
-.uid-line code { font-family: var(--mono); color: var(--text); user-select: text; word-break: break-all; }
-.uid-line .uid-x { color: var(--text-dim); }
-
-.choice-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
-.choice {
-  display: flex;
-  gap: 11px;
-  align-items: flex-start;
-  border: 1px solid var(--border-2);
-  border-radius: 9px;
-  background: var(--bg-2);
-  padding: 12px 14px;
-  cursor: pointer;
-}
-.choice:hover { border-color: var(--accent); }
-.choice input { margin-top: 3px; flex: none; accent-color: var(--accent); }
-.choice-body { display: block; min-width: 0; }
-.choice-head { display: block; font-weight: 650; color: var(--text); margin-bottom: 5px; }
-.choice-head .rec {
-  font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.8px;
-  color: var(--green); background: var(--green-soft); padding: 2px 8px; border-radius: 20px; margin-left: 6px;
-}
-.choice-why { display: block; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; }
-.choice-why b { color: var(--text); }
-.choice-flag { display: block; margin-top: 7px; color: var(--text-faint); font-size: 11.5px; }
-.choice-flag code { color: var(--accent); background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
-
 /* ---------------- Steps this session ---------------- */
 /* The one place the app says, plainly and once, that this screen is a memory
  * of what it did in this session rather than a report about the peer. */
@@ -706,13 +658,6 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
 .pill.ok { color: var(--green); background: var(--green-soft); }
 .pill.warn { color: var(--amber); background: var(--amber-soft); }
 .pill.bad { color: var(--red); background: var(--red-soft); }
-.uid-cell { font-size: 11px; word-break: break-all; max-width: 260px; }
-#steps-close-cmd { margin-bottom: 14px; }
-/* The performed-series option carries its caveat in the label, so the box sits
-   on the first line rather than floating in the middle of wrapped text. */
-#steps-series-row { align-items: flex-start; }
-#steps-series-row input { margin-top: 3px; flex: 0 0 auto; }
-#steps-series-label code { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
 
 /* ==========================================================================
  * THE ONE WORKSPACE: worklist -> perform -> close
@@ -754,15 +699,6 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
 #view-worklist .form-row.qbar-fields { align-items: flex-end; }
 #view-worklist label.narrow { width: 96px; flex: none; }
 
-/* ---------------- Table footnote ----------------
- * A trust invariant, so it stays visible rather than going behind the icon. */
-.table-foot {
-  color: var(--text-dim); font-size: 12px; line-height: 1.5;
-  margin: 8px 0 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
-}
-.table-foot .foot-sep { color: var(--text-faint); margin: 0 4px; }
-.table-foot b { color: var(--text); }
-
 /* ---------------- Row states ----------------
  * Selection is still the only row state this app draws from its own knowledge.
  * Hover and selection are facts about this window's pointer and this window's
@@ -796,60 +732,6 @@ tr.pick-row { scroll-margin-block: 28px; }
 .pill.session.open    { color: var(--amber); background: var(--amber-soft); border-color: rgba(251, 191, 36, 0.35); cursor: pointer; }
 .pill.session.open::before { animation: pulse 1s infinite; }
 
-/* A step this app opened that no row in the current results accounts for. */
-.open-alert {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  border: 1px solid var(--amber); border-left-width: 3px;
-  background: var(--amber-soft); color: var(--amber);
-  border-radius: 9px; padding: 9px 12px; margin-bottom: 12px; font-size: 12.5px;
-}
-.open-alert b { color: var(--amber); }
-
-/* ---------------- Info icon ----------------
- * One short line stays on screen; the reasoning opens as a block directly
- * under that line. Deliberately not a floating popover: at this column width a
- * popover wide enough for 40-90 words would cover the rows it explains and
- * would need edge-collision code this renderer has no business growing.
- * Warnings that matter when they arise are never put in here - the mismatch
- * choice, the folder verdicts, the Type 1 notes and every failed outcome all
- * stay inline. */
-.info-btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 16px; height: 16px; flex: none;
-  padding: 0; margin-left: 6px; vertical-align: -3px;
-  border: 1px solid var(--border-2); border-radius: 50%;
-  background: transparent; color: var(--text-dim);
-  font-family: var(--sans); font-size: 10.5px; font-weight: 700; line-height: 1;
-  cursor: pointer; transition: all 0.12s;
-}
-.info-btn::before { content: "i"; }
-.info-btn:hover { color: var(--accent); border-color: var(--accent); }
-.info-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.info-btn[aria-expanded="true"] {
-  color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
-}
-
-.info-pop {
-  display: block;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--border-2);
-  border-radius: 8px;
-  background: var(--bg-2);
-  padding: 9px 12px;
-  margin: 6px 0 10px;
-  color: var(--text-dim);
-  font-size: 12.5px; line-height: 1.6;
-  font-weight: 400; font-style: normal;
-  animation: fade 0.12s ease;
-}
-.info-pop p { margin: 0 0 8px; }
-.info-pop p:last-child { margin: 0; }
-.info-pop b { color: var(--text); }
-.info-pop code {
-  font-family: var(--mono); color: var(--accent);
-  background: var(--bg-3); padding: 1px 5px; border-radius: 4px;
-}
-
 /* ---------------- The action panel ----------------
  * The panel wears the same accent edge as the selected row's pick cell, so the
  * row and the panel read as one object. */
@@ -861,12 +743,6 @@ tr.pick-row { scroll-margin-block: 28px; }
 .empty-note.dense { padding: 6px 0; }
 .step-hero.compact { padding: 10px 12px 2px; margin-bottom: 10px; }
 .step-hero.compact .hero-uid { margin: 4px 0 10px; }
-
-/* The counter line that replaces the 27-word "nothing is wrong" note. */
-.assert-line {
-  display: flex; align-items: baseline; gap: 8px;
-  color: var(--text-dim); font-size: 12px; margin-bottom: 10px;
-}
 
 /* Folder, mode and go on one line: three controls always used together, and
  * 60px of vertical saved over three stacked rows. */
@@ -885,25 +761,11 @@ tr.pick-row { scroll-margin-block: 28px; }
  * column and is never truncated - only scrolled, if it runs past four lines. */
 #view-worklist .cmd-preview { max-height: 84px; overflow-y: auto; }
 
-/* The mismatch choice stays a real choice - compact, never folded away. */
-.mismatch.compact { padding: 10px 12px; margin-bottom: 10px; }
-.mismatch.compact .mismatch-head { font-size: 12.5px; margin-bottom: 6px; }
-.mismatch.compact .mismatch-body { margin-top: 6px; font-size: 12px; line-height: 1.5; }
-.mismatch.compact .choice-list { gap: 6px; margin-top: 8px; }
-.mismatch.compact .choice { padding: 8px 10px; gap: 9px; }
-.mismatch.compact .choice-head { margin-bottom: 3px; font-size: 12.5px; }
-.mismatch.compact .choice-why { font-size: 12px; line-height: 1.5; }
-.mismatch.compact .choice-flag { margin-top: 5px; }
-.series-note { display: block; margin-top: 5px; }
-
 /* ---------------- Density in the workspace ----------------
  * Ten rows plus the action panel on a 1180x800 window, before a run.
  * Scoped, so Query, Speed test and the rest keep their present rhythm. */
-#view-worklist .view-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-#view-worklist .view-head h1 { font-size: 18px; margin: 0; }
-#view-worklist .view-head .lede {
-  margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); max-width: none;
-}
+#view-worklist .view-head { gap: 12px; }
+#view-worklist .view-head h1 { font-size: 18px; }
 #view-worklist .chip-row { gap: 6px; margin-bottom: 10px; }
 #view-worklist .chip { padding: 5px 12px; font-size: 12px; }
 #view-worklist .chip-input { width: 210px; }
@@ -932,4 +794,268 @@ tr.pick-row { scroll-margin-block: 28px; }
 #view-worklist .console { max-height: 200px; padding: 10px 12px; }
 #view-worklist .attr-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 7px 16px; margin-bottom: 10px; }
 #view-worklist .totals { gap: 10px; margin-bottom: 10px; }
-#view-worklist .correlation-note { margin-bottom: 10px; }
+
+/* ==========================================================================
+ * FOUNDATION: sidebar, peer chip, rehearsal, command fold, tabs, settings
+ * ========================================================================== */
+
+/* Settings is pinned to the bottom of the sidebar, above the footer. */
+.nav-item.nav-settings { margin-top: auto; }
+.sidebar .sidebar-footer { margin-top: 12px; }
+
+/* ---------------- Peer chip ----------------
+ * One line that names the peer a screen will talk to, in the role the screen
+ * wants. It is a view onto state.conn, not a second copy of it: the fields
+ * that used to sit here live in Settings now, and this only chooses among
+ * what Settings saved. Amber when the role has no peer, because a screen with
+ * no peer is a command with no --host on it. */
+.conn-host { position: relative; margin-bottom: 16px; }
+.peer-chip { position: relative; display: inline-block; max-width: 100%; }
+.peer-chip-btn {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+  background: var(--panel); border: 1px solid var(--border-2); color: var(--text);
+  border-radius: 20px; padding: 6px 12px 6px 7px; cursor: pointer; font-size: 12.5px;
+  transition: border-color 0.12s;
+}
+.peer-chip-btn:hover, .peer-chip-btn[aria-expanded="true"] { border-color: var(--accent); }
+.peer-role {
+  color: var(--accent); background: var(--accent-soft); flex: none;
+  font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 12px;
+}
+.peer-name { font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.peer-from { color: var(--text-dim); font-family: var(--mono); white-space: nowrap; }
+.peer-caret { color: var(--text-dim); font-size: 11px; flex: none; }
+.peer-chip.unset .peer-chip-btn { border-color: var(--amber); }
+.peer-chip.unset .peer-name { color: var(--amber); font-family: var(--sans); }
+.peer-chip.unset .peer-role { color: var(--amber); background: var(--amber-soft); }
+
+.peer-menu {
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 30;
+  min-width: 320px; max-width: 560px;
+  background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 9px;
+  padding: 6px; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  animation: fade 0.12s ease;
+}
+.peer-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: none; color: var(--text);
+  padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  font-family: var(--mono); font-size: 12.5px;
+}
+.peer-item:hover { background: var(--bg-3); }
+.peer-item.active { color: var(--accent); background: var(--accent-soft); }
+.peer-item.plain { font-family: var(--sans); color: var(--text-dim); }
+.peer-item.plain:hover { color: var(--text); }
+.peer-item-role {
+  flex: none; min-width: 60px; font-family: var(--sans);
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim);
+}
+.peer-item.active .peer-item-role { color: var(--accent); }
+.peer-menu-sep { border-top: 1px solid var(--border); margin: 6px 0; }
+.peer-menu-note { color: var(--text-dim); padding: 8px 10px; font-size: 12.5px; }
+#view-worklist .conn-host { margin-bottom: 10px; }
+
+/* ---------------- Rehearsal banner ----------------
+ * The amber "this is not what it looks like" idiom, kept on screen for as long
+ * as the mode is on. Sticky, so it is still there when the button is. */
+.rehearsal-banner {
+  position: sticky; top: 0; z-index: 25;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--amber); border-left-width: 3px;
+  background: #1a1305; color: var(--amber);
+  border-radius: 9px; padding: 8px 12px; margin: -8px 0 18px;
+  font-size: 12.5px; max-width: 900px;
+}
+.rehearsal-banner b { color: var(--amber); }
+.rehearsal-banner code { color: var(--text); background: var(--bg-3); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+.rehearsal-banner .linklike { margin: 0 0 0 auto; color: var(--amber); font-size: 12px; }
+
+/* ---------------- Command fold ----------------
+ * The preview is the command and is never absent; it may be folded. The
+ * summary carries the start of the command while it is folded, so a glance
+ * still says what the button will run. */
+/* Every screen ends with the same two disclosures: the command that will run,
+ * then the output of what did. The command may be folded and the output may be
+ * folded; neither may be absent, and nothing that failed is left behind a
+ * triangle (see revealConsole). */
+.out-fold { margin-bottom: 20px; }
+.out-fold > .adv-body { padding: 10px 12px 12px; }
+.out-fold .console-wrap { border-radius: 7px; }
+
+.cmd-fold { margin-bottom: 16px; }
+.cmd-fold > summary {
+  cursor: pointer; list-style: none;
+  display: flex; align-items: baseline; gap: 10px; min-width: 0;
+  color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.9px;
+  padding: 4px 0;
+}
+.cmd-fold > summary::-webkit-details-marker { display: none; }
+.cmd-fold > summary::before {
+  content: "\25B8"; display: inline-block; flex: none;
+  transition: transform 0.12s ease;
+}
+.cmd-fold[open] > summary::before { transform: rotate(90deg); }
+.cmd-fold > summary:hover { color: var(--accent); }
+.cmd-fold .cmd-sum {
+  font-family: var(--mono); text-transform: none; letter-spacing: 0;
+  color: var(--text-faint); font-size: 11.5px; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cmd-fold[open] .cmd-sum { display: none; }
+.cmd-fold .cmd-preview { margin: 6px 0 0; }
+#view-worklist .cmd-fold { margin-bottom: 10px; }
+#view-worklist .cmd-fold > summary { padding: 2px 0; }
+
+/* ---------------- Tabs (DICOMweb, Tools) ---------------- */
+.chip-row.tabs { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.pane-lede { margin: 0 0 16px; color: var(--text-dim); line-height: 1.5; max-width: 680px; }
+.caution .linklike, .local-note .linklike { font-size: 12.5px; margin-left: 4px; }
+
+/* ---------------- Settings ---------------- */
+select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 7px; padding: 8px 10px; font-family: inherit; font-size: inherit;
+}
+.peer-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.peer-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px;
+}
+.peer-row-name {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text;
+}
+.peer-row select { padding: 5px 8px; font-size: 12.5px; }
+.peer-row .btn.small { padding: 4px 10px; font-size: 12px; }
+.peer-row .peer-role { flex: none; }
+#view-settings .conn-grid { grid-template-columns: 2fr 1fr 1.3fr 1.5fr; }
+#view-settings .form-row > .btn { align-self: flex-end; }
+#view-settings .mcp-note b { color: var(--text); }
+#view-settings .checks label { flex-wrap: wrap; }
+#view-settings .checks .dim { font-size: 12px; }
+/* A saved peer that holds no role yet: entries from before roles existed. */
+.peer-role.none { color: var(--text-dim); background: var(--bg-3); }
+
+/* ==========================================================================
+ * THE STATION (worklist)
+ *
+ * Used standing at the console: the list of what is scheduled, one patient,
+ * one verb per button. Everything an operator does not need to read to act is
+ * behind the ? in the header or under Details. Wider than the other screens
+ * on purpose: at >= 1200px the patient sits to the right of the list, so the
+ * row and the command that acts on it are in view together.
+ * ========================================================================== */
+#view-worklist { max-width: none; }
+#view-worklist .view-head { margin-bottom: 10px; }
+
+/* The ? in the header: one button, one panel, every explanation. */
+.help-btn {
+  width: 22px; height: 22px; border-radius: 50%; flex: none;
+  border: 1px solid var(--border-2); background: transparent; color: var(--text-dim);
+  font-weight: 700; font-size: 12px; line-height: 1; cursor: pointer; padding: 0;
+}
+.help-btn:hover, .help-btn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.help-panel {
+  border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 9px;
+  background: var(--bg-2); padding: 12px 16px 6px; margin-bottom: 14px;
+  color: var(--text-dim); font-size: 12.5px; line-height: 1.6; max-width: 900px;
+  max-height: 55vh; overflow-y: auto; user-select: text; animation: fade 0.12s ease;
+}
+.help-panel .help-head { display: flex; align-items: baseline; justify-content: space-between; color: var(--text); margin-bottom: 4px; }
+.help-panel .help-head .linklike { margin: 0; }
+.help-panel h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); }
+.help-panel p { margin: 0 0 8px; }
+.help-panel b { color: var(--text); }
+.help-panel code { font-family: var(--mono); color: var(--accent); background: var(--bg-3); padding: 1px 5px; border-radius: 4px; }
+
+/* ---------------- the top bar ---------------- */
+.station-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.station-bar .conn-host { margin: 0; }
+.station-bar .chip-row { margin: 0; }
+.station-bar .chip-row.seg .chip { padding: 6px 12px; }
+.modality-edit { display: inline-flex; align-items: center; }
+.chip-input.narrow { width: 110px; }
+.search { position: relative; flex: 1; min-width: 260px; }
+.search input { width: 100%; padding-right: 118px; }
+/* The key the text will be sent as. Pinned once clicked; otherwise the box's own guess. */
+.search-key {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  border: 1px solid var(--border-2); background: var(--bg-3); color: var(--text-dim);
+  border-radius: 12px; padding: 2px 8px; font-size: 10.5px; font-family: var(--mono); cursor: pointer;
+}
+.search-key:hover, .search-key.pinned { color: var(--accent); border-color: var(--accent); }
+.auto-toggle { flex-direction: row; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); cursor: pointer; }
+.open-chip { color: var(--amber); border-color: var(--amber); }
+.open-chip.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+
+/* ---------------- the list + the patient ---------------- */
+.station-body { display: block; }
+@media (min-width: 1200px) {
+  .station-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(400px, 480px); gap: 14px; align-items: start; }
+  .station-body .result-table { margin-bottom: 0; }
+}
+#view-worklist .result-table .empty-note { padding: 14px 4px; }
+#mwl-table tr.memory td { color: var(--text-dim); font-style: italic; }
+#mwl-table td.session-cell { overflow: visible; }
+
+/* The patient banner: who, what, when — verbatim off the row. */
+.patient-banner {
+  border: 1px solid var(--border-2); border-left: 3px solid var(--accent); border-radius: 9px;
+  background: var(--bg-2); padding: 10px 12px; margin-bottom: 10px;
+}
+.patient-banner .hero-main { font-size: 15px; gap: 6px; }
+.patient-banner .hero-main .mono, .patient-banner .hero-sub .mono { font-family: var(--mono); }
+.patient-banner .hero-sub { margin-top: 4px; }
+.patient-banner .hero-uid { margin: 4px 0 0; font-size: 11px; color: var(--text-faint); }
+.patient-banner .hero-uid code { color: var(--text-dim); }
+.hero-note { margin-top: 8px; color: var(--text-dim); font-size: 12px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.hero-note b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+
+/* Images: the folder and the one line about it. */
+.images-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.images-label { color: var(--text-dim); font-size: 12px; flex: none; min-width: 78px; }
+.images-row .path-pick { flex: 1; }
+.folder-check.bad { border-left-color: var(--red); color: var(--text); }
+.folder-check b { color: var(--text); }
+.mismatch-switch { margin: -4px 0 10px; }
+.checks.compact { margin: 0 0 10px; }
+.checks.compact label { font-size: 12.5px; color: var(--text-dim); }
+.checks.compact code { font-size: 11px; color: var(--accent); }
+
+/* The verbs. Clear sits at the far end so the primary is always first. */
+#mwl-verbs { margin-bottom: 8px; }
+#mwl-verbs .clear-sel { margin-left: auto; }
+.reason-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.reason-row input { flex: 1; }
+#view-worklist .cmd-fold { margin-bottom: 8px; }
+#view-worklist #mpps-adv { margin-top: 4px; }
+
+/* ==========================================================================
+ * REPAIRS: a failed read, a detached selection, a peer with its own calling
+ * AE, and the reason an exam was stopped.
+ * ========================================================================== */
+
+/* A worklist that could not be read says so where the list would be, and any
+ * rows still on screen are labelled as the previous answer. */
+.list-error { margin: 0 0 10px; }
+.result-table .empty-note.dense { margin: 0 0 10px; }
+
+/* Five fields on the peer form now: the calling AE override is the fifth. */
+#peer-form .conn-grid { grid-template-columns: 2fr 1fr 1.3fr 1.3fr 1.3fr; }
+
+/* The one place a peer is talked to as something other than this station. */
+.peer-from.override { color: var(--amber); }
+.peer-row .peer-from.override { font-size: 11.5px; }
+
+/* The reason picker: the words are chosen here, the code triplet goes on the
+ * command line. The free-text box appears only for "Another code…". */
+.reason-row select { flex: none; min-width: 220px; }
+.reason-row input[hidden] { display: none; }
+
+/* A fold whose label is more than one word must not let the command line
+ * squeeze it into two. */
+.cmd-fold .cmd-label { flex: none; white-space: nowrap; }
+
+/* A verb that is not live because the thing it would do is not yet known. */

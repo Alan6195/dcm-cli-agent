@@ -18,10 +18,12 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 function esc(s) {
+  // Quotes too: saved peer names and URLs go into data- attributes.
   return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 /** Strip ANSI just in case; the engine runs with NO_COLOR but be defensive. */
@@ -53,86 +55,214 @@ const state = {
   info: { home: '', platform: '', version: '' },
   activeRuns: {}, // view -> runId (for cancel/stop)
 
-  // The worklist as the SCP last returned it, plus which row the operator
-  // picked. `matches` is replaced wholesale by a fetch and by nothing else.
-  mwl: { matches: [], selectedIdx: null },
+  // settings.json, normalised (see DEFAULT_SETTINGS). The station's AE Title,
+  // the defaults every command inherits, rehearsal and the engineer options.
+  settings: null,
 
-  // The last `mpps perform` this app ran, the UID the next one will carry, and
-  // what the chosen folder turned out to hold. `lastRun` is kept separately
-  // from the selection so the outcome keeps naming its own study after a
-  // re-query clears the picker.
-  mpps: { lastRun: null, nextUid: null, mismatch: null },
+  // The screen that is open, the tab open in each tabbed screen, and — per
+  // screen — a saved peer the operator picked on the chip this session that
+  // differs from the one holding the screen's role. Session memory only.
+  activeView: 'worklist',
+  tabs: {},
+  peerChoice: {},
 
-  // The steps this app has performed since the window opened, newest first,
-  // and which one is picked. This lives here and nowhere else: nothing is
-  // written to disk, so quitting forgets it. It is a memory of what this app
-  // did, never a claim about the SCP — MPPS has no query service, so there is
-  // no way to ask a peer which steps it is holding.
-  steps: { entries: [], selectedUid: null },
+  // The worklist as the SCP last returned it, and the row the operator picked
+  // (kept by key, so a refresh under their hands does not un-pick it). The
+  // search key is the operator's override of the box's own guess; the timer
+  // is the auto-refresh, alive only while the station is on screen.
+  mwl: {
+    matches: [], selected: null, filterOpen: false, searchKey: null, timer: null,
+    fetched: false, at: null, error: null, detached: false,
+  },
+
+  // The last `mpps` run, the UID the next one will carry, what the chosen
+  // folder turned out to hold, and — when the engineer option allows it —
+  // which way past a study mismatch was chosen.
+  mpps: { lastRun: null, nextUid: null, mismatch: null, scan: null, fix: 'adopt' },
+
+  // The steps this app has opened since the window opened, newest first. This
+  // lives here and nowhere else: nothing is written to disk, so quitting
+  // forgets it. It is a memory of what this app did, never a claim about the
+  // SCP — MPPS has no query service, so there is no way to ask a peer which
+  // steps it is holding. `armed` is a Discontinue that is waiting for its
+  // reason code.
+  steps: { entries: [], armed: false },
 };
 
 // --------------------------------------------------------------------------
-// Connection panel (shared across echo / send / query)
+// Peer chip (every screen that talks to a DIMSE peer)
 // --------------------------------------------------------------------------
-const CONN_HTML = `
-  <div class="conn-panel">
-    <div class="conn-title">
-      <span>Peer connection</span>
-      <div class="conn-profiles">
-        <select data-profile-select><option value="">— saved peers —</option></select>
-        <button class="btn ghost small" data-profile-save>Save peer</button>
-        <button class="btn ghost small" data-profile-del>Delete</button>
-      </div>
-    </div>
-    <div class="conn-grid">
-      <label>Host <input type="text" data-conn-host placeholder="pacs.example.org or localhost" /></label>
-      <label>Port <input type="number" data-conn-port placeholder="11112" min="1" max="65535" /></label>
-      <label>Called AE — peer <input type="text" data-conn-calledae maxlength="16" placeholder="ARCHIVE" /></label>
-      <label>Calling AE — us <input type="text" data-conn-callingae maxlength="16" placeholder="DCM-CLI" /></label>
-    </div>
-  </div>
-`;
+// state.conn is still the single source of truth every builder reads. What
+// changed is where it is set: the four fields live in Settings now, and each
+// screen shows one line — the chip — naming the saved peer state.conn holds,
+// in the role that screen wants. Clicking it switches among the saved peers.
+//
+// A screen declares its role on the host element: data-role="ris" (worklist
+// and MPPS), "archive" (images) or "any" (echo). Showing a screen selects the
+// peer holding that role, unless the operator picked a different one on that
+// screen this session. The calling AE on every command is the station's own
+// AE Title from Settings — one fact that also decides which station an MPPS
+// step is attributed to.
 
-function mountConnectionPanels() {
+const ROLE_LABEL = { ris: 'RIS', archive: 'Archive', any: 'Peer' };
+
+function dimseProfiles() {
+  return state.profiles.filter((p) => !isWebProfile(p));
+}
+
+function profileForRole(role) {
+  return dimseProfiles().find((p) => p.role === role) || null;
+}
+
+/** The saved peer state.conn currently matches, or null. */
+function currentProfile() {
+  const c = state.conn;
+  return dimseProfiles().find((p) =>
+    (p.host || '') === c.host && String(p.port || '') === String(c.port || '') && (p.calledAe || '') === c.calledAe) || null;
+}
+
+function stationAe() {
+  return (state.settings && state.settings.stationAe) || '';
+}
+
+/**
+ * The calling AE a peer is talked to as.
+ *
+ * The station's own AE Title is the answer for every peer, and that is the
+ * point of setting it once — MPPS attributes a step to it. A peer may still
+ * carry its own, because a site whose archive whitelists a different caller
+ * from its RIS has to be able to talk to both; that override is a field on
+ * the peer in Settings, it is what a pre-Settings profile already held, and
+ * the chip shows it in the override colour so it is never a hidden change.
+ */
+function callingAeFor(p) {
+  return (p && p.callingAe) || stationAe() || '';
+}
+
+/** True when this peer is talked to as something other than the station itself. */
+function overridesCallingAe(p) {
+  return Boolean(p && p.callingAe && stationAe() && p.callingAe !== stationAe());
+}
+
+function connLabel(c) {
+  return c.host && c.port && c.calledAe ? `${c.calledAe} @ ${c.host}:${c.port}` : '';
+}
+
+function roleTag(role) {
+  return role === 'ris' ? 'RIS' : role === 'archive' ? 'Archive' : '';
+}
+
+/** Redraws every chip from state.conn. Cheap, and the only way a chip changes. */
+function renderPeerChips() {
+  const label = connLabel(state.conn);
+  const current = currentProfile();
+  const peers = dimseProfiles();
   for (const host of $$('[data-conn]')) {
-    host.innerHTML = CONN_HTML;
-    wireConnPanel(host);
+    const role = host.dataset.role || 'any';
+    const roleName = ROLE_LABEL[role] || 'Peer';
+    const inEcho = Boolean(host.closest('#view-echo'));
+    const items = peers.map((p) =>
+      `<button type="button" class="peer-item ${current && current.name === p.name ? 'active' : ''}" data-peer-pick="${esc(p.name)}">` +
+      `<span class="peer-item-role">${esc(roleTag(p.role))}</span>${esc(p.name)}</button>`).join('');
+    host.innerHTML =
+      `<div class="peer-chip ${label ? '' : 'unset'}">` +
+        '<button type="button" class="peer-chip-btn" aria-haspopup="true" aria-expanded="false">' +
+          `<span class="peer-role">${esc(roleName)}</span>` +
+          `<span class="peer-name">${label ? esc(label) : `no ${esc(roleName)} peer set`}</span>` +
+          (label ? `<span class="peer-from${overridesCallingAe(current) ? ' override' : ''}"` +
+            `${overridesCallingAe(current) ? ' title="This peer is talked to as its own calling AE, not this station\'s."' : ''}>` +
+            `← ${esc(state.conn.callingAe || 'DCM-CLI')}</span>` : '') +
+          '<span class="peer-caret">▾</span>' +
+        '</button>' +
+        '<div class="peer-menu" hidden>' +
+          (items || '<div class="peer-menu-note">No saved peers yet.</div>') +
+          '<div class="peer-menu-sep"></div>' +
+          (inEcho ? '' : '<button type="button" class="peer-item plain" data-peer-echo>Test connection (C-ECHO)…</button>') +
+          '<button type="button" class="peer-item plain" data-peer-settings>Edit in Settings…</button>' +
+        '</div>' +
+      '</div>';
   }
-  syncConnInputs();
-  refreshProfileSelects();
 }
 
-function wireConnPanel(panel) {
-  const map = {
-    host: '[data-conn-host]',
-    port: '[data-conn-port]',
-    calledAe: '[data-conn-calledae]',
-    callingAe: '[data-conn-callingae]',
-  };
-  for (const [key, sel] of Object.entries(map)) {
-    const input = $(sel, panel);
-    input.addEventListener('input', () => {
-      state.conn[key] = input.value.trim();
-      syncConnInputs(panel);
-      updateAllPreviews();
-    });
+function closePeerMenus() {
+  for (const m of $$('.peer-menu:not([hidden])')) {
+    m.hidden = true;
+    const btn = m.parentElement.querySelector('.peer-chip-btn');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
   }
-  $('[data-profile-select]', panel).addEventListener('change', (e) => {
-    applyProfile(e.target.value);
+}
+
+/** The view a DOM node sits in, by the `view-` id convention. */
+function viewOf(el) {
+  const v = el.closest('.view');
+  return v ? v.id.replace(/^view-/, '') : '';
+}
+
+/**
+ * Points state.conn at the peer a screen wants: the operator's pick on that
+ * screen if there is one, else the peer holding the screen's role. A screen
+ * whose role nobody holds gets an empty peer, not somebody else's — an Archive
+ * labelled RIS would be exactly the wrong command with the right label on it.
+ */
+function selectPeerForView(view) {
+  const host = $(`#view-${view} [data-conn]`);
+  if (!host) return;
+  const role = host.dataset.role || 'any';
+  const manual = state.peerChoice[view];
+  let p = manual ? dimseProfiles().find((x) => x.name === manual) : null;
+  if (manual && !p) delete state.peerChoice[view]; // that peer was deleted
+  if (!p && role !== 'any') p = profileForRole(role);
+  if (!p && role === 'any') {
+    if (connLabel(state.conn)) return; // keep whatever the last screen used
+    p = dimseProfiles()[0] || null;
+  }
+  if (p) applyProfile(p.name, { render: false });
+  else if (role !== 'any') state.conn = { host: '', port: '', calledAe: '', callingAe: stationAe() };
+}
+
+function wirePeerChips() {
+  // Delegated: chips are re-rendered from state on every change.
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.peer-chip-btn');
+    if (btn) {
+      const menu = btn.parentElement.querySelector('.peer-menu');
+      const opening = menu.hidden;
+      closePeerMenus();
+      menu.hidden = !opening;
+      btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+      return;
+    }
+    const pick = e.target.closest('[data-peer-pick]');
+    if (pick) {
+      state.peerChoice[viewOf(pick)] = pick.dataset.peerPick;
+      closePeerMenus();
+      applyProfile(pick.dataset.peerPick);
+      return;
+    }
+    const wpick = e.target.closest('[data-web-pick]');
+    if (wpick) {
+      closePeerMenus();
+      applyWebProfile(wpick.dataset.webPick);
+      return;
+    }
+    if (e.target.closest('[data-peer-echo]')) {
+      // Test the peer this chip shows, whichever role it was shown in.
+      const cur = currentProfile();
+      if (cur) state.peerChoice.echo = cur.name; else delete state.peerChoice.echo;
+      closePeerMenus();
+      showView('echo');
+      return;
+    }
+    if (e.target.closest('[data-peer-settings]')) {
+      closePeerMenus();
+      showView('settings');
+      return;
+    }
+    if (!e.target.closest('.peer-menu')) closePeerMenus();
   });
-  $('[data-profile-save]', panel).addEventListener('click', saveCurrentProfile);
-  $('[data-profile-del]', panel).addEventListener('click', deleteSelectedProfile);
-}
-
-/** Push state.conn into every connection panel's inputs (except the source). */
-function syncConnInputs(except) {
-  for (const panel of $$('[data-conn]')) {
-    if (panel === except) continue;
-    $('[data-conn-host]', panel).value = state.conn.host;
-    $('[data-conn-port]', panel).value = state.conn.port;
-    $('[data-conn-calledae]', panel).value = state.conn.calledAe;
-    $('[data-conn-callingae]', panel).value = state.conn.callingAe;
-  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closePeerMenus();
+  });
 }
 
 function connArgs() {
@@ -173,144 +303,559 @@ function isWebProfile(p) {
   return p.kind === 'dicomweb';
 }
 
-function refreshProfileSelects() {
-  const dimse = state.profiles.filter((p) => !isWebProfile(p));
-  for (const sel of $$('[data-profile-select]')) {
-    const current = sel.value;
-    sel.innerHTML = '<option value="">— saved peers —</option>' +
-      dimse.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
-    if (dimse.some((p) => p.name === current)) sel.value = current;
-  }
-  const web = state.profiles.filter(isWebProfile);
-  for (const sel of $$('[data-webprofile-select]')) {
-    const current = sel.value;
-    sel.innerHTML = '<option value="">— saved servers —</option>' +
-      web.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
-    if (web.some((p) => p.name === current)) sel.value = current;
-  }
+/** Redraws everything that lists the saved peers: the chips and Settings. */
+function refreshPeerViews() {
+  renderPeerChips();
+  renderWebChips();
+  renderSettingsPeers();
 }
 
-function applyProfile(name) {
-  const p = state.profiles.find((x) => !isWebProfile(x) && x.name === name);
+function applyProfile(name, { render = true } = {}) {
+  const p = dimseProfiles().find((x) => x.name === name);
   if (!p) return;
-  state.conn = { host: p.host || '', port: p.port || '', calledAe: p.calledAe || '', callingAe: p.callingAe || '' };
-  syncConnInputs();
-  updateAllPreviews();
-}
-
-async function saveCurrentProfile() {
-  if (!state.conn.host && !state.conn.calledAe) return;
-  const name = profileName(state.conn);
-  const entry = { name, ...state.conn };
-  const idx = state.profiles.findIndex((p) => !isWebProfile(p) && p.name === name);
-  if (idx >= 0) state.profiles[idx] = entry;
-  else state.profiles.push(entry);
-  await persistProfiles();
-  refreshProfileSelects();
-  for (const sel of $$('[data-profile-select]')) sel.value = name;
-}
-
-async function deleteSelectedProfile() {
-  const sel = $('[data-profile-select]');
-  const name = sel ? sel.value : '';
-  if (!name) return;
-  state.profiles = state.profiles.filter((p) => isWebProfile(p) || p.name !== name);
-  await persistProfiles();
-  refreshProfileSelects();
-}
-
-// --------------------------------------------------------------------------
-// DICOMweb server panel (shared across the Web: views)
-// --------------------------------------------------------------------------
-// Deliberately parallel to — not shared with — the DIMSE connection panel:
-// distinct data-* attributes keep the two global syncs from touching each
-// other. One base URL mirrors across every [data-webconn] host.
-const WEBCONN_HTML = `
-  <div class="conn-panel">
-    <div class="conn-title">
-      <span>DICOMweb server</span>
-      <div class="conn-profiles">
-        <select data-webprofile-select><option value="">— saved servers —</option></select>
-        <button class="btn ghost small" data-webprofile-save>Save server</button>
-        <button class="btn ghost small" data-webprofile-del>Delete</button>
-      </div>
-    </div>
-    <div class="conn-grid web">
-      <label>Base URL <input type="text" data-webconn-url placeholder="https://pacs.example.org/dicom-web" /></label>
-    </div>
-    <div class="web-auth-hint">Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</div>
-  </div>
-`;
-
-function mountWebPanels() {
-  for (const host of $$('[data-webconn]')) {
-    host.innerHTML = WEBCONN_HTML;
-    wireWebPanel(host);
-  }
-  syncWebInputs();
-  refreshProfileSelects();
-}
-
-function wireWebPanel(panel) {
-  const input = $('[data-webconn-url]', panel);
-  input.addEventListener('input', () => {
-    state.web.url = input.value.trim();
-    syncWebInputs(panel);
+  state.conn = { host: p.host || '', port: p.port || '', calledAe: p.calledAe || '', callingAe: callingAeFor(p) };
+  if (render) {
+    renderPeerChips();
     updateAllPreviews();
-  });
-  $('[data-webprofile-select]', panel).addEventListener('change', (e) => {
-    applyWebProfile(e.target.value);
-  });
-  $('[data-webprofile-save]', panel).addEventListener('click', saveCurrentWebProfile);
-  $('[data-webprofile-del]', panel).addEventListener('click', deleteSelectedWebProfile);
+  }
 }
 
-/** Push state.web into every DICOMweb panel's inputs (except the source). */
-function syncWebInputs(except) {
-  for (const panel of $$('[data-webconn]')) {
-    if (panel === except) continue;
-    $('[data-webconn-url]', panel).value = state.web.url;
+/**
+ * Gives a peer a role, taking it from whichever peer held it before.
+ *
+ * One RIS and one Archive at most: a screen pre-selects "the" peer for its
+ * role, and two candidates would turn that into a guess. Entries from before
+ * roles existed simply have none until one is set here.
+ */
+function setPeerRole(name, role) {
+  for (const p of dimseProfiles()) {
+    if (p.name === name) {
+      if (role) p.role = role; else delete p.role;
+    } else if (role && p.role === role) {
+      delete p.role;
+    }
+  }
+}
+
+/** Saves a peer; `replacing` names the entry an edit is replacing, if any. */
+async function savePeer(entry, replacing) {
+  state.profiles = state.profiles.filter((p) =>
+    isWebProfile(p) || (p.name !== entry.name && p.name !== replacing));
+  state.profiles.push(entry);
+  if (entry.role) setPeerRole(entry.name, entry.role);
+  await persistProfiles();
+}
+
+async function deletePeer(name) {
+  const cur = currentProfile();
+  state.profiles = state.profiles.filter((p) => isWebProfile(p) || p.name !== name);
+  for (const [view, chosen] of Object.entries(state.peerChoice)) {
+    if (chosen === name) delete state.peerChoice[view];
+  }
+  // A deleted peer cannot go on being the one every command names.
+  if (cur && cur.name === name) state.conn = { host: '', port: '', calledAe: '', callingAe: stationAe() };
+  await persistProfiles();
+}
+
+// --------------------------------------------------------------------------
+// DICOMweb server chip (the Web tabs)
+// --------------------------------------------------------------------------
+// Parallel to — not shared with — the peer chip: one base URL in state.web,
+// saved servers in the same profiles file under kind 'dicomweb', added and
+// removed in Settings. The hub tab can also point the chip at itself.
+function webProfiles() {
+  return state.profiles.filter(isWebProfile);
+}
+
+function renderWebChips() {
+  const url = state.web.url;
+  const servers = webProfiles();
+  for (const host of $$('[data-webconn]')) {
+    const items = servers.map((p) =>
+      `<button type="button" class="peer-item ${p.url === url ? 'active' : ''}" data-web-pick="${esc(p.name)}">${esc(p.url)}</button>`).join('');
+    host.innerHTML =
+      `<div class="peer-chip ${url ? '' : 'unset'}">` +
+        '<button type="button" class="peer-chip-btn" aria-haspopup="true" aria-expanded="false">' +
+          '<span class="peer-role">Server</span>' +
+          `<span class="peer-name">${url ? esc(url) : 'no DICOMweb server set'}</span>` +
+          '<span class="peer-caret">▾</span>' +
+        '</button>' +
+        '<div class="peer-menu" hidden>' +
+          (items || '<div class="peer-menu-note">No saved servers yet.</div>') +
+          '<div class="peer-menu-sep"></div>' +
+          '<button type="button" class="peer-item plain" data-peer-settings>Edit in Settings…</button>' +
+        '</div>' +
+      '</div>';
   }
 }
 
 function applyWebProfile(name) {
-  const p = state.profiles.find((x) => isWebProfile(x) && x.name === name);
+  const p = webProfiles().find((x) => x.name === name);
   if (!p) return;
   state.web.url = p.url || '';
-  syncWebInputs();
+  renderWebChips();
   updateAllPreviews();
 }
 
-async function saveCurrentWebProfile() {
-  const url = state.web.url;
-  if (!url) return;
+async function saveWebServer(url) {
   const entry = { name: url, kind: 'dicomweb', url };
-  const idx = state.profiles.findIndex((p) => isWebProfile(p) && p.name === entry.name);
-  if (idx >= 0) state.profiles[idx] = entry;
-  else state.profiles.push(entry);
+  state.profiles = state.profiles.filter((p) => !(isWebProfile(p) && p.name === entry.name));
+  state.profiles.push(entry);
+  if (!state.web.url) state.web.url = url;
   await persistProfiles();
-  refreshProfileSelects();
-  for (const sel of $$('[data-webprofile-select]')) sel.value = entry.name;
 }
 
-async function deleteSelectedWebProfile() {
-  const sel = $('[data-webprofile-select]');
-  const name = sel ? sel.value : '';
-  if (!name) return;
+async function deleteWebServer(name) {
   state.profiles = state.profiles.filter((p) => !(isWebProfile(p) && p.name === name));
   await persistProfiles();
-  refreshProfileSelects();
+}
+
+// --------------------------------------------------------------------------
+// Settings — set once, read by every builder
+// --------------------------------------------------------------------------
+// settings.json is the app's own file, like profiles.json: the renderer reads
+// it and writes every value it uses onto the command line, and the engine
+// never opens it. Nothing here can change what is sent without also changing
+// the command the screen shows — that is the rule this whole file is under.
+const DEFAULT_SETTINGS = Object.freeze({
+  stationAe: '',        // this station's AE Title: the calling AE everywhere, and what MPPS attributes a step to
+  modality: '',         // the worklist's default Modality filter
+  onlyThisStation: false, // send ScheduledStationAETitle=<stationAe> on the worklist query
+  worklistLimit: '',    // --limit on the worklist query; blank = the whole answer
+  defaults: { chunk: '', retry: '', timeout: '', retrieveAe: '', recurse: true },
+  rehearsal: false,     // every command that can take --dry-run gets it
+  cmdExpanded: false,   // the "command" fold under each button starts open
+  allowMismatch: false, // offer --allow-study-mismatch beside --adopt-worklist-identity
+});
+
+/** Whatever was on disk, coerced into the shape above so no reader has to guard. */
+function normalizeSettings(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const d = r.defaults && typeof r.defaults === 'object' ? r.defaults : {};
+  const str = (v, max = 64) => (v == null ? '' : String(v).trim().slice(0, max));
+  return {
+    stationAe: str(r.stationAe, 16),
+    modality: str(r.modality, 16),
+    onlyThisStation: Boolean(r.onlyThisStation),
+    worklistLimit: str(r.worklistLimit, 6).replace(/[^0-9]/g, ''),
+    defaults: {
+      chunk: str(d.chunk), retry: str(d.retry), timeout: str(d.timeout),
+      retrieveAe: str(d.retrieveAe, 16),
+      recurse: d.recurse !== false,
+    },
+    rehearsal: Boolean(r.rehearsal),
+    cmdExpanded: Boolean(r.cmdExpanded),
+    allowMismatch: Boolean(r.allowMismatch),
+  };
+}
+
+// Builders run on every keystroke, before and after the file is read, so the
+// settings are never null — just empty until loadSettings lands.
+state.settings = normalizeSettings({});
+
+async function loadSettings() {
+  let raw = {};
+  try { raw = await window.dcm.settings.get(); } catch { raw = {}; }
+  state.settings = normalizeSettings(raw);
+}
+
+async function persistSettings() {
+  try { await window.dcm.settings.set(state.settings); } catch { /* the screen still holds the values */ }
+}
+
+/** Rehearsal is one switch, read by every builder that has a --dry-run. */
+function rehearsal() {
+  return Boolean(state.settings && state.settings.rehearsal);
+}
+
+/**
+ * A screen field's own value, or the Settings default for that flag when the
+ * field is blank. Typed always wins, so a per-run override is still one field
+ * away; blank everywhere means the flag stays off the command, exactly as it
+ * did before Settings existed.
+ */
+function fieldOr(id, key) {
+  const el = $(`#${id}`);
+  const typed = el ? el.value.trim() : '';
+  if (typed) return typed;
+  const d = state.settings && state.settings.defaults;
+  return d && d[key] ? String(d[key]) : '';
+}
+
+/** Paints the Settings form from state.settings. Called once, at boot. */
+function renderSettingsForm() {
+  const s = state.settings;
+  $('#set-station-ae').value = s.stationAe;
+  $('#set-modality').value = s.modality;
+  $('#set-only-station').checked = s.onlyThisStation;
+  $('#set-mwl-limit').value = s.worklistLimit;
+  $('#set-chunk').value = s.defaults.chunk;
+  $('#set-retry').value = s.defaults.retry;
+  $('#set-timeout').value = s.defaults.timeout;
+  $('#set-retrieve-ae').value = s.defaults.retrieveAe;
+  $('#set-recurse').checked = s.defaults.recurse;
+  $('#set-rehearsal').checked = s.rehearsal;
+  $('#set-cmd-expanded').checked = s.cmdExpanded;
+  $('#set-allow-mismatch').checked = s.allowMismatch;
+  renderStationPlaceholder();
+}
+
+/** Until a station AE is set, what actually goes out as --calling-ae is shown as the placeholder. */
+function renderStationPlaceholder() {
+  const cur = currentProfile();
+  $('#set-station-ae').placeholder = (cur && cur.callingAe) || 'DCM-CLI';
+}
+
+/** Reads the form into state.settings, saves it, and pushes it to every screen. */
+async function commitSettings() {
+  state.settings = normalizeSettings({
+    stationAe: $('#set-station-ae').value,
+    modality: $('#set-modality').value,
+    onlyThisStation: $('#set-only-station').checked,
+    worklistLimit: $('#set-mwl-limit').value,
+    defaults: {
+      chunk: $('#set-chunk').value,
+      retry: $('#set-retry').value,
+      timeout: $('#set-timeout').value,
+      retrieveAe: $('#set-retrieve-ae').value,
+      recurse: $('#set-recurse').checked,
+    },
+    rehearsal: $('#set-rehearsal').checked,
+    cmdExpanded: $('#set-cmd-expanded').checked,
+    allowMismatch: $('#set-allow-mismatch').checked,
+  });
+  await persistSettings();
+  applySettings();
+}
+
+/**
+ * Everything outside the Settings screen that reads Settings, repainted.
+ *
+ * The station AE is re-derived onto state.conn, the screens' own
+ * recurse/modality fields are re-seeded where nobody has typed in them, the
+ * placeholders say what a blank field will send, the command folds open or
+ * shut, and the banner comes or goes. Then every preview is rebuilt, because
+ * every one of those can change a command.
+ */
+function applySettings() {
+  const cur = currentProfile();
+  if (cur) state.conn.callingAe = callingAeFor(cur);
+  seedFromSettings();
+  applyDefaultPlaceholders();
+  applyCmdFold();
+  renderRehearsal();
+  renderPeerChips();
+  renderStationPlaceholder();
+  renderSendAdvSummary();
+  renderSpeedParallelHint();
+  renderModalityPill();
+  // Rehearsal relabels the verbs, the Archive role moves the images, and the
+  // engineer switch appears or goes: the whole panel is repainted.
+  renderMppsPanel();
+  renderStepsClose();
+  updateAllPreviews();
+}
+
+/**
+ * The Settings defaults that are checkboxes on a screen are seeded into the
+ * screen's own control rather than read around it, so the builder keeps
+ * reading one control and the operator can still flip it for one run. A
+ * control someone has touched is theirs and is left alone.
+ */
+function seedFromSettings() {
+  const noRecurse = !state.settings.defaults.recurse;
+  for (const id of ['send-norecurse', 'mpps-norecurse', 'info-norecurse']) {
+    const el = $(`#${id}`);
+    if (el && !el.dataset.touched) el.checked = noRecurse;
+  }
+  const modality = $('#mwl-modality');
+  if (modality && !modality.dataset.touched) modality.value = state.settings.modality;
+}
+
+/** A blank field sends the Settings default, so the placeholder says which. */
+function applyDefaultPlaceholders() {
+  const d = state.settings.defaults;
+  const ph = (id, key, fallback) => {
+    const el = $(`#${id}`);
+    if (el) el.placeholder = d[key] ? `${d[key]} (from Settings)` : fallback;
+  };
+  ph('echo-timeout', 'timeout', '60000');
+  ph('send-retry', 'retry', '1');
+  ph('send-timeout', 'timeout', '60000');
+  ph('send-chunk', 'chunk', 'from the preset');
+  ph('mpps-chunk', 'chunk', '200');
+  ph('mpps-retry', 'retry', '1');
+  ph('mpps-retrieveae', 'retrieveAe', 'ARCHIVE');
+  ph('speed-chunk', 'chunk', 'each run decides');
+  ph('webping-timeout', 'timeout', '60000');
+  ph('websend-chunk', 'chunk', '50');
+  ph('websend-retry', 'retry', '1');
+  ph('websend-timeout', 'timeout', '60000');
+}
+
+/** The preview is never absent; the engineer option only says whether it starts unfolded. */
+function applyCmdFold() {
+  for (const d of $$('.cmd-fold')) d.open = state.settings.cmdExpanded;
+}
+
+/** The amber banner across the top of the content area, for as long as rehearsal is on. */
+function renderRehearsal() {
+  $('#rehearsal-banner').hidden = !rehearsal();
+}
+
+/** The saved peers as Settings lists them: role, name, and the three verbs. */
+function renderSettingsPeers() {
+  const list = $('#set-peers');
+  if (!list) return;
+  const peers = dimseProfiles();
+  const option = (value, label, current) =>
+    `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`;
+  list.innerHTML = peers.length
+    ? peers.map((p) =>
+      `<div class="peer-row" data-peer="${esc(p.name)}">` +
+        `<span class="peer-role ${p.role ? '' : 'none'}">${esc(roleTag(p.role) || 'Other')}</span>` +
+        `<span class="peer-row-name" title="${esc(p.name)}">${esc(p.name)}</span>` +
+        (p.callingAe
+          ? `<span class="peer-from override" title="Talked to as this calling AE, not this station's.">← ${esc(p.callingAe)}</span>`
+          : '') +
+        `<select data-peer-role-of="${esc(p.name)}" aria-label="Role">` +
+          option('', 'Other', p.role || '') +
+          option('ris', 'RIS (worklist &amp; MPPS)', p.role || '') +
+          option('archive', 'Archive (images)', p.role || '') +
+        '</select>' +
+        `<button class="btn ghost small" data-peer-test="${esc(p.name)}">Test</button>` +
+        `<button class="btn ghost small" data-peer-edit="${esc(p.name)}">Edit</button>` +
+        `<button class="btn ghost small" data-peer-delete="${esc(p.name)}">Delete</button>` +
+      '</div>').join('')
+    : '<div class="empty-note dense">No saved peers yet. Add the RIS and the archive below.</div>';
+
+  const web = $('#set-webservers');
+  const servers = webProfiles();
+  web.innerHTML = servers.length
+    ? servers.map((p) =>
+      `<div class="peer-row" data-web="${esc(p.name)}">` +
+        '<span class="peer-role">Web</span>' +
+        `<span class="peer-row-name" title="${esc(p.url)}">${esc(p.url)}</span>` +
+        `<button class="btn ghost small" data-web-delete="${esc(p.name)}">Delete</button>` +
+      '</div>').join('')
+    : '<div class="empty-note dense">No DICOMweb servers yet.</div>';
+}
+
+/** Name of the saved peer the form is editing, or null while adding. */
+let peerEditing = null;
+
+function resetPeerForm() {
+  peerEditing = null;
+  for (const id of ['peer-host', 'peer-port', 'peer-ae', 'peer-callingae']) $(`#${id}`).value = '';
+  $('#peer-role').value = '';
+  $('#peer-form-title').textContent = 'Add a peer';
+  $('#peer-save').textContent = 'Save peer';
+  $('#peer-cancel').hidden = true;
+  $('#peer-form-note').hidden = true;
+}
+
+/** After the saved peers change: the chips, the lists and every command that names a peer. */
+function afterPeersChanged() {
+  selectPeerForView(state.activeView);
+  refreshPeerViews();
+  renderStationPlaceholder();
+  updateAllPreviews();
+}
+
+function wireSettings() {
+  // The form commits as it is typed, a beat behind the keystroke, and at once
+  // on change (blur, Enter, a checkbox) — so leaving the screen never loses it.
+  let timer = null;
+  const soon = () => { clearTimeout(timer); timer = setTimeout(commitSettings, 300); };
+  for (const el of $$('#view-settings input[id^="set-"]')) {
+    el.addEventListener('input', soon);
+    el.addEventListener('change', () => { clearTimeout(timer); commitSettings(); });
+  }
+  $('#rehearsal-off').addEventListener('click', () => {
+    $('#set-rehearsal').checked = false;
+    commitSettings();
+  });
+
+  // The screen controls that Settings seeds stop being seeded once touched.
+  for (const id of ['send-norecurse', 'mpps-norecurse', 'info-norecurse']) {
+    $(`#${id}`).addEventListener('change', (e) => { e.target.dataset.touched = '1'; });
+  }
+  $('#mwl-modality').addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
+
+  // ----- the peer form -----
+  $('#peer-save').addEventListener('click', async () => {
+    const host = $('#peer-host').value.trim();
+    const port = $('#peer-port').value.trim();
+    const calledAe = $('#peer-ae').value.trim();
+    const note = $('#peer-form-note');
+    const miss = [];
+    if (!host) miss.push('host');
+    if (!port) miss.push('port');
+    if (!calledAe) miss.push('called AE');
+    if (miss.length) {
+      note.hidden = false;
+      note.textContent = `Fill in: ${miss.join(', ')}.`;
+      return;
+    }
+    note.hidden = true;
+    const entry = { name: profileName({ host, port, calledAe }), host, port, calledAe };
+    // Blank means "this station's AE Title", which is the answer for almost
+    // every peer. A value here is a deliberate per-peer override — the case a
+    // site whose archive whitelists a different caller from its RIS needs, and
+    // what a profile saved before Settings existed already carried.
+    const callingAe = $('#peer-callingae').value.trim();
+    if (callingAe) entry.callingAe = callingAe;
+    const role = $('#peer-role').value;
+    if (role) entry.role = role;
+    const wasChosen = Object.entries(state.peerChoice).filter(([, n]) => n === peerEditing);
+    await savePeer(entry, peerEditing);
+    // A renamed peer keeps the screens that had picked it.
+    for (const [view] of wasChosen) state.peerChoice[view] = entry.name;
+    resetPeerForm();
+    afterPeersChanged();
+  });
+  $('#peer-cancel').addEventListener('click', resetPeerForm);
+
+  // ----- the lists (delegated: they are re-rendered from state) -----
+  $('#set-peers').addEventListener('change', async (e) => {
+    const sel = e.target.closest('[data-peer-role-of]');
+    if (!sel) return;
+    setPeerRole(sel.dataset.peerRoleOf, sel.value);
+    await persistProfiles();
+    afterPeersChanged();
+  });
+  $('#set-peers').addEventListener('click', async (e) => {
+    const test = e.target.closest('[data-peer-test]');
+    if (test) {
+      state.peerChoice.echo = test.dataset.peerTest;
+      showView('echo');
+      return;
+    }
+    const edit = e.target.closest('[data-peer-edit]');
+    if (edit) {
+      const p = dimseProfiles().find((x) => x.name === edit.dataset.peerEdit);
+      if (!p) return;
+      peerEditing = p.name;
+      $('#peer-host').value = p.host || '';
+      $('#peer-port').value = p.port || '';
+      $('#peer-ae').value = p.calledAe || '';
+      $('#peer-callingae').value = p.callingAe || '';
+      $('#peer-role').value = p.role || '';
+      $('#peer-form-title').textContent = `Edit ${p.name}`;
+      $('#peer-save').textContent = 'Save changes';
+      $('#peer-cancel').hidden = false;
+      $('#peer-form-note').hidden = true;
+      $('#peer-host').focus();
+      return;
+    }
+    const del = e.target.closest('[data-peer-delete]');
+    if (del) {
+      if (peerEditing === del.dataset.peerDelete) resetPeerForm();
+      await deletePeer(del.dataset.peerDelete);
+      afterPeersChanged();
+    }
+  });
+
+  // ----- DICOMweb servers -----
+  const addWeb = async () => {
+    const url = $('#webserver-url').value.trim();
+    if (!/^https?:\/\//i.test(url)) return;
+    await saveWebServer(url);
+    $('#webserver-url').value = '';
+    refreshPeerViews();
+    updateAllPreviews();
+  };
+  $('#webserver-add').addEventListener('click', addWeb);
+  $('#webserver-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') addWeb(); });
+  $('#set-webservers').addEventListener('click', async (e) => {
+    const del = e.target.closest('[data-web-delete]');
+    if (!del) return;
+    const gone = webProfiles().find((p) => p.name === del.dataset.webDelete);
+    await deleteWebServer(del.dataset.webDelete);
+    if (gone && state.web.url === gone.url) state.web.url = (webProfiles()[0] || {}).url || '';
+    refreshPeerViews();
+    updateAllPreviews();
+  });
+
+  resetPeerForm();
+}
+
+// --------------------------------------------------------------------------
+// Tabs (DICOMweb, Tools)
+// --------------------------------------------------------------------------
+// Four former screens sit under one sidebar item as tabs. Each pane keeps its
+// old `view-<name>` id, so every builder, status chip and console resolves as
+// before; only what is on screen changes. The open tab is remembered per group.
+function showTab(group, tab) {
+  const row = $(`[data-tabs="${group}"]`);
+  if (!row) return;
+  const chips = $$('[data-tab]', row);
+  if (!chips.some((c) => c.dataset.tab === tab)) tab = chips[0].dataset.tab;
+  for (const c of chips) {
+    const on = c.dataset.tab === tab;
+    c.classList.toggle('active', on);
+    c.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  const section = row.closest('.view');
+  for (const pane of $$('.tab-pane', section)) pane.hidden = pane.id !== `view-${tab}`;
+  state.tabs[group] = tab;
+}
+
+function wireTabs() {
+  for (const row of $$('[data-tabs]')) {
+    row.addEventListener('click', (e) => {
+      const chip = e.target.closest('[data-tab]');
+      if (!chip) return;
+      showTab(row.dataset.tabs, chip.dataset.tab);
+      renderWebChips();
+      updateAllPreviews();
+      persistAppState();
+    });
+  }
 }
 
 // --------------------------------------------------------------------------
 // Navigation
 // --------------------------------------------------------------------------
 function showView(name) {
-  $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
-  $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
-  syncConnInputs();
-  syncWebInputs();
+  let view = $(`#view-${name}`);
+  // A pane's old screen name (say 'webquery', remembered by a previous
+  // version) still opens: its section, with that tab selected.
+  if (view && view.classList.contains('tab-pane')) {
+    const section = view.closest('.view');
+    const row = $('[data-tabs]', section);
+    if (row) showTab(row.dataset.tabs, name);
+    name = section.id.replace(/^view-/, '');
+    view = section;
+  }
+  if (!view || !view.classList.contains('view')) {
+    name = 'worklist';
+    view = $('#view-worklist');
+  }
+  state.activeView = name;
+  // A screen reached from another (echo, from Settings or a chip) lights the
+  // sidebar item it belongs under rather than none.
+  const nav = view.dataset.nav || name;
+  $$('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === nav));
+  $$('.view').forEach((v) => v.classList.toggle('active', v === view));
+  closePeerMenus();
+  selectPeerForView(name);
+  renderPeerChips();
+  renderWebChips();
   updateAllPreviews();
+  persistAppState();
+  // The station reads its list when it comes on screen and keeps it fresh
+  // while it stays there; off screen, the timer stops.
+  stationVisibility(name === 'worklist');
+}
+
+/** Remembers the open screen and tabs, so the next launch opens where this one left off. */
+function persistAppState() {
+  try {
+    window.dcm.appState.set({ activeView: state.activeView, activeTabs: state.tabs });
+  } catch {
+    /* not worth surfacing */
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -345,10 +890,28 @@ function consoleEl(view) {
   return viewPart(view, 'console');
 }
 
-/** Opens the disclosure the shared console sits in, so a failure is not folded away. */
-function revealConsole() {
-  const box = $('#mwl-out');
-  if (box) box.open = true;
+/**
+ * Opens the disclosure a view's console sits in, so a failure is never folded
+ * away.
+ *
+ * Every screen now ends with a "▸ Output" disclosure, and the rule is the same
+ * on all of them: the output may be folded, but it may never be missing, and
+ * nothing that went wrong is allowed to stay behind a triangle. Called with no
+ * argument this still means the station's shared pane, which is what its own
+ * failure paths ask for.
+ */
+function revealConsole(view) {
+  const c = view ? consoleEl(view) : $('#wl-console');
+  if (!c) return;
+  c.hidden = false;
+  const box = c.closest('details');
+  if (box && !box.open) box.open = true;
+}
+
+/** A refusal the operator has to see: unfold the output, then say why. */
+function fail(view, msg) {
+  revealConsole(view);
+  appendConsole(view, msg, 'stderr');
 }
 
 // --------------------------------------------------------------------------
@@ -742,6 +1305,8 @@ function runStreaming(view, argv, { onExit } = {}) {
       },
       onExit: (code) => {
         delete state.activeRuns[view];
+        // A non-zero exit is exactly the case the fold must not swallow.
+        if (code !== 0) revealConsole(view);
         const result = { code, stdout: out.value, stderr: err.value };
         if (onExit) onExit(result);
         resolve(result);
@@ -778,13 +1343,9 @@ async function stopRun(view, btn) {
   if (btn) { btn.disabled = false; btn.textContent = label; }
   // A run that had already finished on its own is not a failure to stop.
   if (result && !result.stopped && result.reason !== 'not running') {
-    // VIEW_PARTS is exactly the screens whose console is the shared one folded
-    // inside a disclosure; the rest are already on screen.
-    if (VIEW_PARTS[view]) revealConsole();
-    appendConsole(view,
+    fail(view,
       `\nStop did not take: ${result.error || 'the engine is still running'}. `
-      + `Anything it has open with the peer is still open — close the app window to release it.\n`,
-      'stderr');
+      + `Anything it has open with the peer is still open — close the app window to release it.\n`);
   }
   return result;
 }
@@ -808,9 +1369,19 @@ function runCapture(view, argv) {
 // --------------------------------------------------------------------------
 // Command preview
 // --------------------------------------------------------------------------
+function setPreviewEl(el, argv) {
+  if (!el) return;
+  const line = 'dcm ' + argv.map(quoteArg).join(' ');
+  el.textContent = line;
+  // The fold's summary carries the command while the fold is shut, so a
+  // glance still says what the button will run.
+  const fold = el.closest('.cmd-fold');
+  const sum = fold && fold.querySelector('.cmd-sum');
+  if (sum) sum.textContent = line;
+}
+
 function setPreview(view, argv) {
-  const el = viewPart(view, 'cmd');
-  if (el) el.textContent = 'dcm ' + argv.map(quoteArg).join(' ');
+  setPreviewEl(viewPart(view, 'cmd'), argv);
 }
 
 const BUILDERS = {}; // view -> () => argv
@@ -819,15 +1390,15 @@ function updateAllPreviews() {
   for (const [view, build] of Object.entries(BUILDERS)) {
     try { setPreview(view, build()); } catch { /* partial form */ }
   }
-  // The collapsed peer bar's summary is the reason four fields may be folded
-  // away, so it is refreshed by the same hook that catches every edit to them.
-  try { renderMwlPeerSummary(); } catch { /* before the DOM is wired */ }
   // The sweep's list of commands is a preview too — it just holds several
   // commands rather than one, and it is built from the same peer connection.
   // Refreshed from the same hook so that editing the peer, picking a saved
   // profile, switching views or choosing a folder with Browse... cannot leave
   // the listed commands missing flags the single preview above already shows.
   try { renderSpeedPlan(); } catch { /* before the DOM is wired */ }
+  // The station's second verb has its own command, and it changes with the
+  // same keystrokes the first one does.
+  try { if (panelMode()) renderStartPreview(); } catch { /* before the DOM is wired */ }
 }
 
 // --------------------------------------------------------------------------
@@ -835,7 +1406,7 @@ function updateAllPreviews() {
 // --------------------------------------------------------------------------
 BUILDERS.echo = () => {
   const argv = ['echo', ...connArgs()];
-  const t = $('#echo-timeout').value.trim();
+  const t = fieldOr('echo-timeout', 'timeout');
   if (t) argv.push('--timeout', t);
   return argv;
 };
@@ -845,7 +1416,7 @@ function wireEcho() {
   $('#view-echo [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
     clearConsole('echo');
-    if (miss.length) { appendConsole('echo', `Fill in: ${miss.join(', ')}.\n`, 'stderr'); return; }
+    if (miss.length) { fail('echo', `Fill in: ${miss.join(', ')}.\n`); return; }
     setStatus('echo', 'running', 'Testing…');
     const { code } = await runStreaming('echo', BUILDERS.echo());
     setStatus('echo', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : 'Failed');
@@ -864,22 +1435,10 @@ function wireEcho() {
  * disagreeing about what was sent.
  */
 const SEND_SPEEDS = {
-  'normal': {
-    associations: 1,
-    hint: 'One association at a time — ordinary clinical traffic, and the only setting that adds nothing to the receiver’s association count.',
-  },
-  'fast': {
-    associations: 4,
-    hint: 'Four at a time — a backlog or a migration, to a receiver you already know tolerates a handful at once.',
-  },
-  'very-fast': {
-    associations: 8,
-    hint: 'Eight at a time — a bulk move you are watching, on a link with the bandwidth to make the concurrency pay.',
-  },
-  'insane': {
-    associations: 16,
-    hint: 'Sixteen at a time — a benchmark against a receiver you own, not a thing to point at someone else’s archive.',
-  },
+  'normal': { associations: 1, hint: 'One association at a time — ordinary clinical traffic.' },
+  'fast': { associations: 4, hint: 'Four at a time — a backlog or a migration.' },
+  'very-fast': { associations: 8, hint: 'Eight at a time — a bulk move you are watching.' },
+  'insane': { associations: 16, hint: 'Sixteen at a time — the widest the engine goes.' },
 };
 
 /** Which preset the Send screen is set to. */
@@ -911,8 +1470,10 @@ function sendPresetInert() {
  *
  * One line that changes rather than four permanent paragraphs: the descriptions
  * only matter at the moment of choosing, and this screen has been too talkative
- * before. Insane is the exception — its cost lands on someone else's receiver,
- * so it is marked in the row itself and says what going too wide looks like.
+ * before. The full form of all four is in the help panel. Insane is the
+ * exception — its cost lands on someone else's receiver, so it is marked in the
+ * row itself, with a link into the paragraph that says what going too wide
+ * looks like.
  *
  * The row also has an off state, because the command has one. The preview is
  * the command on this screen; a highlighted chip beside a command with no
@@ -924,9 +1485,8 @@ function renderSendSpeed() {
   const inert = sendPresetInert();
   $('#send-speed').classList.toggle('inert', inert);
   $('#send-speed-hint').textContent = inert
-    ? `Not in use. Parallel ${$('#send-parallel').value.trim()} under Advanced replaces the preset, `
-      + 'so the command carries --parallel and no --speed — including the chunk size, which goes back '
-      + 'to the default. Clear that field to send a preset instead.'
+    ? `Not in use: Parallel ${$('#send-parallel').value.trim()} under Advanced replaces the preset, `
+      + 'so the command carries --parallel and no --speed.'
     : preset.hint;
   $('#send-speed-hint').classList.toggle('live', inert);
   // The amber block is about what insane costs a receiver. Nothing is being
@@ -935,7 +1495,7 @@ function renderSendSpeed() {
 }
 
 /**
- * One line naming any override folded away under Advanced.
+ * One line naming every override folded away under Advanced.
  *
  * Folding the controls away must never fold away the values they hold: what is
  * under there decides what goes on the wire, so the summary says so whether the
@@ -946,24 +1506,47 @@ function renderSendAdvSummary() {
   if (!el) return;
   const speed = sendSpeed();
   const parallel = $('#send-parallel').value.trim();
-  const chunk = $('#send-chunk').value.trim();
+  const chunk = fieldOr('send-chunk', 'chunk');
+  // A chunk size inherited from Settings is an override all the same — it is
+  // on the command line — so the summary names it and says where it came from.
+  const inherited = chunk && !$('#send-chunk').value.trim();
   const parts = [];
   if (parallel) parts.push(`--parallel ${parallel}`);
-  if (chunk) parts.push(`--chunk ${chunk}`);
+  if (chunk) parts.push(`--chunk ${chunk}${inherited ? ' (from Settings)' : ''}`);
+  let text;
   if (!parts.length) {
-    el.textContent = `— nothing set; --speed ${speed} sizes the associations and how many run at once`;
+    text = `— nothing set; --speed ${speed} sizes both`;
   } else if (parallel) {
     // Not "overrides --speed": there is no --speed on the command line to
     // override. Saying otherwise would leave the summary naming a flag the
     // preview below it does not show. See sendPresetInert.
-    el.textContent = `— ${parts.join(' · ')}; the ${speed} preset is not used`;
+    text = `— ${parts.join(' · ')}; the ${speed} preset is not used`;
   } else {
     // A typed chunk size really is half an override: the preset still supplies
     // the association count, so --speed stays on the line and the engine says
     // what it displaced.
-    el.textContent = `— ${parts.join(' · ')} replaces that half of --speed ${speed}`;
+    text = `— ${parts.join(' · ')} replaces that half of --speed ${speed}`;
   }
-  el.classList.toggle('changed', parts.length > 0);
+
+  // Retries, the timeout, the transfer syntax and the two switches moved under
+  // here when this screen was trimmed. A flag folded away is still a flag on
+  // the command line, so each one is named the moment it is set — including
+  // the ones inherited from Settings, which are nobody's typing at all.
+  const rest = [];
+  const flag = (id, key, name) => {
+    const v = fieldOr(id, key);
+    if (v) rest.push(`${name} ${v}${$(`#${id}`).value.trim() ? '' : ' (from Settings)'}`);
+  };
+  flag('send-retry', 'retry', '--retry');
+  flag('send-timeout', 'timeout', '--timeout');
+  const syntax = $('#send-syntax').value;
+  if (syntax) rest.push(`--transfer-syntax ${syntax}`);
+  if ($('#send-norecurse').checked) rest.push('--no-recurse');
+  if ($('#send-rewrite').checked) rest.push('--rewrite-series-uid');
+  if (rest.length) text += ` · ${rest.join(' · ')}`;
+
+  el.textContent = text;
+  el.classList.toggle('changed', parts.length > 0 || rest.length > 0);
 }
 
 BUILDERS.send = () => {
@@ -972,7 +1555,7 @@ BUILDERS.send = () => {
   if (folder) argv.push(folder);
   argv.push(...connArgs());
   const parallel = $('#send-parallel').value.trim();
-  const chunk = $('#send-chunk').value.trim();
+  const chunk = fieldOr('send-chunk', 'chunk');
   // The preset first, then the flag that can beat half of it, so the command
   // reads in the order the engine resolves it — except that a typed Parallel
   // beats all of it and the preset is left off entirely. See sendPresetInert
@@ -981,13 +1564,13 @@ BUILDERS.send = () => {
   if (!parallel) argv.push('--speed', sendSpeed());
   if (parallel) argv.push('--parallel', parallel);
   if (chunk) argv.push('--chunk', chunk);
-  const retry = $('#send-retry').value.trim();
-  const timeout = $('#send-timeout').value.trim();
+  const retry = fieldOr('send-retry', 'retry');
+  const timeout = fieldOr('send-timeout', 'timeout');
   if (retry) argv.push('--retry', retry);
   if (timeout) argv.push('--timeout', timeout);
   const syntax = $('#send-syntax').value;
   if (syntax) argv.push('--transfer-syntax', syntax);
-  if ($('#send-dryrun').checked) argv.push('--dry-run');
+  if (rehearsal()) argv.push('--dry-run');
   if ($('#send-norecurse').checked) argv.push('--no-recurse');
   if ($('#send-rewrite').checked) argv.push('--rewrite-series-uid');
   return argv;
@@ -1020,8 +1603,9 @@ function showTotals(t, ok) {
 }
 
 function wireSend() {
-  ['send-folder', 'send-retry', 'send-timeout'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#send-folder').addEventListener('input', updateAllPreviews);
+  ['send-retry', 'send-timeout'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', () => { renderSendAdvSummary(); updateAllPreviews(); }));
   // The two override fields also move the Advanced summary, which is the only
   // thing on screen naming them while the disclosure is shut — and Parallel
   // decides whether the preset is on the command line at all, so the chip row
@@ -1043,19 +1627,19 @@ function wireSend() {
   }
   renderSendSpeed();
   renderSendAdvSummary();
-  $('#send-syntax').addEventListener('change', updateAllPreviews);
-  ['send-dryrun', 'send-norecurse', 'send-rewrite'].forEach((id) =>
-    $(`#${id}`).addEventListener('change', updateAllPreviews));
+  $('#send-syntax').addEventListener('change', () => { renderSendAdvSummary(); updateAllPreviews(); });
+  ['send-norecurse', 'send-rewrite'].forEach((id) =>
+    $(`#${id}`).addEventListener('change', () => { renderSendAdvSummary(); updateAllPreviews(); }));
 
   $('#view-send [data-run]').addEventListener('click', async () => {
     const folder = $('#send-folder').value.trim();
     clearConsole('send');
     $('#view-send [data-totals]').hidden = true;
-    if (!folder) { appendConsole('send', 'Choose a folder to send.\n', 'stderr'); return; }
-    const dry = $('#send-dryrun').checked;
+    if (!folder) { fail('send', 'Choose a folder to send.\n'); return; }
+    const dry = rehearsal();
     if (!dry) {
       const miss = connMissing();
-      if (miss.length) { appendConsole('send', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr'); return; }
+      if (miss.length) { fail('send', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
     }
     setStatus('send', 'running', dry ? 'Scanning…' : 'Sending…');
     $('#view-send [data-run]').disabled = true;
@@ -1093,9 +1677,29 @@ BUILDERS.receive = () => {
   return argv;
 };
 
+/**
+ * One line naming whatever the receiver's Advanced holds.
+ *
+ * Both of the controls under there change who gets in and what gets
+ * acknowledged, which is the whole subject of this screen — so folding them
+ * away is only allowed as long as the fold says what they hold.
+ */
+function renderReceiveAdvSummary() {
+  const el = $('#receive-adv-sum');
+  if (!el) return;
+  const accept = $('#scp-accept').value.trim();
+  const reject = $('#scp-rejectafter').value.trim();
+  const parts = [];
+  if (accept) parts.push(`only ${accept}`);
+  if (reject) parts.push(`stops acknowledging after ${reject}`);
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— accepts every caller, acknowledges everything';
+  el.classList.toggle('changed', parts.length > 0);
+}
+
 function wireReceive() {
   ['scp-port', 'scp-ae', 'scp-persist', 'scp-accept', 'scp-rejectafter'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', updateAllPreviews));
+    $(`#${id}`).addEventListener('input', () => { renderReceiveAdvSummary(); updateAllPreviews(); }));
+  renderReceiveAdvSummary();
 
   $('#view-receive [data-run]').addEventListener('click', async () => {
     clearConsole('receive');
@@ -1175,7 +1779,7 @@ function wireQuery() {
     const miss = connMissing();
     clearConsole('query');
     $('#view-query [data-result]').hidden = true;
-    if (miss.length) { appendConsole('query', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr'); return; }
+    if (miss.length) { fail('query', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
     setStatus('query', 'running', 'Querying…');
     const argv = [...BUILDERS.query(), '--json'];
     const { code, stdout, stderr } = await runCapture('query', argv);
@@ -1184,14 +1788,24 @@ function wireQuery() {
       renderFindResults(JSON.parse(stdout));
     } catch {
       const c = consoleEl('query'); c.hidden = false;
-      appendConsole('query', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+      revealConsole('query'); appendConsole('query', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
     }
   });
 }
 
 // --------------------------------------------------------------------------
-// View: WORKLIST (MWL)
+// View: WORKLIST — the station
 // --------------------------------------------------------------------------
+// One screen, used the way an acquisition console is used: the list of what
+// is scheduled, one selected patient, and a button whose label is the verb.
+// The RIS peer, the station's AE Title and the default modality come from
+// Settings; the images come from a folder; everything else on the command is
+// read off the selected row, verbatim, and never guessed.
+//
+// Three commands run from here — the C-FIND, `mpps perform` (or `mpps start`)
+// and the closing N-SET — and each has its own preview under its own button.
+// The console at the bottom is shared: one workspace, one output pane.
+
 /** Local YYYYMMDD, offset by whole days. DICOM dates are local, not UTC. */
 function dicomDate(offsetDays = 0) {
   const d = new Date();
@@ -1200,185 +1814,331 @@ function dicomDate(offsetDays = 0) {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
 }
 
-/** The date-matching value for the selected preset, or '' for any. */
-function mwlDateValue() {
+function mwlWhen() {
   const active = $('#mwl-when .chip.active');
-  const when = active ? active.dataset.when : 'today';
+  return active ? active.dataset.when : 'today';
+}
+
+/** The date-matching value for the selected preset, or '' for any date. */
+function mwlDateValue() {
+  const when = mwlWhen();
   if (when === 'today') return dicomDate(0);
   if (when === 'tomorrow') return dicomDate(1);
-  // A DICOM date range is inclusive on both ends.
-  if (when === 'week') return `${dicomDate(0)}-${dicomDate(7)}`;
-  if (when === 'custom') return $('#mwl-date').value.trim();
-  return '';
+  // Pick…: a day, a range (inclusive both ends), or blank for any date.
+  return $('#mwl-date').value.trim();
+}
+
+const SEARCH_KEYS = ['PatientName', 'PatientID', 'AccessionNumber'];
+
+/**
+ * Which worklist key a search term is sent as, by the shape of the text.
+ *
+ * Digits alone are a patient ID; letters or a `^` are a name; anything mixed
+ * — an accession like A1 or ACC-77 — is an accession number. The tag beside
+ * the box says which was chosen, and clicking it overrides the guess.
+ */
+function guessSearchKey(text) {
+  if (/^\d+$/.test(text)) return 'PatientID';
+  if (/[\^*?]/.test(text) || /^[A-Za-z ,'-]+$/.test(text)) return 'PatientName';
+  return 'AccessionNumber';
+}
+
+/** The one Key=Value the search box adds, or null when it is empty. */
+function mwlSearchTerm() {
+  const text = $('#mwl-search').value.trim();
+  if (!text) return null;
+  const key = state.mwl.searchKey || guessSearchKey(text);
+  let value = text;
+  // A name is matched anywhere in the name unless a wildcard was typed: a
+  // console operator types the surname they were told, not DOE^JANE.
+  if (key === 'PatientName' && !/[*?]/.test(text)) value = `*${text}*`;
+  return { key, value };
+}
+
+function renderSearchKey() {
+  const tag = $('#mwl-search-key');
+  const term = mwlSearchTerm();
+  tag.hidden = !term;
+  if (term) {
+    tag.textContent = term.key;
+    tag.classList.toggle('pinned', Boolean(state.mwl.searchKey));
+  }
 }
 
 BUILDERS.worklist = () => {
   const argv = ['find', ...connArgs(), '--mwl'];
-  const limit = $('#mwl-limit').value.trim();
-  if (limit) argv.push('--limit', limit);
-
   // Scheduling keys go in as ordinary pairs; the engine routes them into the
   // Scheduled Procedure Step Sequence where a conformant SCP expects them.
   const date = mwlDateValue();
   if (date) argv.push(`ScheduledProcedureStepStartDate=${date}`);
-  const pairs = [
-    ['Modality', $('#mwl-modality').value.trim()],
-    ['ScheduledStationAETitle', $('#mwl-station').value.trim()],
-    ['PatientName', $('#mwl-patientname').value.trim()],
-    ['PatientID', $('#mwl-patientid').value.trim()],
-    ['AccessionNumber', $('#mwl-accession').value.trim()],
-  ];
-  for (const [k, v] of pairs) if (v) argv.push(`${k}=${v}`);
+  const modality = $('#mwl-modality').value.trim();
+  if (modality) argv.push(`Modality=${modality}`);
+  // Only when Settings says "only this station's worklist": the engine warns
+  // on a mismatch anyway, so by default the whole list is shown.
+  const station = state.settings.onlyThisStation ? stationAe() : '';
+  if (station) argv.push(`ScheduledStationAETitle=${station}`);
+  const term = mwlSearchTerm();
+  if (term) argv.push(`${term.key}=${term.value}`);
+  // How many rows to ask for. Blank fetches the whole answer, which is what a
+  // small department wants; a busy RIS being re-read every minute is the case
+  // this exists for, so it is set once in Settings rather than per query.
+  const limit = state.settings.worklistLimit;
+  if (limit) argv.push('--limit', limit);
   return argv;
 };
 
+/** The Modality filter as a pill; the field behind it is what the builder reads. */
+function renderModalityPill() {
+  const v = $('#mwl-modality').value.trim();
+  const pill = $('#mwl-modality-pill');
+  pill.textContent = v || 'any modality';
+  pill.classList.toggle('active', Boolean(v));
+}
+
+// ---------------- rows and pills ----------------
+
 /**
- * The session badge for a worklist row, or null.
+ * The key a row is tracked by across refreshes.
+ *
+ * The study and the step within it when the SCP named a study; otherwise the
+ * accession, the scheduled step and the patient, which is what an MWL row
+ * carries when it names no study yet. Position is never part of a key that
+ * survives a refresh: the SCP is free to return the same rows in a different
+ * order, and a key that meant "the second row" would quietly re-point the
+ * selection at a different patient. A row with nothing identifying on it at
+ * all gets a positional key, and `stableKey` says it may not be re-bound.
+ */
+function rowKey(item, idx) {
+  const step = attrOf(item, 'ScheduledProcedureStepID');
+  const uid = attrOf(item, 'StudyInstanceUID');
+  if (uid) return `${uid}|${step}`;
+  const acc = attrOf(item, 'AccessionNumber');
+  const pid = attrOf(item, 'PatientID');
+  if (acc || step || pid) return `id:${acc}|${step}|${pid}`;
+  return `idx:${idx}`;
+}
+
+/** Whether a key identifies a row rather than a position in the last answer. */
+function stableKey(key) {
+  return Boolean(key) && !String(key).startsWith('idx:');
+}
+
+/** Whether two worklist rows say the same thing about the same patient. */
+function sameRowAttrs(a, b) {
+  if (!a || !b) return false;
+  return JSON.stringify(worklistAttrs(a)) === JSON.stringify(worklistAttrs(b));
+}
+
+/**
+ * The session step for a worklist row, or null.
  *
  * Matched on Study Instance UID, and on the scheduled step ID as well whenever
  * both sides name one. A partial match shows nothing rather than guessing: a
- * badge that named the wrong row would be exactly the false claim about the
- * far end that this table is built to avoid. A row the SCP returned with no
- * Study Instance UID can never be badged, because there is nothing to key on.
+ * pill that named the wrong row would be exactly the false claim about the far
+ * end this table is built to avoid. A row the SCP returned with no Study
+ * Instance UID can never carry a pill, because there is nothing to key on.
  */
-function sessionBadgeFor(item) {
+function stepFor(item) {
+  if (!item) return null;
+  if (item._memoryUid) return state.steps.entries.find((e) => e.mppsUid === item._memoryUid) || null;
   const uid = attrOf(item, 'StudyInstanceUID');
   if (!uid) return null;
   const stepId = attrOf(item, 'ScheduledProcedureStepID');
   // Newest first, so a re-performed study shows what happened most recently.
-  const hit = state.steps.entries.find((e) => e.studyInstanceUid === uid
-    && (!stepId || !e.scheduledStepId || e.scheduledStepId === stepId));
-  if (!hit) return null;
-
-  const c = hit.counts || {};
-  const counts = (c.acknowledged != null && c.found != null)
-    ? ` ${c.acknowledged}/${c.found}` : '';
-  if (hit.status === 'COMPLETED') return { cls: 'done', text: `completed here${counts}`, uid: hit.mppsUid };
-  if (hit.status === 'DISCONTINUED') return { cls: 'stopped', text: `discontinued here${counts}`, uid: hit.mppsUid };
-  return { cls: 'open', text: 'open — not closed', uid: hit.mppsUid };
+  return state.steps.entries.find((e) => e.studyInstanceUid === uid
+    && (!stepId || !e.scheduledStepId || e.scheduledStepId === stepId)) || null;
 }
 
-/** Renders worklist matches as a scheduling table. */
-function renderWorklist(json) {
+const PILL_TITLE = 'What this app sent from this window, in this session — not what the RIS shows.';
+
+/** The status pill for a row: (none) | IN PROGRESS | COMPLETED n/n | DISCONTINUED n/n. */
+function rowPill(item) {
+  const e = stepFor(item);
+  if (!e) return '';
+  const c = e.counts || {};
+  const counts = (c.acknowledged != null && c.found != null) ? ` ${c.acknowledged}/${c.found}` : '';
+  const cls = e.status === 'COMPLETED' ? 'ok' : e.status === 'DISCONTINUED' ? 'bad' : 'warn';
+  return `<span class="pill session ${cls}" title="${PILL_TITLE}">${esc(e.status)}${esc(counts)}</span>`;
+}
+
+/**
+ * A row for a step this app opened that no row in the results accounts for.
+ *
+ * A step left IN PROGRESS has to stay reachable even when the query that
+ * produced its row has been replaced — the only place its UID is remembered
+ * is this window. It is drawn from memory, dimmed, and says so.
+ */
+function memoryItem(e) {
+  return {
+    _memoryUid: e.mppsUid,
+    PatientName: e.patientName, PatientID: e.patientId, Modality: e.modality,
+    AccessionNumber: e.accessionNumber, StudyInstanceUID: e.studyInstanceUid,
+    ScheduledProcedureStepID: e.scheduledStepId,
+    RequestedProcedureDescription: e.description,
+  };
+}
+
+/** The rows on screen: the SCP's matches, then any open step the results do not show. */
+function stationRows() {
+  const rows = state.mwl.matches.map((item, idx) => ({ item, key: rowKey(item, idx) }));
+  const shown = new Set(rows.map((r) => stepFor(r.item)).filter(Boolean).map((e) => e.mppsUid));
+  for (const e of state.steps.entries) {
+    if (e.status === 'IN PROGRESS' && !shown.has(e.mppsUid)) {
+      rows.push({ item: memoryItem(e), key: `mem:${e.mppsUid}`, memory: true });
+    }
+  }
+  if (state.mwl.filterOpen) {
+    return rows.filter((r) => { const e = stepFor(r.item); return e && e.status === 'IN PROGRESS'; });
+  }
+  return rows;
+}
+
+/** A Date as HH:MM, the way the status chip prints the last read. */
+const fmtClock = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+
+const fmtTime = (t) => {
+  const s = String(t || '').replace(/[^0-9]/g, '');
+  return s.length < 4 ? s : `${s.slice(0, 2)}:${s.slice(2, 4)}`;
+};
+const fmtDate = (d) => {
+  const s = String(d || '');
+  return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
+};
+
+/** Draws the list. The selection survives: rows are matched by key, not position. */
+function renderWorklistTable() {
   const box = $('#mwl-results');
-  const matches = Array.isArray(json?.matches) ? json.matches : [];
-  box.hidden = false;
+  const rows = stationRows();
+  const selKey = state.mwl.selected ? state.mwl.selected.key : null;
 
-  // A fetch replaces the list, so any previous pick is gone with it. Carrying a
-  // selection across queries would mean showing attributes the SCP did not just
-  // return, which is exactly the kind of stale local state this screen avoids.
-  state.mwl.matches = matches;
-  clearWorklistSelection();
+  // A query that failed is not an empty worklist, and the difference is the
+  // whole screen: "nothing scheduled" sends the operator to the patient, and
+  // "the RIS did not answer" sends them to the phone.
+  const failed = state.mwl.error
+    ? `<div class="folder-check bad list-error"><b>The worklist could not be read.</b> ${esc(state.mwl.error)}</div>`
+    : '';
 
-  if (!matches.length) {
-    box.innerHTML =
-      '<div class="empty-note">No scheduled procedures matched. Try <b>Any date</b> with no ' +
-      'other filters to see whether this SCP answers for your AE Title at all.</div>';
-    $('#mwl-foot').hidden = true;
-    renderOpenAlert();
+  if (!rows.length) {
+    box.innerHTML = failed || `<div class="empty-note dense">${state.mwl.filterOpen
+      ? 'No open steps.'
+      : (state.mwl.fetched ? 'Nothing scheduled for this query.' : '')}</div>`;
     return;
   }
 
-  const fmtTime = (t) => {
-    const s = String(t || '').replace(/[^0-9]/g, '');
-    if (s.length < 4) return s || '';
-    return `${s.slice(0, 2)}:${s.slice(2, 4)}`;
-  };
-  const fmtDate = (d) => {
-    const s = String(d || '');
-    return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
-  };
+  // Rows survived a failed read: they are the last answer, not this one.
+  const stale = failed
+    ? `<div class="empty-note dense">Showing the last list that was read${state.mwl.at ? `, at ${esc(fmtClock(state.mwl.at))}` : ''}.</div>`
+    : '';
 
-  // The date is printed per row only when the query spans more than one day.
-  // Today / Tomorrow already fix it, and repeating it on every row of a
-  // one-day query is ten wasted characters times N.
-  const active = $('#mwl-when .chip.active');
-  const when = active ? active.dataset.when : 'today';
-  const showDate = when !== 'today' && when !== 'tomorrow';
-
-  const rows = matches.map((m, i) => {
-    const badge = sessionBadgeFor(m);
+  // The date is printed per row only when the query can span more than one day.
+  const showDate = mwlWhen() === 'custom';
+  const html = rows.map((r) => {
+    const m = r.item;
     const procedure = m.RequestedProcedureDescription || m.ScheduledProcedureStepDescription || '';
-    const patient = m.PatientName || '';
-    return `<tr class="pick-row" data-idx="${i}" tabindex="0" role="button" aria-pressed="false">
+    const on = r.key === selKey;
+    return `<tr class="pick-row ${r.memory ? 'memory' : ''} ${on ? 'row-selected' : ''}" data-key="${esc(r.key)}" tabindex="0" role="button" aria-pressed="${on}"
+      ${r.memory ? 'title="Not in the current results — remembered from this session"' : ''}>
       <td class="pick-cell"><span class="pick-dot"></span></td>
       <td class="when">${showDate ? `${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ` : ''}${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
       <td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>
-      <td title="${esc(patient)}">${esc(patient)}</td>
+      <td title="${esc(m.PatientName || '')}">${esc(m.PatientName || '')}</td>
       <td class="mono">${esc(m.PatientID || '')}</td>
       <td class="mono">${esc(m.AccessionNumber || '')}</td>
       <td title="${esc(procedure)}">${esc(procedure)}</td>
-      <td class="session-cell">${badge
-        ? `<span class="pill session ${badge.cls}" data-step-uid="${esc(badge.uid)}" title="This app performed this step from this window, in this session. It is not a statement about what the RIS now shows.">${esc(badge.text)}</span>`
-        : ''}</td>
+      <td class="session-cell">${rowPill(m)}</td>
     </tr>`;
   }).join('');
 
-  box.innerHTML =
-    `<div class="qbar-count">${matches.length} scheduled — click one to perform it</div>` +
+  box.innerHTML = failed + stale +
     '<div class="table-scroll"><table id="mwl-table">' +
-    // Widths sum to 720 of the ~857px column; Procedure takes the slack.
-    // Modality is sized for its own header, not its 2-3 character values.
     '<colgroup><col style="width:26px"><col style="width:100px"><col style="width:80px">' +
     '<col style="width:150px"><col style="width:96px"><col style="width:96px">' +
-    '<col><col style="width:130px"></colgroup>' +
+    '<col><col style="width:150px"></colgroup>' +
     '<thead><tr><th class="pick-cell"></th><th>Scheduled</th><th>Modality</th><th>Patient</th>' +
-    '<th>Patient ID</th><th>Accession</th><th>Procedure</th><th>This app</th></tr></thead>' +
-    `<tbody>${rows}</tbody></table></div>`;
-  $('#mwl-foot').hidden = false;
-  renderOpenAlert();
+    '<th>Patient ID</th><th>Accession</th><th>Procedure</th><th>Status</th></tr></thead>' +
+    `<tbody>${html}</tbody></table></div>`;
+  for (const tr of $$('#mwl-table tr.pick-row')) tr.classList.toggle('row-selected', tr.dataset.key === selKey);
 }
 
 /**
- * Repaints just the badge column against the session list.
- *
- * Called after a run and after a close. It touches the last cell of each row
- * and nothing else — no row is re-coloured, no other cell is rewritten, and
- * the SCP's own data in the other columns is left exactly as it was returned.
+ * Repaints just the pill column and the open-steps chip. Called after a run
+ * and after a close; it touches the last cell of each row and nothing else,
+ * so the SCP's own data in the other columns stays exactly as returned.
  */
-function refreshSessionBadges() {
+function refreshRowPills() {
+  const rows = stationRows();
+  const byKey = new Map(rows.map((r) => [r.key, r]));
+  let stale = false;
   for (const tr of $$('#mwl-table tr.pick-row')) {
-    const item = state.mwl.matches[Number(tr.dataset.idx)];
-    const cell = tr.querySelector('td.session-cell');
-    if (!item || !cell) continue;
-    const badge = sessionBadgeFor(item);
-    cell.innerHTML = badge
-      ? `<span class="pill session ${badge.cls}" data-step-uid="${esc(badge.uid)}" title="This app performed this step from this window, in this session. It is not a statement about what the RIS now shows.">${esc(badge.text)}</span>`
-      : '';
+    const r = byKey.get(tr.dataset.key);
+    if (!r) { stale = true; continue; }
+    tr.querySelector('td.session-cell').innerHTML = rowPill(r.item);
+    byKey.delete(tr.dataset.key);
   }
-  renderOpenAlert();
+  // A memory row appeared or went away: the row set itself changed.
+  if (stale || byKey.size) renderWorklistTable();
+  renderOpenChip();
+}
+
+/** "Open steps: N" — a filter, and the one place a stranded step is counted. */
+function renderOpenChip() {
+  const chip = $('#mwl-open-chip');
+  const open = state.steps.entries.filter((e) => e.status === 'IN PROGRESS').length;
+  if (!open && state.mwl.filterOpen) { state.mwl.filterOpen = false; renderWorklistTable(); }
+  chip.hidden = !open;
+  chip.textContent = `Open steps: ${open}`;
+  chip.classList.toggle('active', state.mwl.filterOpen);
+  chip.setAttribute('aria-pressed', state.mwl.filterOpen ? 'true' : 'false');
 }
 
 /**
- * The step this app opened that no row in the current results accounts for.
- *
- * This is the case the merge would otherwise lose. A step left IN PROGRESS has
- * to stay reachable even when the query that produced its row has been
- * replaced, because the only place its UID is remembered is this window.
+ * Takes a fresh answer from the SCP. The list is replaced wholesale; the
+ * selection is kept by key, so an auto-refresh under the operator's hands
+ * never un-picks the patient they are about to perform. A selected row the
+ * SCP no longer returns stays selected from memory: some SCPs withhold an
+ * item once its step completes, and the outcome on screen still names it.
  */
-function renderOpenAlert() {
-  const el = $('#mwl-open-alert');
-  if (!el) return;
-  const open = state.steps.entries.filter((e) => e.status === 'IN PROGRESS');
-  const shown = new Set($$('#mwl-table tr.pick-row')
-    .map((tr) => sessionBadgeFor(state.mwl.matches[Number(tr.dataset.idx)]))
-    .filter(Boolean).map((b) => b.uid));
-  const stranded = open.filter((e) => !shown.has(e.mppsUid));
-  if (!stranded.length) { el.hidden = true; return; }
-  el.hidden = false;
-  el.innerHTML =
-    `<span><b>${stranded.length} step${stranded.length === 1 ? '' : 's'} this app opened ` +
-    `${stranded.length === 1 ? 'is' : 'are'} still IN PROGRESS and not in these results.</b></span>` +
-    `<button class="btn ghost small" data-show-step="${esc(stranded[0].mppsUid)}">Show it</button>`;
+function renderWorklist(json) {
+  const matches = Array.isArray(json?.matches) ? json.matches : [];
+  state.mwl.matches = matches;
+  state.mwl.fetched = true;
+  state.mwl.error = null;
+  state.mwl.at = new Date();
+  const sel = state.mwl.selected;
+  if (sel) {
+    // Only a key that identifies a row may be re-bound. A positional one is
+    // dropped instead: the patient the operator picked stays on screen from
+    // memory, detached from the list, rather than the panel being re-pointed
+    // at whoever now occupies that position.
+    const idx = stableKey(sel.key) ? matches.findIndex((m, i) => rowKey(m, i) === sel.key) : -1;
+    if (idx >= 0) {
+      const prev = sel.item;
+      sel.item = matches[idx];
+      // The SCP may return the same row with different attributes. Everything
+      // selectRow seeded came off the row, so it is re-seeded here too — the
+      // alternative is a command mixing this answer with the last one.
+      if (!sameRowAttrs(prev, sel.item)) {
+        seedRowFields(sel.item, { prev });
+        checkMppsFolder();
+      }
+    } else if (!stableKey(sel.key)) {
+      state.mwl.detached = true;
+      sel.key = 'mem:selection';
+    }
+  }
+  renderWorklistTable();
+  renderOpenChip();
+  // A refresh can change every attribute the commands are built from, so the
+  // previews are rebuilt with the list. Nothing may run a command the screen
+  // is not showing.
+  renderMppsPanel();
+  updateAllPreviews();
 }
 
-// --------------------------------------------------------------------------
-// Worklist selection — the hand-off into `dcm mpps perform`
-// --------------------------------------------------------------------------
-/** The worklist item the operator picked, or null. */
+// ---------------- selection ----------------
+
 function selectedWorklistItem() {
-  const i = state.mwl.selectedIdx;
-  return i == null ? null : (state.mwl.matches[i] ?? null);
+  return state.mwl.selected ? state.mwl.selected.item : null;
 }
 
 /** First non-empty value among the given keys of a worklist match. */
@@ -1391,7 +2151,7 @@ function attrOf(item, ...keys) {
 }
 
 /**
- * The attributes a selected row hands to `dcm mpps perform`.
+ * The attributes a selected row hands to `dcm mpps`.
  *
  * Everything here came off the wire in the C-FIND response. Nothing is
  * defaulted or guessed: a key the SCP did not return stays empty, and the
@@ -1412,6 +2172,7 @@ function worklistAttrs(item) {
     requestedProcedureId: attrOf(item, 'RequestedProcedureID'),
     requestedProcedureDescription: attrOf(item, 'RequestedProcedureDescription'),
     scheduledStationAe: attrOf(item, 'ScheduledStationAETitle'),
+    startTime: attrOf(item, 'ScheduledProcedureStepStartTime'),
   };
 }
 
@@ -1423,104 +2184,164 @@ function attrCell(label, value, missingLabel = 'not returned by the SCP') {
     `<div class="attr-v">${esc(has ? value : `— ${missingLabel} —`)}</div></div>`;
 }
 
-/**
- * Puts the one action panel into perform mode or closing mode, or takes it down.
- *
- * The panel is one object with two jobs, because a scheduled step and a step
- * this app already opened are two different things to be holding. Only one can
- * be selected at a time, so picking either releases the other.
- */
-function setPanelMode(mode) {
-  const body = $('#mwl-detail-body');
-  const empty = $('#mwl-detail-empty');
-  body.hidden = mode === null;
-  empty.hidden = mode !== null;
-  $('#mwl-perform-mode').hidden = mode !== 'perform';
-  $('#mwl-close-mode').hidden = mode !== 'close';
-  $('#mwl-detail').classList.toggle('open', mode !== null);
-  $('#mwl-detail-title').textContent = mode === 'close'
-    ? ($('#steps-close').hidden ? 'This step is closed' : 'Close this step')
-    : 'Perform this step';
+/** 'perform' | 'close' | null — decided by whether this app holds the row's step open. */
+function panelMode() {
+  const item = selectedWorklistItem();
+  if (!item) return null;
+  const e = stepFor(item);
+  return e && e.status === 'IN PROGRESS' ? 'close' : 'perform';
 }
 
-function selectWorklistRow(idx) {
-  const item = state.mwl.matches[idx];
-  if (!item) return;
-  // One panel, one selection: picking a scheduled row releases any session step.
-  if (state.steps.selectedUid) clearStepsSelection();
-  state.mwl.selectedIdx = idx;
-
-  for (const tr of $$('#mwl-table tr.pick-row')) {
-    const on = Number(tr.dataset.idx) === idx;
-    tr.classList.toggle('row-selected', on);
-    tr.setAttribute('aria-pressed', on ? 'true' : 'false');
-    if (on) tr.scrollIntoView({ block: 'nearest' });
-  }
-
+/**
+ * Everything on the panel that comes off the row, seeded from the row.
+ *
+ * Called when a row is picked and again whenever a refresh replaces the row
+ * behind the selection: every one of these fields ends up on the command, so
+ * leaving one behind would build a command out of two different patients.
+ * The folder is one of them — a different patient's images are not this
+ * patient's — unless the same study is still on the row, or the row's step
+ * was opened by this app with a folder it already sent.
+ */
+function seedRowFields(item, { prev = null } = {}) {
   const a = worklistAttrs(item);
-
-  // Seed the two Type 1 fields the operator is allowed to correct. Re-seeding
-  // on every selection is right: they describe the row that is now picked.
   const stepId = $('#mpps-stepid');
   stepId.value = a.scheduledStepId;
   delete stepId.dataset.touched;
   const desc = $('#mpps-stepdesc');
   desc.value = a.scheduledStepDescription || a.requestedProcedureDescription;
   delete desc.dataset.touched;
+  // The performed station AE follows the station's own AE Title again: a hand
+  // edit belongs to the patient it was made for, not to the rest of the day.
+  delete $('#mpps-stationae').dataset.touched;
+  syncStationAe();
 
-  setPanelMode('perform');
+  const e = stepFor(item);
+  const keep = prev
+    && attrOf(prev, 'StudyInstanceUID') === attrOf(item, 'StudyInstanceUID')
+    && attrOf(prev, 'PatientID') === attrOf(item, 'PatientID');
+  const folder = $('#mpps-folder');
+  if (e && e.status === 'IN PROGRESS' && e.folder) folder.value = e.folder;
+  else if (!keep) folder.value = '';
+  $('#steps-series').checked = Boolean(e && e.folder) && stepFullyAcknowledged(e);
+}
+
+function selectRow(key) {
+  const row = stationRows().find((r) => r.key === key);
+  if (!row) return;
+  const same = state.mwl.selected && state.mwl.selected.key === key;
+  state.mwl.selected = { key, item: row.item };
+  state.mwl.detached = false;
+  for (const tr of $$('#mwl-table tr.pick-row')) {
+    const on = tr.dataset.key === key;
+    tr.classList.toggle('row-selected', on);
+    tr.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (on) tr.scrollIntoView({ block: 'nearest' });
+  }
+  if (same) return;
+
+  // A new patient: the last run's verdict was about someone else.
+  $('#mpps-outcome').hidden = true;
+  $('#mpps-totals').hidden = true;
+  setStatus('mpps', null);
+  setStatus('steps', null);
+  state.steps.armed = false;
+
+  seedRowFields(row.item);
+
   renderMppsPanel();
   updateAllPreviews();
   // A different row is a different study, so whatever was concluded about the
   // chosen folder no longer applies to it.
   checkMppsFolder();
-
-  // The one thing the row cannot supply. This absorbs the side effect of the
-  // deleted "Perform this step →" button, which existed only to cross a screen
-  // boundary that no longer exists.
   const folder = $('#mpps-folder');
   if (!folder.value.trim()) folder.focus();
 }
 
-function clearWorklistSelection() {
-  state.mwl.selectedIdx = null;
-  // Whatever was concluded about the folder was concluded against a row that
-  // is no longer picked, so it cannot go on adding a flag to the command.
+function clearSelection() {
+  state.mwl.selected = null;
+  state.mwl.detached = false;
   state.mpps.mismatch = null;
-  renderMppsMismatch();
+  state.mpps.scan = null;
+  state.steps.armed = false;
   for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
   }
-  if (!state.steps.selectedUid) setPanelMode(null);
   renderMppsPanel();
   updateAllPreviews();
 }
 
-/**
- * Says whether the study we performed is still returned by this query.
- *
- * Deliberately worded as correlation. A worklist item can leave a query's
- * results for reasons that have nothing to do with our MPPS — the date filter,
- * the station AE, the SCP's own rules — and it can stay in them even after a
- * performed step was accepted. Either way, all that has been re-read is this
- * query.
- */
-function renderMwlCorrelation() {
-  const el = $('#mwl-correlation');
-  const last = state.mpps.lastRun;
-  if (!last || !last.studyInstanceUid) { el.hidden = true; return; }
+// ---------------- fetching ----------------
 
-  const uid = last.studyInstanceUid;
-  const present = state.mwl.matches.some((m) => attrOf(m, 'StudyInstanceUID') === uid);
-  const info = '<button type="button" class="info-btn" aria-expanded="false" ' +
-    'aria-controls="info-correlation" aria-label="Why this is correlation"></button>';
-  el.hidden = false;
-  el.innerHTML = present
-    ? 'The study you performed <b>still matches this query.</b> Some SCPs keep a scheduled ' +
-      `step visible after one is reported. ${info}`
-    : 'The study you performed <b>no longer matches this query.</b> That is correlation, not ' +
-      `proof — the date filter or the SCP's own rules can do the same. ${info}`;
+const MWL_AUTO_MS = 60000;
+
+/**
+ * Reads the worklist. `auto` marks the timer's own reads: they are quieter —
+ * no console reset — and they step aside while a step is being performed or
+ * closed, because a list repaint under a running transaction helps nobody.
+ */
+async function fetchWorklist({ auto = false } = {}) {
+  if (state.activeRuns.worklist) return;
+  if (auto && (state.activeRuns.mpps || state.activeRuns.steps)) return;
+  const miss = connMissing();
+  if (miss.length) {
+    if (auto) return;
+    const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+    revealConsole();
+    appendConsole('worklist', `No RIS peer: give a saved peer the RIS role in Settings, or pick one on the chip (missing ${miss.join(', ')}).\n`, 'stderr');
+    return;
+  }
+  setStatus('worklist', 'running', 'Fetching…');
+  const { code, stdout, stderr } = await runCapture('worklist', [...BUILDERS.worklist(), '--json']);
+  const now = new Date();
+  const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  // Zero matches is an answer, not a failure: the engine says so and exits 1
+  // with a parseable result. Everything else that exits 1 — a refused
+  // association, a timeout, an unreachable host — is a failure, and the
+  // engine's own verdict is what says which. It has to be read from `ok` and
+  // `outcome`, never from the shape of `matches`: a network failure carries an
+  // empty matches array too, and reading that as an answer paints a fresh
+  // green clock over a RIS that is down.
+  let json = null;
+  try { json = JSON.parse(stdout); } catch { json = null; }
+  const answered = Boolean(json) && (json.ok === true || json.outcome === 'empty'
+    || (json.ok === undefined && Array.isArray(json.matches)));
+  if (answered) {
+    // The list is drawn before the clock turns green: a green clock over a
+    // list that could not be drawn is the same lie as one over a RIS that
+    // never answered.
+    try {
+      renderWorklist(json);
+      setStatus('worklist', 'ok', hhmm);
+    } catch (err) {
+      setStatus('worklist', 'fail', 'Failed');
+      const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+      revealConsole();
+      appendConsole('worklist', `The worklist was read but could not be drawn: ${err.message}`, 'stderr');
+    }
+  } else {
+    // Said where the list is, not only in a console nobody opened.
+    state.mwl.error = (json && json.message)
+      || stripAnsi(stderr).trim().split('\n').filter(Boolean).pop()
+      || 'The worklist could not be read.';
+    state.mwl.fetched = true;
+    setStatus('worklist', 'fail', 'Failed');
+    renderWorklistTable();
+    const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+    if (!auto) revealConsole();
+    appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+  }
+}
+
+/** Runs the auto-refresh only while the station is the screen on view and the toggle is on. */
+function stationVisibility(visible) {
+  clearInterval(state.mwl.timer);
+  state.mwl.timer = null;
+  if (!visible) return;
+  if (!state.mwl.fetched && !connMissing().length) fetchWorklist({ auto: true });
+  if ($('#mwl-auto').checked) {
+    state.mwl.timer = setInterval(() => fetchWorklist({ auto: true }), MWL_AUTO_MS);
+  }
 }
 
 function wireWorklist() {
@@ -1528,30 +2349,67 @@ function wireWorklist() {
     chip.addEventListener('click', () => {
       $$('#mwl-when .chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
-      $('#mwl-date').hidden = chip.dataset.when !== 'custom';
+      const custom = chip.dataset.when === 'custom';
+      $('#mwl-date').hidden = !custom;
+      if (custom) $('#mwl-date').focus();
       updateAllPreviews();
+      if (!custom) fetchWorklist();
     });
   }
-  ['mwl-date', 'mwl-modality', 'mwl-station', 'mwl-limit', 'mwl-patientname', 'mwl-patientid', 'mwl-accession']
-    .forEach((id) => $(`#${id}`).addEventListener('input', () => {
-      renderMwlMoreSummary();
-      updateAllPreviews();
-    }));
-  renderMwlMoreSummary();
+  $('#mwl-date').addEventListener('input', updateAllPreviews);
+  $('#mwl-date').addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchWorklist(); });
+
+  // The modality pill opens the field; leaving the field closes it.
+  const pill = $('#mwl-modality-pill');
+  const field = $('#mwl-modality');
+  pill.addEventListener('click', () => {
+    pill.hidden = true;
+    field.hidden = false;
+    field.focus();
+    field.select();
+  });
+  const closeModality = () => {
+    field.hidden = true;
+    pill.hidden = false;
+    renderModalityPill();
+    updateAllPreviews();
+    fetchWorklist();
+  };
+  field.addEventListener('blur', closeModality);
+  field.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === 'Escape') field.blur(); });
+  field.addEventListener('input', () => { renderModalityPill(); updateAllPreviews(); });
+  renderModalityPill();
+
+  const search = $('#mwl-search');
+  search.addEventListener('input', () => {
+    if (!search.value.trim()) state.mwl.searchKey = null;
+    renderSearchKey();
+    updateAllPreviews();
+  });
+  search.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchWorklist(); });
+  $('#mwl-search-key').addEventListener('click', () => {
+    const cur = mwlSearchTerm();
+    if (!cur) return;
+    state.mwl.searchKey = SEARCH_KEYS[(SEARCH_KEYS.indexOf(cur.key) + 1) % SEARCH_KEYS.length];
+    renderSearchKey();
+    updateAllPreviews();
+  });
+
+  $('#mwl-run').addEventListener('click', () => fetchWorklist());
+  $('#mwl-auto').addEventListener('change', () => stationVisibility(state.activeView === 'worklist'));
+  $('#mwl-open-chip').addEventListener('click', () => {
+    state.mwl.filterOpen = !state.mwl.filterOpen;
+    renderWorklistTable();
+    renderOpenChip();
+  });
+
+  // The ? and its panel are wired by wireHelp, along with every other screen's.
 
   // Delegated, because the table's innerHTML is replaced on every fetch.
   const results = $('#mwl-results');
   results.addEventListener('click', (e) => {
-    // The "open — not closed" badge is the shortest path to the fix: it picks
-    // the row AND puts the panel straight into closing mode.
-    const badge = e.target.closest('.pill.session.open');
-    if (badge) {
-      e.stopPropagation();
-      selectStepRow(badge.dataset.stepUid);
-      return;
-    }
     const tr = e.target.closest('tr.pick-row');
-    if (tr) selectWorklistRow(Number(tr.dataset.idx));
+    if (tr) selectRow(tr.dataset.key);
   });
   results.addEventListener('keydown', (e) => {
     const tr = e.target.closest('tr.pick-row');
@@ -1565,133 +2423,48 @@ function wireWorklist() {
     }
     if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
-    selectWorklistRow(Number(tr.dataset.idx));
+    selectRow(tr.dataset.key);
   });
-
-  $('#mwl-clearsel').addEventListener('click', () => {
-    if (state.steps.selectedUid) clearStepsSelection();
-    else clearWorklistSelection();
-    setPanelMode(null);
-  });
-
-  // The stranded-open-step alert's own button.
-  $('#mwl-open-alert').addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-show-step]');
-    if (!btn) return;
-    $('#session-steps').open = true;
-    selectStepRow(btn.dataset.showStep);
-  });
-
-  $('#mwl-run').addEventListener('click', async () => {
-    const miss = connMissing();
-    $('#mwl-results').hidden = true;
-    $('#mwl-foot').hidden = true;
-    const c = consoleEl('worklist'); resetConsole(c); c.hidden = true;
-    if (miss.length) {
-      $('#mwl-peer').open = true;
-      revealConsole();
-      appendConsole('worklist', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr');
-      return;
-    }
-    setStatus('worklist', 'running', 'Fetching…');
-    const { code, stdout, stderr } = await runCapture('worklist', [...BUILDERS.worklist(), '--json']);
-    setStatus('worklist', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
-    try {
-      renderWorklist(JSON.parse(stdout));
-      renderMwlCorrelation();
-    } catch {
-      // No parseable answer means nothing was re-read, so the correlation note
-      // from an earlier query would be stale. Take it down.
-      $('#mwl-correlation').hidden = true;
-      revealConsole();
-      appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
-    }
-  });
-}
-
-/** The peer bar's one line, so folding four fields away stays honest. */
-function renderMwlPeerSummary() {
-  const el = $('#mwl-peer-sum');
-  if (!el) return;
-  const c = state.conn;
-  const set = c.host && c.port && c.calledAe;
-  el.textContent = set
-    ? `— ${c.calledAe} @ ${c.host}:${c.port} ← ${c.callingAe || 'DCM-CLI'}`
-    : '— no peer set: fill in host, port and called AE';
-  el.classList.toggle('changed', !set);
-}
-
-/** One line naming the filters folded away under More filters. */
-function renderMwlMoreSummary() {
-  const el = $('#mwl-more-sum');
-  if (!el) return;
-  const parts = [];
-  for (const [id, label] of [
-    ['mwl-station', 'station AE'], ['mwl-patientid', 'patient ID'], ['mwl-limit', 'limit'],
-  ]) {
-    const v = $(`#${id}`).value.trim();
-    if (v) parts.push(`${label} ${v}`);
-  }
-  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
-  el.classList.toggle('changed', parts.length > 0);
+  $('#mwl-clearsel').addEventListener('click', clearSelection);
 }
 
 // --------------------------------------------------------------------------
-// View: MPPS — perform the selected step
+// The selected patient — `dcm mpps perform` / `dcm mpps start`
 // --------------------------------------------------------------------------
-/** The storage peer as the three fields currently read. */
-function mppsStore() {
-  return {
-    host: $('#mpps-store-host').value.trim(),
-    port: $('#mpps-store-port').value.trim(),
-    calledAe: $('#mpps-store-ae').value.trim(),
-  };
-}
-
 /**
- * Keeps the mirrored fields honest.
- *
- * "Same system as the MPPS peer" copies the real values into the storage
- * fields rather than leaving them blank, so the command preview can name both
- * peers in full. The same goes for the Performed Station AE Title, which is
- * Type 1 and would otherwise be an invisible engine default.
+ * Where the images go: the saved peer holding the Archive role, else the RIS
+ * peer itself. Both peers are always written out in full on the command —
+ * `dcm mpps perform` defaults each --store-* to the MPPS peer, but a default
+ * you cannot see is a default nobody can check, and sending images to the
+ * RIS by accident is the exact mistake this screen exists to prevent.
  */
-function syncMppsMirrors() {
-  const same = $('#mpps-store-same').checked;
-  for (const [id, val] of [
-    ['mpps-store-host', state.conn.host],
-    ['mpps-store-port', state.conn.port],
-    ['mpps-store-ae', state.conn.calledAe],
-  ]) {
-    const el = $(`#${id}`);
-    el.readOnly = same;
-    el.classList.toggle('mirrored', same);
-    if (same) el.value = val;
-  }
+function mppsStore() {
+  const p = profileForRole('archive');
+  if (p) return { host: p.host || '', port: String(p.port || ''), calledAe: p.calledAe || '', name: 'Archive' };
+  return { host: state.conn.host, port: String(state.conn.port || ''), calledAe: state.conn.calledAe, name: 'RIS' };
+}
 
+/** The Performed Station AE Title: Type 1, and Settings' station AE unless overridden. */
+function syncStationAe() {
   const station = $('#mpps-stationae');
   if (!station.dataset.touched) station.value = state.conn.callingAe || 'DCM-CLI';
 }
 
-// --------------------------------------------------------------------------
-// The step's own UID
-// --------------------------------------------------------------------------
 /**
  * A fresh MPPS SOP Instance UID.
  *
  * The app mints this rather than letting the engine mint one so that the UID
  * is known BEFORE the run: it appears in the command preview, where it can be
- * read and copied, and it is the handle this session's step list is keyed on
+ * read and copied, and it is the handle the session's step list is keyed on
  * even when the run's output cannot be parsed. 2.25.<128-bit integer> is the
- * UUID-derived form from PS3.5 B.2 — no registered root is needed, and the
- * whole UID is written into the command where it can be read.
+ * UUID-derived form from PS3.5 B.2 — no registered root is needed.
  */
 function newMppsUid() {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   let n = 0n;
   for (const b of bytes) n = (n << 8n) | BigInt(b);
-  if (n === 0n) n = 1n; // a UID component may not be empty
+  if (n === 0n) n = 1n;
   return `2.25.${n.toString()}`;
 }
 
@@ -1701,21 +2474,19 @@ function mppsNextUid() {
   return state.mpps.nextUid;
 }
 
-// --------------------------------------------------------------------------
-// The stock-image case: the folder's study is not the worklist's study
-// --------------------------------------------------------------------------
 /**
- * Which way past a study mismatch is selected, or null when there is none.
+ * Which way past a study mismatch applies, or null when there is none.
  *
- * Returns null unless a real single-study mismatch was detected, so neither
- * flag can be added to a command that does not need one. --adopt-worklist-
- * identity and --allow-study-mismatch are mutually exclusive in the engine.
+ * Null unless a real single-study mismatch was detected, so neither flag can
+ * be added to a command that does not need one. The station re-stamps, as a
+ * modality would; sending as-is exists only while Settings > Engineer options
+ * allows it, and then it is a two-way switch under the folder line.
  */
 function mppsFix() {
   const m = state.mpps.mismatch;
   if (!m || m.kind !== 'one-study') return null;
-  const picked = $$('#mpps-choices input[data-fix]').find((r) => r.checked);
-  return picked ? picked.dataset.fix : 'adopt';
+  if (!state.settings.allowMismatch) return 'adopt';
+  return state.mpps.fix === 'asis' ? 'asis' : 'adopt';
 }
 
 /** Serial number of the newest folder scan, so a stale one cannot land. */
@@ -1727,309 +2498,235 @@ let mppsScanToken = 0;
  * The engine refuses a mismatch, and that refusal is right: a step naming one
  * study while the images belong to another never reconciles. But a refusal
  * arriving as a wall of stderr after a run is a bad way to learn that, so the
- * comparison happens here, before anything is sent, and the two ways forward
- * are offered as a choice. `dcm info --json` is read-only.
+ * comparison happens here, before anything is sent, and the folder line says
+ * what will happen. `dcm info --json` is read-only.
  */
 async function checkMppsFolder() {
   const folder = $('#mpps-folder').value.trim();
   const item = selectedWorklistItem();
-  const box = $('#mpps-folder-check');
   const token = ++mppsScanToken;
 
   state.mpps.mismatch = null;
-  if (!folder || !item) {
-    box.hidden = true;
-    renderMppsMismatch();
-    updateAllPreviews();
-    return;
+  state.mpps.scan = null;
+  // The folder an open step already sent was scanned when it was sent; there
+  // is nothing new to conclude about it.
+  const open = stepsSelected();
+  if (!folder || !item || (open && open.folder === folder)) {
+    renderFolderLine(); applyVerbGuards(); updateAllPreviews(); return;
   }
 
-  box.hidden = false;
-  box.className = 'folder-check';
-  box.textContent = 'Reading the folder…';
-  renderMppsMismatch();
+  // The verbs go dead for as long as this takes: until the folder has been
+  // read, nothing on screen knows whose images these are.
+  state.mpps.scan = { reading: true };
+  renderFolderLine();
+  applyVerbGuards();
 
   // Bounded, because a lost exit event must not leave the panel reading
   // "Reading the folder…" for the rest of the session. This scan is advisory:
-  // it exists to offer the mismatch as a choice BEFORE anything is sent. The
-  // engine still refuses a real mismatch on its own, and wireMpps turns that
-  // refusal back into the same choice, so giving up here loses a convenience,
-  // never a safeguard.
+  // the engine still refuses a real mismatch on its own, and the run handler
+  // turns that refusal back into the same line, so giving up here loses a
+  // convenience, never a safeguard.
   const scanned = await Promise.race([
     runCapture('mpps-scan', ['info', folder, '--json']),
     new Promise((r) => setTimeout(() => r(null), 20000)),
   ]);
-  if (token !== mppsScanToken) return; // a newer folder was chosen meanwhile
-
-  if (!scanned) {
-    box.className = 'folder-check warn';
-    box.textContent = 'Could not read this folder in time. The engine checks it again when it runs.';
-    renderMppsMismatch();
-    updateAllPreviews();
-    return;
-  }
-  const { stdout } = scanned;
+  if (token !== mppsScanToken) return;
 
   let scan = null;
-  try { scan = JSON.parse(stdout); } catch { scan = null; }
-
+  if (scanned) { try { scan = JSON.parse(scanned.stdout); } catch { scan = null; } }
   const studies = Array.isArray(scan?.studies) ? scan.studies : null;
-  if (!studies) {
-    box.className = 'folder-check warn';
-    box.textContent =
-      'This folder could not be read. The engine will say exactly why when it runs.';
-    renderMppsMismatch();
-    updateAllPreviews();
-    return;
-  }
 
-  if (studies.length === 0) {
-    box.className = 'folder-check warn';
-    box.textContent =
-      `No DICOM instances here (${scan.filesExamined} files examined). ` +
-      'A step has to describe images that exist.';
-    renderMppsMismatch();
-    updateAllPreviews();
-    return;
-  }
-
-  const instances = studies.reduce((n, s) => n + (s.instanceCount || 0), 0);
-
-  if (studies.length > 1) {
-    state.mpps.mismatch = { kind: 'many', studies };
-    box.className = 'folder-check warn';
-    box.textContent = `${studies.length} studies, ${instances} instances.`;
-    renderMppsMismatch();
-    updateAllPreviews();
-    return;
-  }
-
-  const study = studies[0];
-  const declared = worklistAttrs(item).studyInstanceUid;
-  box.className = 'folder-check ok';
-
-  if (!declared) {
-    box.textContent =
-      `1 study, ${instances} instances. The row named no study, so the step adopts the ` +
-      'images\'. No flag needed.';
-  } else if (declared === study.studyInstanceUid) {
-    box.textContent = `1 study, ${instances} instances — matches the worklist row.`;
+  if (!scanned) {
+    state.mpps.scan = { warn: 'This folder is taking too long to read, so it has not been checked against this row. The exam still checks the images when it runs, and refuses them if they are a different study.' };
+  } else if (!studies) {
+    state.mpps.scan = { warn: 'This folder could not be read. Running the exam says exactly why.' };
+  } else if (studies.length === 0) {
+    state.mpps.scan = { warn: `No DICOM instances here (${scan.filesExamined} files examined).` };
   } else {
-    box.className = 'folder-check warn';
-    box.textContent = `1 study, ${instances} instances.`;
-    state.mpps.mismatch = {
-      kind: 'one-study',
-      declared,
-      onDisk: study.studyInstanceUid,
-      instances,
-      description: study.studyDescription || '',
-      patientId: study.patientId || '',
-    };
+    const instances = studies.reduce((n, s) => n + (s.instanceCount || 0), 0);
+    const modalities = [...new Set(studies.flatMap((s) => s.modalities || []))].join('+');
+    state.mpps.scan = { instances, modalities, studies: studies.length };
+    const declared = worklistAttrs(item).studyInstanceUid;
+    if (studies.length > 1) {
+      state.mpps.mismatch = { kind: 'many', studies };
+    } else if (declared && declared !== studies[0].studyInstanceUid) {
+      state.mpps.mismatch = { kind: 'one-study', declared, onDisk: studies[0].studyInstanceUid };
+      state.mpps.fix = 'adopt';
+    }
   }
-
-  renderMppsMismatch();
+  renderFolderLine();
+  applyVerbGuards();
   updateAllPreviews();
 }
 
-/** Draws the mismatch panel, or takes it down. */
-function renderMppsMismatch() {
-  const panel = $('#mpps-mismatch');
+/**
+ * One line under the folder: what it holds, and what will be done with it.
+ * It states the outcome rather than asking — the station re-stamps a copy of
+ * a different study the way a modality would. The only choice offered is
+ * the engineer's, and only when Settings turned it on.
+ */
+function renderFolderLine() {
+  const box = $('#mpps-folder-check');
+  const sw = $('#mpps-fix-switch');
+  const s = state.mpps.scan;
   const m = state.mpps.mismatch;
-  const choices = $('#mpps-choices');
+  sw.hidden = true;
+  if (!s) { box.hidden = true; return; }
+  box.hidden = false;
+  if (s.reading) { box.className = 'folder-check'; box.textContent = 'Reading the folder…'; return; }
+  if (s.warn) { box.className = 'folder-check warn'; box.textContent = s.warn; return; }
 
-  if (!m) {
-    panel.hidden = true;
-    choices.hidden = true;
-    delete panel.dataset.for;
+  // Where the images go, by AE Title: the command names it in full. When no
+  // saved peer holds the Archive role they go to the RIS, and that is said.
+  const store = mppsStore();
+  const to = store.name === 'Archive' ? `→ ${store.calledAe}` : `→ ${store.calledAe || '?'} (no Archive peer set)`;
+  const what = `${s.instances} instance${s.instances === 1 ? '' : 's'}${s.modalities ? ` ${s.modalities}` : ''}`;
+
+  if (m && m.kind === 'many') {
+    box.className = 'folder-check bad';
+    box.innerHTML = `<b>${esc(s.studies)} studies</b> in this folder — one step describes exactly one. Split the folder.`;
     return;
   }
-
-  panel.hidden = false;
-
-  if (m.kind === 'many') {
-    panel.className = 'mismatch compact bad';
-    choices.hidden = true;
-    $('#mpps-mismatch-head').textContent =
-      `This folder holds ${m.studies.length} studies. One performed step describes exactly one.`;
-    $('#mpps-mismatch-uids').innerHTML = m.studies.slice(0, 5).map((s) =>
-      `<div class="uid-line"><span class="uid-k">${esc(String(s.instanceCount))} instance(s)</span>` +
-      `<code>${esc(s.studyInstanceUid)}</code></div>`).join('') +
-      (m.studies.length > 5 ? `<div class="uid-line dim">… and ${m.studies.length - 5} more</div>` : '');
-    $('#mpps-mismatch-body').innerHTML =
-      '<b>Re-stamping cannot fix this</b> — it would merge them into a study that never ' +
-      'existed. Split the folder and perform one step per study.' +
-      '<button type="button" class="info-btn" aria-expanded="false" ' +
-      'aria-controls="info-many-studies" aria-label="Why one step is one study"></button>';
+  if (m && m.kind === 'one-study') {
+    // Closing a step is not performing one: `dcm send` has no re-stamping in
+    // it, so images added to an open step go to the archive exactly as they
+    // are. There is no copy, so the line must not promise one — and the
+    // Complete button is blocked while a folder like this is chosen.
+    if (panelMode() === 'close') {
+      box.className = 'folder-check bad';
+      box.innerHTML = `${esc(what)} ${esc(to)} · <b>a different study.</b> Added to this step they would be filed under their own study, ` +
+        'not this step\'s, and the two would never reconcile. Clear the folder to complete without them, or perform this study as its own exam.';
+      return;
+    }
+    box.className = 'folder-check warn';
+    if (state.settings.allowMismatch) {
+      sw.hidden = false;
+      for (const c of $$('#mpps-fix-switch .chip')) c.classList.toggle('active', c.dataset.fix === mppsFix());
+      box.innerHTML = `${esc(what)} ${esc(to)} · a different study — ` + (mppsFix() === 'asis'
+        ? '<b>sent as-is: the step names one study, the images another. Nothing reconciles afterwards.</b>'
+        : 'sent carrying this worklist\'s identity (a re-stamped copy; your folder is not modified).');
+    } else {
+      box.innerHTML = `${esc(what)} ${esc(to)} · a different study — sent carrying this worklist's identity (a re-stamped copy; your folder is not modified).`;
+    }
     return;
   }
+  box.className = 'folder-check ok';
+  const declared = worklistAttrs(selectedWorklistItem()).studyInstanceUid;
+  box.textContent = declared
+    ? `${what} · matches this ${panelMode() === 'close' ? 'step' : 'row'} ${to}`
+    : `${what} ${to} · the row named no study, so the step adopts the images'`;
+}
 
-  panel.className = 'mismatch compact';
-  choices.hidden = false;
+/** The attributes every `mpps` verb takes off the row, in one place. */
+function pushRowAttrs(argv, a) {
+  const push = (flag, value) => { if (value) argv.push(flag, value); };
+  push('--study-uid', a.studyInstanceUid);
+  push('--accession', a.accessionNumber);
+  push('--patient-id', a.patientId);
+  push('--patient-name', a.patientName);
+  push('--patient-birth-date', a.patientBirthDate);
+  push('--patient-sex', a.patientSex);
+  push('--modality', a.modality);
+  push('--scheduled-step-id', a.scheduledStepId);
+  push('--requested-procedure-id', a.requestedProcedureId);
+  push('--requested-procedure-description', a.requestedProcedureDescription);
+}
 
-  // A new mismatch starts on the recommended choice again. Carrying "send
-  // as-is" over to a different folder would be a decision nobody made.
-  const key = `${m.declared}|${m.onDisk}`;
-  if (panel.dataset.for !== key) {
-    panel.dataset.for = key;
-    const adopt = $('#mpps-choices input[data-fix="adopt"]');
-    if (adopt) adopt.checked = true;
-  }
-
-  $('#mpps-mismatch-head').textContent =
-    'These images belong to a different study than the worklist row.';
-  $('#mpps-mismatch-uids').innerHTML =
-    `<div class="uid-line"><span class="uid-k">Worklist row</span><code>${esc(m.declared)}</code></div>` +
-    `<div class="uid-line"><span class="uid-k">This folder</span><code>${esc(m.onDisk)}</code>` +
-    `<span class="uid-x">${esc(m.description || `${m.instances} instance(s)`)}</span></div>`;
-  $('#mpps-mismatch-body').innerHTML =
-    'Normal for stock images. It has to be resolved before anything is sent — the two records ' +
-    'never reconcile otherwise.' +
-    '<button type="button" class="info-btn" aria-expanded="false" ' +
-    'aria-controls="info-mismatch-why" aria-label="Why this happens"></button>';
+/** The performed-step fields: seeded from the row and Settings, editable under Details. */
+function pushStepFields(argv) {
+  const stepId = $('#mpps-stepid').value.trim();
+  if (stepId) argv.push('--step-id', stepId);
+  const station = $('#mpps-stationae').value.trim();
+  if (station) argv.push('--station-ae', station);
+  const stepDesc = $('#mpps-stepdesc').value.trim();
+  if (stepDesc) argv.push('--step-description', stepDesc);
+  // The step's own UID, minted here so it is visible before the run rather
+  // than only afterwards in the report.
+  argv.push('--mpps-uid', mppsNextUid());
 }
 
 BUILDERS.mpps = () => {
   // Builders run on every keystroke anywhere, which makes this the one hook
-  // that catches a change to the shared connection panel too.
-  syncMppsMirrors();
+  // that catches a change to the peer or the station AE too.
+  syncStationAe();
 
   const argv = ['mpps', 'perform'];
   const folder = $('#mpps-folder').value.trim();
   if (folder) argv.push(folder);
-
   argv.push(...connArgs());
 
-  // Both peers, always written out. `dcm mpps perform` defaults each --store-*
-  // to the MPPS peer, but a default you cannot see is a default nobody can
-  // check — and sending images to the RIS by accident is the exact mistake
-  // this screen exists to prevent.
   const store = mppsStore();
   if (store.host) argv.push('--store-host', store.host);
   if (store.port) argv.push('--store-port', store.port);
   if (store.calledAe) argv.push('--store-called-ae', store.calledAe);
 
   const a = worklistAttrs(selectedWorklistItem());
-  if (a) {
-    const push = (flag, value) => { if (value) argv.push(flag, value); };
-    push('--study-uid', a.studyInstanceUid);
-    push('--accession', a.accessionNumber);
-    push('--patient-id', a.patientId);
-    push('--patient-name', a.patientName);
-    push('--patient-birth-date', a.patientBirthDate);
-    push('--patient-sex', a.patientSex);
-    push('--modality', a.modality);
-    push('--scheduled-step-id', a.scheduledStepId);
-    push('--requested-procedure-id', a.requestedProcedureId);
-    push('--requested-procedure-description', a.requestedProcedureDescription);
-  }
-
-  const stepId = $('#mpps-stepid').value.trim();
-  if (stepId) argv.push('--step-id', stepId);
-  const stationAe = $('#mpps-stationae').value.trim();
-  if (stationAe) argv.push('--station-ae', stationAe);
-  const stepDesc = $('#mpps-stepdesc').value.trim();
-  if (stepDesc) argv.push('--step-description', stepDesc);
-
-  // The step's own UID, minted here so it is visible before the run rather
-  // than only afterwards in the report.
-  argv.push('--mpps-uid', mppsNextUid());
+  if (a) pushRowAttrs(argv, a);
+  pushStepFields(argv);
 
   // Exactly one of these, and only when a mismatch was actually found.
   const fix = mppsFix();
   if (fix === 'adopt') argv.push('--adopt-worklist-identity');
   else if (fix === 'asis') argv.push('--allow-study-mismatch');
 
-  const chunk = $('#mpps-chunk').value.trim();
+  const chunk = fieldOr('mpps-chunk', 'chunk');
   if (chunk) argv.push('--chunk', chunk);
-  const retry = $('#mpps-retry').value.trim();
+  const retry = fieldOr('mpps-retry', 'retry');
   if (retry) argv.push('--retry', retry);
-  const retrieveAe = $('#mpps-retrieveae').value.trim();
+  const retrieveAe = fieldOr('mpps-retrieveae', 'retrieveAe');
   if (retrieveAe) argv.push('--retrieve-ae', retrieveAe);
-
+  const timeout = state.settings.defaults.timeout;
+  if (timeout) argv.push('--timeout', timeout);
   if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
   if (mppsDryRun()) argv.push('--dry-run');
   return argv;
 };
 
-/**
- * Whether the perform toggle is on Dry run.
- *
- * A two-state segmented toggle rather than a checkbox with an eighteen-word
- * label: the mode is then legible at a glance instead of parsed from a
- * sentence. Dry run is still the default posture.
- */
+/** `dcm mpps start`: the same step, opened and left IN PROGRESS. No folder, no archive. */
+function mppsStartArgv() {
+  syncStationAe();
+  const argv = ['mpps', 'start', ...connArgs()];
+  const a = worklistAttrs(selectedWorklistItem());
+  if (a) pushRowAttrs(argv, a);
+  pushStepFields(argv);
+  const timeout = state.settings.defaults.timeout;
+  if (timeout) argv.push('--timeout', timeout);
+  if (mppsDryRun()) argv.push('--dry-run');
+  return argv;
+}
+
+/** Whether the perform is a rehearsal: one switch in Settings, and the banner says so. */
 function mppsDryRun() {
-  const active = $('#mpps-mode .chip.active');
-  return !active || active.dataset.mode === 'dry';
+  return rehearsal();
 }
 
-/** Keeps the run button, the hint and the command in step with the toggle. */
-function renderMppsMode() {
-  const dry = mppsDryRun();
-  $('#mpps-run').textContent = dry ? 'Dry run' : 'Perform step';
-  $('#mpps-mode-hint').textContent = dry
-    ? 'Nothing is sent in dry run.'
-    : 'This opens a step on the peer and sends the images.';
-  $('#mpps-mode-hint').classList.toggle('live', !dry);
-}
-
-/** One line naming everything folded away under Advanced that is not a default. */
+/** The Details summary: what the SCP returned, and any override that is not a default. */
 function renderMppsAdvSummary() {
   const el = $('#mpps-adv-sum');
   if (!el) return;
-  const parts = [];
-
-  const store = mppsStore();
-  if (!$('#mpps-store-same').checked) {
-    parts.push(`images → ${store.host || '?'}:${store.port || '?'} ${store.calledAe || '?'}`);
-  }
-
   const a = worklistAttrs(selectedWorklistItem());
-  const stepId = $('#mpps-stepid').value.trim();
-  if (a && stepId && stepId !== a.scheduledStepId) parts.push(`step ID ${stepId}`);
+  const parts = [];
+  if (a) {
+    const cells = attrCells(a);
+    parts.push(`${cells.filter(([, v]) => v !== '').length}/${cells.length} attributes`);
+    const stepId = $('#mpps-stepid').value.trim();
+    if (stepId && stepId !== a.scheduledStepId) parts.push(`step ID ${stepId}`);
+    const desc = $('#mpps-stepdesc').value.trim();
+    if (desc && desc !== (a.scheduledStepDescription || a.requestedProcedureDescription)) parts.push(`description "${desc}"`);
+  }
   const station = $('#mpps-stationae').value.trim();
   if (station && station !== (state.conn.callingAe || 'DCM-CLI')) parts.push(`station AE ${station}`);
-  const desc = $('#mpps-stepdesc').value.trim();
-  const seeded = a ? (a.scheduledStepDescription || a.requestedProcedureDescription) : '';
-  if (desc && desc !== seeded) parts.push(`description "${desc}"`);
-
-  for (const [id, label] of [
-    ['mpps-chunk', 'chunk'], ['mpps-retry', 'retries'], ['mpps-retrieveae', 'retrieve AE'],
-  ]) {
+  for (const [id, label] of [['mpps-chunk', 'chunk'], ['mpps-retry', 'retries'], ['mpps-retrieveae', 'retrieve AE']]) {
     const v = $(`#${id}`).value.trim();
     if (v) parts.push(`${label} ${v}`);
   }
-
-  if ($('#mpps-norecurse').checked) parts.push('no recursion');
-
-  el.textContent = parts.length
-    ? `— ${parts.join(' · ')}`
-    : '— all defaults: images to the MPPS peer, step ID from the row';
-  el.classList.toggle('changed', parts.length > 0);
+  if ($('#mpps-norecurse').checked !== !state.settings.defaults.recurse) parts.push($('#mpps-norecurse').checked ? 'no recursion' : 'recursing');
+  el.textContent = parts.length ? `· ${parts.join(' · ')}` : '';
+  el.classList.toggle('changed', parts.length > 1);
 }
 
-/** Fills the action panel from the selected row. */
-function renderMppsPanel() {
-  const a = worklistAttrs(selectedWorklistItem());
-  if (!a) return;
-
-  const chip = (value, missing) => (value
-    ? `<span>${esc(value)}</span>`
-    : `<span class="miss">— ${esc(missing)} —</span>`);
-
-  $('#mpps-hero').innerHTML =
-    `<div class="hero-main">${chip(a.patientName, 'no patient name')}` +
-    `<span class="hero-sep">·</span>${chip(a.modality, 'no modality')}` +
-    `<span class="hero-sep">·</span>` +
-    `${chip(a.requestedProcedureDescription || a.scheduledStepDescription, 'no procedure description')}</div>` +
-    `<div class="hero-sub">Accession ${chip(a.accessionNumber, 'none returned')}` +
-    `<span class="hero-sep">·</span>Patient ID ${chip(a.patientId, 'none returned')}` +
-    `<span class="hero-sep">·</span>Step ${chip(a.scheduledStepId, 'none returned')}</div>` +
-    `<div class="hero-uid">Study ${a.studyInstanceUid
-      ? `<code>${esc(a.studyInstanceUid)}</code>`
-      : '<span class="miss">— none returned by the SCP —</span>'}</div>`;
-
-  const cells = [
+function attrCells(a) {
+  return [
     ['Patient', a.patientName], ['Patient ID', a.patientId],
     ['Patient birth date', a.patientBirthDate], ['Patient sex', a.patientSex],
     ['Accession', a.accessionNumber], ['Modality', a.modality],
@@ -2037,56 +2734,174 @@ function renderMppsPanel() {
     ['Procedure', a.requestedProcedureDescription || a.scheduledStepDescription],
     ['Scheduled station AE', a.scheduledStationAe], ['Study Instance UID', a.studyInstanceUid],
   ];
-  $('#mpps-attrs').innerHTML = cells.map(([k, v]) => attrCell(k, v)).join('');
-  const filled = cells.filter(([, v]) => v !== '').length;
-  // Always visible, and it replaces the twenty-seven words that used to say
-  // nothing was wrong. A counter says the same thing and can be read at a
-  // glance, which is the whole trade this screen is making.
-  $('#mpps-assert-sum').textContent =
-    `${filled} of ${cells.length} attributes returned by the SCP`;
+}
 
-  // Anything the SCP left out that the engine is Type 1 about. Inline and
-  // amber, never behind the info icon: the third of these stops the N-CREATE
-  // outright, and that cannot be something you discover by opening a
-  // disclosure.
+/** Who, what, when — off the row. One line, one secondary line, the study UID. */
+function renderPatientBanner() {
+  const item = selectedWorklistItem();
+  const a = worklistAttrs(item);
+  if (!a) return;
+  const chip = (value, missing) => (value ? `<span>${esc(value)}</span>` : `<span class="miss">— ${esc(missing)} —</span>`);
+  const sep = '<span class="hero-sep">·</span>';
+  $('#mpps-hero-main').innerHTML =
+    chip(a.patientName, 'no patient name') + sep + chip(a.modality, 'no modality') + sep +
+    chip(a.requestedProcedureDescription || a.scheduledStepDescription, 'no procedure') +
+    (a.accessionNumber ? sep + `<span class="mono">${esc(a.accessionNumber)}</span>` : '') +
+    (a.startTime ? sep + `<span class="mono">${esc(fmtTime(a.startTime))}</span>` : '');
+  const sub = [];
+  if (a.patientId) sub.push(`<span class="mono">${esc(a.patientId)}</span>`);
+  if (a.patientSex) sub.push(esc(a.patientSex));
+  if (a.patientBirthDate) sub.push(esc(fmtDate(a.patientBirthDate)));
+  if (a.scheduledStepId) sub.push(`step <span class="mono">${esc(a.scheduledStepId)}</span>`);
+  if (a.requestedProcedureId) sub.push(`<span class="mono">${esc(a.requestedProcedureId)}</span>`);
+  if (a.scheduledStationAe) sub.push(`station <span class="mono">${esc(a.scheduledStationAe)}</span>`);
+  $('#mpps-hero-sub').innerHTML = sub.join(sep);
+  $('#mpps-hero-uid').innerHTML = a.studyInstanceUid
+    ? `<code>${esc(a.studyInstanceUid)}</code>`
+    : '<span class="miss">— no Study Instance UID returned by the SCP —</span>';
+
+  // In closing mode the banner also says where the step is open, because the
+  // N-SET goes where the N-CREATE went, not wherever the chip points now.
+  const e = stepFor(item);
+  const note = $('#mpps-hero-note');
+  if (e && e.status === 'IN PROGRESS') {
+    const c = e.counts || {};
+    const peer = e.peer && e.peer.host ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}` : '?';
+    note.hidden = false;
+    note.innerHTML = `<span class="pill session warn">IN PROGRESS</span> on <b>${esc(peer)}</b> since ${esc(formatStepWhen(e))}` +
+      (c.acknowledged != null ? ` · ${esc(String(c.acknowledged))}/${esc(String(c.found))} acknowledged` : '');
+  } else {
+    note.hidden = true;
+  }
+}
+
+/** Fills the panel from the selected row, in whichever mode the row's step puts it. */
+function renderMppsPanel() {
+  const mode = panelMode();
+  $('#mwl-detail-body').hidden = mode === null;
+  $('#mwl-detail-empty').hidden = mode !== null;
+  $('#mwl-detail').classList.toggle('open', mode !== null);
+  if (mode === null) return;
+
+  renderPatientBanner();
+  const a = worklistAttrs(selectedWorklistItem());
+  const e = stepFor(selectedWorklistItem());
+  const closing = mode === 'close';
+
+  $('#mpps-attrs').innerHTML = attrCells(a).map(([k, v]) => attrCell(k, v)).join('');
+
+  // What the RIS left out that this exam still needs. Inline and amber, never
+  // behind a disclosure: the step ID stops the exam outright, and that cannot
+  // be something you discover by opening one. Said in the words of the room —
+  // the conformance names for these are in the help panel.
   const notes = [];
-  if (!a.studyInstanceUid) {
-    notes.push('No <b>Study Instance UID</b> on this row. Type 1 — the engine takes it from ' +
-      'the folder if the folder holds one study.');
-  }
-  if (!a.modality) {
-    notes.push('No <b>Modality</b> on this row. Type 1 — the engine takes it from the folder ' +
-      'if the folder holds one.');
-  }
-  const stepIdMissing = !$('#mpps-stepid').value.trim();
-  if (stepIdMissing) {
-    notes.push('<b>Performed step ID</b> is empty. It is Type 1; the engine refuses the ' +
-      'N-CREATE without it.');
-    // Escalated, because the field that fixes it lives under Advanced.
-    $('#mpps-adv').open = true;
+  if (!closing) {
+    if (!a.studyInstanceUid) notes.push('This row names no <b>study</b>. The exam takes it from the folder, if the folder holds exactly one.');
+    if (!a.modality) notes.push('This row names no <b>modality</b>. The exam takes it from the folder, if the folder names one.');
+    if (!$('#mpps-stepid').value.trim()) {
+      notes.push('<b>This step has no ID.</b> The worklist didn\'t send one — type it in below, or ask the RIS to fill it in. The exam can\'t be started without it.');
+      $('#mpps-adv').open = true; // the field that fixes it lives there
+    }
+    if (!$('#mpps-stationae').value.trim()) {
+      notes.push('<b>This station has no AE Title.</b> Set it in Settings, or type one below — it is what the RIS files this exam under.');
+      $('#mpps-adv').open = true;
+    }
   }
   const warn = $('#mpps-type1-warn');
   warn.hidden = notes.length === 0;
   warn.innerHTML = notes.join('<br>');
 
+  // The list may no longer say which row this patient is; the panel says so
+  // rather than the selection quietly moving to whoever is there now.
+  const detached = $('#mwl-detached-note');
+  detached.hidden = !state.mwl.detached;
+  if (state.mwl.detached) {
+    detached.innerHTML = 'This patient is held from the last list that was read. The rows the RIS returns carry nothing that identifies them, so the list cannot say which row this is. Refresh and pick again before performing.';
+  }
+
+  // The verbs. Perform mode: Perform exam / Start only. Close mode: Complete /
+  // Discontinue, and the folder is either the one already sent or one to add.
+  const dry = mppsDryRun();
+  $('#mpps-run').hidden = closing;
+  $('#mpps-start').hidden = closing;
+  $('#mpps-cmd-fold').hidden = closing;
+  $('#steps-close-run').hidden = !closing;
+  $('#steps-discontinue').hidden = !closing;
+  $('#steps-cmd-fold').hidden = !closing;
+  $('#mpps-run').textContent = dry ? 'Rehearse exam' : 'Perform exam';
+  $('#mpps-start').textContent = dry ? 'Rehearse start' : 'Start only';
+
+  const folder = $('#mpps-folder');
+  const sent = closing && e.folder;
+  $('#mpps-folder-label').textContent = sent ? 'Images sent' : 'Images';
+  folder.readOnly = Boolean(sent);
+  folder.placeholder = closing ? 'Folder of images to add before completing (optional)…' : 'Folder holding this exam\'s images…';
+  $('#steps-series-row').hidden = !sent;
+  $('#mpps-adv').hidden = closing;
+
+  renderFolderLine();
   renderMppsAdvSummary();
+  renderStepsClose();
+  renderStartPreview();
+  applyVerbGuards();
 }
 
 /**
- * Reads the engine's own report.
+ * `Start only` runs a different command from `Perform exam` — no folder, no
+ * archive, no re-stamping — so it gets its own preview rather than sharing
+ * one that names things it will not touch. The preview is the command.
+ */
+function renderStartPreview() {
+  const fold = $('#mpps-start-cmd-fold');
+  if (!fold) return;
+  fold.hidden = panelMode() !== 'perform';
+  setPreviewEl($('#mpps-start-cmd'), mppsStartArgv());
+}
+
+/**
+ * The verbs are live only when the thing they would do is known.
  *
- * Deliberately reads the printed report rather than re-deriving anything: the
- * counts and the status sentence shown here are the engine's words, so the app
- * cannot claim more than the transaction did.
+ * A primary button is the first thing a hand goes to, so it must not be armed
+ * while the folder is still being read, while it holds a study this step
+ * cannot carry, or while a required field is empty. Each of those already has
+ * a line on screen saying so; this stops the button from outrunning it.
+ */
+function verbBlock() {
+  const mode = panelMode();
+  if (!mode) return null;
+  const s = state.mpps.scan;
+  if (s && s.reading) return 'Checking the folder…';
+  const m = state.mpps.mismatch;
+  if (m && m.kind === 'many') return 'This folder holds more than one study — split it first.';
+  if (mode === 'close') {
+    if (m && stepsFolderToAdd()) return 'These images carry a different study than this step.';
+    return null;
+  }
+  if (!$('#mpps-stepid').value.trim()) return 'This step has no ID — fill it in under Details.';
+  return null;
+}
+
+function applyVerbGuards() {
+  // A run in flight disables these itself and re-enables them when it ends;
+  // leave that alone rather than fighting it mid-transaction.
+  if (state.activeRuns.mpps || state.activeRuns.steps) return;
+  const why = verbBlock();
+  for (const id of ['mpps-run', 'mpps-start', 'steps-close-run']) {
+    const el = $(`#${id}`);
+    if (!el) continue;
+    el.disabled = Boolean(why);
+    if (why) el.title = why; else el.removeAttribute('title');
+  }
+}
+
+/**
+ * Reads the engine's own report, from both streams.
  *
- * Both streams are read, and that is not incidental. The counts and the final
- * status are the product and go to stdout, but the two sentences that say a
+ * The counts and the final status go to stdout; the two sentences that say a
  * step was never opened or is still open are failures and go to stderr. This
- * screen decides from those two whether a step exists on the peer at all, so
- * reading only stdout would mean deciding it from silence.
- *
- * @param {string} text stdout
- * @param {string} [errText] stderr
+ * screen decides from those whether a step exists on the peer at all, so
+ * reading only stdout would mean deciding it from silence. `start` prints its
+ * verdict as an IN PROGRESS line rather than a `step status` line.
  */
 function parseMppsReport(text, errText = '') {
   const t = stripAnsi(text);
@@ -2096,12 +2911,11 @@ function parseMppsReport(text, errText = '') {
     return m ? Number(m[1]) : null;
   };
   const statusMatch = /^step status +(\S+)/m.exec(t);
-  const uidMatch = /^MPPS SOP Instance UID +(\S+)/m.exec(t);
+  const started = /^IN PROGRESS\s+procedure step opened/m.test(t);
+  const uidMatch = /^\s*MPPS SOP Instance UID +(\S+)/m.exec(t);
   const shortfall = /^\d+ of \d+ instances were acknowledged\.[\s\S]*?unaccounted for\./m.exec(t);
   return {
-    status: statusMatch ? statusMatch[1] : null,
-    // `step status` is only printed once the N-SET lands, so a run whose N-SET
-    // failed reports no status here — stillInProgress below is what says so.
+    status: statusMatch ? statusMatch[1] : (started ? 'IN PROGRESS' : null),
     mppsUid: uidMatch ? uidMatch[1] : null,
     found: num('found'),
     sent: num('sent'),
@@ -2116,16 +2930,13 @@ function parseMppsReport(text, errText = '') {
 function renderMppsTotals(r) {
   const box = $('#mpps-totals');
   if (r.found == null) { box.hidden = true; box.classList.remove('show'); return; }
-  const cell = (n, lbl, cls = '', extra = '') =>
-    `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}${extra}</div></div>`;
+  const cell = (n, lbl, cls = '') =>
+    `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
   const complete = r.acknowledged != null && r.acknowledged === r.found;
   box.innerHTML =
-    cell(r.found, 'found') +
-    cell(r.sent, 'sent') +
+    cell(r.found, 'found') + cell(r.sent, 'sent') +
     cell(r.acknowledged, 'acknowledged', complete ? 'ok' : 'fail') +
-    cell(r.referenced, 'referenced in MPPS', complete ? 'ok' : 'fail',
-      '<button type="button" class="info-btn" aria-expanded="false" ' +
-      'aria-controls="info-performed-series" aria-label="How performed series are built"></button>');
+    cell(r.referenced, 'listed on the step', complete ? 'ok' : 'fail');
   box.hidden = false;
   box.classList.add('show');
 }
@@ -2138,24 +2949,36 @@ function renderMppsTotals(r) {
  * that says DISCONTINUED means the study is not fully accounted for in the
  * archive and somebody has to act on that.
  */
-function renderMppsOutcome({ code, report, dryRun }) {
+function renderMppsOutcome({ code, report, dryRun, verb }) {
   const box = $('#mpps-outcome');
   box.hidden = false;
 
   if (dryRun) {
     box.className = 'outcome';
-    box.innerHTML = '<span class="outcome-head">Dry run — nothing was sent.</span>' +
-      'No connection, no step, no images. Performed series cannot be previewed.';
+    box.innerHTML = '<span class="outcome-head">Rehearsal — nothing was sent.</span>' +
+      (verb === 'start' ? 'No connection, no step.' : 'No connection, no step, no images. Performed series cannot be previewed.');
     setStatus('mpps', code === 0 ? 'ok' : 'fail', code === 0 ? 'Plan ready' : 'Scan failed');
+    return;
+  }
+
+  if (verb === 'start') {
+    if (code === 0 && report.status === 'IN PROGRESS') {
+      box.className = 'outcome';
+      box.innerHTML = `<span class="outcome-head">Step opened — IN PROGRESS on ${esc(state.conn.calledAe)}.</span>` +
+        'Complete or discontinue it below. This window is the only place its UID is kept.';
+      setStatus('mpps', 'ok', 'IN PROGRESS');
+    } else {
+      box.className = 'outcome bad';
+      revealConsole();
+      box.innerHTML = '<span class="outcome-head">N-CREATE failed — no step was opened.</span>The output says why.';
+      setStatus('mpps', 'fail', 'Failed');
+    }
     return;
   }
 
   if (report.status === 'COMPLETED' && code === 0) {
     box.className = 'outcome ok';
-    box.innerHTML = '<span class="outcome-head">Step COMPLETED.</span>' +
-      'Every instance found on disk was acknowledged and referenced.' +
-      '<button type="button" class="info-btn" aria-expanded="false" ' +
-      'aria-controls="info-completed" aria-label="What this does not say"></button>';
+    box.innerHTML = '<span class="outcome-head">Step COMPLETED.</span>Every instance found on disk was acknowledged and referenced.';
     setStatus('mpps', 'ok', 'COMPLETED');
     return;
   }
@@ -2169,262 +2992,176 @@ function renderMppsOutcome({ code, report, dryRun }) {
     // it stays red, and it is never rounded up to a caveat on a success.
     head = 'Step DISCONTINUED — this is a failure.';
     body = (report.shortfall ? `${esc(report.shortfall)} ` : '') +
-      '<b>There is no override.</b> Resend the outstanding instances and open a new step, or ' +
-      'find out why the archive refused them.';
+      '<b>There is no override.</b> Resend the outstanding instances and open a new step, or find out why the archive refused them.';
   } else if (report.neverOpened) {
     head = 'N-CREATE failed — no step was opened.';
     body = 'Nothing was sent, the images are untouched. The output says why.';
   } else if (report.stillInProgress) {
-    // Half the old text was directions to a screen that is gone. The control
-    // itself replaces them.
-    const peer = state.conn.calledAe || 'the MPPS peer';
-    head = `N-SET failed — the step is still open on ${peer}.`;
-    body = 'Close it before quitting; this app remembers the UID only until it closes. ' +
-      '<button class="btn ghost small" id="mpps-close-now">Close this step</button>';
+    head = `N-SET failed — the step is still open on ${esc(state.conn.calledAe || 'the RIS')}.`;
+    body = 'Close it below before quitting; this app remembers the UID only until it closes.';
   } else {
-    body = 'The engine exited ' + esc(String(code)) + ' without reporting a closed step. The ' +
-      'output above is the whole story.';
+    body = `The engine exited ${esc(String(code))} without reporting a closed step. The output is the whole story.`;
   }
-  box.innerHTML = `<span class="outcome-head">${esc(head)}</span>${body}`;
+  box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
   setStatus('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
 }
 
+/** Runs `perform` or `start` for the selected row and remembers what came back. */
+async function runMpps(verb) {
+  const item = selectedWorklistItem();
+  clearConsole('mpps');
+  $('#mpps-outcome').hidden = true;
+  $('#mpps-totals').hidden = true;
+  if (!item) { revealConsole(); appendConsole('mpps', 'Select a patient first.\n', 'stderr'); return; }
+
+  const folder = $('#mpps-folder').value.trim();
+  if (verb === 'perform' && !folder) {
+    revealConsole();
+    appendConsole('mpps', 'Choose the folder holding this exam\'s images.\n', 'stderr');
+    return;
+  }
+  const dryRun = mppsDryRun();
+  if (!dryRun) {
+    const miss = connMissing();
+    if (miss.length) {
+      revealConsole();
+      appendConsole('mpps', `No RIS peer (missing ${miss.join(', ')}). Give a saved peer the RIS role in Settings.\n`, 'stderr');
+      return;
+    }
+  }
+
+  const argv = verb === 'perform' ? BUILDERS.mpps() : mppsStartArgv();
+  const attrs = worklistAttrs(item);
+  // Read before the run: the UID this command carries, and the peers it
+  // names, are what the session entry is built from afterwards.
+  const uid = mppsNextUid();
+  const storePeer = mppsStore();
+  setStatus('mpps', 'running', dryRun ? 'Building…' : (verb === 'perform' ? 'Performing…' : 'Opening…'));
+  $('#mpps-run').disabled = true;
+  $('#mpps-start').disabled = true;
+  if (!dryRun) {
+    $('#mpps-cancel').hidden = false;
+    revealConsole(); // during a real transfer the stream is the interesting thing
+  }
+  const { code, stdout, stderr } = await runStreaming('mpps', argv);
+  $('#mpps-run').disabled = false;
+  $('#mpps-start').disabled = false;
+  $('#mpps-cancel').hidden = true;
+  applyVerbGuards();
+
+  // The engine's own study-mismatch refusal, in case the folder changed
+  // between the scan and the run. It is right to refuse; re-read the folder
+  // so the line under it says what will happen next time.
+  if (/would name one study/.test(stderr) && /--adopt-worklist-identity/.test(stderr)) {
+    await checkMppsFolder();
+    const box = $('#mpps-outcome');
+    box.hidden = false;
+    box.className = 'outcome bad';
+    box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different study.</span>Nothing was sent, nothing on disk touched. See the line under the folder.';
+    setStatus('mpps', 'fail', 'Study mismatch');
+    return;
+  }
+
+  const report = parseMppsReport(stdout, stderr);
+  if (!dryRun) {
+    if (verb === 'perform') renderMppsTotals(report);
+    state.mpps.lastRun = { studyInstanceUid: attrs.studyInstanceUid, status: report.status, code };
+    rememberStep({
+      report, attrs, uid, folder: verb === 'perform' ? folder : '',
+      peer: { ...state.conn }, store: storePeer,
+    });
+    // The UID is spent: a second N-CREATE carrying the same one would be a
+    // different step claiming the same identity. Mint the next one now.
+    state.mpps.nextUid = null;
+    refreshRowPills();
+    // The row's step may now be open, which puts the panel into closing mode.
+    renderMppsPanel();
+    updateAllPreviews();
+  }
+  renderMppsOutcome({ code, report, dryRun, verb });
+}
+
 function wireMpps() {
-  const ids = [
-    'mpps-store-host', 'mpps-store-port', 'mpps-store-ae',
-    'mpps-stepid', 'mpps-stationae', 'mpps-stepdesc',
-    'mpps-chunk', 'mpps-retry', 'mpps-retrieveae',
-  ];
+  // A field the row seeds stops being seeded once it is edited by hand. This
+  // is wired FIRST: a listener that rebuilt the command before the field was
+  // marked would run syncStationAe and put the seeded value straight back, so
+  // clearing the station AE would look like it had not happened.
+  ['mpps-stationae', 'mpps-stepid', 'mpps-stepdesc'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
+  const ids = ['mpps-stepid', 'mpps-stationae', 'mpps-stepdesc', 'mpps-chunk', 'mpps-retry', 'mpps-retrieveae'];
   ids.forEach((id) => $(`#${id}`).addEventListener('input', () => {
     renderMppsAdvSummary();
     updateAllPreviews();
   }));
-
-  // Once either Type 1 field is edited by hand, stop overwriting it.
-  ['mpps-stationae', 'mpps-stepid', 'mpps-stepdesc'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
-
-  // Filling in a missing Type 1 step ID should retire the warning about it.
+  // Filling in a missing step ID or station AE retires the warning about it,
+  // and — for the step ID — puts the verbs back.
   $('#mpps-stepid').addEventListener('input', renderMppsPanel);
+  $('#mpps-stationae').addEventListener('input', renderMppsPanel);
+  $('#mpps-norecurse').addEventListener('change', () => { renderMppsAdvSummary(); updateAllPreviews(); });
 
   // A different folder is a different study, so re-read it. Debounced because
   // this fires per keystroke when the path is typed rather than picked.
   let folderTimer = null;
   $('#mpps-folder').addEventListener('input', () => {
     updateAllPreviews();
+    // In closing mode the folder is images to add, which changes the verb's
+    // label and its command.
+    renderStepsClose();
     clearTimeout(folderTimer);
     folderTimer = setTimeout(checkMppsFolder, 350);
   });
 
-  for (const radio of $$('#mpps-choices input[data-fix]')) {
-    radio.addEventListener('change', updateAllPreviews);
-  }
-
-  $('#mpps-store-same').addEventListener('change', () => {
-    renderMppsAdvSummary();
+  $('#mpps-fix-switch').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-fix]');
+    if (!chip) return;
+    state.mpps.fix = chip.dataset.fix;
+    renderFolderLine();
     updateAllPreviews();
   });
-  $('#mpps-norecurse').addEventListener('change', () => {
-    renderMppsAdvSummary();
-    updateAllPreviews();
-  });
-  for (const chip of $$('#mpps-mode .chip')) {
-    chip.addEventListener('click', () => {
-      $$('#mpps-mode .chip').forEach((c) => c.classList.remove('active'));
-      chip.classList.add('active');
-      renderMppsMode();
-      updateAllPreviews();
-    });
-  }
 
-  // The assert grid: read once, then trusted, so it opens on demand behind the
-  // counter line rather than occupying eleven cells of permanent screen.
-  $('#mpps-assert-toggle').addEventListener('click', () => {
-    const grid = $('#mpps-attrs');
-    grid.hidden = !grid.hidden;
-    $('#mpps-assert-toggle').textContent = grid.hidden ? 'Show all' : 'Hide';
-  });
+  $('#mpps-cancel').addEventListener('click', (e) => stopRun('mpps', e.currentTarget));
+  $('#mpps-run').addEventListener('click', () => runMpps('perform'));
+  $('#mpps-start').addEventListener('click', () => runMpps('start'));
 
-  $('#mpps-cancel').addEventListener('click', (e) => {
-    stopRun('mpps', e.currentTarget);
-  });
-
-  // The inline "Close this step" the still-IN-PROGRESS outcome offers. It puts
-  // the panel into closing mode without leaving the screen, which is the whole
-  // reason the third screen could go.
-  $('#mpps-outcome').addEventListener('click', (e) => {
-    if (!e.target.closest('#mpps-close-now')) return;
-    const open = state.steps.entries.find((x) => x.status === 'IN PROGRESS');
-    if (open) { $('#session-steps').open = true; selectStepRow(open.mppsUid); }
-  });
-
-  $('#mpps-run').addEventListener('click', async () => {
-    const item = selectedWorklistItem();
-    clearConsole('mpps');
-    $('#mpps-outcome').hidden = true;
-    $('#mpps-totals').hidden = true;
-
-    if (!item) {
-      revealConsole();
-      appendConsole('mpps', 'Select a worklist row first.\n', 'stderr');
-      return;
-    }
-    const folder = $('#mpps-folder').value.trim();
-    if (!folder) {
-      revealConsole();
-      appendConsole('mpps', 'Choose the folder holding this study\'s images.\n', 'stderr');
-      return;
-    }
-
-    const dryRun = mppsDryRun();
-    if (!dryRun) {
-      const miss = connMissing();
-      if (miss.length) {
-        appendConsole('mpps', `Fill in the MPPS peer: ${miss.join(', ')}.\n`, 'stderr');
-        return;
-      }
-      const store = mppsStore();
-      const storeMiss = [
-        ['host', store.host], ['port', store.port], ['called AE', store.calledAe],
-      ].filter(([, v]) => !v).map(([label]) => label);
-      if (storeMiss.length) {
-        appendConsole('mpps',
-          `Fill in the storage peer under Advanced: ${storeMiss.join(', ')}. Both peers are named ` +
-          'in full in the command, so neither can be left to a hidden default.\n', 'stderr');
-        return;
-      }
-    }
-
-    const argv = BUILDERS.mpps();
-    const attrs = worklistAttrs(item);
-    // Read before the run: the UID this command carries, and the peers it
-    // names, are what the session entry is built from afterwards.
-    const uid = mppsNextUid();
-    const storePeer = mppsStore();
-    setStatus('mpps', 'running', dryRun ? 'Scanning…' : 'Performing…');
-    $('#mpps-run').disabled = true;
-    if (!dryRun) {
-      $('#mpps-cancel').hidden = false;
-      // During a real transfer the stream is the interesting thing.
-      revealConsole();
-    }
-
-    const { code, stdout, stderr } = await runStreaming('mpps', argv);
-
-    $('#mpps-run').disabled = false;
-    $('#mpps-cancel').hidden = true;
-
-    // The engine's own study-mismatch refusal, in case the folder changed
-    // between the scan above and the run. It is right to refuse; what it
-    // cannot do is offer the choice as a choice, so re-read and do that.
-    if (/would name one study/.test(stderr) && /--adopt-worklist-identity/.test(stderr)) {
-      await checkMppsFolder();
-      const box = $('#mpps-outcome');
-      box.hidden = false;
-      box.className = 'outcome bad';
-      box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different ' +
-        'study.</span>Nothing was sent, nothing on disk touched. Pick one of the two options above.';
-      setStatus('mpps', 'fail', 'Study mismatch');
-      return;
-    }
-
-    const report = parseMppsReport(stdout, stderr);
-    if (!dryRun) {
-      renderMppsTotals(report);
-      // Recorded so the re-query can name the study it is looking for, even
-      // after a fresh fetch clears the selection.
-      state.mpps.lastRun = {
-        studyInstanceUid: attrs.studyInstanceUid,
-        status: report.status,
-        code,
-      };
-      rememberStep({
-        report, attrs, uid, folder, peer: { ...state.conn }, store: storePeer,
-      });
-      // The badge column, and only the badge column. Everything else in the
-      // table is what the SCP returned and stays exactly as it was returned;
-      // a fresh query is still the only thing that may replace it.
-      refreshSessionBadges();
-      // The one button now does both jobs, so after a run it says which one.
-      $('#mwl-run').textContent = 'Re-query worklist';
-      // The UID is spent: a step is identified by it, and a second N-CREATE
-      // carrying the same one would be a different step claiming the same
-      // identity. Mint the next one now so the preview shows what will run.
-      state.mpps.nextUid = null;
-      updateAllPreviews();
-    }
-    renderMppsOutcome({ code, report, dryRun });
-  });
-
-  // Resting state: no row picked, so the panel is one line of empty note.
-  setPanelMode(null);
-  renderMppsMode();
-  renderMppsAdvSummary();
+  renderMppsPanel();
 }
 
 // --------------------------------------------------------------------------
-// Session steps — what this app did since it was opened
+// Session steps — what this app opened, and closing it
 // --------------------------------------------------------------------------
 /**
- * Adds a step this app just performed to the session list.
+ * Adds a step this app just opened to the session list.
  *
  * Session memory on purpose. There is no records directory and no per-step
  * file, so the only place a performed step is remembered is this window, and
  * quitting forgets it. That is the honest shape for it: this list is a note of
  * what THIS APP did, and a note cannot be mistaken for the peer's own state.
- * It could not be that anyway — MPPS has no query service, so there is no way
- * to ask an SCP which steps it is holding, and a file on disk claiming to know
- * would only be a stale guess with a timestamp on it.
- *
- * A run that never opened a step is not remembered. If the N-CREATE failed
- * there is no step on the peer, and an entry for one would name something that
- * does not exist.
- *
- * @param {{report: object, attrs: object, uid: string, folder: string,
- *          peer: object, store: object}} run
- * @returns {boolean} Whether an entry was added.
+ * A run that never opened a step is not remembered — an entry for it would
+ * name something that does not exist.
  */
 function rememberStep({ report, attrs, uid, folder, peer, store }) {
   if (report.neverOpened) return false;
-
   // The engine prints the UID it used. Prefer it over the one this app minted
   // so the list names what actually went on the wire.
   const mppsUid = report.mppsUid || uid;
   const status = report.status || (report.stillInProgress ? 'IN PROGRESS' : '');
   if (!mppsUid || !status) return false;
-
   state.steps.entries.unshift({
-    mppsUid,
-    status,
+    mppsUid, status,
     patientName: attrs.patientName || '',
     patientId: attrs.patientId || '',
+    accessionNumber: attrs.accessionNumber || '',
+    description: attrs.requestedProcedureDescription || attrs.scheduledStepDescription || '',
     studyInstanceUid: attrs.studyInstanceUid || '',
-    // Recorded so a badge can be matched on the study AND the scheduled step,
-    // rather than on a study UID alone.
     scheduledStepId: attrs.scheduledStepId || '',
     modality: attrs.modality || '',
     at: new Date(),
     folder,
     peer: { ...peer },
     store: { ...store },
-    counts: {
-      found: report.found, sent: report.sent,
-      acknowledged: report.acknowledged, referenced: report.referenced,
-    },
+    counts: { found: report.found, sent: report.sent, acknowledged: report.acknowledged, referenced: report.referenced },
   });
-  renderSteps();
   return true;
-}
-
-/** complete or discontinue. */
-function stepsVerb() {
-  const active = $('#steps-verb .chip.active');
-  return active ? active.dataset.verb : 'complete';
-}
-
-function stepsSelected() {
-  const uid = state.steps.selectedUid;
-  return uid ? (state.steps.entries.find((e) => e.mppsUid === uid) || null) : null;
 }
 
 /** True when a folder scan and the acknowledged set are the same set. */
@@ -2433,273 +3170,242 @@ function stepFullyAcknowledged(e) {
   return c.found != null && c.acknowledged != null && c.found === c.acknowledged;
 }
 
+/** The IN PROGRESS entry the selected row maps to, or null. */
+function stepsSelected() {
+  const e = stepFor(selectedWorklistItem());
+  return e && e.status === 'IN PROGRESS' ? e : null;
+}
+
+function formatStepWhen(e) {
+  const d = e.at instanceof Date ? e.at : new Date(e.at);
+  return Number.isNaN(d.getTime()) ? '' : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/** A folder picked for an open step that was opened without one: images still to send. */
+function stepsFolderToAdd() {
+  const e = stepsSelected();
+  const folder = $('#mpps-folder').value.trim();
+  return e && !e.folder && folder ? folder : '';
+}
+
 /**
  * The exact `dcm mpps complete|discontinue` this screen would run.
  *
- * The peer comes from the entry, not from the connection panel: the step lives
- * on the system that took the N-CREATE, and closing it against whatever the
- * panel happens to say now would be an N-SET aimed at a peer that never heard
- * of this UID.
+ * The peer comes from the entry, not from the chip: the step lives on the
+ * system that took the N-CREATE, and closing it against whatever the chip
+ * happens to say now would be an N-SET aimed at a peer that never heard of
+ * this UID.
  */
-function stepsCloseArgv() {
+function stepsCloseArgv(verb = 'complete', { seriesFrom = '' } = {}) {
   const e = stepsSelected();
-  const argv = ['mpps', stepsVerb()];
+  const argv = ['mpps', verb];
   if (e) {
     argv.push(e.mppsUid);
     if (e.peer.host) argv.push('--host', e.peer.host);
     if (e.peer.port) argv.push('--port', String(e.peer.port));
     if (e.peer.calledAe) argv.push('--called-ae', e.peer.calledAe);
     if (e.peer.callingAe) argv.push('--calling-ae', e.peer.callingAe);
-    if (e.folder && $('#steps-series').checked) argv.push('--series-from', e.folder);
+    const from = seriesFrom || (e.folder && $('#steps-series').checked ? e.folder : '');
+    if (from) argv.push('--series-from', from);
   }
-  if (stepsVerb() === 'discontinue') {
-    const code = $('#steps-reasoncode').value.trim();
+  if (verb === 'discontinue') {
+    const code = reasonCode();
     if (code) argv.push('--reason-code', code);
   }
   if (stepsDryRun()) argv.push('--dry-run');
   return argv;
 }
 
-/** Whether the closing toggle is on Dry run. Same segmented control as perform. */
-function stepsDryRun() {
-  const active = $('#steps-mode .chip.active');
-  return !active || active.dataset.mode === 'dry';
+/** `dcm send` for images added to a step opened without them. Goes to the archive, like perform's C-STORE. */
+function stepsSendArgv(folder) {
+  const store = mppsStore();
+  const argv = ['send', folder];
+  if (store.host) argv.push('--host', store.host);
+  if (store.port) argv.push('--port', store.port);
+  if (store.calledAe) argv.push('--called-ae', store.calledAe);
+  const e = stepsSelected();
+  const calling = (e && e.peer.callingAe) || state.conn.callingAe;
+  if (calling) argv.push('--calling-ae', calling);
+  const chunk = fieldOr('mpps-chunk', 'chunk');
+  if (chunk) argv.push('--chunk', chunk);
+  const retry = fieldOr('mpps-retry', 'retry');
+  if (retry) argv.push('--retry', retry);
+  const timeout = state.settings.defaults.timeout;
+  if (timeout) argv.push('--timeout', timeout);
+  if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
+  if (stepsDryRun()) argv.push('--dry-run');
+  return argv;
 }
 
+/**
+ * The reason an exam was stopped, as the code item the engine requires.
+ *
+ * A coded reason has to be a real code — the engine refuses free text, and it
+ * is right to: `value^scheme^meaning` is what the RIS reads. So the operator
+ * picks the reason in words and the triplet is what goes on the command line,
+ * where it is still visible. "Another code…" keeps a private scheme reachable
+ * for the site that has one.
+ */
+function reasonCode() {
+  const sel = $('#steps-reason');
+  const chosen = sel ? sel.value : '';
+  if (chosen === '__other') return $('#steps-reasoncode').value.trim();
+  return chosen;
+}
+
+/** Whether the close is a rehearsal. The one Settings switch, same as perform. */
+function stepsDryRun() {
+  return rehearsal();
+}
+
+/** Several commands in one preview: one per line, joined with && in the fold's summary. */
+function setPreviewLines(el, argvs) {
+  const lines = argvs.map((argv) => 'dcm ' + argv.map(quoteArg).join(' '));
+  el.textContent = lines.join('\n');
+  const fold = el.closest('.cmd-fold');
+  const sum = fold && fold.querySelector('.cmd-sum');
+  if (sum) sum.textContent = lines.join(' && ');
+}
+
+/** The closing verbs and their preview: Complete (with images to add, if any) or the armed Discontinue. */
 function renderStepsClose() {
   const e = stepsSelected();
-  const closed = Boolean(e) && e.status !== 'IN PROGRESS';
-
-  // A closed step is history and offers nothing. Taking the controls down is
-  // the honest form of that: a disabled button beside a complete command still
-  // reads as something that could be made to work.
-  $('#steps-close').hidden = !e || closed;
-  if (state.steps.selectedUid) {
-    $('#mwl-detail-title').textContent = closed ? 'This step is closed' : 'Close this step';
-  }
-
-  $('#steps-reason-row').hidden = stepsVerb() !== 'discontinue';
+  const armed = Boolean(e) && state.steps.armed;
   const dry = stepsDryRun();
-  const btn = $('#steps-close-run');
-  btn.textContent = dry ? 'Dry run' : (stepsVerb() === 'complete' ? 'Complete step' : 'Discontinue step');
-  btn.disabled = !e || closed;
+  const adding = stepsFolderToAdd();
 
-  // The performed-series option only exists while there is a folder to scan
-  // and a step still open to close.
-  const row = $('#steps-series-row');
-  row.hidden = !e || closed || !e.folder;
-  if (!row.hidden) {
-    $('#steps-series-label').innerHTML =
-      'Name the images in this folder as the performed series ' +
-      '<button type="button" class="info-btn" aria-expanded="false" ' +
-      'aria-controls="info-series-from" aria-label="What series-from asserts"></button> ' +
-      '<code>--series-from</code>';
-  }
+  $('#steps-reason-row').hidden = !armed;
+  $('#steps-close-run').hidden = !e || armed;
+  $('#steps-discontinue').hidden = !e || armed;
+  $('#steps-close-run').textContent = (dry ? 'Rehearse ' : '') + (adding ? 'Add images & complete' : 'Complete');
+  $('#steps-discontinue-run').textContent = dry ? 'Rehearse discontinue' : 'Discontinue step';
 
-  const note = $('#steps-note');
-  if (!e) {
-    note.textContent = '';
-  } else if (closed) {
-    note.innerHTML =
-      `This app set this step to <b>${esc(e.status)}</b>. Both COMPLETED and DISCONTINUED are ` +
-      'final; a conformant SCP refuses an N-SET out of either.';
-  } else {
-    const c = e.counts || {};
-    let series;
-    if (!e.folder) {
-      series = 'No folder remembered. Performed series will be empty — the N-SET claims the ' +
-        'work finished and names no images.';
-    } else if (stepFullyAcknowledged(e)) {
-      series = `All ${c.found} instances in that folder were acknowledged, so the two sets match.`;
-    } else if (c.found != null && c.acknowledged != null) {
-      // A shortfall stays visible and stays specific.
-      series = `Only ${c.acknowledged} of ${c.found} were acknowledged, so a scan of that folder ` +
-        'would name images the archive may not hold. Off by default.';
-    } else {
-      series = 'This run reported no counts, so nothing here says that folder matches what the ' +
-        'archive took.';
-    }
-    // Naming the actual peer makes the invariant checkable rather than merely
-    // stated: the N-SET goes where the N-CREATE went, not where the peer bar
-    // now points.
-    const peer = e.peer && e.peer.host
-      ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}`
-      : (e.peer && e.peer.calledAe) || '?';
-    note.innerHTML =
-      `This app opened this step on <b>${esc(peer)}</b> and has not closed it. The N-SET goes ` +
-      'there.<button type="button" class="info-btn" aria-expanded="false" ' +
-      'aria-controls="info-close-peer" aria-label="Why that peer"></button> ' +
-      `<span class="series-note">${series}</span>`;
-  }
-
-  $('#steps-close-cmd').textContent = 'dcm ' + stepsCloseArgv().map(quoteArg).join(' ');
+  const el = $('#steps-close-cmd');
+  if (!e) { setPreviewLines(el, [['mpps', 'complete']]); return; }
+  if (armed) setPreviewLines(el, [stepsCloseArgv('discontinue')]);
+  else if (adding) setPreviewLines(el, [stepsSendArgv(adding), stepsCloseArgv('complete', { seriesFrom: adding })]);
+  else setPreviewLines(el, [stepsCloseArgv('complete')]);
+  applyVerbGuards();
 }
 
-function clearStepsSelection() {
-  state.steps.selectedUid = null;
-  for (const tr of $$('#steps-results tr.pick-row')) {
-    tr.classList.remove('row-selected');
-    tr.setAttribute('aria-pressed', 'false');
-  }
-  if (state.mwl.selectedIdx == null) setPanelMode(null);
-}
-
-function selectStepRow(uid) {
-  const e = state.steps.entries.find((x) => x.mppsUid === uid);
-  if (!e) return;
-  // One panel, one selection: picking a session step releases the worklist row.
-  if (state.mwl.selectedIdx != null) clearWorklistSelection();
-  state.steps.selectedUid = uid;
-  for (const tr of $$('#steps-results tr.pick-row')) {
-    const on = tr.dataset.uid === uid;
-    tr.classList.toggle('row-selected', on);
-    tr.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-
-  const c = e.counts || {};
-  const peerLine = (p) => (p && p.host
-    ? `${p.calledAe || '?'} @ ${p.host}:${p.port || '?'}`
-    : '');
-  $('#steps-attrs').innerHTML =
-    attrCell('Status', e.status) +
-    attrCell('Patient', e.patientName || e.patientId || '', 'not named by the worklist row') +
-    attrCell('Modality', e.modality || '', 'not named by the worklist row') +
-    attrCell('Study Instance UID', e.studyInstanceUid || '', 'taken from the folder by the engine') +
-    attrCell('MPPS SOP Instance UID', e.mppsUid) +
-    attrCell('Acknowledged', c.acknowledged == null ? '' : `${c.acknowledged} of ${c.found} found`, 'no counts reported') +
-    attrCell('Performed at', formatStepWhen(e)) +
-    attrCell('MPPS peer', peerLine(e.peer), 'not known for this run') +
-    attrCell('Storage peer', peerLine(e.store), 'not known for this run') +
-    attrCell('Folder sent', e.folder || '', 'none');
-  setPanelMode('close');
-  // A fresh selection starts on the option that suits it, rather than
-  // inheriting a choice made about a different step. This default IS the
-  // shortfall invariant: a folder is only offered as the performed series when
-  // every instance in it was acknowledged.
-  $('#steps-series').checked = Boolean(e.folder) && stepFullyAcknowledged(e);
-  renderStepsClose();
-  $('#mwl-detail').scrollIntoView({ block: 'nearest' });
-}
-
-function formatStepWhen(e) {
-  const d = e.at instanceof Date ? e.at : new Date(e.at);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
-}
-
-/** Draws the session list. */
-function renderSteps() {
-  const box = $('#steps-results');
-  const strip = $('#session-steps');
-  const entries = state.steps.entries;
-  const keep = state.steps.selectedUid;
-
-  // With no separate screen, an empty session list simply does not render.
-  // Nothing to explain, so nothing to explain it with.
-  if (!entries.length) {
-    strip.hidden = true;
-    box.innerHTML = '';
-    clearStepsSelection();
-    renderOpenAlert();
+/** The verdict on a close, in the same box the perform uses. */
+function renderCloseOutcome({ code, dry, verb, peer, extra = '' }) {
+  const box = $('#mpps-outcome');
+  box.hidden = false;
+  if (dry) {
+    box.className = 'outcome';
+    box.innerHTML = '<span class="outcome-head">Rehearsal — nothing was sent.</span>The N-SET was built and printed, not sent.';
     return;
   }
-  strip.hidden = false;
+  if (code === 0) {
+    const status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
+    box.className = verb === 'complete' ? 'outcome ok' : 'outcome bad';
+    box.innerHTML = `<span class="outcome-head">Step ${status}.</span>Closed on ${esc(peer)}. ${extra}`;
+  } else {
+    box.className = 'outcome bad';
+    box.innerHTML = `<span class="outcome-head">N-SET failed — the step is still open on ${esc(peer)}.</span>The output says why. ${extra}`;
+  }
+}
 
-  const statusClass = (s) => (s === 'COMPLETED' ? 'ok' : s === 'DISCONTINUED' ? 'bad' : 'warn');
-  const rows = entries.map((e) => {
-    const c = e.counts || {};
-    const patient = e.patientName || e.patientId || '';
-    return `<tr class="pick-row" data-uid="${esc(e.mppsUid)}" tabindex="0" role="button" aria-pressed="false">
-      <td class="pick-cell"><span class="pick-dot"></span></td>
-      <td><span class="pill ${statusClass(e.status)}">${esc(e.status)}</span></td>
-      <td>${patient ? esc(patient) : '<span class="miss">— not named by the row —</span>'}</td>
-      <td>${esc(e.modality || '')}</td>
-      <td class="mono uid-cell">${esc(e.studyInstanceUid || '')}</td>
-      <td class="mono">${c.acknowledged == null ? '—' : `${c.acknowledged}/${c.found}`}</td>
-      <td class="when">${esc(formatStepWhen(e))}</td>
-      <td>${esc(e.peer && e.peer.host ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}` : '')}</td>
-    </tr>`;
-  }).join('');
+/**
+ * Closes the selected open step.
+ *
+ * With images to add, `dcm send` runs first, and the step is completed
+ * naming that folder only if every instance was acknowledged — otherwise it
+ * is discontinued, for the same reason `perform` would: COMPLETED means the
+ * archive holds everything found on disk, and there is no override.
+ */
+async function runClose(verb) {
+  const e = stepsSelected();
+  if (!e) return;
+  clearConsole('steps');
+  $('#mpps-outcome').hidden = true;
+  $('#mpps-totals').hidden = true;
+  const dry = stepsDryRun();
+  const peer = e.peer && e.peer.host ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}` : (e.peer.calledAe || '?');
+  const adding = verb === 'complete' ? stepsFolderToAdd() : '';
+  // The images added to a step are sent by `dcm send`, which re-stamps
+  // nothing. A folder that is not this step's study cannot be added to it,
+  // and the line under the folder says so; this is the same refusal in code,
+  // for the case the button was reached some other way.
+  if (adding && state.mpps.mismatch) {
+    revealConsole();
+    appendConsole('steps', 'These images carry a different study than this step. Clear the folder to complete without them, or perform that study as its own exam.\n', 'stderr');
+    return;
+  }
+  let argv = stepsCloseArgv(verb);
+  let extra = '';
 
-  const open = entries.filter((e) => e.status === 'IN PROGRESS').length;
-  box.innerHTML =
-    '<table><thead><tr><th class="pick-cell"></th><th>Status</th><th>Patient</th><th>Modality</th>' +
-    '<th>Study Instance UID</th><th>Acknowledged</th><th>Performed at</th><th>MPPS peer</th></tr></thead>' +
-    `<tbody>${rows}</tbody></table>`;
+  for (const b of ['steps-close-run', 'steps-discontinue', 'steps-discontinue-run']) $(`#${b}`).disabled = true;
+  if (!dry) revealConsole();
 
-  // The summary carries the count and, when it matters, the one that still
-  // needs an action — so a step left open is legible with the strip closed.
-  const sum = $('#session-steps-sum');
-  sum.textContent = open
-    ? `— ${entries.length}, ${open} still IN PROGRESS`
-    : `— ${entries.length}`;
-  sum.classList.toggle('changed', open > 0);
-  if (open) strip.open = true;
+  if (adding) {
+    setStatus('steps', 'running', dry ? 'Building…' : 'Sending…');
+    const sent = await runStreaming('steps', stepsSendArgv(adding));
+    const t = parseTotals(stripAnsi(sent.stdout));
+    argv = stepsCloseArgv('complete', { seriesFrom: adding });
+    if (!dry) {
+      e.folder = adding;
+      e.counts = { ...e.counts, found: t.found, sent: t.sent, acknowledged: t.acknowledged };
+      const ok = sent.code === 0 && t.found != null && t.found === t.acknowledged;
+      if (!ok) {
+        // The same rule as perform: a shortfall cannot be COMPLETED.
+        verb = 'discontinue';
+        extra = `${t.acknowledged ?? '?'} of ${t.found ?? '?'} instances were acknowledged, so the step could not be completed. <b>There is no override.</b>`;
+        appendConsole('steps', `\n${extra.replace(/<[^>]+>/g, '')} Discontinuing instead.\n`, 'stderr');
+        argv = stepsCloseArgv('discontinue', { seriesFrom: adding });
+      } else {
+        argv = stepsCloseArgv('complete', { seriesFrom: adding });
+      }
+      renderMppsTotals({ found: t.found, sent: t.sent, acknowledged: t.acknowledged, referenced: ok ? t.acknowledged : null });
+    }
+  }
 
-  // Re-drawing must not silently drop a selection that still exists — a close
-  // that just landed re-renders this table under the operator's cursor.
-  if (keep && entries.some((e) => e.mppsUid === keep)) selectStepRow(keep);
-  else clearStepsSelection();
-  renderOpenAlert();
+  setStatus('steps', 'running', dry ? 'Building…' : 'Closing…');
+  const { code } = await runStreaming('steps', argv);
+  for (const b of ['steps-close-run', 'steps-discontinue', 'steps-discontinue-run']) $(`#${b}`).disabled = false;
+  applyVerbGuards();
+  setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : (verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED')) : 'Failed');
+  if (code !== 0) revealConsole();
+
+  // The entry moves only when a real N-SET was accepted: the engine exits zero
+  // only when the SCP accepted the status it was sent, and that status is the
+  // one written here.
+  if (!dry && code === 0) {
+    e.status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
+    state.steps.armed = false;
+    refreshRowPills();
+  }
+  renderCloseOutcome({ code, dry, verb, peer, extra });
+  renderMppsPanel();
+  updateAllPreviews();
 }
 
 function wireSteps() {
-  for (const chip of $$('#steps-verb .chip')) {
-    chip.addEventListener('click', () => {
-      $$('#steps-verb .chip').forEach((c) => c.classList.remove('active'));
-      chip.classList.add('active');
-      renderStepsClose();
-    });
-  }
   $('#steps-reasoncode').addEventListener('input', renderStepsClose);
+  $('#steps-reason').addEventListener('change', () => {
+    const other = $('#steps-reason').value === '__other';
+    $('#steps-reasoncode').hidden = !other;
+    if (other) $('#steps-reasoncode').focus();
+    renderStepsClose();
+  });
   $('#steps-series').addEventListener('change', renderStepsClose);
-  for (const chip of $$('#steps-mode .chip')) {
-    chip.addEventListener('click', () => {
-      $$('#steps-mode .chip').forEach((c) => c.classList.remove('active'));
-      chip.classList.add('active');
-      renderStepsClose();
-    });
-  }
-
-  const results = $('#steps-results');
-  results.addEventListener('click', (e) => {
-    const tr = e.target.closest('tr.pick-row');
-    if (tr) selectStepRow(tr.dataset.uid);
+  $('#steps-close-run').addEventListener('click', () => runClose('complete'));
+  $('#steps-discontinue').addEventListener('click', () => {
+    state.steps.armed = true;
+    // A reason belongs to the step it was given for: arming starts blank
+    // rather than carrying the last patient's reason into this one.
+    $('#steps-reason').value = '';
+    $('#steps-reasoncode').value = '';
+    $('#steps-reasoncode').hidden = true;
+    renderStepsClose();
+    $('#steps-reason').focus();
   });
-  results.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    const tr = e.target.closest('tr.pick-row');
-    if (!tr) return;
-    e.preventDefault();
-    selectStepRow(tr.dataset.uid);
+  $('#steps-discontinue-cancel').addEventListener('click', () => {
+    state.steps.armed = false;
+    renderStepsClose();
   });
-
-  $('#steps-close-run').addEventListener('click', async () => {
-    const e = stepsSelected();
-    clearConsole('steps');
-    if (!e) return;
-    const dry = stepsDryRun();
-    const verb = stepsVerb();
-    setStatus('steps', 'running', dry ? 'Building…' : 'Closing…');
-    $('#steps-close-run').disabled = true;
-    if (!dry) revealConsole();
-    const { code } = await runStreaming('steps', stepsCloseArgv());
-    $('#steps-close-run').disabled = false;
-    setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Closed') : 'Failed');
-    if (code !== 0) revealConsole();
-
-    // The entry moves only when a real N-SET was accepted. This is not the app
-    // repainting a row from what it hoped happened: the engine exits zero only
-    // when the SCP accepted the status it was sent, and that status is the one
-    // written here.
-    if (!dry && code === 0) {
-      e.status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
-      renderSteps();
-      // The worklist row's badge names this app's own step, so it moves with it.
-      refreshSessionBadges();
-    }
-  });
-
-  renderSteps();
+  $('#steps-discontinue-run').addEventListener('click', () => runClose('discontinue'));
   renderStepsClose();
 }
 
@@ -2722,7 +3428,7 @@ function speedMode() {
  */
 function speedRuns() {
   const prefix = ($('#speed-aeprefix').value.trim() || 'AST').toUpperCase();
-  const baseChunk = $('#speed-chunk').value.trim();
+  const baseChunk = fieldOr('speed-chunk', 'chunk');
   const mode = speedMode();
   const runs = [];
 
@@ -2835,10 +3541,12 @@ BUILDERS.speed = () => {
 function renderSpeedParallelHint() {
   const el = $('#speed-parallel-hint');
   if (!el) return;
-  const baseChunk = $('#speed-chunk').value.trim();
+  const baseChunk = fieldOr('speed-chunk', 'chunk');
   if (baseChunk) {
-    el.textContent = `Chunk size ${baseChunk} below applies to every run and overrides each preset's own sizing, `
-      + 'so a preset may not reach its association count. Clear it to compare the presets as they ship.';
+    const from = $('#speed-chunk').value.trim() ? 'below' : 'from Settings';
+    el.innerHTML = esc(`Chunk size ${baseChunk} ${from} applies to every run and overrides each preset's own sizing, `
+      + 'so a preset may not reach its association count. ')
+      + '<button type="button" class="linklike" data-help="speed-help">Why</button>';
     el.classList.add('live');
     return;
   }
@@ -2858,14 +3566,12 @@ function renderSpeedParallelHint() {
   // came back short in 4 of 4 runs, 150 unacknowledged.
   //
   // Which ending arrives is timing, not a setting, so the line promises
-  // neither. It names both and points at the column that answers each. This
-  // wording tracks desktop/README.md and `dcm send --help`; the three say the
-  // same thing on purpose.
-  el.textContent = 'This is how you find the receiver\'s ceiling — read the Width column and the Ack column '
-    + 'afterwards, because neither answers the other\'s question: a refused association is retried with no '
-    + 'backoff, so the attempts burn out in milliseconds, and the run either finishes clean at a width it '
-    + 'never reached or ends with instances the receiver never acknowledged. Width says whether it ran as '
-    + 'wide as asked; the counts say whether all of it arrived.';
+  // neither. It names both and points at the column that answers each. The
+  // full paragraph moved into the help panel when this screen was trimmed; it
+  // still tracks desktop/README.md and `dcm send --help`, and the three say
+  // the same thing on purpose.
+  el.innerHTML = 'Read the Width and Ack columns afterwards. '
+    + '<button type="button" class="linklike" data-help="speed-help">Why</button>';
   el.classList.remove('live');
 }
 
@@ -3228,18 +3934,18 @@ async function runSpeedTest() {
   c.hidden = true;
 
   if (!folder) {
-    appendConsole('speed', 'Choose a study folder to send.\n', 'stderr');
+    fail('speed', 'Choose a study folder to send.\n');
     return;
   }
   const miss = connMissing();
   if (miss.length) {
-    appendConsole('speed', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'stderr');
+    fail('speed', `Fill in the peer connection: ${miss.join(', ')}.\n`);
     return;
   }
 
   const runs = speedRuns();
   if (!runs.length) {
-    appendConsole('speed', 'Pick at least one thing to compare.\n', 'stderr');
+    fail('speed', 'Pick at least one thing to compare.\n');
     return;
   }
 
@@ -3323,7 +4029,7 @@ async function runSpeedTest() {
 BUILDERS.webping = () => {
   const argv = ['web', 'ping'];
   if (state.web.url) argv.push('--url', state.web.url);
-  const t = $('#webping-timeout').value.trim();
+  const t = fieldOr('webping-timeout', 'timeout');
   if (t) argv.push('--timeout', t);
   return argv;
 };
@@ -3332,7 +4038,7 @@ function wireWebping() {
   $('#webping-timeout').addEventListener('input', updateAllPreviews);
   $('#view-webping [data-run]').addEventListener('click', async () => {
     clearConsole('webping');
-    if (!state.web.url) { appendConsole('webping', 'Fill in the server URL.\n', 'stderr'); return; }
+    if (!state.web.url) { fail('webping', 'Fill in the server URL.\n'); return; }
     setStatus('webping', 'running', 'Testing…');
     const { code } = await runStreaming('webping', BUILDERS.webping());
     setStatus('webping', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : 'Failed');
@@ -3347,31 +4053,32 @@ BUILDERS.websend = () => {
   const folder = $('#websend-folder').value.trim();
   if (folder) argv.push(folder);
   if (state.web.url) argv.push('--url', state.web.url);
-  const chunk = $('#websend-chunk').value.trim();
+  const chunk = fieldOr('websend-chunk', 'chunk');
   if (chunk) argv.push('--chunk', chunk);
-  const retry = $('#websend-retry').value.trim();
+  const retry = fieldOr('websend-retry', 'retry');
   if (retry !== '') argv.push('--retry', retry);
-  const timeout = $('#websend-timeout').value.trim();
+  const timeout = fieldOr('websend-timeout', 'timeout');
   if (timeout) argv.push('--timeout', timeout);
-  if ($('#websend-dryrun').checked) argv.push('--dry-run');
+  if (rehearsal()) argv.push('--dry-run');
   return argv;
 };
 
 function wireWebsend() {
   ['websend-folder', 'websend-chunk', 'websend-retry', 'websend-timeout'].forEach((id) =>
     $(`#${id}`).addEventListener('input', updateAllPreviews));
-  $('#websend-dryrun').addEventListener('change', updateAllPreviews);
 
   $('#view-websend [data-run]').addEventListener('click', async () => {
     const folder = $('#websend-folder').value.trim();
     clearConsole('websend');
-    if (!folder) { appendConsole('websend', 'Choose a folder to send.\n', 'stderr'); return; }
-    if (!state.web.url) { appendConsole('websend', 'Fill in the server URL.\n', 'stderr'); return; }
-    setStatus('websend', 'running', 'Sending…');
+    if (!folder) { fail('websend', 'Choose a folder to send.\n'); return; }
+    // A rehearsal opens no connection, so it needs no server.
+    const dry = rehearsal();
+    if (!dry && !state.web.url) { fail('websend', 'Pick a DICOMweb server on the chip, or add one in Settings.\n'); return; }
+    setStatus('websend', 'running', dry ? 'Scanning…' : 'Sending…');
     $('#view-websend [data-run]').disabled = true;
     const { code } = await runStreaming('websend', BUILDERS.websend());
     $('#view-websend [data-run]').disabled = false;
-    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? 'Complete' : 'Failed');
+    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Complete') : 'Failed');
   });
 }
 
@@ -3398,6 +4105,8 @@ BUILDERS.webquery = () => {
   else if (level === 'instances') argv.push('--instances');
   const limit = $('#webquery-limit').value.trim();
   if (limit) argv.push('--limit', limit);
+  const timeout = state.settings.defaults.timeout;
+  if (timeout) argv.push('--timeout', timeout);
   return argv;
 };
 
@@ -3433,7 +4142,7 @@ function wireWebquery() {
   $('#view-webquery [data-run]').addEventListener('click', async () => {
     clearConsole('webquery');
     $('#view-webquery [data-result]').hidden = true;
-    if (!state.web.url) { appendConsole('webquery', 'Fill in the server URL.\n', 'stderr'); return; }
+    if (!state.web.url) { fail('webquery', 'Fill in the server URL.\n'); return; }
     setStatus('webquery', 'running', 'Querying…');
     const { code, stdout, stderr } = await runCapture('webquery', [...BUILDERS.webquery(), '--json']);
 
@@ -3450,7 +4159,7 @@ function wireWebquery() {
       renderWebQueryResults(parsed);
     } else {
       const c = consoleEl('webquery'); c.hidden = false;
-      appendConsole('webquery', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+      revealConsole('webquery'); appendConsole('webquery', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
     }
   });
 }
@@ -3473,6 +4182,19 @@ BUILDERS.webhub = () => {
   return argv;
 };
 
+/** One line naming whatever the hub's Advanced holds: both knobs make it refuse things. */
+function renderWebhubAdvSummary() {
+  const el = $('#webhub-adv-sum');
+  if (!el) return;
+  const token = $('#webhub-token').value.trim();
+  const reject = $('#webhub-rejectafter').value.trim();
+  const parts = [];
+  if (token) parts.push('a Bearer token is required');
+  if (reject) parts.push(`rejects after ${reject}`);
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— open, accepts everything';
+  el.classList.toggle('changed', parts.length > 0);
+}
+
 function wireWebhub() {
   // The hub IS the server, so it has no Base URL field — but the other Web
   // screens need one. Show the address to point them at, built from the port
@@ -3485,23 +4207,24 @@ function wireWebhub() {
       return;
     }
     const url = `http://127.0.0.1:${port}`;
-    hint.innerHTML = `Clients point at <code>${esc(url)}</code> — <button class="linklike" id="webhub-use">use it on the other Web screens</button>`;
+    hint.innerHTML = `Clients point at <code>${esc(url)}</code> — <button class="linklike" id="webhub-use">use it on the other tabs</button>`;
     $('#webhub-use').addEventListener('click', () => {
       state.web.url = url;
-      syncWebInputs();
+      renderWebChips();
       updateAllPreviews();
     });
   };
 
   ['webhub-port', 'webhub-persist', 'webhub-root', 'webhub-token', 'webhub-rejectafter'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', updateAllPreviews));
+    $(`#${id}`).addEventListener('input', () => { renderWebhubAdvSummary(); updateAllPreviews(); }));
   $('#webhub-port').addEventListener('input', showBaseUrl);
   showBaseUrl();
+  renderWebhubAdvSummary();
 
   $('#view-webhub [data-run]').addEventListener('click', async () => {
     clearConsole('webhub');
     const port = $('#webhub-port').value.trim();
-    if (!port) { appendConsole('webhub', 'Choose a port to listen on.\n', 'stderr'); return; }
+    if (!port) { fail('webhub', 'Choose a port to listen on.\n'); return; }
     setStatus('webhub', 'running', 'Listening');
     $('#view-webhub [data-run]').disabled = true;
     $('#view-webhub [data-cancel]').hidden = false;
@@ -3584,12 +4307,12 @@ function wireInventory() {
     const t = $('#info-folder').value.trim();
     $('#view-inventory [data-result]').hidden = true;
     const c = consoleEl('inventory'); resetConsole(c); c.hidden = true;
-    if (!t) { appendConsole('inventory', 'Choose a folder or file.\n', 'stderr'); return; }
+    if (!t) { fail('inventory', 'Choose a folder or file.\n'); return; }
     setStatus('inventory', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('inventory', [...BUILDERS.inventory(), '--json']);
     setStatus('inventory', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
     try { renderInventory(JSON.parse(stdout)); }
-    catch { appendConsole('inventory', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
+    catch { revealConsole('inventory'); appendConsole('inventory', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
   });
 }
 
@@ -3631,12 +4354,12 @@ function wireTags() {
     const t = $('#tags-target').value.trim();
     $('#view-tags [data-result]').hidden = true;
     const c = consoleEl('tags'); resetConsole(c); c.hidden = true;
-    if (!t) { appendConsole('tags', 'Choose a file or folder.\n', 'stderr'); return; }
+    if (!t) { fail('tags', 'Choose a file or folder.\n'); return; }
     setStatus('tags', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('tags', [...BUILDERS.tags(), '--json']);
     setStatus('tags', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
     try { renderTags(JSON.parse(stdout)); }
-    catch { appendConsole('tags', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
+    catch { revealConsole('tags'); appendConsole('tags', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
   });
 }
 
@@ -3672,7 +4395,9 @@ BUILDERS.edit = () => {
   const out = $('#edit-out').value.trim();
   if (out) argv.push('--out', out);
   if (editScope() === 'one') argv.push('--no-recurse');
-  if ($('#edit-dryrun').checked) argv.push('--dry-run');
+  // Preview-only is this tab's own switch (it is about the disk, not a peer);
+  // rehearsal adds the same flag from the other direction.
+  if ($('#edit-dryrun').checked || rehearsal()) argv.push('--dry-run');
   if ($('#edit-force').checked) argv.push('--force');
   return argv;
 };
@@ -3760,7 +4485,7 @@ async function loadTagsForEditing() {
   const target = $('#edit-target').value.trim();
   clearConsole('edit');
   if (!target) {
-    appendConsole('edit', 'Choose a study folder or a .dcm file first.\n', 'stderr');
+    fail('edit', 'Choose a study folder or a .dcm file first.\n');
     return;
   }
 
@@ -3771,7 +4496,7 @@ async function loadTagsForEditing() {
   setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Loaded' : 'Failed');
 
   if (code !== 0) {
-    appendConsole('edit', stdout || stderr || 'Could not read tags.\n', 'stderr');
+    fail('edit', stdout || stderr || 'Could not read tags.\n');
     return;
   }
 
@@ -3779,13 +4504,13 @@ async function loadTagsForEditing() {
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    appendConsole('edit', stdout || 'Unexpected output.\n', 'stderr');
+    fail('edit', stdout || 'Unexpected output.\n');
     return;
   }
 
   const first = (parsed.results || [])[0];
   if (!first) {
-    appendConsole('edit', 'No DICOM instances found there.\n', 'stderr');
+    fail('edit', 'No DICOM instances found there.\n');
     return;
   }
 
@@ -3825,12 +4550,12 @@ function wireEdit() {
     const target = $('#edit-target').value.trim();
     const out = $('#edit-out').value.trim();
 
-    if (!target) { appendConsole('edit', 'Choose a source folder or file.\n', 'stderr'); return; }
+    if (!target) { fail('edit', 'Choose a source folder or file.\n'); return; }
     if (!editState.changes.size && !editState.removals.size) {
-      appendConsole('edit', 'Nothing to apply — change a value or tick a tag to remove.\n', 'stderr');
+      fail('edit', 'Nothing to apply — change a value or tick a tag to remove.\n');
       return;
     }
-    if (!out) { appendConsole('edit', 'Choose where to write the edited copy.\n', 'stderr'); return; }
+    if (!out) { fail('edit', 'Choose where to write the edited copy.\n'); return; }
 
     const touchingUid = [...editState.changes.keys(), ...editState.removals]
       .some((kw) => UID_KEYWORDS.has(kw));
@@ -3842,7 +4567,7 @@ function wireEdit() {
       return;
     }
 
-    setStatus('edit', 'running', $('#edit-dryrun').checked ? 'Previewing…' : 'Writing…');
+    setStatus('edit', 'running', ($('#edit-dryrun').checked || rehearsal()) ? 'Previewing…' : 'Writing…');
     const { code } = await runStreaming('edit', BUILDERS.edit());
     setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
   });
@@ -3864,15 +4589,31 @@ BUILDERS.anon = () => {
   return argv;
 };
 
+/** One line naming what de-identification was told to keep. */
+function renderAnonAdvSummary() {
+  const el = $('#anon-adv-sum');
+  if (!el) return;
+  const prefix = $('#anon-prefix').value.trim();
+  const parts = [];
+  if (prefix) parts.push(`pseudonyms as ${prefix}…`);
+  if ($('#anon-keepdesc').checked) parts.push('keeps descriptions');
+  if ($('#anon-keepprivate').checked) parts.push('keeps private tags');
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— removes everything it knows how to remove';
+  el.classList.toggle('changed', parts.length > 0);
+}
+
 function wireAnon() {
-  ['anon-folder', 'anon-out', 'anon-prefix'].forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
-  ['anon-keepdesc', 'anon-keepprivate'].forEach((id) => $(`#${id}`).addEventListener('change', updateAllPreviews));
+  ['anon-folder', 'anon-out', 'anon-prefix'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', () => { renderAnonAdvSummary(); updateAllPreviews(); }));
+  ['anon-keepdesc', 'anon-keepprivate'].forEach((id) =>
+    $(`#${id}`).addEventListener('change', () => { renderAnonAdvSummary(); updateAllPreviews(); }));
+  renderAnonAdvSummary();
   $('#view-anon [data-run]').addEventListener('click', async () => {
     clearConsole('anon');
     const f = $('#anon-folder').value.trim();
     const out = $('#anon-out').value.trim();
-    if (!f) { appendConsole('anon', 'Choose a folder to de-identify.\n', 'stderr'); return; }
-    if (!out) { appendConsole('anon', 'Choose an output folder.\n', 'stderr'); return; }
+    if (!f) { fail('anon', 'Choose a folder to de-identify.\n'); return; }
+    if (!out) { fail('anon', 'Choose an output folder.\n'); return; }
     setStatus('anon', 'running', 'De-identifying…');
     const { code } = await runStreaming('anon', BUILDERS.anon());
     setStatus('anon', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
@@ -3957,74 +4698,86 @@ async function checkMcpStatus() {
   }
 }
 
-/** Ctrl/Cmd+Enter runs the active view's primary action. */
 // --------------------------------------------------------------------------
-// Info icons — one handler for every circled-i in the app
+// Help panels — the ? in a screen's header
 // --------------------------------------------------------------------------
 /**
- * One short line stays on screen; the reasoning behind it opens as a block
- * directly under that line.
+ * Every explanation the screens used to carry inline, one panel per screen.
  *
- * Deliberately a block and not a floating popover. These explanations run to
- * 40-90 words, and at this column width a popover wide enough to hold one
- * would cover the very rows it is explaining and would need edge-collision
- * code against the page, the capped table scroll and the panel — measurement
- * logic this renderer has no business growing. A block cannot be clipped and
- * cannot cover data.
+ * Deliberately a block under the header and not a floating popover. These
+ * explanations run to several paragraphs, and a popover wide enough to hold
+ * one would cover the very controls it is explaining and would need
+ * edge-collision code against the page, the capped table scroll and the
+ * panels — measurement logic this renderer has no business growing. A block
+ * cannot be clipped and cannot cover data.
  *
- * Warnings that matter when they arise are never put in here: the mismatch
- * choice, the folder verdicts, the missing Type 1 notes and every failed
- * outcome stay inline.
+ * Nothing that matters at the moment it arises is put in here: the folder
+ * verdicts, the missing Type 1 notes, the amber Insane warning and every
+ * failed outcome stay on the screen. What lives in a panel is the reasoning —
+ * what an operator does not need to read to act, but does need to read to
+ * trust the thing.
+ *
+ * Any control can open one: the Insane note and the de-identify caution carry
+ * their own link into the panel that explains them, so the short line on
+ * screen and the long form behind it are never two separate texts to keep in
+ * agreement.
  */
-function infoBtnFor(pop) {
-  return $(`.info-btn[aria-controls="${pop.id}"]`);
-}
-
-function closeInfo(pop, focusBtn = false) {
-  pop.hidden = true;
-  const btn = infoBtnFor(pop);
-  if (btn) {
-    btn.setAttribute('aria-expanded', 'false');
-    if (focusBtn) btn.focus();
+function setHelp(id, open) {
+  const panel = document.getElementById(id);
+  if (!panel) return;
+  panel.hidden = !open;
+  for (const btn of $$(`.help-btn[aria-controls="${id}"]`)) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
+  if (open) panel.scrollTop = 0;
 }
 
-function closeAllInfo(except) {
-  for (const p of $$('.info-pop:not([hidden])')) if (p !== except) closeInfo(p);
-}
-
-function wireInfo() {
+function wireHelp() {
   document.addEventListener('click', (e) => {
-    // A click inside an open explanation is someone reading or selecting it.
-    if (e.target.closest('.info-pop')) return;
-    const btn = e.target.closest('.info-btn');
-    if (!btn) { closeAllInfo(); return; }
-    // The icons inside a <label class="choice"> and inside a <summary> would
-    // otherwise pick the radio / toggle the disclosure on the way past.
+    // A click inside an open panel is someone reading or selecting it.
+    const close = e.target.closest('[data-help-close]');
+    if (close) {
+      const panel = close.closest('.help-panel');
+      if (panel) setHelp(panel.id, false);
+      return;
+    }
+    if (e.target.closest('.help-panel')) return;
+    const btn = e.target.closest('[data-help]');
+    if (!btn) return;
+    // The icons sit inside <summary> and <label> elements that would otherwise
+    // toggle a disclosure or a checkbox on the way past.
     e.preventDefault();
     e.stopPropagation();
-    const pop = document.getElementById(btn.getAttribute('aria-controls'));
-    if (!pop) return;
-    const opening = pop.hidden;
-    closeAllInfo(pop); // only one open at a time, so layout grows by one block
-    pop.hidden = !opening;
-    btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    const panel = document.getElementById(btn.dataset.help);
+    if (!panel) return;
+    // The header's ? toggles; a link from inside the screen always opens, so
+    // clicking "what going too wide looks like" never shuts the answer.
+    const open = btn.classList.contains('help-btn') ? panel.hidden : true;
+    setHelp(panel.id, open);
+    if (open && !btn.classList.contains('help-btn')) panel.scrollIntoView({ block: 'nearest' });
   });
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    const open = $$('.info-pop:not([hidden])');
+    const open = $$('.help-panel:not([hidden])');
     if (!open.length) return;
     e.stopPropagation();
-    open.forEach((p, i) => closeInfo(p, i === 0));
+    for (const p of open) {
+      setHelp(p.id, false);
+      const btn = $(`.help-btn[aria-controls="${p.id}"]`);
+      if (btn) btn.focus();
+    }
   });
 }
 
+/** Ctrl/Cmd+Enter runs the active view's primary action. */
 function wireKeyboard() {
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       const active = $('.view.active');
-      const run = active && active.querySelector('[data-run]:not([disabled])');
+      // The first run button that is actually on screen: a tabbed screen holds
+      // one per tab, and only the open tab's is in layout.
+      const run = active && $$('[data-run]:not([disabled])', active).find((b) => b.offsetParent !== null);
       if (run) { run.click(); e.preventDefault(); }
     }
   });
@@ -4130,12 +4883,22 @@ async function boot() {
   $('#engine-version').textContent = `engine v${state.info.version}`;
 
   $$('.nav-item').forEach((b) => b.addEventListener('click', () => showView(b.dataset.view)));
+  // In-page links to another screen ("← Settings" on the echo screen).
+  document.addEventListener('click', (e) => {
+    const go = e.target.closest('[data-goto]');
+    if (go) showView(go.dataset.goto);
+  });
 
+  await loadSettings();
   await loadProfiles();
-  mountConnectionPanels();
-  mountWebPanels();
+  // The web chip starts on the first saved server; the peer chips start on
+  // whichever saved peer holds each screen's role, chosen when the screen opens.
+  state.web.url = (webProfiles()[0] || {}).url || '';
+  wirePeerChips();
+  wireTabs();
+  wireSettings();
 
-  wireInfo();
+  wireHelp();
   wireEcho();
   wireSend();
   wireReceive();
@@ -4158,7 +4921,20 @@ async function boot() {
   wireUpdates();
   checkMcpStatus();
 
-  updateAllPreviews();
+  renderSettingsForm();
+  refreshPeerViews();
+  // Seeds the screens from Settings, folds the commands, raises the banner,
+  // and rebuilds every preview from all of it.
+  applySettings();
+
+  // Where the last session left off. The first launch, and any launch whose
+  // remembered screen no longer exists, lands on the station (showView falls
+  // back to the worklist for a name it does not know).
+  let remembered = null;
+  try { remembered = await window.dcm.appState.get(); } catch { remembered = null; }
+  const tabs = (remembered && remembered.activeTabs) || {};
+  for (const [group, tab] of Object.entries(tabs)) if (typeof tab === 'string') showTab(group, tab);
+  showView((remembered && remembered.activeView) || 'worklist');
 }
 
 boot();

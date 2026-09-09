@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.15.0
+
+The app is rebuilt around the worklist. It opens there, peers are configured
+once, and performing an exam is two clicks and a folder.
+
+Verbosity had been raised three times — the MPPS panel, then the merged
+worklist screen, then everything. The first two passes trimmed inside the
+existing structure and it kept coming back, so this pass changed the
+structure. An audit put numbers on it: the worklist screen carried 23 inputs,
+25 buttons, 5 disclosures and 858 visible words, three times any other screen,
+and the app had 14 info-popovers and 15 flat sidebar entries. It now stands at
+43 visible words above the primary button, and eight sidebar entries plus
+Settings.
+
+**The worklist is a station.** It is the landing screen, it fetches on open and
+refreshes every 60 seconds while visible, and it reads: peer chip, modality
+pill, one search box that decides for itself whether you typed a name, an ID
+or an accession, and Today / Tomorrow / Pick. Click a patient and you get the
+banner, an Images picker, one line saying what the folder holds, and **Perform
+exam** — with **Start only** beside it for the split flow, which then offers
+Complete or Discontinue. Everything else moved: the storage peer to Settings,
+the step ID and station AE to a Details fold seeded from the row, chunk and
+retry to Settings defaults, and every info-popover paragraph into one help
+panel behind the header's ?. Nothing that was written was deleted.
+
+**The mismatch question is answered rather than asked.** Stock images carrying
+a study the worklist never heard of used to raise a two-radio choice between
+`--adopt-worklist-identity` and `--allow-study-mismatch`. The station now does
+what a modality does — sends a re-stamped copy — and says so in one line. The
+as-is path still exists, behind an engineer option in Settings, because it is
+occasionally the thing being tested.
+
+**Peers are configured once.** Settings holds the station's AE Title (one fact:
+the worklist keys on the called AE, MPPS attribution on the performed station
+AE, which is this), the saved peers with a RIS or Archive role, defaults for
+chunk / retry / timeout / retrieve AE / recurse / worklist limit, and the
+engineer options. Every screen shows a one-line peer chip instead of four
+fields, pre-selecting the peer holding the role that screen needs. Existing
+`profiles.json` entries keep working with no role until you give them one, and
+a peer may still carry its own calling AE.
+
+**Rehearsal replaces the dry-run controls.** One toggle in Settings puts
+`--dry-run` on every command and an amber banner across the top. The per-screen
+dry-run chips and checkboxes are gone.
+
+**Fifteen screens became eight.** The four DICOMweb screens are one tabbed
+screen; Inventory, Tags, Edit and De-identify are one Tools screen. Every
+screen follows the same shape: what → peer → the few controls that change what
+is sent → one primary button → status → result → the command → the output. The
+active screen and tab are remembered across launches.
+
+The command is still the command. It is folded under the button now rather
+than always open — an engineer option keeps them all expanded — but it is
+never absent, and the output still shows exactly what ran.
+
+**What three reviews found, all of it fixed before this shipped.** An operator
+walkthrough, a flag-by-flag audit against the old builders, and a code and
+preview-integrity pass ran against the finished redesign. Eleven findings; the
+ones worth recording:
+
+- **Auto-refresh could re-point the selection at a different patient**, and the
+  resulting `mpps perform` then carried attributes from two of them. Found
+  independently by two of the three reviews. Rows are now identified by study
+  and step rather than by position, a row that cannot be keyed detaches from
+  the table instead of silently re-binding, and a refresh that changes the row
+  behind the selection re-seeds the panel and re-checks the folder. This is the
+  defect that justified the review phase: it is the one failure this tool must
+  never have, since attributing one patient's images to another patient's order
+  is exactly what MPPS exists to get right.
+- **A RIS that was down read as "nothing scheduled"**, with a green timestamp.
+  The success test accepted an empty match list, which a connection failure
+  produces. It now reads the engine's own verdict, turns the chip red, prints
+  the error where the list goes, and labels any surviving rows with the time
+  they were actually read.
+- **The image folder carried over to the next patient**, and the verbs were
+  clickable before the folder had been checked against the selected row.
+- **The close path promised a re-stamped copy it never makes.** Adding images
+  to an already-open step cannot re-stamp them, so the line now says what would
+  actually happen and the verb is blocked while such a folder is chosen.
+- **"Start only" ran a command that was never shown**, which breaks this app's
+  one rule. It has its own fold now.
+- Conformance vocabulary — "Type 1", "N-CREATE" — is off the workflow surface
+  and lives in the help panel. Discontinuing an exam is a picker of the seven
+  standard reasons in plain words rather than a code triplet typed from memory.
+- `--limit` on the worklist query had become unreachable; it is a Settings
+  field again.
+
 ## v0.14.3
 
 The app locked up mid-send and held the association open. Reported against a

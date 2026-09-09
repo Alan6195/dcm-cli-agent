@@ -130,8 +130,37 @@ function migrateLegacyProfiles() {
   }
 }
 
-/** GUI-only state: window bounds, last-run version. Same policy as profiles —
- * this is the app's own file, the engine still never reads any config. */
+/** Where the GUI's settings live: the station's AE Title, peer roles' defaults,
+ * rehearsal and the engineer options. Mirrors the profiles file exactly, and
+ * under the same policy — the renderer reads it and writes every value it uses
+ * into the command line; the engine never opens it. */
+function settingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function readSettings() {
+  try {
+    const data = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
+    if (data && typeof data === 'object' && !Array.isArray(data)) return data;
+  } catch {
+    /* no settings yet */
+  }
+  return {};
+}
+
+function writeSettings(data) {
+  try {
+    fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+    fs.writeFileSync(settingsPath(), JSON.stringify(data, null, 2));
+    return true;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+/** GUI-only state: window bounds, last-run version, the screen that was open.
+ * Same policy as profiles — this is the app's own file, the engine still never
+ * reads any config. */
 function appStatePath() {
   return path.join(app.getPath('userData'), 'app-state.json');
 }
@@ -747,6 +776,23 @@ app.whenReady().then(() => {
 
   ipcMain.handle('dcm:profiles:get', () => readProfiles());
   ipcMain.handle('dcm:profiles:set', (_event, data) => writeProfiles(data));
+
+  ipcMain.handle('dcm:settings:get', () => readSettings());
+  ipcMain.handle('dcm:settings:set', (_event, data) => writeSettings(data));
+
+  // The renderer may remember which screen and tabs were open, and nothing
+  // else: the bounds and the version stamp are this process's to write.
+  ipcMain.handle('dcm:appstate:get', () => {
+    const s = readAppState();
+    return { activeView: s.activeView || null, activeTabs: s.activeTabs || {} };
+  });
+  ipcMain.handle('dcm:appstate:set', (_event, patch) => {
+    const next = {};
+    if (patch && typeof patch.activeView === 'string') next.activeView = patch.activeView;
+    if (patch && patch.activeTabs && typeof patch.activeTabs === 'object') next.activeTabs = patch.activeTabs;
+    if (Object.keys(next).length) writeAppState(next);
+    return { ok: true };
+  });
 
   ipcMain.handle('dcm:reveal', (_event, target) => {
     if (target && fs.existsSync(target)) {

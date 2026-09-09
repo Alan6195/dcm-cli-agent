@@ -9,7 +9,9 @@
 </head>
 <body>
   <div class="app">
-    <!-- Sidebar -->
+    <!-- Sidebar: eight screens and Settings. The peers, the station's own AE
+         Title and every default live in Settings, so the screens carry only what
+         changes per run. Settings is pinned at the bottom, above the footer. -->
     <nav class="sidebar">
       <div class="brand">
         <div class="brand-mark">◈</div>
@@ -19,57 +21,33 @@
         </div>
       </div>
 
-      <div class="nav-group-label">Connectivity</div>
-      <button class="nav-item active" data-view="echo">
-        <span class="nav-ico">◎</span> Test connection
+      <button class="nav-item" data-view="worklist">
+        <span class="nav-ico">▦</span> Worklist
       </button>
       <button class="nav-item" data-view="send">
-        <span class="nav-ico">▲</span> Send a study
+        <span class="nav-ico">▲</span> Send
       </button>
       <button class="nav-item" data-view="receive">
-        <span class="nav-ico">▼</span> Receive images
+        <span class="nav-ico">▼</span> Receive
       </button>
       <button class="nav-item" data-view="query">
-        <span class="nav-ico">⌕</span> Query a peer
+        <span class="nav-ico">⌕</span> Query
       </button>
-      <button class="nav-item" data-view="worklist">
-        <span class="nav-ico">▦</span> Worklist &amp; perform
+      <button class="nav-item" data-view="web">
+        <span class="nav-ico">⊚</span> DICOMweb
+      </button>
+      <button class="nav-item" data-view="tools">
+        <span class="nav-ico">≣</span> Tools
       </button>
       <button class="nav-item" data-view="speed">
         <span class="nav-ico">⏱</span> Speed test
       </button>
-
-      <div class="nav-group-label">DICOMweb</div>
-      <button class="nav-item" data-view="webping">
-        <span class="nav-ico">⊚</span> Web: test connection
-      </button>
-      <button class="nav-item" data-view="websend">
-        <span class="nav-ico">⇧</span> Web: send a study
-      </button>
-      <button class="nav-item" data-view="webquery">
-        <span class="nav-ico">⌗</span> Web: query (QIDO)
-      </button>
-      <button class="nav-item" data-view="webhub">
-        <span class="nav-ico">⌂</span> Web: local hub
-      </button>
-
-      <div class="nav-group-label">Local files</div>
-      <button class="nav-item" data-view="inventory">
-        <span class="nav-ico">▤</span> Inventory
-      </button>
-      <button class="nav-item" data-view="tags">
-        <span class="nav-ico">≣</span> Inspect tags
-      </button>
-      <button class="nav-item" data-view="edit">
-        <span class="nav-ico">✎</span> Edit tags
-      </button>
-      <button class="nav-item" data-view="anon">
-        <span class="nav-ico">⦸</span> De-identify
-      </button>
-
-      <div class="nav-group-label">Assistant</div>
       <button class="nav-item" data-view="mcp">
-        <span class="nav-ico">✦</span> Connect to Claude
+        <span class="nav-ico">✦</span> Claude
+      </button>
+
+      <button class="nav-item nav-settings" data-view="settings">
+        <span class="nav-ico">⚙</span> Settings
       </button>
 
       <div class="sidebar-footer">
@@ -93,362 +71,188 @@
     <!-- Main -->
     <main class="content">
 
-      <!-- ECHO -->
-      <section class="view active" id="view-echo">
+      <!-- Rehearsal is one switch in Settings, not a control per screen. While it
+           is on this banner stays on screen so a "Perform" or "Send" button can
+           never be read as the real thing. -->
+      <div class="rehearsal-banner" id="rehearsal-banner" hidden>
+        <b>Rehearsal</b> — nothing is sent. Every command that can take <code>--dry-run</code> gets it.
+        <button class="linklike" id="rehearsal-off">Turn off</button>
+      </div>
+
+      <!-- WORKLIST — the station.
+           Built to be used standing at the acquisition console: the list of
+           what is scheduled at the top, the one selected patient below it,
+           one verb per button. The RIS peer, the station's AE Title and the
+           default modality come from Settings; the images come from a folder;
+           everything else on the command is read off the selected row. -->
+      <section class="view station" id="view-worklist">
         <header class="view-head">
-          <h1>Test a connection</h1>
-          <p>C-ECHO — is the peer there, and does it accept your AE Title? Nothing is sent.</p>
+          <h1>Worklist</h1>
+          <button type="button" class="help-btn" id="mwl-help-btn" data-help="mwl-help" aria-expanded="false" aria-controls="mwl-help" title="How worklist &amp; MPPS work">?</button>
         </header>
-        <div class="conn-host" data-conn></div>
-        <div class="form-row">
-          <label>Timeout (ms)<input type="number" id="echo-timeout" placeholder="60000" min="1000" step="1000" /></label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Run C-ECHO</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
 
-      <!-- SEND -->
-      <section class="view" id="view-send">
-        <header class="view-head">
-          <h1>Send a study</h1>
-          <p>C-STORE a folder to a peer, then report exactly what was acknowledged. A partial transfer is a failure.</p>
-        </header>
-        <div class="form-row">
-          <label class="grow">Folder to send
-            <div class="path-pick">
-              <input type="text" id="send-folder" placeholder="Choose a folder of DICOM files…" />
-              <button class="btn ghost" data-pick="send-folder" data-pick-mode="folder">Browse…</button>
-            </div>
-          </label>
-        </div>
-        <div class="conn-host" data-conn></div>
+        <!-- Every explanation this screen used to carry inline, in one place.
+             Nothing here is needed to use the screen; all of it is needed to
+             trust it, so none of it was deleted — only moved. -->
+        <div class="help-panel" id="mwl-help" hidden>
+          <div class="help-head"><b>How worklist &amp; MPPS work</b><button type="button" class="linklike" id="mwl-help-close" data-help-close>Close</button></div>
 
-        <div class="section-title">Speed</div>
-        <div class="chip-row" id="send-speed">
-          <button class="chip active" data-speed="normal">Normal</button>
-          <button class="chip" data-speed="fast">Fast</button>
-          <button class="chip" data-speed="very-fast">Very fast</button>
-          <button class="chip warn" data-speed="insane">Insane</button>
-        </div>
-        <p class="mode-hint" id="send-speed-hint"></p>
-        <div class="local-note" id="send-speed-danger" hidden>
-          <b>Insane is a benchmark setting, against a receiver you own.</b> The receiver decides how many
-          associations it will accept, and going past that limit gets the extras rejected. A rejected
-          association is retried, so this usually does not arrive as a slower run or as a shortfall between
-          instances found and acknowledged: it arrives as a run that reports a narrower parallelism than the
-          sixteen it asked for, at the bottom of the output. A study also has to split into at least sixteen
-          chunks before sixteen associations can run at once, so a small one runs narrower than this no matter
-          what the receiver allows.
+          <h4>The list</h4>
+          <p>The query is a C-FIND at worklist level and changes nothing on the SCP. Scheduling filters go inside the <b>Scheduled Procedure Step Sequence</b>, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty. The worklist SCP keys on the <b>called AE</b>; an MPPS step is attributed to the <b>performed station AE</b>, which is this station's AE Title from Settings — one fact that decides both. The engine warns when a row's scheduled station differs from it.</p>
+          <p>The search box sends one key: digits only become <code>PatientID</code>, a name (letters, or <code>^</code>) becomes a <code>PatientName</code> wildcard, anything mixed becomes <code>AccessionNumber</code>. The tag beside the box says which was chosen; click it to pick a different key.</p>
+          <p>A query that fails is not an empty worklist. An unreachable RIS, a refused association or a timeout is said where the list is, in red, with the engine's own sentence — and any rows still on screen are labelled as the last answer that was read, not this one.</p>
+          <p>Only a fresh query changes the list. A row can leave the results for reasons that have nothing to do with the performed step — the date filter, the station AE, or the SCP's own rules — and it can stay in them even after a step was accepted. What the SCP did with a scheduled entry after a performed step is not visible from this side; some SCPs keep the entry, some drop it. The list re-reads itself every minute while this screen is open. The selected patient stays selected across a refresh, matched by study and scheduled step — or, for a row that names no study, by accession, step and patient ID. A row carrying none of those cannot be matched at all: the patient stays on the panel, the panel says the list no longer identifies which row they are, and nothing is re-pointed. <b>Worklist rows to fetch</b> in Settings caps the query with <code>--limit</code>; blank asks for the whole answer.</p>
+
+          <h4>Performing an exam</h4>
+          <p><b>Perform exam</b> is one <code>dcm mpps perform</code> transaction: N-CREATE opens the step on the RIS, C-STORE sends the images to the archive, N-SET closes it. <b>COMPLETED requires every instance found on disk to have been acknowledged.</b> A shortfall makes the step DISCONTINUED and the run fails; there is no override. The RIS that takes the procedure step and the archive that takes the images are often different systems, so both are written out in full in the command even when they are the same — <b>a default you cannot see is a default nobody can check.</b> The archive is whichever saved peer holds the Archive role in Settings; with none set, the images go to the RIS peer.</p>
+          <p><b>Start only</b> is the same transaction taken apart: <code>dcm mpps start</code> opens the step and leaves it IN PROGRESS, for when the images are sent by something else or the step has to stay open in between. The row then offers <b>Complete</b> and <b>Discontinue</b>. Adding a folder to an open step sends it with <code>dcm send</code> first and then completes the step naming those images — and only if every instance was acknowledged; otherwise the step is discontinued, for the same reason as above.</p>
+          <p>PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing. <code>--series-from</code> asserts what is on this disk rather than what the archive acknowledged, so it is only taken by default when every instance found in that folder was acknowledged — otherwise the N-SET would name images the archive may not hold.</p>
+          <p>The fields the panel calls <b>Performed step ID</b> and <b>Performed station AE</b> are Type 1 in the N-CREATE — the engine refuses to open a step without either, which is why an empty one is said in amber on the panel rather than left to the run. The station AE follows this station's AE Title from Settings unless it is typed over for one patient; picking another patient puts it back.</p>
+          <p>A discontinuation reason is a code item — <code>value^scheme^meaning</code>, e.g. <code>110513^DCM^Discontinued for equipment failure</code> — so the panel offers the standard DCM reasons by name and puts the triplet on the command line. Free text is refused by the engine: a coded reason has to be a real code, not one invented here. <b>Another code…</b> is there for a site with a private scheme.</p>
+
+          <h4>When the images carry a different study</h4>
+          <p>The RIS invented its Study Instance UID before these pictures existed, so nothing on disk could be carrying it. A step naming one study while the images carry another is a pair of records the archive can never reconcile. So the station does what a modality does: a copy carrying the worklist's study, patient and accession is written to a staging directory and sent (<code>--adopt-worklist-identity</code>). Your folder is not modified; Series and SOP Instance UIDs are left alone — they belong to the equipment, not the order.</p>
+          <p>Sending the images exactly as they are (<code>--allow-study-mismatch</code>) is offered only when Settings › Engineer options allows it. The archive then files the images under one study while the RIS closes a step naming another, and nothing reconciles afterwards. Pick it only when that is the thing you are testing — or when a private tag matters, since the re-stamped copy is written by a dataset writer that does not carry private tags across.</p>
+          <p>Re-stamping belongs to <code>dcm mpps perform</code>. Images added to a step that was opened with <b>Start only</b> are sent by <code>dcm send</code>, which copies nothing and changes nothing — so a folder carrying a different study cannot be added to an open step at all, and the panel refuses it rather than filing the images under one study while closing a step that names another. Perform that study as its own exam instead.</p>
+          <p>A folder holding several studies cannot be re-stamped: Study Instance UID is the key the RIS reconciles the step against, so sending two studies under one step would attribute half these images to the wrong order, and merging them would make a study that never existed. Split the folder and perform one step per study.</p>
+
+          <h4>What the status pills mean</h4>
+          <p>A pill on a row says what <b>this app</b> sent, from this window, in this session. It is never a statement about what the RIS now shows: MPPS has no query service — there is no C-FIND for performed procedure steps — so no peer was asked. A step shown IN PROGRESS may already have been closed at someone's console, and a step this app did not perform never appears. To see what the SCP now returns, query again.</p>
+          <p>Open steps live in this window and nowhere else. Nothing is written to disk, so <b>quitting forgets them</b>: the MPPS SOP Instance UID printed by <code>start</code> is the only handle on a step, and once this window is gone nothing can hand it back. Close every open step before quitting. A step is closed on the system that took the N-CREATE, not whatever the peer chip says now; if someone else already closed it, that peer refuses the N-SET and says so. Both COMPLETED and DISCONTINUED are final.</p>
         </div>
 
-        <div class="form-row triple">
-          <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
-          <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
-        </div>
-        <div class="form-row triple">
-          <label>Convert to transfer syntax <span class="dim">(before sending)</span>
-            <select id="send-syntax">
-              <option value="">Send as stored (no conversion)</option>
-              <option value="implicit">Implicit VR Little Endian</option>
-              <option value="explicit">Explicit VR Little Endian</option>
-              <option value="deflated">Deflated Explicit VR LE</option>
-              <option value="rle">RLE Lossless</option>
-              <option value="jpeg-lossless">JPEG Lossless</option>
-              <option value="jpeg-ls">JPEG-LS Lossless</option>
-              <option value="jpeg2000">JPEG 2000 Lossless</option>
-              <option value="jpeg2000-lossy">JPEG 2000 Lossy</option>
-              <option value="jpeg-baseline">JPEG Baseline (lossy)</option>
-            </select>
-          </label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="send-dryrun" checked /> Dry run first (scan &amp; plan, no connection)</label>
-          <label><input type="checkbox" id="send-norecurse" /> Don't recurse into subfolders</label>
-          <label><input type="checkbox" id="send-rewrite" /> Rewrite Series UIDs <span class="warn-inline">(changes your data)</span></label>
-        </div>
-
-        <details class="adv" id="send-adv">
-          <summary>Advanced <span class="adv-sum" id="send-adv-sum"></span></summary>
-          <div class="adv-body">
-            <p class="mode-hint">A preset sets both of these together, because setting one alone caps the other.
-              A chunk size typed here replaces the preset's half of that and leaves its association count in
-              place — the command carries both flags and the engine names what it displaced. An association
-              count typed here replaces the preset outright: the command drops <code>--speed</code>, because a
-              preset that has lost its width would still be sizing the chunks off your number. Clear the field
-              to go back to the preset.</p>
-            <div class="form-row triple">
-              <label>Parallel associations <span class="dim">(1–16)</span>
-                <input type="number" id="send-parallel" placeholder="from the preset" min="1" max="16" />
-              </label>
-              <label>Chunk size <span class="dim">(instances per association)</span>
-                <input type="number" id="send-chunk" placeholder="from the preset" min="1" />
-              </label>
-            </div>
+        <!-- ---------------- the top bar ---------------- -->
+        <div class="station-bar">
+          <div class="conn-host" data-conn data-role="ris"></div>
+          <!-- The Modality filter: the pill shows the value, the field edits
+               it. One id (#mwl-modality) so Settings can seed it. -->
+          <span class="modality-edit">
+            <button type="button" class="chip" id="mwl-modality-pill" title="Modality filter (from Settings) — click to change"></button>
+            <input type="text" id="mwl-modality" class="chip-input narrow" maxlength="16" placeholder="modality" hidden />
+          </span>
+          <div class="chip-row seg" id="mwl-when">
+            <button class="chip active" data-when="today">Today</button>
+            <button class="chip" data-when="tomorrow">Tomorrow</button>
+            <button class="chip" data-when="custom">Pick…</button>
           </div>
-        </details>
-
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Run</button>
-          <button class="btn danger" data-cancel hidden>Stop</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="totals" data-totals hidden></div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- RECEIVE -->
-      <section class="view" id="view-receive">
-        <header class="view-head">
-          <h1>Receive images</h1>
-          <p>Run a permissive receiver (C-STORE SCP) that accepts everything and logs what arrives.</p>
-        </header>
-        <div class="form-row triple">
-          <label>Port<input type="number" id="scp-port" placeholder="11112" min="1" max="65535" /></label>
-          <label>Our AE Title<input type="text" id="scp-ae" placeholder="any" maxlength="16" /></label>
-          <label>Stop ack after (test)<input type="number" id="scp-rejectafter" placeholder="off" min="1" /></label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Save arriving images to
-            <div class="path-pick">
-              <input type="text" id="scp-persist" placeholder="(optional) acknowledge and discard if empty" />
-              <button class="btn ghost" data-pick="scp-persist" data-pick-mode="create">Browse…</button>
-              <button class="btn ghost" data-reveal="scp-persist">Open</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Only accept these calling AE Titles
-            <input type="text" id="scp-accept" placeholder="(optional) comma-separated allowlist" />
-          </label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Start receiver</button>
-          <button class="btn danger" data-cancel hidden>Stop</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap tall"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- QUERY -->
-      <section class="view" id="view-query">
-        <header class="view-head">
-          <h1>Query a peer</h1>
-          <p>C-FIND. Note: a peer can accept your images and still return zero matches — storing and indexing are different.</p>
-        </header>
-        <div class="conn-host" data-conn></div>
-        <div class="form-row">
-          <div class="level-row">
-            <span class="level-label">Level</span>
-            <label><input type="radio" name="find-level" value="study" checked /> Study</label>
-            <label><input type="radio" name="find-level" value="series" /> Series</label>
-            <label><input type="radio" name="find-level" value="image" /> Image</label>
-            <label><input type="radio" name="find-level" value="mwl" /> Worklist</label>
-            <label class="limit-inline">Limit<input type="number" id="find-limit" placeholder="all" min="1" /></label>
-          </div>
-        </div>
-        <div class="kv-block">
-          <div class="kv-label">Matching keys <span class="dim">(DICOM keyword = value; wildcards * ? and date ranges allowed)</span></div>
-          <div id="find-keys" class="kv-rows"></div>
-          <button class="btn ghost small" id="find-addkey">+ Add key</button>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Run C-FIND</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="result-table" data-result hidden></div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- WORKLIST (MWL) -->
-      <!-- WORKLIST & PERFORM — one workspace: query, pick a row, perform it, close it.
-           Formerly three screens (Worklist / Perform a step / Steps this session). The
-           merge is the point: the row you picked and the command that acts on it are in
-           view together, so nothing has to be carried across a screen boundary. -->
-      <section class="view" id="view-worklist">
-        <header class="view-head">
-          <h1>Modality Worklist</h1>
-          <p class="lede">Ask what's scheduled, then perform a step against a folder of images.<button type="button" class="info-btn" aria-expanded="false" aria-controls="info-overview" aria-label="Why this works this way"></button></p>
-        </header>
-        <div class="info-pop" id="info-overview" role="note" hidden>
-          <p>The query is a C-FIND at worklist level and changes nothing on the SCP. Scheduling filters go inside the <b>Scheduled Procedure Step Sequence</b>, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty.</p>
-          <p>Performing a step is one <code>dcm mpps perform</code> transaction: N-CREATE opens the step, C-STORE sends the images, N-SET closes it. <b>COMPLETED requires every instance found on disk to have been acknowledged.</b></p>
-        </div>
-
-        <!-- The peer, collapsed. Set once a session, so it does not deserve four fields
-             of permanent screen. The summary carries the live values, which is what makes
-             folding it away honest. -->
-        <details class="adv" id="mwl-peer">
-          <summary>MPPS peer <span class="adv-sum" id="mwl-peer-sum"></span></summary>
-          <div class="adv-body">
-            <div class="conn-host" data-conn></div>
-          </div>
-        </details>
-
-        <!-- ---------------- query bar ---------------- -->
-        <div class="chip-row" id="mwl-when">
-          <span class="qbar-label">Scheduled</span>
-          <button class="chip active" data-when="today">Today</button>
-          <button class="chip" data-when="tomorrow">Tomorrow</button>
-          <button class="chip" data-when="week">Next 7 days</button>
-          <button class="chip" data-when="any">Any date</button>
-          <button class="chip" data-when="custom">Custom…</button>
-          <input type="text" id="mwl-date" class="chip-input" placeholder="YYYYMMDD or YYYYMMDD-YYYYMMDD" hidden />
-        </div>
-
-        <div class="form-row qbar-fields">
-          <label class="narrow">Modality<input type="text" id="mwl-modality" placeholder="any" maxlength="16" /></label>
-          <label class="grow">Patient name<input type="text" id="mwl-patientname" placeholder="any — DOE^JANE, wildcards ok" /></label>
-          <label class="grow">Accession<input type="text" id="mwl-accession" placeholder="any" /></label>
-        </div>
-        <details class="adv" id="mwl-more">
-          <summary>More filters <span class="adv-sum" id="mwl-more-sum"></span></summary>
-          <div class="adv-body">
-            <div class="form-row triple">
-              <label>Scheduled station AE<input type="text" id="mwl-station" placeholder="any — e.g. CT01" maxlength="16" /></label>
-              <label>Patient ID<input type="text" id="mwl-patientid" placeholder="any" /></label>
-              <label>Limit<input type="number" id="mwl-limit" placeholder="all" min="1" /></label>
-            </div>
-          </div>
-        </details>
-
-        <div class="cmd-preview" id="mwl-cmd"></div>
-        <div class="actions">
-          <button class="btn primary" data-run id="mwl-run">Fetch worklist</button>
+          <input type="text" id="mwl-date" class="chip-input" placeholder="YYYYMMDD or a range; blank = any date" hidden />
+          <button class="btn primary small" data-run id="mwl-run">Refresh</button>
+          <label class="auto-toggle" title="Re-read the list every 60 seconds while this screen is open"><input type="checkbox" id="mwl-auto" checked /> Auto</label>
           <span class="status-chip" id="mwl-status" hidden></span>
+          <button type="button" class="chip open-chip" id="mwl-open-chip" hidden aria-pressed="false"></button>
+          <span class="search">
+            <input type="text" id="mwl-search" placeholder="Patient name, ID or accession" />
+            <button type="button" class="search-key" id="mwl-search-key" hidden title="The key this text is sent as — click to change"></button>
+          </span>
         </div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" id="mwl-cmd"></div>
+        </details>
 
-        <div class="correlation-note" id="mwl-correlation" hidden></div>
-        <div class="info-pop" id="info-correlation" role="note" hidden>
-          <p>A worklist item can leave a query's results for reasons that have nothing to do with the performed step — the date filter, the station AE, or the SCP's own rules — and it can stay in them even after a step was accepted. All that has been re-read is this query.</p>
-        </div>
+        <!-- ---------------- the list + the patient ---------------- -->
+        <div class="station-body">
+          <div class="result-table" id="mwl-results"></div>
 
-        <!-- ---------------- the table ---------------- -->
-        <div class="result-table" id="mwl-results" hidden></div>
+          <div class="pick-panel" id="mwl-detail">
+            <div class="empty-note dense" id="mwl-detail-empty">Select a patient.</div>
 
-        <p class="table-foot" id="mwl-foot" hidden>
-          Only a fresh query changes this table.<button type="button" class="info-btn" aria-expanded="false" aria-controls="info-badges" aria-label="What the badges mean"></button>
-          <span class="foot-sep">·</span>
-          <span class="dim">Badges say what <b>this app</b> sent, not what the RIS shows.</span>
-        </p>
-        <div class="info-pop" id="info-badges" role="note" hidden>
-          <p>A row is never re-coloured to claim the far end changed. What the SCP did with a scheduled entry after a performed step is not visible from this side — some SCPs keep the entry, some drop it.</p>
-          <p>The <b>This app</b> badge means only that this app performed a step here, in this window, just now. To see what the SCP now returns, query again.</p>
-        </div>
-
-        <!-- An open step whose row is not in the current results. The one case the
-             merge would otherwise lose, and the one the invariants care most about. -->
-        <div class="open-alert" id="mwl-open-alert" hidden></div>
-
-        <!-- ---------------- the action panel ---------------- -->
-        <div class="pick-panel" id="mwl-detail">
-          <div class="empty-note dense" id="mwl-detail-empty">Set a peer and fetch a worklist, then click a scheduled step to perform it.</div>
-
-          <div id="mwl-detail-body" hidden>
-            <div class="pick-head">
-              <span class="pick-title" id="mwl-detail-title">Perform this step</span>
-              <button class="btn ghost small" id="mwl-clearsel">Clear</button>
-            </div>
-
-            <!-- ===== PERFORM MODE ===== -->
-            <div id="mwl-perform-mode">
-              <div class="step-hero compact">
-                <div class="hero-line" id="mpps-hero"></div>
+            <div id="mwl-detail-body" hidden>
+              <!-- The patient banner: who, what, when — off the row, verbatim. -->
+              <div class="patient-banner">
+                <div class="hero-main" id="mpps-hero-main"></div>
+                <div class="hero-sub" id="mpps-hero-sub"></div>
+                <div class="hero-uid" id="mpps-hero-uid"></div>
+                <div class="hero-note" id="mpps-hero-note" hidden></div>
               </div>
 
-              <div class="assert-line">
-                <span id="mpps-assert-sum"></span>
-                <button class="linklike" id="mpps-assert-toggle" type="button">Show all</button>
-              </div>
-              <div class="attr-grid" id="mpps-attrs" hidden></div>
+              <!-- The list no longer says which row this patient is. Said here
+                   rather than moving the selection under the operator's hands. -->
+              <div class="folder-check warn" id="mwl-detached-note" hidden></div>
 
-              <!-- Type 1 attributes the SCP did not return. Never behind an info icon:
-                   the last of these blocks the N-CREATE outright. -->
+              <!-- Attributes the SCP did not return that the exam needs. Never
+                   behind a disclosure: the step ID stops the exam outright. -->
               <div class="folder-check warn" id="mpps-type1-warn" hidden></div>
 
-              <div class="detail-run">
+              <!-- Images: the folder, and one line saying what it holds and
+                   what will happen to it. No question is asked here — a
+                   different study is re-stamped, as a modality would, unless
+                   Settings > Engineer options turns that into a switch. -->
+              <div class="images-row">
+                <span class="images-label" id="mpps-folder-label">Images</span>
                 <div class="path-pick">
-                  <input type="text" id="mpps-folder" placeholder="Folder holding this study's images…" />
+                  <input type="text" id="mpps-folder" placeholder="Folder holding this exam's images…" />
                   <button class="btn ghost small" data-pick="mpps-folder" data-pick-mode="folder">Browse…</button>
                 </div>
-                <div class="chip-row seg" id="mpps-mode">
-                  <button class="chip active" data-mode="dry">Dry run</button>
-                  <button class="chip" data-mode="send">Perform</button>
-                </div>
-                <button class="btn primary" data-run id="mpps-run">Dry run</button>
+              </div>
+              <div class="folder-check" id="mpps-folder-check" hidden></div>
+              <div class="chip-row seg mismatch-switch" id="mpps-fix-switch" hidden>
+                <button type="button" class="chip active" data-fix="adopt" title="--adopt-worklist-identity">Re-stamp a copy</button>
+                <button type="button" class="chip warn" data-fix="asis" title="--allow-study-mismatch">Send as-is</button>
+              </div>
+              <div class="checks compact" id="steps-series-row" hidden>
+                <label><input type="checkbox" id="steps-series" /> Name this folder's images as the performed series <code>--series-from</code></label>
+              </div>
+
+              <!-- ===== the verbs ===== -->
+              <div class="detail-run" id="mwl-verbs">
+                <!-- perform mode -->
+                <button class="btn primary" data-run id="mpps-run">Perform exam</button>
+                <button class="btn ghost" id="mpps-start">Start only</button>
                 <button class="btn danger small" id="mpps-cancel" hidden>Stop</button>
                 <span class="status-chip" id="mpps-status" hidden></span>
+                <!-- close mode -->
+                <button class="btn primary" id="steps-close-run" hidden>Complete</button>
+                <button class="btn ghost" id="steps-discontinue" hidden>Discontinue</button>
+                <span class="status-chip" id="steps-status" hidden></span>
+                <button class="btn ghost small clear-sel" id="mwl-clearsel">Clear</button>
               </div>
-              <p class="mode-hint" id="mpps-mode-hint">Nothing is sent in dry run.</p>
-
-              <div class="folder-check" id="mpps-folder-check" hidden></div>
-
-              <!-- The stock-image case. Inline, always — never behind the info icon. -->
-              <div class="mismatch compact" id="mpps-mismatch" hidden>
-                <div class="mismatch-head" id="mpps-mismatch-head"></div>
-                <div class="uid-pair" id="mpps-mismatch-uids"></div>
-                <div class="mismatch-body" id="mpps-mismatch-body"></div>
-                <div class="info-pop" id="info-mismatch-why" role="note" hidden>
-                  <p>The RIS invented its Study Instance UID before these pictures existed, so nothing on disk could be carrying it. A step naming one study while the images carry another is a pair of records the archive can never reconcile.</p>
-                </div>
-                <div class="info-pop" id="info-many-studies" role="note" hidden>
-                  <p>Study Instance UID is the key the RIS reconciles the step against, so sending two studies under one step would attribute half these images to the wrong order. Adopting the worklist identity gives one folder one identity — doing it here would merge these studies into a single study that never existed.</p>
-                </div>
-                <div class="choice-list" id="mpps-choices" hidden>
-                  <label class="choice">
-                    <input type="radio" name="mpps-fix" data-fix="adopt" checked />
-                    <span class="choice-body">
-                      <span class="choice-head">Adopt the worklist identity <span class="rec">what a modality does</span></span>
-                      <span class="choice-why">Sends a re-stamped <b>copy</b>. Your folder is not modified.</span>
-                      <span class="choice-flag">adds <code>--adopt-worklist-identity</code><button type="button" class="info-btn" aria-expanded="false" aria-controls="info-adopt" aria-label="Why adopt the worklist identity"></button></span>
-                      <span class="info-pop" id="info-adopt" role="note" hidden>
-                        A RIS invents the study identity before the patient is on the table, and the modality stamps it onto whatever it acquires. This does the same: a copy carrying the worklist's study, patient and accession is written to a staging directory and its path is printed. Series and SOP Instance UIDs are left alone — they belong to the equipment, not the order.
-                      </span>
-                    </span>
-                  </label>
-                  <label class="choice">
-                    <input type="radio" name="mpps-fix" data-fix="asis" />
-                    <span class="choice-body">
-                      <span class="choice-head">Send the images exactly as they are</span>
-                      <span class="choice-why">The step names one study, the images another. <b>Nothing reconciles afterwards.</b></span>
-                      <span class="choice-flag">adds <code>--allow-study-mismatch</code><button type="button" class="info-btn" aria-expanded="false" aria-controls="info-asis" aria-label="Why send as-is"></button></span>
-                      <span class="info-pop" id="info-asis" role="note" hidden>
-                        The archive files the images under one study while the RIS closes a step naming another. Pick this only when that is the thing you are testing — or when a private tag matters, since the re-stamped copy is written by a dataset writer that does not carry private tags across.
-                      </span>
-                    </span>
-                  </label>
-                </div>
+              <!-- The reason code exists only once Discontinue is chosen. -->
+              <div class="reason-row" id="steps-reason-row" hidden>
+                <select id="steps-reason" aria-label="Reason the exam was stopped">
+                  <option value="">No reason given</option>
+                  <option value="110513^DCM^Discontinued for equipment failure">Equipment failure</option>
+                  <option value="110514^DCM^Incorrect procedure ordered">Incorrect procedure ordered</option>
+                  <option value="110515^DCM^Patient allergic to media/contrast">Patient allergic to the contrast</option>
+                  <option value="110516^DCM^Patient died">Patient died</option>
+                  <option value="110518^DCM^Patient did not arrive">Patient did not arrive</option>
+                  <option value="110519^DCM^Patient refused to continue">Patient refused to continue</option>
+                  <option value="110526^DCM^Incorrect worklist entry selected">Wrong worklist entry picked</option>
+                  <option value="__other">Another code…</option>
+                </select>
+                <input type="text" id="steps-reasoncode" hidden placeholder="value^scheme^meaning, e.g. 110513^DCM^Discontinued for equipment failure" />
+                <button class="btn danger small" id="steps-discontinue-run">Discontinue step</button>
+                <button class="btn ghost small" id="steps-discontinue-cancel">Cancel</button>
               </div>
 
+              <details class="cmd-fold" id="mpps-cmd-fold">
+                <summary>command <span class="cmd-sum"></span></summary>
+                <div class="cmd-preview" id="mpps-cmd"></div>
+              </details>
+              <!-- Start only runs a different command from Perform exam — no
+                   folder, no archive — so it carries its own preview. -->
+              <details class="cmd-fold" id="mpps-start-cmd-fold">
+                <summary><span class="cmd-label">command · start only</span><span class="cmd-sum"></span></summary>
+                <div class="cmd-preview" id="mpps-start-cmd"></div>
+              </details>
+              <details class="cmd-fold" id="steps-cmd-fold" hidden>
+                <summary>command <span class="cmd-sum"></span></summary>
+                <div class="cmd-preview" id="steps-close-cmd"></div>
+              </details>
+
+              <div class="outcome" id="mpps-outcome" hidden></div>
+              <div class="totals" id="mpps-totals" hidden></div>
+
+              <!-- Everything the row returned, and the per-run overrides.
+                   The Type 1 fields are seeded from the row; the transfer
+                   fields fall back to Settings > Defaults when blank. -->
               <details class="adv" id="mpps-adv">
-                <summary>Advanced <span class="adv-sum" id="mpps-adv-sum"></span></summary>
+                <summary>Details <span class="adv-sum" id="mpps-adv-sum"></span></summary>
                 <div class="adv-body">
-                  <div class="conn-panel">
-                    <div class="conn-title">
-                      <span>Storage peer — where the images go<button type="button" class="info-btn" aria-expanded="false" aria-controls="info-two-peers" aria-label="Why two peers"></button></span>
-                    </div>
-                    <div class="info-pop" id="info-two-peers" role="note" hidden>
-                      <p>The RIS that takes the procedure step and the archive that takes the images are often different systems. Both are written out in full in the command below even when they are the same — <b>a default you cannot see is a default nobody can check.</b></p>
-                    </div>
-                    <div class="checks">
-                      <label><input type="checkbox" id="mpps-store-same" checked /> Same system as the MPPS peer</label>
-                    </div>
-                    <div class="conn-grid store">
-                      <label>Host <input type="text" id="mpps-store-host" placeholder="pacs.example.org" /></label>
-                      <label>Port <input type="number" id="mpps-store-port" placeholder="104" min="1" max="65535" /></label>
-                      <label>Called AE — archive <input type="text" id="mpps-store-ae" maxlength="16" placeholder="ARCHIVE" /></label>
-                    </div>
-                  </div>
-
+                  <div class="attr-grid" id="mpps-attrs"></div>
                   <div class="form-row triple">
-                    <label>Performed step ID <span class="dim">(Type 1)</span><input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
-                    <label>Performed station AE <span class="dim">(Type 1)</span><input type="text" id="mpps-stationae" maxlength="16" placeholder="our calling AE" /></label>
+                    <label>Performed step ID<input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
+                    <label>Performed station AE<input type="text" id="mpps-stationae" maxlength="16" placeholder="this station's AE" /></label>
                     <label>Performed step description<input type="text" id="mpps-stepdesc" placeholder="optional" /></label>
                   </div>
                   <div class="form-row triple">
@@ -461,74 +265,9 @@
                   </div>
                 </div>
               </details>
-
-              <div class="cmd-preview" id="mpps-cmd"></div>
-
-              <div class="outcome" id="mpps-outcome" hidden></div>
-              <div class="info-pop" id="info-completed" role="note" hidden>
-                <p>What the MPPS SCP does with the scheduled worklist entry is not visible from here. Re-query the worklist if you need to see whether it still matches.</p>
-              </div>
-              <div class="totals" id="mpps-totals" hidden></div>
-              <div class="info-pop" id="info-performed-series" role="note" hidden>
-                <p>PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing.</p>
-              </div>
-            </div>
-
-            <!-- ===== CLOSING MODE ===== a session step is selected -->
-            <div id="mwl-close-mode" hidden>
-              <div class="attr-grid" id="steps-attrs"></div>
-              <p class="pick-note" id="steps-note"></p>
-              <div class="info-pop" id="info-close-peer" role="note" hidden>
-                <p>The step lives on the system that took the N-CREATE, not whatever the peer bar says now. If someone else already closed it, that peer refuses the N-SET and says so.</p>
-              </div>
-
-              <!-- A closed step is history: these controls are taken down rather than
-                   disabled, so there is no command on screen that cannot be run. -->
-              <div id="steps-close" hidden>
-                <div class="chip-row" id="steps-verb">
-                  <button class="chip active" data-verb="complete">Complete</button>
-                  <button class="chip" data-verb="discontinue">Discontinue</button>
-                </div>
-                <div class="form-row" id="steps-reason-row" hidden>
-                  <label class="grow">Discontinuation reason code <span class="dim">(optional)</span><button type="button" class="info-btn" aria-expanded="false" aria-controls="info-reason-code" aria-label="Reason code format"></button>
-                    <input type="text" id="steps-reasoncode" placeholder="110513^DCM^Discontinued for equipment failure" />
-                  </label>
-                </div>
-                <div class="info-pop" id="info-reason-code" role="note" hidden>
-                  <p>Format <code>value^scheme^meaning</code>, e.g. <code>110513^DCM^Discontinued for equipment failure</code>. Free text is refused: a coded reason has to be a real code, not one invented here.</p>
-                </div>
-                <div class="checks">
-                  <label id="steps-series-row" hidden><input type="checkbox" id="steps-series" /> <span id="steps-series-label"></span></label>
-                </div>
-                <div class="info-pop" id="info-series-from" role="note" hidden>
-                  <p><code>--series-from</code> asserts what is on this disk rather than what the archive acknowledged. It is only taken by default when every instance found in that folder was acknowledged, because otherwise the N-SET would name images the archive may not hold.</p>
-                </div>
-                <div class="detail-run">
-                  <div class="chip-row seg" id="steps-mode">
-                    <button class="chip active" data-mode="dry">Dry run</button>
-                    <button class="chip" data-mode="send">Close</button>
-                  </div>
-                  <button class="btn primary" id="steps-close-run">Dry run</button>
-                  <span class="status-chip" id="steps-status" hidden></span>
-                </div>
-                <div class="cmd-preview" id="steps-close-cmd"></div>
-              </div>
             </div>
           </div>
         </div>
-
-        <!-- What this app did since it opened. Collapsed: it costs a line until a step
-             is still open, and then it says so on the summary. -->
-        <details class="adv" id="session-steps" hidden>
-          <summary>Steps this app performed this session <span class="adv-sum" id="session-steps-sum"></span><button type="button" class="info-btn" aria-expanded="false" aria-controls="info-session-scope" aria-label="What this list is and is not"></button></summary>
-          <div class="adv-body">
-            <div class="info-pop" id="info-session-scope" role="note" hidden>
-              <p>This is what this app did since you opened it, held in this window and nowhere else. Close the app and the list is gone.</p>
-              <p>It is also <b>not what the server believes</b>: MPPS has no query service — there is no C-FIND for performed procedure steps — so no peer was asked. A step shown IN PROGRESS may already have been closed at someone's console, and a step this app did not perform never appears here.</p>
-            </div>
-            <div class="result-table" id="steps-results"></div>
-          </div>
-        </details>
 
         <details class="adv" id="mwl-out">
           <summary>Output <span class="adv-sum" id="mwl-out-sum"></span></summary>
@@ -538,15 +277,598 @@
         </details>
       </section>
 
+      <!-- Every screen below is the same shape, top to bottom: what it acts on,
+           the peer, the few controls that change what is sent, one primary
+           button, status, result, the command, the output. What an operator has
+           to read to act stays on screen; what they need to read to trust it is
+           behind the ? in the header. Nothing was deleted, only moved. -->
+
+      <!-- SEND -->
+      <section class="view" id="view-send">
+        <header class="view-head">
+          <h1>Send a study</h1>
+          <button type="button" class="help-btn" data-help="send-help" aria-expanded="false" aria-controls="send-help" title="How sending works">?</button>
+        </header>
+        <div class="help-panel" id="send-help" hidden>
+          <div class="help-head"><b>How sending works</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <h4>The accounting</h4>
+          <p>C-STORE a folder to a peer, then report exactly what was acknowledged. <b>A partial transfer is a failure</b>: found, sent and acknowledged are counted separately and the run only succeeds when all three agree.</p>
+          <h4>The speed presets</h4>
+          <p><b>Normal</b> — one association at a time: ordinary clinical traffic, and the only setting that adds nothing to the receiver's association count. <b>Fast</b> — four at a time: a backlog or a migration, to a receiver you already know tolerates a handful at once. <b>Very fast</b> — eight at a time: a bulk move you are watching, on a link with the bandwidth to make the concurrency pay. <b>Insane</b> — sixteen at a time: a benchmark against a receiver you own, not a thing to point at someone else's archive.</p>
+          <p><b>Insane is a benchmark setting, against a receiver you own.</b> The receiver decides how many associations it will accept, and going past that limit gets the extras rejected. A rejected association is retried, so this usually does not arrive as a slower run or as a shortfall between instances found and acknowledged: it arrives as a run that reports a narrower parallelism than the sixteen it asked for, at the bottom of the output. A study also has to split into at least sixteen chunks before sixteen associations can run at once, so a small one runs narrower than this no matter what the receiver allows.</p>
+          <h4>Chunk size and parallel, under Advanced</h4>
+          <p>A preset sets both of these together, because setting one alone caps the other. A chunk size typed there replaces the preset's half of that and leaves its association count in place — the command carries both flags and the engine names what it displaced. An association count typed there replaces the preset outright: the command drops <code>--speed</code>, because a preset that has lost its width would still be sizing the chunks off your number. Clear the field to go back to the preset.</p>
+          <p>Retries, timeout and chunk size fall back to Settings › Defaults when the field is blank. Whatever ends up in force is on the command line below the button.</p>
+        </div>
+        <p class="pane-lede">C-STORE a folder to a peer. A partial transfer is a failure.</p>
+        <div class="form-row">
+          <label class="grow">Folder to send
+            <div class="path-pick">
+              <input type="text" id="send-folder" placeholder="Choose a folder of DICOM files…" />
+              <button class="btn ghost" data-pick="send-folder" data-pick-mode="folder">Browse…</button>
+            </div>
+          </label>
+        </div>
+        <div class="conn-host" data-conn data-role="archive"></div>
+
+        <div class="section-title">Speed</div>
+        <div class="chip-row" id="send-speed">
+          <button class="chip active" data-speed="normal">Normal</button>
+          <button class="chip" data-speed="fast">Fast</button>
+          <button class="chip" data-speed="very-fast">Very fast</button>
+          <button class="chip warn" data-speed="insane">Insane</button>
+        </div>
+        <p class="mode-hint" id="send-speed-hint"></p>
+        <!-- Insane's cost lands on someone else's receiver, so it is marked
+             where it is chosen. What going too wide looks like is a paragraph,
+             and a paragraph belongs in the help panel. -->
+        <div class="local-note" id="send-speed-danger" hidden>
+          <b>A benchmark setting, against a receiver you own.</b>
+          <button type="button" class="linklike" data-help="send-help">Why</button>
+        </div>
+
+        <!-- The per-run adjustments. Folded, never hidden: the summary beside
+             the disclosure names anything they hold, and the command below the
+             button carries it. -->
+        <details class="adv" id="send-adv">
+          <summary>Advanced <span class="adv-sum" id="send-adv-sum"></span></summary>
+          <div class="adv-body">
+            <div class="form-row triple">
+              <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
+              <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
+            </div>
+            <div class="form-row triple">
+              <label>Parallel associations <span class="dim">(1–16)</span>
+                <input type="number" id="send-parallel" placeholder="from the preset" min="1" max="16" />
+              </label>
+              <label>Chunk size <span class="dim">(instances per association)</span>
+                <input type="number" id="send-chunk" placeholder="from the preset" min="1" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="grow">Convert to transfer syntax <span class="dim">(before sending)</span>
+                <select id="send-syntax">
+                  <option value="">Send as stored (no conversion)</option>
+                  <option value="implicit">Implicit VR Little Endian</option>
+                  <option value="explicit">Explicit VR Little Endian</option>
+                  <option value="deflated">Deflated Explicit VR LE</option>
+                  <option value="rle">RLE Lossless</option>
+                  <option value="jpeg-lossless">JPEG Lossless</option>
+                  <option value="jpeg-ls">JPEG-LS Lossless</option>
+                  <option value="jpeg2000">JPEG 2000 Lossless</option>
+                  <option value="jpeg2000-lossy">JPEG 2000 Lossy</option>
+                  <option value="jpeg-baseline">JPEG Baseline (lossy)</option>
+                </select>
+              </label>
+            </div>
+            <div class="checks">
+              <label><input type="checkbox" id="send-norecurse" /> Don't recurse into subfolders</label>
+              <label><input type="checkbox" id="send-rewrite" /> Rewrite Series UIDs <span class="warn-inline">(changes your data)</span></label>
+            </div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn primary" data-run>Send</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="totals" data-totals hidden></div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" data-cmd></div>
+        </details>
+        <details class="adv out-fold">
+          <summary>Output</summary>
+          <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+        </details>
+      </section>
+
+      <!-- RECEIVE -->
+      <section class="view" id="view-receive">
+        <header class="view-head">
+          <h1>Receive images</h1>
+          <button type="button" class="help-btn" data-help="receive-help" aria-expanded="false" aria-controls="receive-help" title="How the receiver works">?</button>
+        </header>
+        <div class="help-panel" id="receive-help" hidden>
+          <div class="help-head"><b>How the receiver works</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>A permissive C-STORE SCP: it accepts every presentation context offered, acknowledges what arrives and logs it. It is a test receiver, not an archive — nothing is indexed and nothing is queryable.</p>
+          <p>Leave <b>Save arriving images to</b> empty and instances are acknowledged and discarded, which is what you want when the question is only whether the sender can reach you. Give it a folder and everything that arrives is written there.</p>
+          <p>Under Advanced: an <b>allowlist</b> of calling AE Titles refuses associations from anything else, so you can prove a sender is being rejected for the reason you think. <b>Stop acknowledging after N</b> is a fault injector — the receiver accepts the association and then stops acknowledging, which is how you reproduce a shortfall on the sending side on purpose. Both are test knobs; leave them empty for an ordinary receive.</p>
+          <p>The run holds the port until you stop it. The output below is the whole record of what arrived.</p>
+        </div>
+        <p class="pane-lede">A C-STORE SCP that accepts everything and logs what arrives.</p>
+        <div class="form-row triple">
+          <label>Port<input type="number" id="scp-port" placeholder="11112" min="1" max="65535" /></label>
+          <label>Our AE Title<input type="text" id="scp-ae" placeholder="any" maxlength="16" /></label>
+        </div>
+        <div class="form-row">
+          <label class="grow">Save arriving images to
+            <div class="path-pick">
+              <input type="text" id="scp-persist" placeholder="(optional) acknowledge and discard if empty" />
+              <button class="btn ghost" data-pick="scp-persist" data-pick-mode="create">Browse…</button>
+              <button class="btn ghost" data-reveal="scp-persist">Open</button>
+            </div>
+          </label>
+        </div>
+        <details class="adv" id="receive-adv">
+          <summary>Advanced <span class="adv-sum" id="receive-adv-sum"></span></summary>
+          <div class="adv-body">
+            <div class="form-row">
+              <label class="grow">Only accept these calling AE Titles
+                <input type="text" id="scp-accept" placeholder="(optional) comma-separated allowlist" />
+              </label>
+              <label>Stop acknowledging after<input type="number" id="scp-rejectafter" placeholder="off" min="1" /></label>
+            </div>
+          </div>
+        </details>
+        <div class="actions">
+          <button class="btn primary" data-run>Start receiver</button>
+          <button class="btn danger" data-cancel hidden>Stop</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" data-cmd></div>
+        </details>
+        <!-- Open by default: on this screen the log is the result. -->
+        <details class="adv out-fold" open>
+          <summary>Output</summary>
+          <div class="adv-body"><div class="console-wrap tall"><pre class="console" data-console></pre></div></div>
+        </details>
+      </section>
+
+      <!-- QUERY -->
+      <section class="view" id="view-query">
+        <header class="view-head">
+          <h1>Query a peer</h1>
+          <button type="button" class="help-btn" data-help="query-help" aria-expanded="false" aria-controls="query-help" title="How querying works">?</button>
+        </header>
+        <div class="help-panel" id="query-help" hidden>
+          <div class="help-head"><b>How querying works</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>C-FIND asks the peer what it holds and changes nothing. A peer can accept your images and still return zero matches here — <b>storing and indexing are different operations</b>, and some archives index on a schedule.</p>
+          <p><b>Matching keys</b> are DICOM keyword = value. Wildcards <code>*</code> and <code>?</code> are allowed, and dates take a range: <code>20260101-20260201</code>. An empty value asks the peer to return that attribute rather than match on it — which is how you find out what it will tell you.</p>
+          <p><b>Level</b> decides what a match is: a study, a series, an image, or a scheduled procedure step (Worklist). Worklist here is the raw query; the Worklist screen is the same C-FIND with the scheduling keys routed into the Scheduled Procedure Step Sequence, which is what an MWL SCP expects.</p>
+          <p><b>Limit</b> stops reading after that many matches. It is a client-side stop, so the peer may already have done the work.</p>
+        </div>
+        <p class="pane-lede">C-FIND. Reads what a peer holds; changes nothing.</p>
+        <div class="conn-host" data-conn data-role="archive"></div>
+        <div class="form-row">
+          <div class="level-row">
+            <span class="level-label">Level</span>
+            <label><input type="radio" name="find-level" value="study" checked /> Study</label>
+            <label><input type="radio" name="find-level" value="series" /> Series</label>
+            <label><input type="radio" name="find-level" value="image" /> Image</label>
+            <label><input type="radio" name="find-level" value="mwl" /> Worklist</label>
+            <label class="limit-inline">Limit<input type="number" id="find-limit" placeholder="all" min="1" /></label>
+          </div>
+        </div>
+        <div class="kv-block">
+          <div class="kv-label">Matching keys</div>
+          <div id="find-keys" class="kv-rows"></div>
+          <button class="btn ghost small" id="find-addkey">+ Add key</button>
+        </div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run C-FIND</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <div class="result-table" data-result hidden></div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" data-cmd></div>
+        </details>
+        <details class="adv out-fold">
+          <summary>Output</summary>
+          <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+        </details>
+      </section>
+
+      <!-- DICOMWEB — one screen, four tabs. Each pane keeps the id its former
+           screen had (view-webping, view-websend, view-webquery, view-webhub) so
+           its builder, status chip, results and console resolve exactly as before. -->
+      <section class="view" id="view-web">
+        <header class="view-head">
+          <h1>DICOMweb</h1>
+          <button type="button" class="help-btn" data-help="web-help" aria-expanded="false" aria-controls="web-help" title="How DICOMweb works here">?</button>
+        </header>
+        <div class="help-panel" id="web-help" hidden>
+          <div class="help-head"><b>How DICOMweb works here</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <h4>The server and its credentials</h4>
+          <p>The chip on each tab picks one of the saved base URLs; they are edited in Settings. Authentication comes from the environment — <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic), set before launching the app. There is deliberately no token field: a credential typed into a window is a credential in a window.</p>
+          <h4>Test</h4>
+          <p>A QIDO-RS request that asks for nothing: it answers whether there is a DICOMweb service at this URL and whether your credentials open it. Nothing is sent.</p>
+          <h4>Send</h4>
+          <p>STOW-RS uploads a folder of DICOM files, with the same found/sent/acknowledged accounting the DIMSE send screen uses. Chunk size, retries and timeout fall back to Settings › Defaults when blank.</p>
+          <h4>Query</h4>
+          <p>QIDO-RS searches for studies, series or instances and changes nothing. Blank fields are simply not sent.</p>
+          <h4>Hub</h4>
+          <p>A local DICOMweb server (STOW and QIDO) to point the other tabs — or any DICOMweb client — at. <b>Save arriving studies to</b> empty means accept and discard. <b>Pre-populate index from</b> serves an existing folder of DICOM files at startup, so there is something to query straight away.</p>
+          <p>Under Advanced: <b>Require token</b> is a test knob — clients without that Bearer token get 401s, which is how you reproduce an auth failure. It is not real security. <b>Reject after N</b> stops accepting partway through, on purpose, so a client's failure handling can be watched.</p>
+        </div>
+        <div class="chip-row tabs" role="tablist" data-tabs="web">
+          <button class="chip active" role="tab" aria-selected="true" data-tab="webping">Test</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="websend">Send</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="webquery">Query</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="webhub">Hub</button>
+        </div>
+
+        <!-- WEB PING (DICOMweb) -->
+        <div class="tab-pane" id="view-webping">
+          <p class="pane-lede">Is a DICOMweb service there, and do your credentials open it? Nothing is sent.</p>
+          <div class="conn-host" data-webconn></div>
+          <div class="form-row">
+            <label>Timeout (ms)<input type="number" id="webping-timeout" placeholder="60000" min="1000" step="1000" /></label>
+          </div>
+          <div class="actions">
+            <button class="btn primary" data-run>Test connection</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+
+        <!-- WEB SEND (STOW-RS) -->
+        <div class="tab-pane" id="view-websend" hidden>
+          <p class="pane-lede">STOW-RS — upload a folder of DICOM files.</p>
+          <div class="form-row">
+            <label class="grow">Folder to send
+              <div class="path-pick">
+                <input type="text" id="websend-folder" placeholder="Choose a folder of DICOM files…" />
+                <button class="btn ghost" data-pick="websend-folder" data-pick-mode="folder">Browse…</button>
+              </div>
+            </label>
+          </div>
+          <div class="conn-host" data-webconn></div>
+          <div class="form-row triple">
+            <label>Chunk size<input type="number" id="websend-chunk" placeholder="50" min="1" /></label>
+            <label>Retries<input type="number" id="websend-retry" placeholder="1" min="0" /></label>
+            <label>Timeout (ms)<input type="number" id="websend-timeout" placeholder="60000" min="1000" step="1000" /></label>
+          </div>
+          <div class="actions">
+            <button class="btn primary" data-run>Send (STOW-RS)</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+
+        <!-- WEB QUERY (QIDO-RS) -->
+        <div class="tab-pane" id="view-webquery" hidden>
+          <p class="pane-lede">QIDO-RS — search for studies, series or instances. Changes nothing.</p>
+          <div class="conn-host" data-webconn></div>
+          <div class="chip-row" id="webquery-level">
+            <button class="chip active" data-level="studies">Studies</button>
+            <button class="chip" data-level="series">Series</button>
+            <button class="chip" data-level="instances">Instances</button>
+          </div>
+          <div class="form-row triple">
+            <label>Patient ID<input type="text" id="webquery-patientid" placeholder="any" /></label>
+            <label>Patient name<input type="text" id="webquery-patientname" placeholder="any — DOE^JANE, wildcards ok" /></label>
+            <label>Study date<input type="text" id="webquery-studydate" placeholder="any — YYYYMMDD or YYYYMMDD-YYYYMMDD" /></label>
+          </div>
+          <div class="form-row">
+            <label class="grow">Study Instance UID<input type="text" id="webquery-studyuid" placeholder="any" /></label>
+            <label>Limit<input type="number" id="webquery-limit" placeholder="all" min="1" /></label>
+          </div>
+          <div class="actions">
+            <button class="btn primary" data-run>Run QIDO query</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <div class="result-table" data-result hidden></div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+
+        <!-- WEB HUB (serve) -->
+        <div class="tab-pane" id="view-webhub" hidden>
+          <p class="pane-lede">A local DICOMweb server (STOW/QIDO) to point clients at.</p>
+          <div class="form-row triple">
+            <label>Port<input type="number" id="webhub-port" placeholder="10808" min="1" max="65535" /></label>
+          </div>
+          <div class="web-auth-hint" id="webhub-baseurl"></div>
+          <div class="form-row">
+            <label class="grow">Save arriving studies to
+              <div class="path-pick">
+                <input type="text" id="webhub-persist" placeholder="(optional) accept and discard if empty" />
+                <button class="btn ghost" data-pick="webhub-persist" data-pick-mode="create">Browse…</button>
+                <button class="btn ghost" data-reveal="webhub-persist">Open</button>
+              </div>
+            </label>
+          </div>
+          <div class="form-row">
+            <label class="grow">Pre-populate index from
+              <div class="path-pick">
+                <input type="text" id="webhub-root" placeholder="(optional) folder of DICOM files to serve at startup" />
+                <button class="btn ghost" data-pick="webhub-root" data-pick-mode="folder">Browse…</button>
+              </div>
+            </label>
+          </div>
+          <details class="adv" id="webhub-adv">
+            <summary>Advanced <span class="adv-sum" id="webhub-adv-sum"></span></summary>
+            <div class="adv-body">
+              <div class="form-row">
+                <label class="grow">Require token <span class="dim">(test only)</span>
+                  <input type="text" id="webhub-token" placeholder="(optional) e.g. test-token-123" />
+                </label>
+                <label>Reject after<input type="number" id="webhub-rejectafter" placeholder="off" min="1" /></label>
+              </div>
+            </div>
+          </details>
+          <div class="actions">
+            <button class="btn primary" data-run>Start hub</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <!-- Open by default: on this tab the log is the result. -->
+          <details class="adv out-fold" open>
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap tall"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+      </section>
+
+      <!-- TOOLS — one screen, four tabs, over local files. Same id rule as DICOMweb. -->
+      <section class="view" id="view-tools">
+        <header class="view-head">
+          <h1>Tools</h1>
+          <button type="button" class="help-btn" data-help="tools-help" aria-expanded="false" aria-controls="tools-help" title="What these tools do">?</button>
+        </header>
+        <div class="help-panel" id="tools-help" hidden>
+          <div class="help-head"><b>What these tools do</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>Every tab here works on local files and sends nothing to any peer.</p>
+          <h4>Inventory</h4>
+          <p>Reads metadata only — it stops before pixel data, so it is fast on big trees. <b>Break down per series</b> also flags colliding Series UIDs, which is the usual sign that two studies were merged into one folder or that something rewrote UIDs on the way in.</p>
+          <h4>Tags</h4>
+          <p>Dumps the tags in a file or folder. It reads metadata only and never prints pixel data. The filter takes a keyword, a tag or a value, and <code>/regex/</code> is allowed. By default one file per series is read, because the tags that differ per instance are rarely the ones being looked for; <b>Every file</b> reads all of them.</p>
+          <h4>Edit</h4>
+          <p>Load a study or a single file, change values, then write the result to a new folder. <b>The source is never modified.</b> <b>Preview only</b> shows what would change and writes nothing — it is this tab's own switch, about the disk rather than a peer, and Rehearsal mode adds the same flag from the other direction.</p>
+          <p>UIDs are structural, so editing one is gated behind <b>Allow editing UIDs</b>. Changing a Series or Study UID on some instances and not others splits a study into pieces no archive will put back together.</p>
+          <h4>De-identify</h4>
+          <p><b>Best-effort, not certified.</b> It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
+        </div>
+        <div class="chip-row tabs" role="tablist" data-tabs="tools">
+          <button class="chip active" role="tab" aria-selected="true" data-tab="inventory">Inventory</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="tags">Tags</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="edit">Edit</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="anon">De-identify</button>
+        </div>
+
+        <!-- INVENTORY -->
+        <div class="tab-pane" id="view-inventory">
+          <p class="pane-lede">Reads metadata only. Sends nothing.</p>
+          <div class="form-row">
+            <label class="grow">Folder or file
+              <div class="path-pick">
+                <input type="text" id="info-folder" placeholder="Choose a folder or a .dcm file…" />
+                <button class="btn ghost" data-pick="info-folder" data-pick-mode="folder">Browse…</button>
+                <button class="btn ghost" data-pick="info-folder" data-pick-mode="file">File…</button>
+              </div>
+            </label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="info-series" checked /> Break down per series</label>
+            <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
+          </div>
+          <div class="actions">
+            <button class="btn primary" data-run>Inventory</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <div class="inventory-result" data-result hidden></div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console hidden></pre></div></div>
+          </details>
+        </div>
+
+        <!-- TAGS -->
+        <div class="tab-pane" id="view-tags" hidden>
+          <p class="pane-lede">Dump the tags in a file or folder. Never prints pixel data.</p>
+          <div class="form-row">
+            <label class="grow">File or folder
+              <div class="path-pick">
+                <input type="text" id="tags-target" placeholder="Choose a folder or a .dcm file…" />
+                <button class="btn ghost" data-pick="tags-target" data-pick-mode="folder">Browse…</button>
+                <button class="btn ghost" data-pick="tags-target" data-pick-mode="file">File…</button>
+              </div>
+            </label>
+          </div>
+          <div class="form-row">
+            <label class="grow">Filter<input type="text" id="tags-filter" placeholder="keyword, tag or value; /regex/ allowed" /></label>
+            <label class="grow">Has value<input type="text" id="tags-value" placeholder="e.g. DOE^JANE" /></label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="tags-private" /> Private / unrecognised tags only</label>
+            <label><input type="checkbox" id="tags-all" /> Every file <span class="dim">(default: one per series)</span></label>
+          </div>
+          <div class="actions">
+            <button class="btn primary" data-run>Dump tags</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <div class="tags-result" data-result hidden></div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console hidden></pre></div></div>
+          </details>
+        </div>
+
+        <!-- EDIT -->
+        <div class="tab-pane" id="view-edit" hidden>
+          <p class="pane-lede">Change values into a new folder. The source is never modified.</p>
+
+          <div class="form-row">
+            <label class="grow">Study folder or single file
+              <div class="path-pick">
+                <input type="text" id="edit-target" placeholder="Choose a study folder or one .dcm file…" />
+                <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Folder…</button>
+                <button class="btn ghost" data-pick="edit-target" data-pick-mode="file">File…</button>
+                <button class="btn ghost" id="edit-load">Load tags</button>
+              </div>
+            </label>
+          </div>
+
+          <div id="edit-scope-row" class="chip-row" hidden>
+            <span class="level-label">Apply changes to</span>
+            <button class="chip active" data-scope="study">Every instance</button>
+            <button class="chip" data-scope="one">Only the loaded file</button>
+          </div>
+
+          <div id="edit-loaded" hidden>
+            <div class="form-row">
+              <label class="grow">Filter tags<input type="text" id="edit-filter" placeholder="Type to narrow the list — e.g. Patient" /></label>
+            </div>
+            <div class="tag-editor" id="edit-grid"></div>
+            <div class="pending-summary" id="edit-pending" hidden></div>
+          </div>
+
+          <div class="form-row">
+            <label class="grow">Write the edited copy to
+              <div class="path-pick">
+                <input type="text" id="edit-out" placeholder="Destination folder…" />
+                <button class="btn ghost" data-pick="edit-out" data-pick-mode="create">Browse…</button>
+                <button class="btn ghost" data-reveal="edit-out">Open</button>
+              </div>
+            </label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="edit-dryrun" checked /> Preview only <span class="dim">(write nothing)</span></label>
+            <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(can split a study)</span></label>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary" data-run>Apply changes</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+
+        <!-- ANON -->
+        <div class="tab-pane" id="view-anon" hidden>
+          <p class="pane-lede">Copy a folder with identifiers removed and UIDs remapped.</p>
+          <div class="caution">
+            <strong>Best-effort, not certified.</strong> Inspect a sample before sharing.
+            <button type="button" class="linklike" data-help="tools-help">What survives</button>
+          </div>
+          <div class="form-row">
+            <label class="grow">Folder to de-identify
+              <div class="path-pick">
+                <input type="text" id="anon-folder" placeholder="Choose the source folder…" />
+                <button class="btn ghost" data-pick="anon-folder" data-pick-mode="folder">Browse…</button>
+              </div>
+            </label>
+          </div>
+          <div class="form-row">
+            <label class="grow">Write the de-identified copy to
+              <div class="path-pick">
+                <input type="text" id="anon-out" placeholder="Destination folder (must be outside the source)…" />
+                <button class="btn ghost" data-pick="anon-out" data-pick-mode="create">Browse…</button>
+                <button class="btn ghost" data-reveal="anon-out">Open</button>
+              </div>
+            </label>
+          </div>
+          <details class="adv" id="anon-adv">
+            <summary>Advanced <span class="adv-sum" id="anon-adv-sum"></span></summary>
+            <div class="adv-body">
+              <div class="form-row">
+                <label>Pseudonym prefix<input type="text" id="anon-prefix" placeholder="ANON" /></label>
+              </div>
+              <div class="checks">
+                <label><input type="checkbox" id="anon-keepdesc" /> Keep study/series descriptions</label>
+                <label><input type="checkbox" id="anon-keepprivate" /> Keep private tags</label>
+              </div>
+            </div>
+          </details>
+          <div class="actions">
+            <button class="btn primary" data-run>De-identify</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+          </details>
+        </div>
+      </section>
+
       <!-- SPEED TEST -->
       <section class="view" id="view-speed">
         <header class="view-head">
           <h1>Speed test</h1>
-          <p>Send the same study repeatedly and compare. Each run uses its own calling AE Title, so you can pick it out of the peer's ingress logs.</p>
+          <button type="button" class="help-btn" data-help="speed-help" aria-expanded="false" aria-controls="speed-help" title="How to read a sweep">?</button>
         </header>
+        <div class="help-panel" id="speed-help" hidden>
+          <div class="help-head"><b>How to read a sweep</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>Each run in a sweep uses its own calling AE Title — the prefix with a run number appended — so you can pick any single run out of the peer's ingress logs afterwards.</p>
+          <h4>The numbers</h4>
+          <p>Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for. Width is measured the same way: it is the associations the peer actually had open at once, not the number the run asked for, and it is a floor — it can read one low on a run whose last chunks drain early, and never reads high.</p>
+          <h4>Finding a receiver's ceiling</h4>
+          <p>This is how you find the receiver's ceiling — read the Width column and the Ack column afterwards, because neither answers the other's question: a refused association is retried with no backoff, so the attempts burn out in milliseconds, and the run either finishes clean at a width it never reached or ends with instances the receiver never acknowledged. Width says whether it ran as wide as asked; the counts say whether all of it arrived.</p>
+          <h4>Chunk size across a sweep</h4>
+          <p>A chunk size in the field below applies to every run and overrides each preset's own sizing, so a preset may not reach its association count. Clear it to compare the presets as they ship. Association counts typed into <b>Also try</b> are each sent as <code>--parallel</code>, which overrides the preset's chunk sizing in the same way.</p>
+        </div>
+        <p class="pane-lede">Send the same study repeatedly and compare.</p>
 
         <div class="form-row">
-          <label class="grow">Study folder to send
+          <label class="grow">Study folder
             <div class="path-pick">
               <input type="text" id="speed-folder" placeholder="Choose a folder of DICOM files…" />
               <button class="btn ghost" data-pick="speed-folder" data-pick-mode="folder">Browse…</button>
@@ -554,19 +876,19 @@
           </label>
         </div>
 
-        <div class="conn-host" data-conn></div>
+        <div class="conn-host" data-conn data-role="archive"></div>
 
         <div class="section-title">What to compare</div>
         <div class="chip-row" id="speed-mode">
-          <button class="chip active" data-mode="syntax">Transfer syntaxes</button>
+          <button class="chip active" data-mode="syntax">Syntaxes</button>
           <button class="chip" data-mode="chunk">Chunk sizes</button>
-          <button class="chip" data-mode="parallel">Speed presets</button>
-          <button class="chip" data-mode="repeat">Repeat the same run</button>
+          <button class="chip" data-mode="parallel">Presets</button>
+          <button class="chip" data-mode="repeat">Repeat</button>
         </div>
 
         <div id="speed-syntax-opts">
           <div class="checks inline-checks">
-            <label><input type="checkbox" class="ts-opt" value="" checked /> As stored (no request)</label>
+            <label><input type="checkbox" class="ts-opt" value="" checked /> As stored</label>
             <label><input type="checkbox" class="ts-opt" value="implicit" /> Implicit VR LE</label>
             <label><input type="checkbox" class="ts-opt" value="explicit" /> Explicit VR LE</label>
             <label><input type="checkbox" class="ts-opt" value="rle" /> RLE Lossless</label>
@@ -577,7 +899,7 @@
 
         <div id="speed-chunk-opts" hidden>
           <div class="form-row">
-            <label class="grow">Chunk sizes to try <span class="dim">(instances per association, comma separated)</span>
+            <label class="grow">Chunk sizes to try <span class="dim">(comma separated)</span>
               <input type="text" id="speed-chunks" value="50, 200, 500" />
             </label>
           </div>
@@ -588,12 +910,12 @@
             <label><input type="checkbox" class="speed-opt" value="normal" checked /> Normal <span class="dim">(1)</span></label>
             <label><input type="checkbox" class="speed-opt" value="fast" checked /> Fast <span class="dim">(4)</span></label>
             <label><input type="checkbox" class="speed-opt" value="very-fast" checked /> Very fast <span class="dim">(8)</span></label>
-            <label><input type="checkbox" class="speed-opt" value="insane" checked /> Insane <span class="warn-inline">(16 — a receiver you own)</span></label>
+            <label><input type="checkbox" class="speed-opt" value="insane" checked /> Insane <span class="warn-inline">(16)</span></label>
           </div>
           <p class="mode-hint" id="speed-parallel-hint"></p>
           <div class="form-row">
-            <label class="grow">Also try these association counts <span class="dim">(optional, comma separated — each is sent as --parallel, which overrides the preset's chunk sizing)</span>
-              <input type="text" id="speed-parallels" value="" placeholder="e.g. 2, 6, 12" />
+            <label class="grow">Also try these association counts
+              <input type="text" id="speed-parallels" value="" placeholder="comma separated — e.g. 2, 6, 12" />
             </label>
           </div>
         </div>
@@ -605,326 +927,56 @@
         </div>
 
         <div class="form-row triple">
-          <label>Calling AE prefix <span class="dim">(a run number is appended)</span>
-            <input type="text" id="speed-aeprefix" value="AST" maxlength="10" />
-          </label>
-          <label>Chunk size <span class="dim">(blank = each run decides)</span>
-            <input type="number" id="speed-chunk" placeholder="200" min="1" />
-          </label>
+          <label>Calling AE prefix<input type="text" id="speed-aeprefix" value="AST" maxlength="10" /></label>
+          <label>Chunk size<input type="number" id="speed-chunk" placeholder="each run decides" min="1" /></label>
         </div>
 
-        <div class="cmd-preview" data-cmd></div>
         <div class="actions">
           <button class="btn primary" data-run>Run speed test</button>
           <button class="btn danger" data-cancel hidden>Stop</button>
           <span class="status-chip" data-status hidden></span>
         </div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" data-cmd></div>
+        </details>
 
         <div class="speed-progress" id="speed-progress" hidden></div>
         <div class="result-table" data-result hidden></div>
-        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
-        <p class="mcp-note dim">Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for. Width is measured the same way: it is the associations the peer actually had open at once, not the number the run asked for, and it is a floor — it can read one low on a run whose last chunks drain early, and never reads high.</p>
+        <details class="adv out-fold">
+          <summary>Output</summary>
+          <div class="adv-body"><div class="console-wrap"><pre class="console" data-console hidden></pre></div></div>
+        </details>
       </section>
 
-      <!-- WEB PING (DICOMweb) -->
-      <section class="view" id="view-webping">
-        <header class="view-head">
-          <h1>Web: test connection</h1>
-          <p>QIDO-RS — is there a DICOMweb service at this URL, and do your credentials open it? Nothing is sent.</p>
-        </header>
-        <div class="conn-host" data-webconn></div>
-        <div class="form-row">
-          <label>Timeout (ms)<input type="number" id="webping-timeout" placeholder="60000" min="1000" step="1000" /></label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Test connection</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- WEB SEND (STOW-RS) -->
-      <section class="view" id="view-websend">
-        <header class="view-head">
-          <h1>Web: send a study</h1>
-          <p>STOW-RS — upload a folder of DICOM files to a DICOMweb server, with a live transfer report.</p>
-        </header>
-        <div class="form-row">
-          <label class="grow">Folder to send
-            <div class="path-pick">
-              <input type="text" id="websend-folder" placeholder="Choose a folder of DICOM files…" />
-              <button class="btn ghost" data-pick="websend-folder" data-pick-mode="folder">Browse…</button>
-            </div>
-          </label>
-        </div>
-        <div class="conn-host" data-webconn></div>
-        <div class="form-row triple">
-          <label>Chunk size<input type="number" id="websend-chunk" placeholder="50" min="1" /></label>
-          <label>Retries<input type="number" id="websend-retry" placeholder="1" min="0" /></label>
-          <label>Timeout (ms)<input type="number" id="websend-timeout" placeholder="60000" min="1000" step="1000" /></label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="websend-dryrun" /> Dry run (scan &amp; plan, nothing uploaded)</label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Send (STOW-RS)</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- WEB QUERY (QIDO-RS) -->
-      <section class="view" id="view-webquery">
-        <header class="view-head">
-          <h1>Web: query (QIDO)</h1>
-          <p>QIDO-RS — search a DICOMweb server for studies, series or instances. Changes nothing.</p>
-        </header>
-        <div class="conn-host" data-webconn></div>
-        <div class="section-title">Search level</div>
-        <div class="chip-row" id="webquery-level">
-          <button class="chip active" data-level="studies">Studies</button>
-          <button class="chip" data-level="series">Series</button>
-          <button class="chip" data-level="instances">Instances</button>
-        </div>
-        <div class="form-row triple">
-          <label>Patient ID<input type="text" id="webquery-patientid" placeholder="any" /></label>
-          <label>Patient name<input type="text" id="webquery-patientname" placeholder="any — DOE^JANE, wildcards ok" /></label>
-          <label>Study date<input type="text" id="webquery-studydate" placeholder="any — YYYYMMDD or YYYYMMDD-YYYYMMDD" /></label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Study Instance UID<input type="text" id="webquery-studyuid" placeholder="any" /></label>
-          <label>Limit<input type="number" id="webquery-limit" placeholder="all" min="1" /></label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Run QIDO query</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="result-table" data-result hidden></div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- WEB HUB (serve) -->
-      <section class="view" id="view-webhub">
-        <header class="view-head">
-          <h1>Web: local hub (serve)</h1>
-          <p>Run a local DICOMweb server (STOW/QIDO) for testing. Point the other Web screens — or any DICOMweb client — at it.</p>
-        </header>
-        <div class="form-row triple">
-          <label>Port<input type="number" id="webhub-port" placeholder="10808" min="1" max="65535" /></label>
-          <label>Reject after (test)<input type="number" id="webhub-rejectafter" placeholder="off" min="1" /></label>
-        </div>
-        <div class="web-auth-hint" id="webhub-baseurl"></div>
-        <div class="form-row">
-          <label class="grow">Save arriving studies to
-            <div class="path-pick">
-              <input type="text" id="webhub-persist" placeholder="(optional) accept and discard if empty" />
-              <button class="btn ghost" data-pick="webhub-persist" data-pick-mode="create">Browse…</button>
-              <button class="btn ghost" data-reveal="webhub-persist">Open</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Pre-populate index from
-            <div class="path-pick">
-              <input type="text" id="webhub-root" placeholder="(optional) folder of DICOM files to serve at startup" />
-              <button class="btn ghost" data-pick="webhub-root" data-pick-mode="folder">Browse…</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Require token <span class="dim">(test only — clients without this Bearer token get 401s; for reproducing auth failures, not real security)</span>
-            <input type="text" id="webhub-token" placeholder="(optional) e.g. test-token-123" />
-          </label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Start hub</button>
-          <button class="btn danger" data-cancel hidden>Stop</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap tall"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- INVENTORY -->
-      <section class="view" id="view-inventory">
-        <header class="view-head">
-          <h1>Inventory a folder</h1>
-          <p>Reads metadata only (stops before pixel data), so it's fast on big trees. Sends nothing.</p>
-        </header>
-        <div class="form-row">
-          <label class="grow">Folder or file
-            <div class="path-pick">
-              <input type="text" id="info-folder" placeholder="Choose a folder or a .dcm file…" />
-              <button class="btn ghost" data-pick="info-folder" data-pick-mode="folder">Browse…</button>
-              <button class="btn ghost" data-pick="info-folder" data-pick-mode="file">File…</button>
-            </div>
-          </label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="info-series" checked /> Break down per series (flags colliding Series UIDs)</label>
-          <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Inventory</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="inventory-result" data-result hidden></div>
-        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
-      </section>
-
-      <!-- TAGS -->
-      <section class="view" id="view-tags">
-        <header class="view-head">
-          <h1>Inspect DICOM tags</h1>
-          <p>Dump the tags in a file or folder. Reads metadata only and never prints pixel data.</p>
-        </header>
-        <div class="form-row">
-          <label class="grow">File or folder
-            <div class="path-pick">
-              <input type="text" id="tags-target" placeholder="Choose a folder or a .dcm file…" />
-              <button class="btn ghost" data-pick="tags-target" data-pick-mode="folder">Browse…</button>
-              <button class="btn ghost" data-pick="tags-target" data-pick-mode="file">File…</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Filter <span class="dim">(keyword, tag or value; /regex/ allowed)</span><input type="text" id="tags-filter" placeholder="e.g. Patient" /></label>
-          <label class="grow">Has value<input type="text" id="tags-value" placeholder="e.g. DOE^JANE" /></label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="tags-private" /> Private / unrecognised tags only</label>
-          <label><input type="checkbox" id="tags-all" /> Every file (default: one per series)</label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Dump tags</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="tags-result" data-result hidden></div>
-        <div class="console-wrap"><pre class="console" data-console hidden></pre></div>
-      </section>
-
-      <!-- EDIT -->
-      <section class="view" id="view-edit">
-        <header class="view-head">
-          <h1>Edit tags</h1>
-          <p>Load a study or a single file, change values in place, then write the result to a new folder. The source is never modified.</p>
-        </header>
-
-        <div class="form-row">
-          <label class="grow">Study folder or single file
-            <div class="path-pick">
-              <input type="text" id="edit-target" placeholder="Choose a study folder or one .dcm file…" />
-              <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Folder…</button>
-              <button class="btn ghost" data-pick="edit-target" data-pick-mode="file">File…</button>
-              <button class="btn primary" id="edit-load">Load tags</button>
-            </div>
-          </label>
-        </div>
-
-        <div id="edit-scope-row" class="chip-row" hidden>
-          <span class="level-label">Apply changes to</span>
-          <button class="chip active" data-scope="study">Every instance</button>
-          <button class="chip" data-scope="one">Only the loaded file</button>
-        </div>
-
-        <div id="edit-loaded" hidden>
-          <div class="form-row">
-            <label class="grow">Filter tags<input type="text" id="edit-filter" placeholder="Type to narrow the list — e.g. Patient" /></label>
-          </div>
-          <div class="tag-editor" id="edit-grid"></div>
-          <div class="pending-summary" id="edit-pending" hidden></div>
-        </div>
-
-        <div class="form-row">
-          <label class="grow">Write the edited copy to
-            <div class="path-pick">
-              <input type="text" id="edit-out" placeholder="Destination folder…" />
-              <button class="btn ghost" data-pick="edit-out" data-pick-mode="create">Browse…</button>
-              <button class="btn ghost" data-reveal="edit-out">Open</button>
-            </div>
-          </label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="edit-dryrun" checked /> Preview only (show what would change, write nothing)</label>
-          <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(can split a study)</span></label>
-        </div>
-
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>Apply changes</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- ANON -->
-      <section class="view" id="view-anon">
-        <header class="view-head">
-          <h1>De-identify a folder</h1>
-          <p>Copy a folder with identifiers removed and UIDs remapped. The source is never modified.</p>
-        </header>
-        <div class="caution">
-          <strong>Best-effort, not certified.</strong> It does not read pixel data, so burned-in
-          annotations survive, and identifiers inside nested sequences (SR, presentation states) can
-          survive. Always inspect a sample before sharing anything this produces.
-        </div>
-        <div class="form-row">
-          <label class="grow">Folder to de-identify
-            <div class="path-pick">
-              <input type="text" id="anon-folder" placeholder="Choose the source folder…" />
-              <button class="btn ghost" data-pick="anon-folder" data-pick-mode="folder">Browse…</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label class="grow">Write the de-identified copy to
-            <div class="path-pick">
-              <input type="text" id="anon-out" placeholder="Destination folder (must be outside the source)…" />
-              <button class="btn ghost" data-pick="anon-out" data-pick-mode="create">Browse…</button>
-              <button class="btn ghost" data-reveal="anon-out">Open</button>
-            </div>
-          </label>
-        </div>
-        <div class="form-row">
-          <label>Pseudonym prefix<input type="text" id="anon-prefix" placeholder="ANON" /></label>
-        </div>
-        <div class="checks">
-          <label><input type="checkbox" id="anon-keepdesc" /> Keep study/series descriptions</label>
-          <label><input type="checkbox" id="anon-keepprivate" /> Keep private tags</label>
-        </div>
-        <div class="cmd-preview" data-cmd></div>
-        <div class="actions">
-          <button class="btn primary" data-run>De-identify</button>
-          <span class="status-chip" data-status hidden></span>
-        </div>
-        <div class="console-wrap"><pre class="console" data-console></pre></div>
-      </section>
-
-      <!-- MCP / CONNECT TO CLAUDE -->
+      <!-- MCP / CONNECT TO CLAUDE — instructions rather than a command, so this
+           screen is allowed more words than the others. -->
       <section class="view" id="view-mcp">
         <header class="view-head">
           <h1>Connect to Claude</h1>
-          <p>Let Claude (or any MCP client) drive these DICOM operations as tools, using the same engine this app runs.</p>
+          <button type="button" class="help-btn" data-help="mcp-help" aria-expanded="false" aria-controls="mcp-help" title="What MCP is doing here">?</button>
         </header>
+        <div class="help-panel" id="mcp-help" hidden>
+          <div class="help-head"><b>What MCP is doing here</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>MCP is how an assistant calls a local program as a tool. Registering this server hands Claude the same <code>dcm</code> engine this app runs — not a copy, and not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
+          <p>It requires <code>dcm</code> installed and on your PATH. If <code>claude mcp add</code> is not found, install Claude Code first. The one-line registration is run once; Claude Desktop instead reads the JSON block from its config file, so that one needs a restart to take.</p>
+          <p>The tools are the read-and-send half of this app. Nothing that closes a procedure step is exposed: MPPS is a transaction against a RIS, and it is not a thing to hand to something that cannot see the worklist row it belongs to.</p>
+        </div>
+        <p class="pane-lede">Let Claude (or any MCP client) drive these DICOM operations as tools.</p>
 
         <div class="mcp-status" id="mcp-status">
           <span class="dot"></span><span id="mcp-status-text">Checking whether <code>dcm</code> is on your PATH…</span>
         </div>
 
         <div class="section-title">Claude Code (terminal)</div>
-        <p class="mcp-note">Run this once. It registers the server so Claude Code can call it.</p>
+        <p class="mcp-note">Run this once.</p>
         <div class="copy-box" data-copy="claude mcp add dcm-dicom -- dcm mcp">
           <code>claude mcp add dcm-dicom -- dcm mcp</code>
           <button class="btn ghost small">Copy</button>
         </div>
 
         <div class="section-title">Claude Desktop</div>
-        <p class="mcp-note">Add this to your <code>claude_desktop_config.json</code> (Settings → Developer → Edit Config), then restart Claude.</p>
+        <p class="mcp-note">Add this to <code>claude_desktop_config.json</code> (Settings → Developer → Edit Config), then restart Claude.</p>
         <div class="copy-box block" data-copy='{
   "mcpServers": {
     "dcm-dicom": { "command": "dcm", "args": ["mcp"] }
@@ -938,19 +990,134 @@
           <button class="btn ghost small">Copy</button>
         </div>
 
-        <div class="section-title">What Claude can then do</div>
+        <div class="section-title">The tools Claude gets</div>
         <div class="tool-grid">
-          <div class="tool-card"><b>dcm_echo</b> Test a peer connection (C-ECHO).</div>
-          <div class="tool-card"><b>dcm_inventory</b> Inventory a folder — studies, series, sizes.</div>
+          <div class="tool-card"><b>dcm_echo</b> Test a peer (C-ECHO).</div>
+          <div class="tool-card"><b>dcm_inventory</b> Studies, series, sizes.</div>
           <div class="tool-card"><b>dcm_query</b> Query a peer (C-FIND).</div>
           <div class="tool-card"><b>dcm_tags</b> Inspect DICOM tags.</div>
-          <div class="tool-card"><b>dcm_send</b> Send a study (C-STORE), with found/sent/acknowledged accounting.</div>
+          <div class="tool-card"><b>dcm_send</b> Send a study (C-STORE).</div>
           <div class="tool-card"><b>dcm_anon</b> De-identify a folder.</div>
-          <div class="tool-card"><b>dcm_edit</b> Change or remove tags into a new folder.</div>
+          <div class="tool-card"><b>dcm_edit</b> Change tags into a new folder.</div>
         </div>
-        <p class="mcp-note dim">Requires <code>dcm</code> installed and on your PATH (the same command this app uses). If <code>claude mcp add</code> isn't found, install Claude Code first.</p>
+      </section>
+      <!-- SETTINGS — set once. The station's identity, the saved peers and their
+           roles, the defaults every command inherits, rehearsal, and the engineer
+           options. Everything here lands on the command line where it can be read;
+           the engine never reads this file. -->
+      <section class="view" id="view-settings">
+        <header class="view-head">
+          <h1>Settings</h1>
+        </header>
+        <p class="pane-lede">Set once. Anything here that changes a command shows up in that command's line.</p>
+
+        <div class="section-title">This station</div>
+        <div class="form-row triple">
+          <label>This station's AE Title <span class="dim">(the calling AE on every command unless a peer below overrides it; MPPS attributes the step to it)</span>
+            <input type="text" id="set-station-ae" maxlength="16" placeholder="DCM-CLI" />
+          </label>
+          <label>Modality <span class="dim">(default worklist filter)</span>
+            <input type="text" id="set-modality" maxlength="16" placeholder="e.g. CT" />
+          </label>
+          <label>Worklist rows to fetch <span class="dim">(blank = all)</span>
+            <input type="number" id="set-mwl-limit" min="1" placeholder="all" />
+          </label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="set-only-station" /> Only this station's worklist <span class="dim">(adds ScheduledStationAETitle to the query; the engine warns on a mismatch either way)</span></label>
+        </div>
+
+        <div class="section-title">Peers</div>
+        <p class="mcp-note">One peer can be the <b>RIS</b> (worklist and MPPS) and one the <b>Archive</b> (images). They may be the same system.</p>
+        <div class="peer-list" id="set-peers"></div>
+        <div class="conn-panel" id="peer-form">
+          <div class="conn-title"><span id="peer-form-title">Add a peer</span></div>
+          <div class="conn-grid">
+            <label>Host <input type="text" id="peer-host" placeholder="pacs.example.org or localhost" /></label>
+            <label>Port <input type="number" id="peer-port" placeholder="11112" min="1" max="65535" /></label>
+            <label>Called AE — peer <input type="text" id="peer-ae" maxlength="16" placeholder="ARCHIVE" /></label>
+            <label>Calling AE <span class="dim">(only if this peer needs a different one)</span>
+              <input type="text" id="peer-callingae" maxlength="16" placeholder="this station's AE" />
+            </label>
+            <label>Role
+              <select id="peer-role">
+                <option value="">Other</option>
+                <option value="ris">RIS (worklist &amp; MPPS)</option>
+                <option value="archive">Archive (images)</option>
+              </select>
+            </label>
+          </div>
+          <div class="folder-check warn" id="peer-form-note" hidden></div>
+          <div class="actions">
+            <button class="btn primary small" id="peer-save">Save peer</button>
+            <button class="btn ghost small" id="peer-cancel" hidden>Cancel</button>
+          </div>
+        </div>
+
+        <div class="section-title">DICOMweb servers</div>
+        <div class="peer-list" id="set-webservers"></div>
+        <div class="form-row">
+          <label class="grow">Base URL<input type="text" id="webserver-url" placeholder="https://pacs.example.org/dicom-web" /></label>
+          <button class="btn ghost" id="webserver-add">Add server</button>
+        </div>
+        <p class="web-auth-hint">Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</p>
+
+        <div class="section-title">Defaults</div>
+        <p class="mcp-note">Used wherever a screen leaves the field blank. A screen's own field still wins for that run.</p>
+        <div class="form-row triple">
+          <label>Chunk size<input type="number" id="set-chunk" placeholder="engine default" min="1" /></label>
+          <label>Retries<input type="number" id="set-retry" placeholder="engine default" min="0" /></label>
+          <label>Timeout (ms)<input type="number" id="set-timeout" placeholder="engine default" min="1000" step="1000" /></label>
+          <label>Retrieve AE<input type="text" id="set-retrieve-ae" maxlength="16" placeholder="the archive's AE" /></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="set-recurse" checked /> Recurse into subfolders</label>
+        </div>
+
+        <div class="section-title">Rehearsal</div>
+        <div class="checks">
+          <label><input type="checkbox" id="set-rehearsal" /> Rehearsal mode — every command that can take <code>--dry-run</code> gets it, and a banner says so</label>
+        </div>
+
+        <div class="section-title">Engineer options</div>
+        <div class="checks">
+          <label><input type="checkbox" id="set-cmd-expanded" /> Show commands expanded</label>
+          <label><input type="checkbox" id="set-allow-mismatch" /> Allow sending images that carry a different study than the worklist row</label>
+        </div>
+        <p class="mcp-note dim">Saved to <code>settings.json</code> in this app's data folder. The engine never reads it.</p>
       </section>
 
+      <!-- ECHO — reached from a peer chip ("Test connection…") or a peer's Test
+           button in Settings, so it sits under Settings in the sidebar. -->
+      <section class="view" id="view-echo" data-nav="settings">
+        <header class="view-head">
+          <h1>Test a connection</h1>
+          <button type="button" class="help-btn" data-help="echo-help" aria-expanded="false" aria-controls="echo-help" title="What C-ECHO proves">?</button>
+          <button class="linklike" data-goto="settings">← Settings</button>
+        </header>
+        <div class="help-panel" id="echo-help" hidden>
+          <div class="help-head"><b>What C-ECHO proves</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>C-ECHO opens an association, asks the peer to verify it, and closes. It proves three things together: the host and port are reachable, the peer accepts this station's AE Title as a caller, and it answers to the called AE you typed.</p>
+          <p>It proves nothing about storage. A peer can verify happily and still refuse every image you offer it, because the presentation contexts it accepts for C-STORE are a separate negotiation. A failed echo is conclusive; a successful one is only the first step.</p>
+        </div>
+        <p class="pane-lede">C-ECHO. Nothing is sent.</p>
+        <div class="conn-host" data-conn data-role="any"></div>
+        <div class="form-row">
+          <label>Timeout (ms)<input type="number" id="echo-timeout" placeholder="60000" min="1000" step="1000" /></label>
+        </div>
+        <div class="actions">
+          <button class="btn primary" data-run>Run C-ECHO</button>
+          <span class="status-chip" data-status hidden></span>
+        </div>
+        <details class="cmd-fold">
+          <summary>command <span class="cmd-sum"></span></summary>
+          <div class="cmd-preview" data-cmd></div>
+        </details>
+        <details class="adv out-fold">
+          <summary>Output</summary>
+          <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
+        </details>
+      </section>
     </main>
   </div>
   <script src="app.js"></script>

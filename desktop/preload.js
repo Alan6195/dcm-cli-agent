@@ -45,6 +45,18 @@ contextBridge.exposeInMainWorld('dcm', {
     set: (data) => ipcRenderer.invoke('dcm:profiles:set', data),
   },
 
+  /** settings.json — station identity, defaults, rehearsal, engineer options. */
+  settings: {
+    get: () => ipcRenderer.invoke('dcm:settings:get'),
+    set: (data) => ipcRenderer.invoke('dcm:settings:set', data),
+  },
+
+  /** The screen and tabs that were open, restored on the next launch. */
+  appState: {
+    get: () => ipcRenderer.invoke('dcm:appstate:get'),
+    set: (patch) => ipcRenderer.invoke('dcm:appstate:set', patch),
+  },
+
   /**
    * Start a `dcm` run.
    *
