@@ -1920,11 +1920,18 @@ BUILDERS.worklist = () => {
   return argv;
 };
 
-/** The Modality filter as a pill; the field behind it is what the builder reads. */
+/**
+ * The Modality filter as a pill; the field behind it is what the builder reads.
+ *
+ * Named, because it sits in a row of chips that are verbs — Today, Tomorrow,
+ * Pick… — and a bare "any modality" among them reads as a button that would DO
+ * something rather than as the filter's current value. "Modality: CT" is the
+ * shape the "Open steps: N" chip beside it already uses for the same job.
+ */
 function renderModalityPill() {
   const v = $('#mwl-modality').value.trim();
   const pill = $('#mwl-modality-pill');
-  pill.textContent = v || 'any modality';
+  pill.textContent = `Modality: ${v || 'any'}`;
   pill.classList.toggle('active', Boolean(v));
 }
 
@@ -2147,6 +2154,10 @@ function renderWorklist(json) {
     if (idx >= 0) {
       const prev = sel.item;
       sel.item = matches[idx];
+      // The list holds this row again, so whatever was said about it having
+      // left is no longer true. Cleared here rather than only in selectRow,
+      // so a row that comes back re-attaches on its own.
+      state.mwl.detached = false;
       // The SCP may return the same row with different attributes. Everything
       // selectRow seeded came off the row, so it is re-seeded here too — the
       // alternative is a command mixing this answer with the last one.
@@ -2155,8 +2166,20 @@ function renderWorklist(json) {
         checkMppsFolder();
       }
     } else if (!stableKey(sel.key)) {
-      state.mwl.detached = true;
+      state.mwl.detached = 'unkeyed';
       sel.key = 'mem:selection';
+    } else if (!sel.key.startsWith('mem:')) {
+      // The row WAS identified, and this answer does not contain it.
+      //
+      // The neighbouring case to 'unkeyed', and the one that let the panel
+      // describe a patient the table no longer held: an SCP that withholds an
+      // entry once its step is done, an order that was cancelled, a date or
+      // station filter that moved. Which of those it was is not knowable from
+      // this side, so the patient is kept — the last run's verdict names them
+      // — and the panel says the list no longer holds this row. The key is
+      // kept too: if the next answer carries the row again it re-attaches
+      // above, rather than the operator having to notice and re-pick.
+      state.mwl.detached = 'gone';
     }
   }
   renderWorklistTable();
@@ -2209,12 +2232,29 @@ function worklistAttrs(item) {
   };
 }
 
+/**
+ * How this screen says "the SCP returned nothing for this" — once, everywhere.
+ *
+ * It used to be said two ways in two places about the same field: the banner
+ * read "— no procedure —" while Details read "— not returned by the SCP —".
+ * Both were true, which is exactly why two of them is worse than one: a reader
+ * comparing the panel against the grid has to work out that the two sentences
+ * are the same sentence. The words are short because they are repeated up to
+ * eleven times down the attribute grid; the part that carries the weight —
+ * that the app did not lose this, the RIS never sent it — is on the hover and
+ * in the help panel, where it is read once instead of eleven times.
+ */
+const MISSING_TITLE = 'The SCP returned nothing for this.';
+const missingCell = (field) => `<span class="miss" title="${MISSING_TITLE}">no ${esc(field)}</span>`;
+
 /** One "key / value" cell, amber when the SCP returned nothing for it. */
-function attrCell(label, value, missingLabel = 'not returned by the SCP') {
+function attrCell(label, value) {
   const has = value !== '';
   return `<div class="attr ${has ? '' : 'missing'}">` +
     `<div class="attr-k">${esc(label)}</div>` +
-    `<div class="attr-v">${esc(has ? value : `— ${missingLabel} —`)}</div></div>`;
+    // The label verbatim, not lowercased: these are field names, and
+    // "no Study Instance UID" is right where "no study instance uid" is not.
+    `<div class="attr-v">${has ? esc(value) : missingCell(label)}</div></div>`;
 }
 
 /** 'perform' | 'close' | null — decided by whether this app holds the row's step open. */
@@ -2295,6 +2335,9 @@ function clearSelection() {
   state.mwl.detached = false;
   state.mpps.mismatch = null;
   state.mpps.scan = null;
+  // The verdict went with the selection, so nothing on screen is about any
+  // folder now — the next `change`, blur included, has to re-read.
+  mppsScanFor = null;
   state.steps.armed = false;
   for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
@@ -2526,6 +2569,16 @@ function mppsFix() {
 let mppsScanToken = 0;
 
 /**
+ * The folder the verdict on screen is about, or null when there is none.
+ *
+ * Only ever used to tell a folder that changed from one that did not. `change`
+ * fires on blur with nothing retyped, and re-reading the folder then would
+ * spawn a child per tab-out; the same test makes the `input`-then-`change`
+ * pair a picked path produces settle into a single read.
+ */
+let mppsScanFor = null;
+
+/**
  * Reads the chosen folder and compares its study with the worklist row's.
  *
  * The engine refuses a mismatch, and that refusal is right: a step naming one
@@ -2538,6 +2591,9 @@ async function checkMppsFolder() {
   const folder = $('#mpps-folder').value.trim();
   const item = selectedWorklistItem();
   const token = ++mppsScanToken;
+  // Whatever brought us here — a keystroke, Browse…, a new row, "Read it
+  // again" — this folder is now the one the screen's verdict is about.
+  mppsScanFor = folder;
 
   state.mpps.mismatch = null;
   state.mpps.scan = null;
@@ -2563,6 +2619,9 @@ async function checkMppsFolder() {
     runCapture('mpps-scan', ['info', folder, '--json']),
     new Promise((r) => setTimeout(() => r(null), 20000)),
   ]);
+  // A newer scan owns the state now; this one's answer is about a folder or a
+  // row that is no longer chosen. It renders nothing, because the newer scan
+  // has already drawn "Reading the folder…" and will draw its own verdict.
   if (token !== mppsScanToken) return;
 
   let scan = null;
@@ -2570,9 +2629,9 @@ async function checkMppsFolder() {
   const studies = Array.isArray(scan?.studies) ? scan.studies : null;
 
   if (!scanned) {
-    state.mpps.scan = { warn: 'This folder is taking too long to read, so it has not been checked against this row. The exam still checks the images when it runs, and refuses them if they are a different study.' };
+    state.mpps.scan = { warn: 'This folder took too long to read, so its study is unknown.' };
   } else if (!studies) {
-    state.mpps.scan = { warn: 'This folder could not be read. Running the exam says exactly why.' };
+    state.mpps.scan = { warn: 'This folder could not be read.' };
   } else if (studies.length === 0) {
     state.mpps.scan = { warn: `No DICOM instances here (${scan.filesExamined} files examined).` };
   } else {
@@ -2593,6 +2652,39 @@ async function checkMppsFolder() {
 }
 
 /**
+ * Whether this screen can say what the chosen folder holds — and if not, why.
+ *
+ * ONE function, read by the verdict line and by the verb guard, because the
+ * field failure this exists to stop was those two disagreeing: the line was
+ * hidden (`state.mpps.scan` was null, which `renderFolderLine` treated as
+ * "nothing to say") while "Perform exam" stayed live, so the app built a
+ * command out of a folder nothing on screen had read and the engine refused it
+ * with exit 2. A scan that never ran, never finished, timed out, could not be
+ * parsed or found no DICOM is the SAME situation as one still running: the
+ * folder's study is unknown, so the command cannot be known either.
+ *
+ * Null means there is genuinely nothing to say: no folder yet, no row yet, or
+ * the folder an open step already sent — which was checked when it was sent.
+ *
+ * @returns {{why: string, retry: boolean}|null}
+ */
+function mppsFolderUnknown() {
+  const folder = $('#mpps-folder').value.trim();
+  // Both of these stop the run in runMpps with their own message; a second
+  // amber line here would be saying it twice before anything went wrong.
+  if (!folder || !selectedWorklistItem()) return null;
+  const open = stepsSelected();
+  if (open && open.folder === folder) return null;
+  const s = state.mpps.scan;
+  if (!s) {
+    return { why: 'This folder has not been read, so its study is unknown.', retry: true };
+  }
+  if (s.reading) return { why: 'Reading the folder…', retry: false };
+  if (s.warn) return { why: s.warn, retry: true };
+  return null;
+}
+
+/**
  * One line under the folder: what it holds, and what will be done with it.
  * It states the outcome rather than asking — the station re-stamps a copy of
  * a different study the way a modality would. The only choice offered is
@@ -2604,10 +2696,30 @@ function renderFolderLine() {
   const s = state.mpps.scan;
   const m = state.mpps.mismatch;
   sw.hidden = true;
-  if (!s) { box.hidden = true; return; }
+
+  // Said BEFORE anything else, and never hidden: while this is set the verbs
+  // are dead (verbBlock reads the same function), and a dead button with no
+  // line above it is the screen that let a real exam fail.
+  const unknown = mppsFolderUnknown();
+  if (unknown) {
+    box.hidden = false;
+    box.className = unknown.retry ? 'folder-check warn' : 'folder-check';
+    box.textContent = unknown.why;
+    // A folder that could not be read is not a folder that will never read:
+    // the usual cause is a slow disk or a busy machine, so the way out is one
+    // click rather than re-typing the path.
+    if (unknown.retry) {
+      box.insertAdjacentHTML('beforeend',
+        ' <button type="button" class="linklike" id="mpps-recheck">Read it again</button>');
+    }
+    return;
+  }
+  // Everything past here reads facts off the scan, so a scan that carries no
+  // facts stops here even though mppsFolderUnknown() found nothing to say —
+  // the folder or the row can be cleared between the scan starting and this
+  // running, and `s.instances` would then print as "undefined instances".
+  if (!s || s.reading || s.warn) { box.hidden = true; return; }
   box.hidden = false;
-  if (s.reading) { box.className = 'folder-check'; box.textContent = 'Reading the folder…'; return; }
-  if (s.warn) { box.className = 'folder-check warn'; box.textContent = s.warn; return; }
 
   // Where the images go, by AE Title: the command names it in full. When no
   // saved peer holds the Archive role they go to the RIS, and that is said.
@@ -2774,11 +2886,12 @@ function renderPatientBanner() {
   const item = selectedWorklistItem();
   const a = worklistAttrs(item);
   if (!a) return;
-  const chip = (value, missing) => (value ? `<span>${esc(value)}</span>` : `<span class="miss">— ${esc(missing)} —</span>`);
+  // Same words the attribute grid uses for the same fact — see missingCell.
+  const chip = (value, field) => (value ? `<span>${esc(value)}</span>` : missingCell(field));
   const sep = '<span class="hero-sep">·</span>';
   $('#mpps-hero-main').innerHTML =
-    chip(a.patientName, 'no patient name') + sep + chip(a.modality, 'no modality') + sep +
-    chip(a.requestedProcedureDescription || a.scheduledStepDescription, 'no procedure') +
+    chip(a.patientName, 'Patient name') + sep + chip(a.modality, 'Modality') + sep +
+    chip(a.requestedProcedureDescription || a.scheduledStepDescription, 'Procedure') +
     (a.accessionNumber ? sep + `<span class="mono">${esc(a.accessionNumber)}</span>` : '') +
     (a.startTime ? sep + `<span class="mono">${esc(fmtTime(a.startTime))}</span>` : '');
   const sub = [];
@@ -2791,7 +2904,7 @@ function renderPatientBanner() {
   $('#mpps-hero-sub').innerHTML = sub.join(sep);
   $('#mpps-hero-uid').innerHTML = a.studyInstanceUid
     ? `<code>${esc(a.studyInstanceUid)}</code>`
-    : '<span class="miss">— no Study Instance UID returned by the SCP —</span>';
+    : missingCell('Study Instance UID');
 
   // In closing mode the banner also says where the step is open, because the
   // N-SET goes where the N-CREATE went, not wherever the chip points now.
@@ -2848,7 +2961,20 @@ function renderMppsPanel() {
   // rather than the selection quietly moving to whoever is there now.
   const detached = $('#mwl-detached-note');
   detached.hidden = !state.mwl.detached;
-  if (state.mwl.detached) {
+  if (state.mwl.detached === 'gone') {
+    // The row was identified and has left the list. Performing is blocked in
+    // verbBlock, so this says so; closing is not, because an N-SET goes to the
+    // peer that took the N-CREATE and never consults the worklist.
+    //
+    // Two sentences, on purpose. This sits above the primary button inside the
+    // station's word budget, and WHY a row can leave the answer is prose —
+    // it lives in the help panel behind the ?. The time of the read is not
+    // repeated here either; the status chip beside Refresh already carries it.
+    detached.innerHTML = '<b>The RIS no longer lists this row.</b> '
+      + (closing
+        ? 'Closing the open step still works.'
+        : 'Performing is blocked until it comes back.');
+  } else if (state.mwl.detached) {
     detached.innerHTML = 'This patient is held from the last list that was read. The rows the RIS returns carry nothing that identifies them, so the list cannot say which row this is. Refresh and pick again before performing.';
   }
 
@@ -2902,10 +3028,19 @@ function renderStartPreview() {
 function verbBlock() {
   const mode = panelMode();
   if (!mode) return null;
-  const s = state.mpps.scan;
-  if (s && s.reading) return 'Checking the folder…';
+  // The same question the verdict line answers, asked by the same function:
+  // whenever the screen cannot say what the folder holds, the button that
+  // would send it is dead and carries that reason. Two separate tests here
+  // and there is how the line came to be hidden while the button stayed live.
+  const unknown = mppsFolderUnknown();
+  if (unknown) return unknown.why;
   const m = state.mpps.mismatch;
   if (m && m.kind === 'many') return 'This folder holds more than one study — split it first.';
+  // A patient the current list does not hold: the row this command is built
+  // from is not in the answer on screen, so it may no longer be scheduled.
+  if (state.mwl.detached === 'gone' && mode === 'perform') {
+    return 'This row is not in the list the RIS last returned — refresh and pick it again.';
+  }
   if (mode === 'close') {
     if (m && stepsFolderToAdd()) return 'These images carry a different study than this step.';
     return null;
@@ -2960,6 +3095,37 @@ function parseMppsReport(text, errText = '') {
   };
 }
 
+/**
+ * The engine's own sentence for a run that failed, or ''.
+ *
+ * `log.error` prefixes the FIRST line of a message with "error " and leaves
+ * the rest of it unprefixed, and a usage error is followed by a second
+ * message — "Run 'dcm … --help' for usage." — that helps nobody standing at a
+ * console. So the first block is taken whole and the next "error " line ends
+ * it.
+ *
+ * This exists because the app printed "the output is the whole story" over a
+ * story it was holding: the engine had said, in one line on stderr, exactly
+ * which part of the command it refused, and the screen replaced that with a
+ * generic sentence and a fold nobody opened. The fold is still revealed
+ * underneath — this is the same text, where it will actually be read.
+ */
+function engineErrorText(stderr) {
+  const lines = stripAnsi(String(stderr || '')).split('\n');
+  const start = lines.findIndex((l) => /^error\s/.test(l));
+  if (start < 0) return '';
+  const out = [lines[start].replace(/^error\s+/, '')];
+  for (const line of lines.slice(start + 1)) {
+    if (/^error\s/.test(line)) break;
+    out.push(line);
+  }
+  // A stack trace is the engine failing rather than the engine explaining, and
+  // pasting one into a red box teaches an operator nothing. Its first line
+  // still names the error, so that line is kept and the frames are not.
+  if (/^\s*at\s/.test(out[1] || '')) return out[0].trim();
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function renderMppsTotals(r) {
   const box = $('#mpps-totals');
   if (r.found == null) { box.hidden = true; box.classList.remove('show'); return; }
@@ -2982,15 +3148,31 @@ function renderMppsTotals(r) {
  * that says DISCONTINUED means the study is not fully accounted for in the
  * archive and somebody has to act on that.
  */
-function renderMppsOutcome({ code, report, dryRun, verb }) {
+function renderMppsOutcome({ code, report, dryRun, verb, stderr = '' }) {
   const box = $('#mpps-outcome');
   box.hidden = false;
+  const said = engineErrorText(stderr);
+  // The engine's own words, kept as the engine wrote them: these messages are
+  // laid out in lines and indented columns, and reflowing them into a
+  // paragraph would lose the two-ways-forward list that is the useful half.
+  const quote = (text) => `<div class="engine-said">${esc(text)}</div>`;
 
   if (dryRun) {
+    // A rehearsal that failed is the rehearsal doing its job: it found the
+    // thing that would have stopped the real run. Saying only "nothing was
+    // sent" would throw away the finding it was run for.
+    if (code !== 0) {
+      box.className = 'outcome bad';
+      revealConsole();
+      box.innerHTML = '<span class="outcome-head">The rehearsal did not get through — nothing was sent.</span>'
+        + (said ? quote(said) : 'The output says why. The real run would stop here too.');
+      setStatus('mpps', 'fail', 'Rehearsal failed');
+      return;
+    }
     box.className = 'outcome';
     box.innerHTML = '<span class="outcome-head">Rehearsal — nothing was sent.</span>' +
       (verb === 'start' ? 'No connection, no step.' : 'No connection, no step, no images. Performed series cannot be previewed.');
-    setStatus('mpps', code === 0 ? 'ok' : 'fail', code === 0 ? 'Plan ready' : 'Scan failed');
+    setStatus('mpps', 'ok', 'Plan ready');
     return;
   }
 
@@ -3003,7 +3185,8 @@ function renderMppsOutcome({ code, report, dryRun, verb }) {
     } else {
       box.className = 'outcome bad';
       revealConsole();
-      box.innerHTML = '<span class="outcome-head">N-CREATE failed — no step was opened.</span>The output says why.';
+      box.innerHTML = '<span class="outcome-head">N-CREATE failed — no step was opened.</span>'
+        + (said ? quote(said) : 'The output says why.');
       setStatus('mpps', 'fail', 'Failed');
     }
     return;
@@ -3028,12 +3211,27 @@ function renderMppsOutcome({ code, report, dryRun, verb }) {
       '<b>There is no override.</b> Resend the outstanding instances and open a new step, or find out why the archive refused them.';
   } else if (report.neverOpened) {
     head = 'N-CREATE failed — no step was opened.';
-    body = 'Nothing was sent, the images are untouched. The output says why.';
+    body = 'Nothing was sent, the images are untouched. '
+      + (said ? quote(said) : 'The output says why.');
   } else if (report.stillInProgress) {
     head = `N-SET failed — the step is still open on ${esc(state.conn.calledAe || 'the RIS')}.`;
-    body = 'Close it below before quitting; this app remembers the UID only until it closes.';
+    body = 'Close it below before quitting; this app remembers the UID only until it closes.'
+      + (said ? quote(said) : '');
+  } else if (code === 2 && report.sent == null) {
+    // Exit 2 is a usage error: the engine refused the command this app built,
+    // and it refuses before opening an association, so nothing left this
+    // machine. Which part of the command was wrong is knowable only from the
+    // engine's own sentence — this app wrote the command, so a generic line
+    // here blames the operator for something the app did.
+    head = 'Refused before anything ran — nothing was sent, nothing on disk touched.';
+    body = said
+      ? quote(said)
+      : `The engine exited 2 — it would not accept this command — and said nothing on either stream. `
+        + 'The output is the whole story.';
   } else {
-    body = `The engine exited ${esc(String(code))} without reporting a closed step. The output is the whole story.`;
+    body = (said ? quote(said) : '')
+      + `The engine exited ${esc(String(code))} without reporting a closed step.`
+      + (said ? '' : ' The output is the whole story.');
   }
   box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
   setStatus('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
@@ -3090,10 +3288,20 @@ async function runMpps(verb) {
     const box = $('#mpps-outcome');
     box.hidden = false;
     box.className = 'outcome bad';
-    box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different study.</span>Nothing was sent, nothing on disk touched. See the line under the folder.';
+    const said = engineErrorText(stderr);
+    box.innerHTML = '<span class="outcome-head">Refused — the images belong to a different study.</span>'
+      + 'Nothing was sent, nothing on disk touched. See the line under the folder.'
+      // The engine names both UIDs. Neither is on this screen anywhere else,
+      // and they are what a call to the RIS is about.
+      + (said ? `<div class="engine-said">${esc(said)}</div>` : '');
     setStatus('mpps', 'fail', 'Study mismatch');
     return;
   }
+
+  // Any other refusal is also a verdict about the folder — most of them are
+  // reached while scanning it — so the line under the folder is re-read
+  // before the outcome is drawn, and comes back saying the same thing.
+  if (code === 2) await checkMppsFolder();
 
   const report = parseMppsReport(stdout, stderr);
   if (!dryRun) {
@@ -3111,7 +3319,7 @@ async function runMpps(verb) {
     renderMppsPanel();
     updateAllPreviews();
   }
-  renderMppsOutcome({ code, report, dryRun, verb });
+  renderMppsOutcome({ code, report, dryRun, verb, stderr });
 }
 
 function wireMpps() {
@@ -3135,13 +3343,58 @@ function wireMpps() {
   // A different folder is a different study, so re-read it. Debounced because
   // this fires per keystroke when the path is typed rather than picked.
   let folderTimer = null;
-  $('#mpps-folder').addEventListener('input', () => {
+  const folderChanged = () => {
+    // A blur over a folder nobody retyped is not a new folder. `change` fires
+    // on blur whether or not the value moved, so without this every tab-out of
+    // the field would spawn another `dcm info` child and blink the verbs dead
+    // for the length of it. Claimed here rather than in checkMppsFolder so the
+    // `input`/`change` pair a picked path produces does the work once.
+    const folder = $('#mpps-folder').value.trim();
+    if (folder === mppsScanFor) return;
+    mppsScanFor = folder;
+
+    // Invalidated on the keystroke, not 350ms later. What was concluded about
+    // the last folder is not a fact about this one, and for those 350ms the
+    // old verdict sat on screen over the new path with the verbs live —
+    // which is the defect this screen was rebuilt around. The scan is
+    // debounced; disowning its answer is not.
+    //
+    // Set to `reading` rather than cleared to null, because a scan IS coming:
+    // the line then says the thing it will go on saying once the child is
+    // running, instead of flashing amber between every two characters of a
+    // pasted path. Either way the verbs are dead, which is the point.
+    state.mpps.scan = { reading: true };
+    state.mpps.mismatch = null;
+    mppsScanToken++;
     updateAllPreviews();
     // In closing mode the folder is images to add, which changes the verb's
     // label and its command.
     renderStepsClose();
+    renderFolderLine();
+    applyVerbGuards();
     clearTimeout(folderTimer);
     folderTimer = setTimeout(checkMppsFolder, 350);
+  };
+  // Both events, not one.
+  //
+  // The property this screen exists to hold is that the verbs are dead
+  // whenever the folder's study is unknown — and that has to be true however
+  // the folder got there. Bound to `input` alone, it was not: wirePickers used
+  // to announce a picked path with `change` only, so Browse… changed the field
+  // without ever reaching this, leaving the previous verdict on screen and
+  // "Perform exam" live over a folder nothing had read. The engine refused
+  // those runs with exit 2, which is the whole reason this pass exists.
+  //
+  // wirePickers now fires both, so that particular route is repaired at the
+  // source; this is the other side of the same guarantee, and the reason a
+  // future field-setter that emits only `change` cannot re-open the hole.
+  $('#mpps-folder').addEventListener('input', folderChanged);
+  $('#mpps-folder').addEventListener('change', folderChanged);
+
+  // "Read it again" is drawn inside the verdict line, so it is replaced on
+  // every render — delegated to the box that survives.
+  $('#mpps-folder-check').addEventListener('click', (e) => {
+    if (e.target.id === 'mpps-recheck') checkMppsFolder();
   });
 
   $('#mpps-fix-switch').addEventListener('click', (e) => {
@@ -3322,9 +3575,10 @@ function renderStepsClose() {
 }
 
 /** The verdict on a close, in the same box the perform uses. */
-function renderCloseOutcome({ code, dry, verb, peer, extra = '' }) {
+function renderCloseOutcome({ code, dry, verb, peer, extra = '', stderr = '' }) {
   const box = $('#mpps-outcome');
   box.hidden = false;
+  const said = engineErrorText(stderr);
   if (dry) {
     box.className = 'outcome';
     box.innerHTML = '<span class="outcome-head">Rehearsal — nothing was sent.</span>The N-SET was built and printed, not sent.';
@@ -3336,7 +3590,12 @@ function renderCloseOutcome({ code, dry, verb, peer, extra = '' }) {
     box.innerHTML = `<span class="outcome-head">Step ${status}.</span>Closed on ${esc(peer)}. ${extra}`;
   } else {
     box.className = 'outcome bad';
-    box.innerHTML = `<span class="outcome-head">N-SET failed — the step is still open on ${esc(peer)}.</span>The output says why. ${extra}`;
+    // The same rule as perform: the engine's own sentence, not a pointer at a
+    // fold. An N-SET the SCP refused names a status or a UID it would not
+    // take, and that is the whole of what to do next.
+    box.innerHTML = `<span class="outcome-head">N-SET failed — the step is still open on ${esc(peer)}.</span>`
+      + (said ? `<div class="engine-said">${esc(said)}</div>` : 'The output says why. ')
+      + extra;
   }
 }
 
@@ -3395,7 +3654,7 @@ async function runClose(verb) {
   }
 
   setStatus('steps', 'running', dry ? 'Building…' : 'Closing…');
-  const { code } = await runStreaming('steps', argv);
+  const { code, stderr } = await runStreaming('steps', argv);
   for (const b of ['steps-close-run', 'steps-discontinue', 'steps-discontinue-run']) $(`#${b}`).disabled = false;
   applyVerbGuards();
   setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : (verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED')) : 'Failed');
@@ -3409,7 +3668,7 @@ async function runClose(verb) {
     state.steps.armed = false;
     refreshRowPills();
   }
-  renderCloseOutcome({ code, dry, verb, peer, extra });
+  renderCloseOutcome({ code, dry, verb, peer, extra, stderr });
   renderMppsPanel();
   updateAllPreviews();
 }
@@ -3634,7 +3893,12 @@ function renderSpeedPlan(runs) {
     `<div class="section-title">${list.length} run${list.length === 1 ? '' : 's'}, in order</div>` +
     list.map((r, i) =>
       `<div class="run-line" id="speed-line-${i}">` +
-        `<span>${esc(r.title)} · ${esc(r.callingAe)}</span><span class="rate">waiting…</span></div>` +
+        // "waiting…" only while a sweep is actually in flight. Sitting under a
+        // green "Done" chip beside a finished comparison table, four lines all
+        // reading "waiting…" looked like a run that had hung; this list is the
+        // plan for the NEXT sweep, and it says so.
+        `<span>${esc(r.title)} · ${esc(r.callingAe)}</span>` +
+        `<span class="rate">${speedRunning ? 'waiting…' : 'not run yet'}</span></div>` +
       // r.argv is set once, by runSpeedTest, at the moment the sweep is frozen.
       // Before that there is no sweep to freeze and the current form is the
       // truth. Either way the string printed here is the argv that is spawned.
@@ -4801,6 +5065,11 @@ function syncRenameButton() {
 
 /** Everything the loaded study put on screen, taken back off it. */
 function resetRenameStudy() {
+  // The chip goes with the study it described. Left behind, a green "Loaded"
+  // sat over an empty folder box and no study card — the screen claiming to
+  // hold something it had just been told to forget, which is the same lie as
+  // a patient panel describing a row the list no longer has.
+  setStatus('rename', null);
   renameState.path = '';
   renameState.study = null;
   renameState.current = null;
@@ -4928,7 +5197,9 @@ function wireRename() {
   // A typed path is scanned when it is finished with, not per keystroke — each
   // scan is a child process. Changing it drops the loaded study first, so the
   // fields on screen can never belong to a folder other than the one named
-  // above them. The picker dispatches `change`, so Browse… lands here too.
+  // above them. The picker dispatches both events in the order typing
+  // produces them, so Browse… drops the old study here and scans below,
+  // exactly as finishing a typed path does — one scan, not two.
   $('#rename-folder').addEventListener('input', () => {
     if ($('#rename-folder').value.trim() !== renameState.path) resetRenameStudy();
   });
@@ -5250,9 +5521,21 @@ function wirePickers() {
       if (res && res.path) {
         const field = $(`#${targetId}`);
         field.value = res.path;
-        // A picked path is a path the operator chose, exactly as if they had
-        // typed it and pressed Enter — so it fires `change` and any screen
-        // that reacts to a folder being settled on (Rename reads it) reacts.
+        // Both events, in the order typing produces them.
+        //
+        // A picked path is a path the operator chose, so it has to reach every
+        // listener a typed one reaches. Firing `change` alone did not: the
+        // station's folder logic — invalidate the old verdict, rescan, block
+        // the verbs until the study is known — is bound to `input`, so a
+        // folder chosen with Browse… left a live "Perform exam" over a folder
+        // nothing had read, and the engine refused the run with exit 2. That
+        // is the bug this whole pass was about, reached by the one route an
+        // operator is most likely to take.
+        //
+        // Dispatching both here rather than adding a second listener there
+        // fixes it for every picker-fed field at once, including the ones that
+        // only listen for `change` today.
+        field.dispatchEvent(new Event('input', { bubbles: true }));
         field.dispatchEvent(new Event('change', { bubbles: true }));
         updateAllPreviews();
       }

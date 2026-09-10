@@ -1,7 +1,7 @@
 {
   "name": "ascendi-dcm-desktop",
   "productName": "AscendI DICOM",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "private": true,
   "description": "Desktop app for the AscendI DICOM CLI Agent — echo, inventory, send, receive, worklist, tags, edit, de-identify and DICOMweb (STOW/QIDO/WADO), with a live transfer report.",
   "author": "AscendI",

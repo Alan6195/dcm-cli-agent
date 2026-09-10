@@ -29,6 +29,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+// This file only ever runs inside the main process, which has already loaded
+// electron; taking ipcMain from it is how the native folder dialog is answered
+// without one being put on a screen nobody is looking at. See armPicker().
+const { ipcMain } = require('electron');
 
 /** The engine this app spawns, vendored by copy-engine.js. */
 const ENGINE_ENTRY = path.join(__dirname, '..', 'engine', 'bin', 'dcm.js');
@@ -78,6 +82,14 @@ const RUN_PANES = ['worklist', 'send', 'receive', 'query', 'speed', 'echo', ...T
 const BUDGET = {
   'worklist-list': 17,   // the station with nothing selected: the whole screen
   worklist: 60,          // the station with a row selected, above "Perform exam"
+  // The station with its repair notes showing — the row has left the list, or
+  // the folder could not be read, or both. A repair is allowed to cost words
+  // that the ordinary screen is not, because it has to say what is wrong and
+  // the button below it is dead anyway. It still has a ceiling: without one,
+  // "the screen where it is fine to explain things" is how the prose the
+  // redesign moved into the help panel walks back onto the station.
+  'worklist-gone': 60,       // a row that left the list, folder fine
+  'worklist-repairs': 70,    // and the folder unread on top of it
   send: 46,
   receive: 34,
   query: 27,
@@ -165,6 +177,25 @@ async function jsJSON(expr) {
 function bad(msg) {
   throw new Error(msg);
 }
+
+/**
+ * Does a rendered command name this path?
+ *
+ * The app puts a path into the command exactly as it sits in the field, and
+ * the field holds what the operator typed or what the picker handed back — on
+ * Windows, backslashes. These assertions used to compare against one spelling
+ * (`fixtures.replace(/\\/g, '/')`), which made the whole harness pass only when
+ * DCM_SMOKE_FIXTURES happened to be supplied with forward slashes: given the
+ * natural `C:\...\fixtures\study-1` it died at H1. Worse, the two NEGATIVE
+ * uses — "the start command must NOT name the folder" — passed vacuously for
+ * the same reason, so the harness was at its least trustworthy exactly where
+ * it looked strictest.
+ *
+ * Comparing on a separator-normalised form accepts either spelling of the same
+ * folder and still rejects a different one.
+ */
+const slashes = (s) => String(s).replace(/\\/g, '/');
+const cmdNames = (cmd, p) => slashes(cmd).includes(slashes(p));
 
 /**
  * Waits until an expression evaluates truthy in the renderer.
@@ -270,6 +301,14 @@ const HELPERS = `(() => {
 
   window.__smoke = {
     vis,
+    /**
+     * Every engine child the renderer has started since this was last emptied.
+     *
+     * Filled by a wrapper the harness puts around runCapture when it needs to
+     * know whether one gesture spawned one process or two — a doubled folder
+     * scan shows up nowhere on screen, only here.
+     */
+    spawns: [],
     /** Visible words above a pane's primary button, and the controls beside them. */
     measure(paneSel, stopSel) {
       const root = document.querySelector(paneSel);
@@ -338,6 +377,92 @@ const HELPERS = `(() => {
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }
       return true;
+    },
+
+    /**
+     * Whether the page scrolls sideways, and what is pushing it.
+     *
+     * A page-level horizontal scrollbar is the defect; the offender list is
+     * only there so a failure names a selector rather than sending somebody
+     * back to the screenshots. An element inside a container that clips on the
+     * x axis is excluded — a table cell ellipsising is doing its job, and it
+     * cannot move the page. Everything else whose right edge is past the
+     * document's client width is reported, outermost first.
+     */
+    overflow() {
+      // The window's own scroller is NOT documentElement: .content carries
+      // overflow-y:auto, which CSS promotes overflow-x to auto as well, so the
+      // sideways scrollbar an operator sees along the bottom of the window
+      // belongs to .content and documentElement.scrollWidth never moves. A
+      // check that asked only the document would pass over a window that is
+      // visibly scrolling sideways — it did.
+      //
+      // These three are the shell. A container that opts into overflow-x
+      // itself — the results table, the console — is not one of them: scrolling
+      // a wide table inside its own box is the fix, not the defect.
+      const shells = [document.documentElement, document.body, document.querySelector('.content')]
+        .filter(Boolean);
+      const name = (el) => {
+        const cls = typeof el.className === 'string' && el.className.trim()
+          ? '.' + el.className.trim().split(/\\s+/).slice(0, 3).join('.') : '';
+        return (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + cls).slice(0, 90);
+      };
+      const worst = shells
+        .map((el) => ({ el, sel: name(el), scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }))
+        .sort((a, b) => (b.scrollWidth - b.clientWidth) - (a.scrollWidth - a.clientWidth))[0];
+
+      // What is sticking out of it, outermost first. Anything inside a box
+      // that clips or scrolls on its own account is skipped: it cannot move
+      // the shell, so it is not what is being looked for here.
+      const shell = worst.el;
+      const box = shell.getBoundingClientRect();
+      const limit = box.left + shell.clientWidth;
+      const clipped = (el) => {
+        for (let p = el.parentElement; p && p !== shell; p = p.parentElement) {
+          if (getComputedStyle(p).overflowX !== 'visible') return true;
+        }
+        return false;
+      };
+      const offenders = [];
+      for (const el of shell.querySelectorAll('*')) {
+        if (!vis(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.right <= limit + 1) continue;
+        if (clipped(el)) continue;
+        if (offenders.some((o) => o.el.contains(el))) continue;
+        offenders.push({ el, sel: name(el), right: Math.round(r.right), width: Math.round(r.width) });
+      }
+      return {
+        shell: worst.sel,
+        scrollWidth: worst.scrollWidth,
+        clientWidth: worst.clientWidth,
+        offenders: offenders.slice(0, 6).map(({ sel, right, width }) => ({ sel, right, width })),
+      };
+    },
+
+    /**
+     * Text cut off mid-word inside a container, rather than wrapped.
+     *
+     * Distinct from overflow(): this is the panel that fits on the page but
+     * whose own contents do not fit in it. Elements that ellipsise on purpose
+     * are excluded, as are inputs, whose value legitimately scrolls.
+     */
+    clipping(rootSel) {
+      const root = document.querySelector(rootSel);
+      if (!root) return [];
+      const out = [];
+      for (const el of root.querySelectorAll('*')) {
+        if (!vis(el)) continue;
+        if (el.matches('input, textarea, select')) continue;
+        const cs = getComputedStyle(el);
+        if (cs.textOverflow === 'ellipsis') continue;
+        if (cs.overflowX === 'visible' || cs.overflowX === 'auto' || cs.overflowX === 'scroll') continue;
+        if (el.scrollWidth > el.clientWidth + 1) {
+          out.push({ sel: (el.id ? '#' + el.id : el.tagName.toLowerCase()),
+            scroll: el.scrollWidth, client: el.clientWidth });
+        }
+      }
+      return out;
     },
 
     /** The console text of a view, whichever disclosure it lives in. */
@@ -432,6 +557,77 @@ function stopPeers() {
   for (const p of peers) {
     try { p.child.kill(); } catch { /* already gone */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pressing the app's own Browse… buttons
+//
+// Until this existed, nothing in the suite had ever driven a [data-pick]
+// button. Every route the harness had into a path field went through
+// __smoke.set(), which dispatches input AND change — so every one of them took
+// a branch that worked, and the branch a picked path actually took was never
+// run once. It was broken: wirePickers announced the chosen path with `change`
+// alone, the station's invalidate-and-rescan hung off `input`, and Browse…
+// therefore left the previous verdict on screen with the verbs live over a
+// folder nothing had read. The engine refused those runs with exit 2, in the
+// field, on the one route an operator is most likely to take.
+//
+// The only thing replaced here is the native dialog, which cannot open on a
+// headless machine: main.js's 'dcm:pick' IPC handler. Everything on either
+// side of it is the app's own — the click on the real button, the
+// contextBridge call in preload, the handler in wirePickers, and every
+// listener the events it dispatches reach.
+// ---------------------------------------------------------------------------
+
+/** What the next dialog answers with. null is exactly what Cancel returns. */
+let pickAnswer = null;
+
+/**
+ * Takes over 'dcm:pick' for the rest of the run.
+ *
+ * Not restored afterwards, deliberately: a real showOpenDialog raised during a
+ * headless run would block until the harness timed out, so once the dialog is
+ * off it stays off.
+ */
+function armPicker() {
+  ipcMain.removeHandler('dcm:pick');
+  ipcMain.handle('dcm:pick', async () => ({ path: pickAnswer }));
+}
+
+/**
+ * Presses a Browse… button and waits for the path to land in its field.
+ *
+ * The snapshot comes back from the same renderer turn the field changed in —
+ * before the station's 350ms scan debounce can have fired — because that
+ * instant is where the defect lived: the new path was in the field and nothing
+ * had yet reacted to it.
+ *
+ * @param {string} targetId    the field the button fills, e.g. 'mpps-folder'.
+ * @param {string} folder      what the dialog will answer.
+ * @param {string} [readExpr]  a renderer expression for extra state to capture
+ *                             at that instant, merged into the result.
+ */
+async function pressPicker(targetId, folder, readExpr = '({})') {
+  if (!folder) bad(`pressPicker needs a folder for #${targetId}`);
+  pickAnswer = folder;
+  const out = await jsJSON(`(async () => {
+    const field = document.querySelector('#${targetId}');
+    const btn = document.querySelector('[data-pick="${targetId}"]');
+    if (!field || !btn) throw new Error('no picker for ${targetId}');
+    const before = field.value;
+    btn.click();
+    // wirePickers awaits an IPC round trip, so yield until the field moves.
+    // Only ever called with a path the field is not already holding, which is
+    // what makes "it moved" a usable signal.
+    for (let i = 0; i < 600 && field.value === before; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return JSON.stringify(Object.assign({ value: field.value }, ${readExpr}));
+  })()`);
+  if (out.value !== folder) {
+    bad(`Browse… did not put the chosen path into #${targetId}: ${JSON.stringify(out.value)}`);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,8 +1957,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
           name: worklistAttrs(selectedWorklistItem()).patientName,
           stepId: document.querySelector('#mpps-stepid').value,
           argv: BUILDERS.mpps().join(' '),
-          detached: !!state.mwl.detached,
+          detached: state.mwl.detached || false,
           note: document.querySelector('#mwl-detached-note').hidden ? '' : 'shown',
+          noteText: document.querySelector('#mwl-detached-note').textContent,
+          performDead: document.querySelector('#mpps-run').disabled,
+          performWhy: document.querySelector('#mpps-run').title || '',
         });
         renderWorklist({ ok: true, matches: [A, B] });
         selectRow(document.querySelector('#mwl-table tr.pick-row').dataset.key);
@@ -1771,6 +1970,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         const reordered = read();
         renderWorklist({ ok: true, matches: [B] });      // and now ALPHA has left the list
         const gone = read();
+        renderWorklist({ ok: true, matches: [B, A] });   // …and now it is back
+        const returned = read();
         // Rows carrying nothing that identifies them: keyed by position, so
         // the selection is dropped rather than re-pointed.
         renderWorklist({ ok: true, matches: [{ PatientName: 'CHARLIE^CHO' }, { PatientName: 'DELTA^DEE' }] });
@@ -1782,7 +1983,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         // Those synthetic rows named no step, which forces Details open — the
         // screen the budget is measured on is the one an operator walks up to.
         document.querySelector('#mpps-adv').open = false;
-        return JSON.stringify({ before, reordered, gone, picked, unkeyed });
+        return JSON.stringify({ before, reordered, gone, returned, picked, unkeyed });
       })()`);
       record(`refresh: rows reversed under a selected ALPHA^ANN left "${drift.reordered.name}" `
         + `on the panel with step ${drift.reordered.stepId}`);
@@ -1797,6 +1998,66 @@ async function runSmoke(win, app, mainHelpers = {}) {
           if (!m.argv.includes(mine)) bad(`the command lost the selected row (${label}): ${m.argv}`);
         }
       }
+      // A row that WAS identified and has left the list: the panel keeps the
+      // patient — the outcome and any open step still name them — but it says
+      // so where it can be read, and "Perform exam" goes dead. Describing a
+      // patient the list no longer holds while the button stays live is what
+      // this asserts against; it happened in front of an operator.
+      if (drift.before.detached || drift.reordered.detached) {
+        bad(`a row that is still in the list came up detached: ${JSON.stringify(drift.reordered)}`);
+      }
+      if (drift.gone.detached !== 'gone' || drift.gone.note !== 'shown') {
+        bad(`a row that left the list said nothing: ${JSON.stringify(drift.gone)}`);
+      }
+      if (!/no longer lists this row/.test(drift.gone.noteText)) {
+        bad(`the note does not say the list no longer holds the row: ${drift.gone.noteText}`);
+      }
+      if (!drift.gone.performDead || !/not in the list/.test(drift.gone.performWhy)) {
+        bad(`"Perform exam" stayed live for a row the list no longer holds: ${JSON.stringify(drift.gone)}`);
+      }
+      // And it heals: the row comes back, the note goes, the verb comes back.
+      if (drift.returned.detached || drift.returned.note !== '' || drift.returned.performDead) {
+        bad(`the row came back and the panel did not re-attach: ${JSON.stringify(drift.returned)}`);
+      }
+      if (drift.returned.name !== 'ALPHA^ANN') bad(`re-attaching moved the patient: ${JSON.stringify(drift.returned)}`);
+      say('refresh: a row that leaves the list detaches visibly and kills the verb; a row that comes back re-attaches');
+
+      // The station's word budget with its repair notes ON. Those notes sit
+      // above the primary button like everything else, so a repair that is
+      // three sentences long is a screen nobody reads — the reasons belong in
+      // the help panel, and the budget is what keeps them there.
+      const repairWords = await jsJSON(`(() => {
+        renderWorklist({ ok: true, matches: [{ PatientName: 'ALPHA^ANN', PatientID: 'P-111',
+          AccessionNumber: 'ACC-01', Modality: 'CT', ScheduledProcedureStepID: 'SPS-A',
+          ScheduledProcedureStepDescription: 'Head CT' }] });
+        selectRow(document.querySelector('#mwl-table tr.pick-row').dataset.key);
+        renderWorklist({ ok: true, matches: [{ PatientName: 'BRAVO^BOB', PatientID: 'P-222' }] });
+        const gone = __smoke.measure('#view-worklist', '#mpps-run');
+        // …and again with the folder unread on top of it, which is the other
+        // repair line and the two can be on screen together.
+        document.querySelector('#mpps-folder').value = 'C:/nowhere';
+        state.mpps.scan = null;
+        renderFolderLine();
+        applyVerbGuards();
+        const both = __smoke.measure('#view-worklist', '#mpps-run');
+        document.querySelector('#mpps-folder').value = '';
+        state.mpps.scan = null;
+        clearSelection();
+        return JSON.stringify({ gone, both });
+      })()`);
+      // Asserted here rather than pooled: the pooled check ran back in section
+      // C, long before this state could be reached.
+      for (const [label, key] of [['gone', 'worklist-gone'], ['both', 'worklist-repairs']]) {
+        const m = repairWords[label];
+        record(`words: ${key} — ${m.words} words above "${m.primary}" (budget ${BUDGET[key]})`);
+        wordLog.push(`${key} (${m.words} words above "${m.primary}"):\n  ${m.text}\n`);
+        if (m.words > BUDGET[key]) {
+          bad(`word budget exceeded — the station with its repair notes on (${key}): `
+            + `${m.words} words above "${m.primary}", budget ${BUDGET[key]}\n  ${m.text}`);
+        }
+      }
+      artefact('word-measure.txt', wordLog.join('\n'));
+
       if (drift.picked.detached) bad('a fresh selection came up detached');
       if (drift.unkeyed.name !== 'CHARLIE^CHO' || !drift.unkeyed.detached || drift.unkeyed.note !== 'shown') {
         bad(`an unidentifiable row was re-pointed instead of held: ${JSON.stringify(drift.unkeyed)}`);
@@ -1820,9 +2081,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
           return true;
         })()`);
       };
+      // The app's own answer, not a guess from the text: mppsFolderUnknown()
+      // is the single function the verdict line and the verb guard both read,
+      // so waiting on it is waiting on exactly the state the screen is in.
       const VERDICT = "(() => { const b = document.querySelector('#mpps-folder-check');"
-        + " return !b.hidden && b.textContent && !b.textContent.startsWith('Reading'); })()";
-      const SLOW = "/taking too long/.test(document.querySelector('#mpps-folder-check').textContent)";
+        + " return !b.hidden && b.textContent && !mppsFolderUnknown(); })()";
+      const SLOW = "/took too long/.test(document.querySelector('#mpps-folder-check').textContent)";
       const waitFolder = async () => {
         // The app gives the scan 20 seconds and then says so rather than
         // hanging. On a loaded machine a child can take that long to hand
@@ -1873,7 +2137,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`the folder line does not say the study matches and where it goes: ${panel.folderLine}`);
       }
       if (!panel.folderCls.includes('ok')) bad(`a matching folder is not styled as OK: ${panel.folderCls}`);
-      for (const needed of ['mpps perform', fixtures.replace(/\\/g, '/'), '--study-uid ' + FIX_STUDY,
+      if (!cmdNames(panel.cmd, fixtures)) bad(`the perform command does not name the folder: ${panel.cmd}`);
+      for (const needed of ['mpps perform', '--study-uid ' + FIX_STUDY,
         '--accession ACC-78', '--patient-id P-2002', '--patient-name "SMITH^ALAN"', '--modality CT',
         '--scheduled-step-id SPS-2', '--step-id SPS-2', '--station-ae CT01', '--mpps-uid 2.25.',
         `--store-host 127.0.0.1`, `--store-port ${archivePort}`, '--store-called-ae ARCHIVE',
@@ -1910,7 +2175,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
           bad(`the folded start summary does not carry its command: ${startCmdFold.sum}`);
         }
         if (!/^dcm mpps start /.test(startCmdFold.cmd)) bad(`the start preview is not a start: ${startCmdFold.cmd}`);
-        if (startCmdFold.cmd.includes('--store-host') || startCmdFold.cmd.includes(fixtures.replace(/\\/g, '/'))) {
+        if (startCmdFold.cmd.includes('--store-host') || cmdNames(startCmdFold.cmd, fixtures)) {
           bad(`the start preview names an archive or a folder it will not touch: ${startCmdFold.cmd}`);
         }
       }
@@ -2170,6 +2435,389 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad('the engine did not say the source folder was left alone');
       }
 
+      // --- H2b: the screen must never arm a verb it cannot explain ---------
+      //
+      // The failure this reproduces happened to a real operator against a real
+      // RIS: the line under the folder was HIDDEN — `state.mpps.scan` was null,
+      // which renderFolderLine treated as "nothing to say" — while "Perform
+      // exam" stayed live, so the app built a command from a folder nothing on
+      // screen had read and the engine refused it with exit 2. There is
+      // nothing special about null: a scan that timed out, could not be
+      // parsed, or found no DICOM leaves the screen just as ignorant, and
+      // those cases used to leave the verbs live too.
+      //
+      // So the rule is asserted as a class. For each way of not knowing what
+      // the folder holds: the verdict line is on screen, and both verbs are
+      // dead with the reason on them.
+      const blindStates = await jsJSON(`(() => {
+        const box = document.querySelector('#mpps-folder-check');
+        const read = () => ({
+          hidden: box.hidden,
+          line: box.textContent,
+          perform: document.querySelector('#mpps-run').disabled,
+          start: document.querySelector('#mpps-start').disabled,
+          why: document.querySelector('#mpps-run').title || '',
+          adopts: document.querySelector('#mpps-cmd').textContent.includes('--adopt-worklist-identity'),
+          retry: !!document.querySelector('#mpps-recheck'),
+        });
+        const put = (scan) => {
+          state.mpps.scan = scan;
+          state.mpps.mismatch = null;
+          renderFolderLine();
+          updateAllPreviews();
+          applyVerbGuards();
+          return read();
+        };
+        const out = {
+          neverRan: put(null),
+          timedOut: put({ warn: 'This folder took too long to read, so its study is unknown.' }),
+          unreadable: put({ warn: 'This folder could not be read.' }),
+          noDicom: put({ warn: 'No DICOM instances here (12 files examined).' }),
+          reading: put({ reading: true }),
+        };
+        return JSON.stringify(out);
+      })()`);
+      for (const [label, s] of Object.entries(blindStates)) {
+        if (s.hidden) bad(`the verdict line is hidden while the folder is unknown (${label}): ${JSON.stringify(s)}`);
+        if (!s.line.trim()) bad(`the verdict line is empty while the folder is unknown (${label})`);
+        if (!s.perform || !s.start) {
+          bad(`a verb stayed live over an unread folder (${label}): ${JSON.stringify(s)}`);
+        }
+        if (!s.why.trim()) bad(`the dead verb carries no reason (${label})`);
+        // Only the folder's own study can put --adopt-worklist-identity on the
+        // command; a screen that does not know the study must not be claiming
+        // to have re-stamped for it.
+        if (s.adopts) bad(`the command claims a re-stamp for a folder nothing read (${label}): ${JSON.stringify(s)}`);
+        say(`unread folder (${label}): "${s.line.trim().slice(0, 80)}" — verbs dead, reason "${s.why.slice(0, 60)}"`);
+      }
+      // Three of those five offer the one-click way out; "reading" does not,
+      // because a scan is already running.
+      if (!blindStates.neverRan.retry || !blindStates.unreadable.retry) {
+        bad('a folder that could not be read offers no way to read it again');
+      }
+      if (blindStates.reading.retry) bad('"Read it again" is offered while a scan is already running');
+      record('station: every way of not knowing what the folder holds kills both verbs and says so where the verdict goes');
+
+      // …and the way out works: the same folder, read again, comes back to a
+      // verdict and live verbs rather than needing the path re-typed.
+      await js(`(() => { state.mpps.scan = null; renderFolderLine(); applyVerbGuards();
+        document.querySelector('#mpps-recheck').click(); return true; })()`);
+      await waitFolder();
+      const rescanned = await jsJSON(`JSON.stringify({
+        perform: document.querySelector('#mpps-run').disabled,
+        line: document.querySelector('#mpps-folder-check').textContent,
+        adopts: document.querySelector('#mpps-cmd').textContent.includes('--adopt-worklist-identity'),
+      })`);
+      if (rescanned.perform || !rescanned.adopts) {
+        bad(`"Read it again" did not put the screen back: ${JSON.stringify(rescanned)}`);
+      }
+      say('station: "Read it again" re-reads the same folder and the verbs come back');
+
+      // --- H2c: an exit 2 the app cannot predict, and whose reason it holds -
+      //
+      // The other half of the same field failure. The app built a command the
+      // engine refused, the engine said in one line on stderr exactly which
+      // part it refused, and the screen printed "The engine exited 2 without
+      // reporting a closed step. The output is the whole story" over the top
+      // of it. The story was one line long and the app was holding it.
+      //
+      // Driven with a row whose Study Instance UID is not a UID. Nothing on
+      // this screen can know that — the folder scans fine, the mismatch is
+      // found, --adopt-worklist-identity goes on the command — and the engine
+      // refuses on the UID before it opens anything. That is the shape: a
+      // usage error that is NOT the study mismatch the app special-cases.
+      const BAD_UID_ROW = {
+        PatientName: 'BADUID^TEST', PatientID: 'P-9009', AccessionNumber: 'ACC-99',
+        StudyInstanceUID: '1.2.3..4', Modality: 'CT', ScheduledProcedureStepID: 'SPS-9',
+        RequestedProcedureDescription: 'Bad UID row', RequestedProcedureID: 'RP-9',
+      };
+      await js(`(() => {
+        __smoke.savedMatches = state.mwl.matches;
+        renderWorklist({ ok: true, matches: [${JSON.stringify(BAD_UID_ROW)}] });
+        document.querySelector('#mwl-table tr.pick-row').click();
+        return true;
+      })()`);
+      await js(`__smoke.set('mpps-folder', ${JSON.stringify(fixtures)}); true`);
+      await waitFolder();
+      const willRefuse = await js("document.querySelector('#mpps-cmd').textContent");
+      if (!willRefuse.includes('--study-uid 1.2.3..4')) {
+        bad(`the bad UID did not reach the command, so this proves nothing: ${willRefuse}`);
+      }
+      await js(`document.querySelector('#mpps-run').click(); true`);
+      await mustWait("!document.querySelector('#mpps-status').className.includes('running')",
+        RUN_MS, 'the refused perform to come back');
+      const refused = await jsJSON(`JSON.stringify({
+        status: document.querySelector('#mpps-status').textContent,
+        cls: document.querySelector('#mpps-outcome').className,
+        head: (document.querySelector('#mpps-outcome .outcome-head') || {}).textContent || '',
+        said: (document.querySelector('#mpps-outcome .engine-said') || {}).textContent || '',
+        all: document.querySelector('#mpps-outcome').textContent,
+        outOpen: __smoke.outOpen('mpps'),
+      })`);
+      record(`refused: ${refused.head} ${refused.said.split('\\n')[0]}`);
+      artefact('mpps-refused-outcome.txt', refused.all);
+      await shot('wl-5b-refused-exit2');
+      if (refused.status !== 'Failed') bad(`a refused run did not read as failed: ${refused.status}`);
+      if (!refused.cls.includes('bad')) bad(`a refused run is not in the red box: ${refused.cls}`);
+      if (!refused.said) {
+        bad(`the engine's own sentence is not on screen: ${JSON.stringify(refused)}`);
+      }
+      if (!/not a valid DICOM UID/.test(refused.said)) {
+        bad(`the screen shows something other than what the engine refused on: ${refused.said}`);
+      }
+      // The generic sentence the app used to print INSTEAD of the above. It
+      // may not come back, and it may not sit alongside a message either.
+      if (/is the whole story/.test(refused.all)) {
+        bad(`the app is still printing a generic line over a message it holds: ${refused.all}`);
+      }
+      if (!/Refused before anything ran/.test(refused.head)) {
+        bad(`an exit 2 is not said to be a refusal reached before anything ran: ${refused.head}`);
+      }
+      if (!refused.outOpen) bad('a refused run left the output folded away');
+      // Nothing was sent, so nothing may have been remembered as a step.
+      const noStep = await js("state.steps.entries.filter((e) => e.patientId === 'P-9009').length");
+      if (noStep) bad(`a refused run was remembered as ${noStep} step(s)`);
+      record('station: an exit 2 shows the engine\'s own sentence, says nothing was sent, and remembers no step');
+      await js(`(() => { renderWorklist({ ok: true, matches: __smoke.savedMatches }); clearSelection(); return true; })()`);
+
+      // --- H2d: the station, driven by its own Browse… button -------------
+      //
+      // The regression test for the defect this pass was about. See the block
+      // above pressPicker() for what was wrong and why nothing here caught it:
+      // in short, no test had ever pressed a picker, so the one route an
+      // operator actually takes into #mpps-folder was the one route never run.
+      //
+      // Three presses from a clean screen, each of which reached the engine
+      // and was refused: a folder holding two studies, a folder with no DICOM,
+      // and a folder whose study differs from the row.
+      armPicker();
+
+      // Both refusable folders are built from the fixtures rather than
+      // described. `dcm anon` remaps UIDs consistently, so study-a and study-b
+      // under one parent really are two Study Instance UIDs, not one twice.
+      const pickTwo = path.join(work, 'picked-two-studies');
+      fs.rmSync(pickTwo, { recursive: true, force: true });
+      fs.mkdirSync(pickTwo, { recursive: true });
+      fs.cpSync(fixtures, path.join(pickTwo, 'study-a'), { recursive: true });
+      const secondStudy = await runEngine(['anon', fixtures, '--out', path.join(pickTwo, 'study-b')]);
+      if (secondStudy.code !== 0) {
+        bad(`could not build a two-study folder to pick: ${secondStudy.err.slice(-400)}`);
+      }
+      // Files, not an empty directory: "nothing here is DICOM" is the case an
+      // operator hits by pointing at the wrong folder, and it is a different
+      // engine answer from "there is nothing here at all".
+      const pickNone = path.join(work, 'picked-no-dicom');
+      fs.rmSync(pickNone, { recursive: true, force: true });
+      fs.mkdirSync(pickNone, { recursive: true });
+      fs.writeFileSync(path.join(pickNone, 'notes.txt'), 'not DICOM\n');
+      fs.writeFileSync(path.join(pickNone, 'photo.jpg'), 'not DICOM either\n');
+
+      // What the screen says the instant a picked path lands, and what it says
+      // once the folder has been read. The first is the assertion that fails
+      // on the old code: with `change` alone the field held a new folder while
+      // the verdict line stayed hidden and both verbs stayed live.
+      const AT_PRESS = `({
+        reading: !!(state.mpps.scan && state.mpps.scan.reading),
+        lineHidden: document.querySelector('#mpps-folder-check').hidden,
+        line: document.querySelector('#mpps-folder-check').textContent,
+        perform: document.querySelector('#mpps-run').disabled,
+        start: document.querySelector('#mpps-start').disabled,
+        why: document.querySelector('#mpps-run').title || '',
+      })`;
+      const settled = () => jsJSON(`JSON.stringify({
+        line: document.querySelector('#mpps-folder-check').textContent,
+        lineHidden: document.querySelector('#mpps-folder-check').hidden,
+        cls: document.querySelector('#mpps-folder-check').className,
+        perform: document.querySelector('#mpps-run').disabled,
+        start: document.querySelector('#mpps-start').disabled,
+        why: document.querySelector('#mpps-run').title || '',
+        cmd: document.querySelector('#mpps-cmd').textContent,
+      })`);
+      // "No DICOM here" is a warning rather than a verdict, so mppsFolderUnknown()
+      // stays truthy for it by design and waitFolder would wait for a verdict
+      // that is never coming. This waits for the scan to settle instead, and
+      // re-asks on the one settled state that is about the machine rather than
+      // about the folder.
+      const waitScanned = async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          // eslint-disable-next-line no-await-in-loop
+          await mustWait('!!state.mpps.scan && !state.mpps.scan.reading', 60000, 'the folder scan to settle');
+          // eslint-disable-next-line no-await-in-loop
+          if (!await js(SLOW)) return;
+          say('folder check: the scan ran out of time on a busy machine — asking again');
+          // eslint-disable-next-line no-await-in-loop
+          await js('checkMppsFolder(); true');
+          // eslint-disable-next-line no-await-in-loop
+          await wait(300);
+        }
+        bad('the folder scan never settled');
+      };
+      // A dead button cannot be pressed, and this is how that is proved rather
+      // than asserted: click it for real and show that no run began.
+      const pressPerform = () => jsJSON(`(async () => {
+        document.querySelector('#mpps-run').click();
+        await new Promise((r) => setTimeout(r, 400));
+        return JSON.stringify({
+          ran: !!state.activeRuns.mpps,
+          status: document.querySelector('#mpps-status').textContent,
+        });
+      })()`);
+
+      // ---- 1. a folder holding two studies.
+      await selectRowFor('DOE^JANE');
+      const twoAt = await pressPicker('mpps-folder', pickTwo, AT_PRESS);
+      if (twoAt.lineHidden || !twoAt.reading) {
+        bad(`Browse… changed the folder without the screen disowning the old verdict: ${JSON.stringify(twoAt)}`);
+      }
+      if (!twoAt.perform || !twoAt.start) {
+        bad(`a verb was live the instant Browse… filled the field — this is the exit 2: ${JSON.stringify(twoAt)}`);
+      }
+      record(`picked (two studies): at the press — "${twoAt.line.trim()}", verbs dead ("${twoAt.why}")`);
+      await waitFolder();
+      const two = await settled();
+      await shot('wl-5c-picked-two-studies');
+      record(`picked (two studies): ${two.line.trim()}`);
+      if (two.lineHidden || !/2 studies/.test(two.line) || !/Split the folder/.test(two.line)) {
+        bad(`a picked two-study folder is not named as one: ${JSON.stringify(two)}`);
+      }
+      if (!two.cls.includes('bad')) bad(`a refused folder is not styled as refused: ${two.cls}`);
+      if (!two.perform || !two.start) bad(`a verb is live over two studies: ${JSON.stringify(two)}`);
+      if (!/more than one study/.test(two.why)) bad(`the dead verb does not say why: ${two.why}`);
+      if (two.cmd.includes('--adopt-worklist-identity')) {
+        bad(`a folder holding two studies claims a re-stamp: ${two.cmd}`);
+      }
+      const twoPress = await pressPerform();
+      if (twoPress.ran) bad(`pressing Perform over two studies started a run: ${JSON.stringify(twoPress)}`);
+
+      // ---- 2. a folder with no DICOM in it.
+      const noneAt = await pressPicker('mpps-folder', pickNone, AT_PRESS);
+      if (noneAt.lineHidden || !noneAt.reading || !noneAt.perform || !noneAt.start) {
+        bad(`Browse… to a second folder left the first one's answer standing: ${JSON.stringify(noneAt)}`);
+      }
+      await waitScanned();
+      const none = await settled();
+      await shot('wl-5d-picked-no-dicom');
+      record(`picked (no DICOM): ${none.line.trim()}`);
+      if (none.lineHidden || !/No DICOM instances here/.test(none.line)) {
+        bad(`a picked folder with no DICOM in it does not say so: ${JSON.stringify(none)}`);
+      }
+      if (!none.perform || !none.start) bad(`a verb is live over a folder with no images: ${JSON.stringify(none)}`);
+      if (!none.why.trim()) bad('the dead verb carries no reason for a folder with no DICOM');
+      if (none.cmd.includes('--adopt-worklist-identity')) {
+        bad(`a folder nothing could be read from claims a re-stamp: ${none.cmd}`);
+      }
+      const nonePress = await pressPerform();
+      if (nonePress.ran) bad(`pressing Perform over a folder with no DICOM started a run: ${JSON.stringify(nonePress)}`);
+
+      // ---- 3. a folder whose study differs from the row, end to end.
+      // DOE^JANE names a study no folder on this machine carries, so the
+      // fixtures are a mismatch for it: the verdict, the re-stamp flag and a
+      // real run that has to come back 0.
+      const diffAt = await pressPicker('mpps-folder', fixtures, AT_PRESS);
+      if (diffAt.lineHidden || !diffAt.reading || !diffAt.perform || !diffAt.start) {
+        bad(`Browse… to the fixtures did not put the screen back into reading: ${JSON.stringify(diffAt)}`);
+      }
+      await waitFolder();
+      const diff = await settled();
+      await shot('wl-5e-picked-mismatch');
+      record(`picked (different study): ${diff.line.trim()}`);
+      if (diff.lineHidden || !/different study/.test(diff.line) || !/re-stamped copy/.test(diff.line)) {
+        bad(`a picked folder of another study does not say what will happen: ${JSON.stringify(diff)}`);
+      }
+      if (diff.perform || diff.start) {
+        bad(`the verbs stayed dead over a folder that was read: ${JSON.stringify(diff)}`);
+      }
+      if (!diff.cmd.includes('--adopt-worklist-identity')) {
+        bad(`a picked mismatch did not reach the re-stamp flag: ${diff.cmd}`);
+      }
+      if (!cmdNames(diff.cmd, fixtures)) bad(`the command does not name the picked folder: ${diff.cmd}`);
+      await js(`document.querySelector('#mpps-run').click(); true`);
+      await mustWait("!document.querySelector('#mpps-status').className.includes('running')",
+        RUN_MS, 'the picked perform to finish');
+      const pickedRun = await jsJSON(`JSON.stringify({
+        status: document.querySelector('#mpps-status').textContent,
+        cls: document.querySelector('#mpps-outcome').className,
+        all: document.querySelector('#mpps-outcome').textContent.replace(/\\s+/g, ' ').trim(),
+      })`);
+      record(`picked (different study): performed — ${pickedRun.status}`);
+      artefact('mpps-picked-outcome.txt', pickedRun.all);
+      await shot('wl-5f-picked-performed');
+      if (pickedRun.status !== 'COMPLETED' || !pickedRun.cls.includes('ok')) {
+        bad(`a folder chosen with Browse… did not perform cleanly: ${JSON.stringify(pickedRun)}`);
+      }
+      // The exact failure this pass exists to close. It is worth naming.
+      if (/Refused before anything ran|exited 2/.test(pickedRun.all)) {
+        bad(`Browse… can still reach exit 2: ${pickedRun.all}`);
+      }
+      record('station: Browse… invalidates the verdict, blocks the verbs until the folder is read, and performs 0');
+
+      // ---- 4. defence in depth: the change-only route.
+      //
+      // The picker no longer takes it, but the property that matters is that
+      // the verbs are dead whenever the folder's study is unknown, whichever
+      // event got us there — so it is asserted from the other side too. This
+      // is the assertion that would have caught the original bug without
+      // anyone having to think of the picker: set the value and dispatch
+      // `change` alone, from a clean screen with live verbs, and the screen
+      // must still refuse to act on a folder it has not read.
+      const liveBefore = await jsJSON(`JSON.stringify({
+        perform: document.querySelector('#mpps-run').disabled,
+        start: document.querySelector('#mpps-start').disabled,
+      })`);
+      if (liveBefore.perform || liveBefore.start) {
+        bad('the change-only check has to start from a screen whose verbs are live');
+      }
+      const changeOnly = await jsJSON(`(() => {
+        const field = document.querySelector('#mpps-folder');
+        field.value = ${JSON.stringify(pickTwo)};
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        return JSON.stringify({
+          value: field.value,
+          lineHidden: document.querySelector('#mpps-folder-check').hidden,
+          line: document.querySelector('#mpps-folder-check').textContent,
+          perform: document.querySelector('#mpps-run').disabled,
+          start: document.querySelector('#mpps-start').disabled,
+          why: document.querySelector('#mpps-run').title || '',
+          cmd: document.querySelector('#mpps-cmd').textContent,
+        });
+      })()`);
+      if (changeOnly.value !== pickTwo) bad('the change-only route did not change the field');
+      if (changeOnly.lineHidden || !changeOnly.line.trim()) {
+        bad(`a change-only folder change left the verdict line hidden: ${JSON.stringify(changeOnly)}`);
+      }
+      if (!changeOnly.perform || !changeOnly.start) {
+        bad(`a change-only folder change left a verb live over an unread folder: ${JSON.stringify(changeOnly)}`);
+      }
+      if (!changeOnly.why.trim()) bad('the change-only route left a dead verb with no reason on it');
+      if (changeOnly.cmd.includes('--adopt-worklist-identity')) {
+        bad(`the change-only route kept the last folder's re-stamp claim: ${changeOnly.cmd}`);
+      }
+      record(`station: a folder set with \`change\` alone is unknown too — "${changeOnly.line.trim()}", verbs dead`);
+      // It is a real change, not just a blocked one: the rescan it scheduled
+      // has to land on the folder that was set, with the same verdict pressing
+      // Browse… gave.
+      await waitFolder();
+      const changeSettled = await settled();
+      if (!/2 studies/.test(changeSettled.line) || !changeSettled.perform) {
+        bad(`the change-only route did not re-read the folder it named: ${JSON.stringify(changeSettled)}`);
+      }
+      // A blur over a folder nobody retyped must NOT spawn another child: the
+      // guard that lets `change` be safe here is the one that would otherwise
+      // put a `dcm info` behind every tab-out of the field.
+      const idleBlur = await jsJSON(`(() => {
+        const before = mppsScanToken;
+        const field = document.querySelector('#mpps-folder');
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        return JSON.stringify({ before, after: mppsScanToken, reading: !!(state.mpps.scan && state.mpps.scan.reading) });
+      })()`);
+      if (idleBlur.after !== idleBlur.before || idleBlur.reading) {
+        bad(`blurring the folder field re-read a folder that had not changed: ${JSON.stringify(idleBlur)}`);
+      }
+      record('station: blurring the folder field over an unchanged path reads nothing again');
+
+      await js(`(() => { clearSelection(); return true; })()`);
+
       // --- H3: start only, then add images and complete -------------------
       // This row names the study the fixtures carry, which is the only case in
       // which images may be added to an already-open step: `dcm send` copies
@@ -2179,7 +2827,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await waitFolder();
       const startCmd = await js(`mppsStartArgv().join(' ')`);
       say(`start argv: dcm ${startCmd}`);
-      if (!/^mpps start /.test(startCmd) || startCmd.includes(fixtures.replace(/\\/g, '/'))) {
+      if (!/^mpps start /.test(startCmd) || cmdNames(startCmd, fixtures)) {
         bad(`start must open a step and send nothing: ${startCmd}`);
       }
       await js(`document.querySelector('#mpps-start').click(); true`);
@@ -3238,6 +3886,262 @@ async function runSmoke(win, app, mainHelpers = {}) {
         + 'kept the other two, on screen and on disk');
 
       await js("__smoke.set('rename-folder', ''); true");
+    }
+
+    // =====================================================================
+    // K2. Layout, at the window sizes this app is actually used at.
+    //
+    // A page that scrolls sideways is the defect, and it is the one an eye
+    // misses: a detail panel jammed past the right edge with its labels cut
+    // off mid-word looks, in a screenshot, like a panel that is merely tight.
+    // So it is asserted rather than looked at — on every screen, at every
+    // width from a small laptop to a 4K desktop, with the screens full of the
+    // data this run has already put on them.
+    //
+    // 1915x1017 is in the list because it is the size the window was at when a
+    // real exam was run against a real RIS and the panel came out clipped.
+    // =====================================================================
+    const SIZES = [
+      { w: 1024, h: 768, label: '1024x768' },
+      { w: 1440, h: 900, label: '1440x900' },
+      { w: 1915, h: 1017, label: '1915x1017', wide: true },  // the owner's maximised window
+      { w: 2560, h: 1440, label: '2560x1440' },
+    ];
+    const layoutProblems = [];
+    const startBounds = win.getContentBounds();
+    // The station is put into the state the screenshots were taken in: the
+    // real list, a patient picked, a folder chosen, and Details open — which
+    // is where the three-field form row and the store-AE placeholder live, and
+    // where the clipping was. A layout pass over a folded-away form proves
+    // nothing about the form.
+    await js(`(() => {
+      showView('worklist');
+      renderWorklist({ ok: true, matches: __smoke.realMatches || state.mwl.matches });
+      const tr = Array.from(document.querySelectorAll('#mwl-table tr.pick-row'))[0];
+      if (tr) tr.click();
+      document.querySelector('#mpps-adv').open = true;
+      return true;
+    })()`);
+    await js(`__smoke.set('mpps-folder', ${JSON.stringify(fixtures)}); true`);
+    // A verdict, or the app's own "it took too long" — either is a settled
+    // screen, which is all this pass needs. It is not measuring the scan.
+    await mustWait("!document.querySelector('#mpps-folder-check').hidden && !mppsFolderUnknown()"
+      + " || /took too long/.test(document.querySelector('#mpps-folder-check').textContent)",
+    60000, 'the station to settle before the layout pass');
+    for (const size of SIZES) {
+      win.setContentSize(size.w, size.h);
+      // eslint-disable-next-line no-await-in-loop
+      await wait(250);
+      // eslint-disable-next-line no-await-in-loop
+      const got = await jsJSON('JSON.stringify({ w: innerWidth, h: innerHeight })');
+      // A display smaller than the size asked for clamps the window on some
+      // platforms. Say what was actually measured rather than what was asked
+      // for, so a pass at 2560 cannot be a pass at 1900 wearing its name.
+      say(`layout: asked for ${size.label}, the window reports ${got.w}x${got.h}`);
+      if (got.w < size.w - 4) {
+        layoutProblems.push(`${size.label}: the window would not go wider than ${got.w}px, so this width was not tested`);
+        continue;
+      }
+      for (const name of SECTIONS) {
+        // eslint-disable-next-line no-await-in-loop
+        await js(`showView(${JSON.stringify(name)}); true`);
+        const panes = TABS[name] ? TABS[name] : [null];
+        for (const tab of panes) {
+          if (tab) {
+            // eslint-disable-next-line no-await-in-loop
+            await js(`showTab(${JSON.stringify(name)}, ${JSON.stringify(tab)}); true`);
+          }
+          // eslint-disable-next-line no-await-in-loop
+          await wait(60);
+          // eslint-disable-next-line no-await-in-loop
+          const o = await jsJSON('JSON.stringify(__smoke.overflow())');
+          const where = tab ? `${name}/${tab}` : name;
+          // One full set of frames at the size the field report came from, so
+          // every screen can be looked at as the operator sees it rather than
+          // only asserted about.
+          if (size.wide) {
+            // eslint-disable-next-line no-await-in-loop
+            await shot(`wide-${where.replace('/', '-')}`);
+          }
+          if (o.scrollWidth > o.clientWidth) {
+            layoutProblems.push(`${size.label} ${where}: the page scrolls sideways — `
+              + `${o.shell} scrollWidth ${o.scrollWidth} > clientWidth ${o.clientWidth}`
+              + (o.offenders.length ? `; pushed by ${o.offenders.map((x) => `${x.sel} (right ${x.right})`).join(', ')}` : ''));
+          }
+        }
+        if (TABS[name]) {
+          // eslint-disable-next-line no-await-in-loop
+          await js(`showTab(${JSON.stringify(name)}, ${JSON.stringify(TABS[name][0])}); true`);
+        }
+      }
+
+      // The station with a patient on it is the screen that broke, so its
+      // panel is checked for its own clipping as well as the page's.
+      // eslint-disable-next-line no-await-in-loop
+      await js('showView("worklist"); true');
+      // eslint-disable-next-line no-await-in-loop
+      await wait(150);
+      // eslint-disable-next-line no-await-in-loop
+      const clip = await jsJSON('JSON.stringify(__smoke.clipping("#mwl-detail"))');
+      if (clip.length) {
+        layoutProblems.push(`${size.label} worklist: the patient panel cuts its own contents off — `
+          + clip.map((c) => `${c.sel} needs ${c.scroll}px in ${c.client}px`).join(', '));
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const station = await jsJSON(`JSON.stringify({
+        cols: getComputedStyle(document.querySelector('.station-body')).gridTemplateColumns,
+        panelRight: Math.round(document.querySelector('#mwl-detail').getBoundingClientRect().right),
+        tableRows: Math.round(document.querySelector('#view-worklist .table-scroll') ? document.querySelector('#view-worklist .table-scroll').clientHeight : 0),
+        cmdLines: (() => { const el = document.querySelector('#mpps-cmd');
+          return el ? Math.round(el.scrollHeight / parseFloat(getComputedStyle(el).lineHeight)) : 0; })(),
+        cmdScrolls: (() => { const el = document.querySelector('#mpps-cmd');
+          return el ? (el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1) : false; })(),
+      })`);
+      record(`layout ${size.label}: station columns ${station.cols}, panel right edge ${station.panelRight} `
+        + `of ${got.w}, list ${station.tableRows}px tall, command ${station.cmdLines} line(s)`);
+      // The command preview is this app's promise. It may be folded; it may
+      // never need scrolling to be read from its first character.
+      if (station.cmdScrolls) {
+        layoutProblems.push(`${size.label} worklist: the command preview scrolls inside itself instead of wrapping`);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await shot(`layout-${size.label}-worklist`);
+      // eslint-disable-next-line no-await-in-loop
+      await js('showView("settings"); true');
+      // eslint-disable-next-line no-await-in-loop
+      await wait(120);
+      // eslint-disable-next-line no-await-in-loop
+      await shot(`layout-${size.label}-settings`);
+    }
+    win.setContentBounds(startBounds);
+    await wait(200);
+    await js('showView("worklist"); true');
+    if (layoutProblems.length) {
+      artefact('layout-problems.txt', layoutProblems.join('\n'));
+      for (const p of layoutProblems) say(`layout PROBLEM: ${p}`);
+      bad(`${layoutProblems.length} layout problem(s) — see layout-problems.txt`);
+    }
+    record(`layout: no page-level horizontal scrolling on any screen at ${SIZES.map((s) => s.label).join(', ')}`);
+
+    // =====================================================================
+    // K2. Every other Browse… button.
+    //
+    // wirePickers is shared: repairing the station repaired it by making a
+    // picked path announce itself with `input` and then `change`, in the order
+    // typing produces them, which changes what happens on every screen a
+    // picker feeds. Several of those fields had listeners on only one of the
+    // two events, so the question is not academic — a field that used to see
+    // one event now sees both, and a handler that runs twice is a second child
+    // process or a second render.
+    //
+    // The property asserted is the strongest one available and needs no
+    // per-field knowledge: pressing Browse… must leave the app in exactly the
+    // state typing the same path leaves it in — every builder's argv, across
+    // every screen, identical — and must not start more engine children than
+    // typing did. Anything a picker does that typing does not is, by
+    // definition, a path only the picker can take, which is where the last bug
+    // lived.
+    // =====================================================================
+    {
+      armPicker();
+      const pickPath = fixtures || work;
+      // Where each picker-fed field lives. mpps-folder is not here: it is
+      // driven end to end against the real RIS in section H, which needs a
+      // selected worklist row this one has no business creating.
+      const PICKERS = [
+        ['send-folder', "showView('send')"],
+        ['scp-persist', "showView('receive')"],
+        ['websend-folder', "showView('web'); showTab('web', 'websend')"],
+        ['webhub-persist', "showView('web'); showTab('web', 'webhub')"],
+        ['webhub-root', "showView('web'); showTab('web', 'webhub')"],
+        ['info-folder', "showView('tools'); showTab('tools', 'inventory')"],
+        ['tags-target', "showView('tools'); showTab('tools', 'tags')"],
+        ['rename-folder', "showView('tools'); showTab('tools', 'rename')"],
+        ['rename-out', "showView('tools'); showTab('tools', 'rename')"],
+        ['edit-target', "showView('tools'); showTab('tools', 'edit')"],
+        ['edit-out', "showView('tools'); showTab('tools', 'edit')"],
+        ['anon-folder', "showView('tools'); showTab('tools', 'anon')"],
+        ['anon-out', "showView('tools'); showTab('tools', 'anon')"],
+        ['speed-folder', "showView('speed')"],
+      ];
+      // Nothing may be added to index.html without being pressed here.
+      const inDom = await jsJSON(`JSON.stringify(Array.from(new Set(
+        Array.from(document.querySelectorAll('[data-pick]')).map((b) => b.dataset.pick))))`);
+      const covered = new Set([...PICKERS.map(([id]) => id), 'mpps-folder']);
+      const uncovered = inDom.filter((id) => !covered.has(id));
+      if (uncovered.length) bad(`picker(s) nothing presses: ${uncovered.join(', ')}`);
+      if (covered.size !== inDom.length) {
+        bad(`this list names a picker index.html does not have: ${JSON.stringify([...covered])} vs ${JSON.stringify(inDom)}`);
+      }
+
+      // Engine children are counted where the renderer starts them. A doubled
+      // folder scan is the specific cost worth naming, and it does not show up
+      // in any rendered output — only in a second process.
+      await js(`(() => {
+        __smoke._origCapture = runCapture;
+        runCapture = function (view, argv) {
+          __smoke.spawns.push(view + ': ' + argv.join(' '));
+          return __smoke._origCapture.apply(null, arguments);
+        };
+        return true;
+      })()`);
+
+      // 600ms clears the station's 350ms debounce and every render these
+      // fields set off. Rename is the only one of them that reads the folder,
+      // so it is the only one with a child to wait on properly.
+      const settle = async (id) => {
+        if (id.startsWith('rename')) await waitFor('!state.activeRuns.rename', 30000, 'the rename scan to finish');
+        await wait(600);
+      };
+      const fill = async (id, how) => {
+        await js(`(() => { __smoke.set('${id}', ''); __smoke.spawns = []; return true; })()`);
+        await settle(id);
+        await js(`(() => { __smoke.spawns = []; return true; })()`);
+        if (how === 'type') await js(`__smoke.set('${id}', ${JSON.stringify(pickPath)}); true`);
+        else await pressPicker(id, pickPath);
+        await settle(id);
+        return jsJSON(`JSON.stringify({
+          value: document.querySelector('#${id}').value,
+          argvs: __smoke.argvs(),
+          spawns: __smoke.spawns.slice(),
+          errors: window.__errors.length,
+        })`);
+      };
+
+      const pickerNotes = [];
+      for (const [id, goto] of PICKERS) {
+        // eslint-disable-next-line no-await-in-loop
+        await js(`(() => { ${goto}; return true; })()`);
+        // eslint-disable-next-line no-await-in-loop
+        await wait(150);
+        // eslint-disable-next-line no-await-in-loop
+        const typed = await fill(id, 'type');
+        // eslint-disable-next-line no-await-in-loop
+        const picked = await fill(id, 'pick');
+
+        if (picked.value !== pickPath) bad(`Browse… did not fill #${id}: ${JSON.stringify(picked.value)}`);
+        if (picked.errors !== typed.errors) {
+          bad(`pressing Browse… on #${id} threw where typing did not — see __errors`);
+        }
+        if (JSON.stringify(picked.argvs) !== JSON.stringify(typed.argvs)) {
+          bad(`Browse… and typing leave #${id} in different states.\n  typed:  ${JSON.stringify(typed.argvs)}\n  picked: ${JSON.stringify(picked.argvs)}`);
+        }
+        if (picked.spawns.length > typed.spawns.length) {
+          bad(`Browse… on #${id} started ${picked.spawns.length} engine child(ren) where typing started `
+            + `${typed.spawns.length}: ${JSON.stringify(picked.spawns)}`);
+        }
+        if (picked.spawns.length > 1) {
+          bad(`one Browse… on #${id} started ${picked.spawns.length} engine children: ${JSON.stringify(picked.spawns)}`);
+        }
+        pickerNotes.push(`${id}: picked === typed, ${picked.spawns.length} engine child(ren)`);
+        // eslint-disable-next-line no-await-in-loop
+        await js(`(() => { __smoke.set('${id}', ''); return true; })()`);
+      }
+      await js(`(() => { runCapture = __smoke._origCapture; return true; })()`);
+      artefact('pickers.txt', pickerNotes.join('\n'));
+      for (const n of pickerNotes) say(`picker ${n}`);
+      record(`pickers: all ${PICKERS.length} other Browse… buttons leave the app exactly where typing does, `
+        + 'and none of them starts a second engine child');
     }
 
     // =====================================================================

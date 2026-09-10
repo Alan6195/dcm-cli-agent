@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.16.1
+
+An exam refused with exit 2 and the screen let it happen, from a real station
+against a real RIS. Everything here came out of that one screenshot.
+
+**The verb was live over a folder nothing had read.** `renderFolderLine()`
+opened with "no scan state, hide the line and return", while the guard that
+disables the buttons tested a different condition. Two tests for one question,
+and they came apart: whenever the folder had not been read — never scanned,
+timed out, unreadable, no DICOM in it — the verdict line vanished and
+**Perform exam** stayed clickable. The command then went out without
+`--adopt-worklist-identity`, and the engine refused it.
+
+One function now answers "can this screen name the folder's study?", and both
+the line and the guard read it. Five states that used to be silent now say
+what is wrong where the verdict goes, offer to read the folder again, and keep
+both verbs dead until they can. A screen that does not know what the folder
+holds cannot claim a re-stamp, and cannot start an exam.
+
+**Browse… took a different route than typing, and only typing was guarded.**
+The fix above was bound to the field's `input` event; the picker fired only
+`change`. So a folder chosen the ordinary way — the way the screenshot was
+taken — walked straight past it. The picker now fires both, in the order
+typing produces them, which repairs every picker-fed field at once; the folder
+handler listens for both, so neither route can be the unguarded one. A blur
+over an unchanged path still reads nothing again.
+
+This one is worth recording because the tests could not see it. They forced
+the scan state into each failure shape and checked what rendered, so they
+exercised the rendering and never the wiring meant to reach it — and the
+harness's own field setter dispatched both events, so every test took the
+branch that worked. Nothing in the suite had ever pressed a picker. It can
+now, through the real button with only the native dialog stubbed, and the
+three refusable folders are built rather than described.
+
+**When the engine does refuse, it now says why on screen.** The red box read
+"The engine exited 2 without reporting a closed step. The output is the whole
+story" while the app was holding the engine's own one-line explanation on
+stderr. That sentence is now printed verbatim in a selectable block, with a
+head that says nothing was sent and nothing on disk was touched.
+
+**The panel described a patient who was not in the list.** A row that leaves
+the worklist between refreshes had no branch: the selection silently fell
+through and the panel kept naming a patient the RIS no longer returned. It
+detaches visibly now and blocks performing, while Complete and Discontinue
+stay live — an N-SET goes to the peer that took the N-CREATE and never
+consults the worklist. A row that comes back re-attaches on its own.
+
+**The window was clipped and scrolled sideways.** At 1915x1017 the detail
+panel ran off the edge mid-word and the page grew a horizontal scrollbar,
+while the middle of the screen sat empty. The cause was flex and grid items
+defaulting to their content's minimum width, so three fields could not shrink
+into the panel and pushed it out of its column. Fixed at every width from 1024
+to 2560, asserted on `.content` as well as the document — `.content` is the
+element that actually carries the scrollbar, so a probe that asked only the
+document passed a visibly broken page. The Output pane moved into the left
+column under the list, so the engine's stream and the patient it belongs to
+are on screen together.
+
+**The command preview started mid-token.** It had a height clamp and broke on
+characters, so a long command scrolled inside its own box and could begin
+`n.ai --store-port`. It wraps at the spaces between arguments now and starts
+at `dcm ` at every width.
+
+Also: the modality chip reads "Modality: CT" rather than being a button
+labelled "any modality"; one helper renders "not returned by the SCP" so the
+banner and the attribute grid stop phrasing one fact two ways; and three smoke
+assertions that compared paths with forward slashes only — passing vacuously
+on a Windows path, including two that asserted a folder was *absent* from a
+command — accept either spelling.
+
 ## v0.16.0
 
 **Rename a study without knowing DICOM.** Tools › Rename takes a folder, shows

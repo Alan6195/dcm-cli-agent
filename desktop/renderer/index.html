@@ -104,11 +104,13 @@
           <p>The search box sends one key: digits only become <code>PatientID</code>, a name (letters, or <code>^</code>) becomes a <code>PatientName</code> wildcard, anything mixed becomes <code>AccessionNumber</code>. The tag beside the box says which was chosen; click it to pick a different key.</p>
           <p>A query that fails is not an empty worklist. An unreachable RIS, a refused association or a timeout is said where the list is, in red, with the engine's own sentence — and any rows still on screen are labelled as the last answer that was read, not this one.</p>
           <p>Only a fresh query changes the list. A row can leave the results for reasons that have nothing to do with the performed step — the date filter, the station AE, or the SCP's own rules — and it can stay in them even after a step was accepted. What the SCP did with a scheduled entry after a performed step is not visible from this side; some SCPs keep the entry, some drop it. The list re-reads itself every minute while this screen is open. The selected patient stays selected across a refresh, matched by study and scheduled step — or, for a row that names no study, by accession, step and patient ID. A row carrying none of those cannot be matched at all: the patient stays on the panel, the panel says the list no longer identifies which row they are, and nothing is re-pointed. <b>Worklist rows to fetch</b> in Settings caps the query with <code>--limit</code>; blank asks for the whole answer.</p>
+          <p>A row that <em>was</em> matched and has since left the answer is the same rule seen from the other side. The patient stays on the panel — the outcome and any open step still name them — and the panel says, in amber, that the list read most recently does not hold this row. <b>Perform exam</b> goes dead while that is true: the order may have been cancelled, the date or modality filter may have moved, or the SCP may simply withhold an entry once its step is accepted, and none of those are distinguishable from this side. Completing or discontinuing a step this app opened is <em>not</em> blocked — an N-SET goes to the peer that took the N-CREATE and never consults the worklist. If the next refresh carries the row again, the selection re-attaches by itself and the panel goes quiet.</p>
 
           <h4>Performing an exam</h4>
           <p><b>Perform exam</b> is one <code>dcm mpps perform</code> transaction: N-CREATE opens the step on the RIS, C-STORE sends the images to the archive, N-SET closes it. <b>COMPLETED requires every instance found on disk to have been acknowledged.</b> A shortfall makes the step DISCONTINUED and the run fails; there is no override. The RIS that takes the procedure step and the archive that takes the images are often different systems, so both are written out in full in the command even when they are the same — <b>a default you cannot see is a default nobody can check.</b> The archive is whichever saved peer holds the Archive role in Settings; with none set, the images go to the RIS peer.</p>
           <p><b>Start only</b> is the same transaction taken apart: <code>dcm mpps start</code> opens the step and leaves it IN PROGRESS, for when the images are sent by something else or the step has to stay open in between. The row then offers <b>Complete</b> and <b>Discontinue</b>. Adding a folder to an open step sends it with <code>dcm send</code> first and then completes the step naming those images — and only if every instance was acknowledged; otherwise the step is discontinued, for the same reason as above.</p>
           <p>PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing. <code>--series-from</code> asserts what is on this disk rather than what the archive acknowledged, so it is only taken by default when every instance found in that folder was acknowledged — otherwise the N-SET would name images the archive may not hold.</p>
+          <p>The folder is read before anything is sent — <code>dcm info --json</code>, which opens nothing and changes nothing — and the line under it says what it holds and where it is going. Until that line is there, <b>Perform exam</b> and <b>Start only</b> are dead and say why on the button: the study on disk is what decides whether the command needs <code>--adopt-worklist-identity</code>, so a command built before the folder was read would be the wrong command. That covers every way of not knowing — the read never ran, it was still running, it ran out of time, the folder could not be opened, or nothing DICOM was found in it — and each says which, with <b>Read it again</b> beside it. A rejected run is not a fallback for this: the engine refuses a command it cannot accept with an exit code and one sentence on standard error, which the panel now prints in full rather than pointing at the output.</p>
           <p>The fields the panel calls <b>Performed step ID</b> and <b>Performed station AE</b> are Type 1 in the N-CREATE — the engine refuses to open a step without either, which is why an empty one is said in amber on the panel rather than left to the run. The station AE follows this station's AE Title from Settings unless it is typed over for one patient; picking another patient puts it back.</p>
           <p>A discontinuation reason is a code item — <code>value^scheme^meaning</code>, e.g. <code>110513^DCM^Discontinued for equipment failure</code> — so the panel offers the standard DCM reasons by name and puts the triplet on the command line. Free text is refused by the engine: a coded reason has to be a real code, not one invented here. <b>Another code…</b> is there for a site with a private scheme.</p>
 
@@ -269,14 +271,21 @@
               </details>
             </div>
           </div>
-        </div>
 
-        <details class="adv" id="mwl-out">
-          <summary>Output <span class="adv-sum" id="mwl-out-sum"></span></summary>
-          <div class="adv-body">
-            <div class="console-wrap tall"><pre class="console" id="wl-console"></pre></div>
-          </div>
-        </details>
+          <!-- Inside the two columns, not under them. On a wide window this
+               sits below the list, in the space the list does not need, so the
+               engine's stream and the patient it belongs to are on screen
+               together instead of the stream being pushed under a panel three
+               quarters of a screen tall. Below 1200px .station-body is a plain
+               block and source order puts it back where it was: list, patient,
+               output. -->
+          <details class="adv" id="mwl-out">
+            <summary>Output <span class="adv-sum" id="mwl-out-sum"></span></summary>
+            <div class="adv-body">
+              <div class="console-wrap tall"><pre class="console" id="wl-console"></pre></div>
+            </div>
+          </details>
+        </div>
       </section>
 
       <!-- Every screen below is the same shape, top to bottom: what it acts on,
