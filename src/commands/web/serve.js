@@ -10,11 +10,13 @@ const log = require('../../lib/log');
 const args = require('../../lib/args');
 const { scan, readMetadata } = require('../../lib/scan');
 const { safeUidSegment } = require('../../lib/uid');
+const tagLib = require('../../lib/tags');
 const {
   parseMultipartRelated,
   buildMultipartRelated,
   joinUrl,
   attr,
+  pnAttr,
   TAGS,
 } = require('../../lib/webdicom');
 
@@ -97,12 +99,36 @@ Note:
 `.trimStart();
 
 
-/** PN values arrive as a bare string, {Alphabetic}, or a one-element array of either; normalise. */
+/**
+ * A Person Name as one string: the whole name, every group it carries.
+ *
+ * readMetadata already joins the groups, so on today's only caller this is the
+ * identity function. It stays because the index is the one place a PN's shape
+ * is assumed, and going through the shared joiner means an object arriving
+ * here would be joined rather than silently reduced to whichever key was read
+ * first. This is what the hub matches on; `pnAttr` is what splits it back into
+ * the keys DICOM JSON wants when a QIDO answer goes out.
+ */
 function pnText(value) {
-  if (Array.isArray(value)) value = value[0];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value === 'object') return value.Alphabetic;
-  return String(value);
+  const text = tagLib.personNameText(value);
+  return text === '' ? undefined : text;
+}
+
+/**
+ * PN matching, against the whole name and against each group separately.
+ *
+ * A conforming client asking for `PatientName=Yamada^Tarou` means that patient,
+ * and it does not know or care that this particular record also carries the
+ * kanji and the kana. Matching only the joined value would answer 204 for a
+ * study the hub is holding; matching only the Alphabetic group — what this did
+ * before — cannot find a patient by the spelling their own department uses.
+ * Trying the whole value and then each group finds the study either way, which
+ * for a single-group name is the same single comparison it always was.
+ */
+function pnMatch(value, pattern) {
+  if (value === undefined || value === null) return false;
+  if (wildcardMatch(value, pattern)) return true;
+  return String(value).split('=').some((group) => group !== '' && wildcardMatch(group, pattern));
 }
 
 /** DICOM single-value matching with * and ? wildcards, per QIDO-RS. */
@@ -302,7 +328,9 @@ function createWebServer(config, stats) {
         '00080020': attr('DA', first.studyDate),
         '00080050': attr('SH', first.accessionNumber),
         '00080061': attr('CS', ...[...modalities].sort()),
-        '00100010': patientName ? { vr: 'PN', Value: [{ Alphabetic: patientName }] } : { vr: 'PN' },
+        // Not `{Alphabetic: patientName}`: patientName is the whole Part 10
+        // value, and PS3.18 F.2.2 wants one key per component group.
+        '00100010': pnAttr(patientName),
         '00100020': attr('LO', first.patientId),
         '0020000D': attr('UI', studyUid),
         '00201206': attr('IS', seriesMap.size),
@@ -316,7 +344,7 @@ function createWebServer(config, stats) {
   const STUDY_KEYS = {
     ...keyed('StudyInstanceUID', '0020000D', (row, p) => row.studyUid === p),
     ...keyed('PatientID', '00100020', (row, p) => wildcardMatch(row.meta.patientId, p)),
-    ...keyed('PatientName', '00100010', (row, p) => wildcardMatch(row.patientName, p)),
+    ...keyed('PatientName', '00100010', (row, p) => pnMatch(row.patientName, p)),
     ...keyed('StudyDate', '00080020', (row, p) => dateMatch(row.meta.studyDate, p)),
     ...keyed('ModalitiesInStudy', '00080061', (row, p) =>
       [...row.modalities].some((m) => wildcardMatch(m, p))

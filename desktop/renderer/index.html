@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
-  <title>Asteris DICOM App</title>
+  <title>AscendI DICOM</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -16,7 +16,7 @@
       <div class="brand">
         <div class="brand-mark">◈</div>
         <div class="brand-text">
-          <div class="brand-name">ASTERIS</div>
+          <div class="brand-name">ASCENDI</div>
           <div class="brand-sub">DICOM</div>
         </div>
       </div>
@@ -664,6 +664,13 @@
           <p>Reads metadata only — it stops before pixel data, so it is fast on big trees. <b>Break down per series</b> also flags colliding Series UIDs, which is the usual sign that two studies were merged into one folder or that something rewrote UIDs on the way in.</p>
           <h4>Tags</h4>
           <p>Dumps the tags in a file or folder. It reads metadata only and never prints pixel data. The filter takes a keyword, a tag or a value, and <code>/regex/</code> is allowed. By default one file per series is read, because the tags that differ per instance are rarely the ones being looked for; <b>Every file</b> reads all of them.</p>
+          <h4>Rename</h4>
+          <p>Changes the four fields that say who a study belongs to — patient name, patient ID, study description, accession number — and nothing else. It is <b>Edit</b> underneath with the DICOM keywords filled in for you, and it never passes <code>--force</code>, so no UID is touched. Renaming changes what a study is <i>called</i>, never what it <i>is</i>.</p>
+          <p>A folder holding more than one study is refused rather than renamed. <code>dcm edit</code> applies to every instance under the path and cannot be scoped to one study inside it, so renaming one of three would write a single identity over all three — a merge, not a rename.</p>
+          <p><b>When the study&#39;s own instances disagree.</b> The four fields are read across every instance, not off whichever one the scan reaches first, so a study whose two series carry two different patient IDs is shown as carrying two. Nothing is prefilled from one of them &mdash; picking a value would be inventing the answer &mdash; and one amber panel lists every field that disagrees, with each competing value as a button. Choosing one and renaming writes it to all of them, which is the repair. <code>dcm info</code> on the same folder prints a paragraph per disagreeing field on what that particular disagreement costs.</p>
+          <p><b>Names written in more than one script.</b> A DICOM patient name can hold the same name three times &mdash; in Latin letters, in ideographs, and phonetically &mdash; as one value with the parts separated by <code>=</code>, so a Japanese or Korean patient may arrive as <code>Yamada^Tarou=山田^太郎=やまだ^たろう</code>. The two boxes here edit the Latin spelling only. The others are carried through unchanged and are shown in the composed line under the boxes, which is exactly the value that gets written &mdash; correcting a surname in Latin letters does not delete the kanji. If the other spellings need correcting too, the <b>Edit</b> tab takes the whole value.</p>
+          <p><b>What this means downstream.</b> Because the UIDs survive, an archive that already holds this study sees the same study with different demographics, not a new one — and archives differ in what they do about that. Some reconcile the record, some keep the demographics they already had and ignore yours, some file a second copy. Renaming before the first send is unambiguous; renaming after one is a question about that archive, so find out what yours does before relying on it.</p>
+          <p><b>Study date is deliberately not offered here.</b> A date is not a name. It is when the images were made, and rewriting it re-files the study in every date-ordered view an archive has while the SeriesDate and AcquisitionDate inside each instance still say otherwise. The Edit tab will change it if you genuinely need to.</p>
           <h4>Edit</h4>
           <p>Load a study or a single file, change values, then write the result to a new folder. <b>The source is never modified.</b> <b>Preview only</b> shows what would change and writes nothing — it is this tab's own switch, about the disk rather than a peer, and Rehearsal mode adds the same flag from the other direction.</p>
           <p>UIDs are structural, so editing one is gated behind <b>Allow editing UIDs</b>. Changing a Series or Study UID on some instances and not others splits a study into pieces no archive will put back together.</p>
@@ -673,6 +680,7 @@
         <div class="chip-row tabs" role="tablist" data-tabs="tools">
           <button class="chip active" role="tab" aria-selected="true" data-tab="inventory">Inventory</button>
           <button class="chip" role="tab" aria-selected="false" data-tab="tags">Tags</button>
+          <button class="chip" role="tab" aria-selected="false" data-tab="rename">Rename</button>
           <button class="chip" role="tab" aria-selected="false" data-tab="edit">Edit</button>
           <button class="chip" role="tab" aria-selected="false" data-tab="anon">De-identify</button>
         </div>
@@ -740,6 +748,93 @@
           <details class="adv out-fold">
             <summary>Output</summary>
             <div class="adv-body"><div class="console-wrap"><pre class="console" data-console hidden></pre></div></div>
+          </details>
+        </div>
+
+        <!-- RENAME -->
+        <!--
+          The guided sibling of Edit. Edit asks which tag; this asks which
+          patient. Everything on it is `dcm edit --set` underneath, so there is
+          nothing here Edit could not do — what it adds is knowing which four
+          keywords those are, what the study currently says, and that a folder
+          holding two studies cannot have one of them renamed.
+
+          Two blocks carry `data-result`: the scan panel and the change list.
+          Both are renderings of data — what `dcm info --json` found, and the
+          operator's own edits back as current -> new — rather than prose the
+          screen is asking anyone to read, so they sit outside the word budget
+          for the same reason the inventory table does.
+
+          The one exception is the conflict panel the scan panel draws when the
+          study's instances disagree about who it belongs to: two sentences,
+          then a row per disagreeing field. They are inside a `data-result`
+          block and so go uncounted, which is a loophole and is named here
+          rather than leant on — a screen that only ever sees an intact study
+          never draws them at all, and the version that does draw them is
+          deliberately two sentences and not four paragraphs. The per-field
+          reasoning lives in `dcm info`, which prints a paragraph written for
+          the field that actually disagreed.
+        -->
+        <div class="tab-pane" id="view-rename" hidden>
+          <p class="pane-lede">Change who a study is filed under. Its UIDs are never touched.</p>
+          <div class="form-row">
+            <label class="grow">One study's folder
+              <div class="path-pick">
+                <input type="text" id="rename-folder" placeholder="Choose the folder holding one study…" />
+                <button class="btn ghost" data-pick="rename-folder" data-pick-mode="folder">Browse…</button>
+              </div>
+            </label>
+          </div>
+
+          <div class="rename-found" id="rename-found" data-result hidden></div>
+
+          <div id="rename-form" hidden>
+            <div class="section-title">New values</div>
+            <div class="form-row">
+              <label class="grow">Family name<input type="text" id="rename-family" placeholder="DOE" /></label>
+              <label class="grow">Given names<input type="text" id="rename-given" placeholder="JANE" /></label>
+            </div>
+            <div class="pn-composed" id="rename-pn"></div>
+            <div class="form-row">
+              <label class="grow">Patient ID<input type="text" id="rename-patientid" /></label>
+            </div>
+            <div class="form-row">
+              <label class="grow">Study description<input type="text" id="rename-desc" /></label>
+              <label class="grow">Accession number<input type="text" id="rename-accession" /></label>
+            </div>
+
+            <div class="pending-summary rn-diff" id="rename-diff" data-result hidden></div>
+
+            <div class="chip-row" id="rename-dest-row">
+              <span class="level-label">Write</span>
+              <button type="button" class="chip active" data-dest="copy">a renamed copy</button>
+              <button type="button" class="chip" data-dest="inplace">over the originals</button>
+            </div>
+            <div class="form-row" id="rename-out-row">
+              <label class="grow">Copy goes to
+                <div class="path-pick">
+                  <input type="text" id="rename-out" placeholder="Destination folder…" />
+                  <button class="btn ghost" data-pick="rename-out" data-pick-mode="create">Browse…</button>
+                  <button class="btn ghost" data-reveal="rename-out">Open</button>
+                </div>
+              </label>
+            </div>
+            <div class="local-note" id="rename-inplace-note" hidden>
+              <b>No copy and no undo.</b> The source files are rewritten where they are. Rehearsal previews it first.
+            </div>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary" data-run disabled>Rename study</button>
+            <span class="status-chip" data-status hidden></span>
+          </div>
+          <details class="cmd-fold">
+            <summary>command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" data-cmd></div>
+          </details>
+          <details class="adv out-fold">
+            <summary>Output</summary>
+            <div class="adv-body"><div class="console-wrap"><pre class="console" data-console></pre></div></div>
           </details>
         </div>
 
@@ -1098,7 +1193,7 @@
           <h4>The warning you will get, and how to get past it</h4>
           <p>Opening the app the first time, macOS says <b>"Apple could not verify … is free of malware"</b>. That is Gatekeeper reporting the missing Developer ID, not a claim about this build. Open <b>System Settings → Privacy &amp; Security</b>, scroll to the message naming the app, and click <b>Open Anyway</b>. macOS 15 Sequoia removed the old right-click → Open shortcut, so that is the only route through the interface.</p>
           <p>From a terminal, the equivalent is to strip the quarantine attribute the download put on it:</p>
-          <p><code>xattr -cr "/Applications/Asteris DICOM App.app"</code></p>
+          <p><code>xattr -cr "/Applications/AscendI DICOM.app"</code></p>
           <p>Both do the same thing: tell macOS you accept an app Apple has not notarised. You only do it once per installed copy — and once per update, since each update is a new copy.</p>
         </div>
 

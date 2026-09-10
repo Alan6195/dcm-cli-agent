@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Asteris DICOM — renderer.
+ * AscendI DICOM — renderer.
  *
  * No Node here. Everything goes through window.dcm (see preload.js). Each view
  * builds the exact `dcm` argument vector a person would type, shows it, and
@@ -26,14 +26,47 @@ function esc(s) {
     .replace(/"/g, '&quot;');
 }
 
+/**
+ * One of the four identity fields `dcm info` reports, as the scan found it.
+ *
+ * Each is reported as a pair: a singular that is a string only when every
+ * instance carrying the field agrees, and a plural holding the distinct values
+ * in the order the walk met them. The singular is null in two different
+ * situations — the instances disagree, and no instance carries one — so
+ * reading it alone turns a disagreement into an absence, and reading the first
+ * instance's value (which is what the scan used to report) turns a
+ * disagreement into a fact. Both are lies about a study, and this is the one
+ * place either half is read, so neither can be told by accident.
+ */
+function identityState(study, one, many) {
+  const values = Array.isArray(study[many]) ? study[many] : [];
+  const value = typeof study[one] === 'string' ? study[one] : '';
+  return { value, values, conflict: !value && values.length > 1 };
+}
+
+/** Every value of a disagreement, amber, never a count and never one of them. */
+function identityClash(values) {
+  return `<b class="collision">${values.map(esc).join(' / ')}</b>`;
+}
+
 /** Strip ANSI just in case; the engine runs with NO_COLOR but be defensive. */
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-/** Quote an argv element for display the way a shell would need it. */
+/**
+ * Quote an argv element for display the way a shell would need it.
+ *
+ * `^` is in here because of what this text is for. The preview is copyable —
+ * clicking it puts the line on the clipboard — and in cmd.exe `^` is the
+ * escape character, so an unquoted `--set PatientName=DOE^JANE` pasted into a
+ * Windows prompt arrives at the engine as `PatientName=DOEJANE`. A name
+ * silently losing its separator is the worst shape that bug could take, and
+ * quoting costs nothing anywhere else: `^` is ordinary in POSIX shells, and
+ * the app itself spawns an argv array rather than a command line.
+ */
 function quoteArg(a) {
-  return /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
+  return /[\s"^]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
 }
 
 function humanBytes(n) {
@@ -4269,8 +4302,16 @@ function renderInventory(j) {
   for (const s of j.studies || []) {
     const seenSeries = new Map();
     (s.series || []).forEach((se) => seenSeries.set(se.seriesInstanceUid, (seenSeries.get(se.seriesInstanceUid) || 0) + 1));
+    // A study whose instances disagree about its description or patient ID has
+    // no single one to head the card with. Left as-is it would fall through to
+    // "Study" with no ID beside it, which reads as a study that carries neither
+    // — a disagreement quietly filed as an absence. Absence itself is unchanged:
+    // that is what this card has always shown for a study that really has none.
+    const desc = identityState(s, 'studyDescription', 'studyDescriptions');
+    const pid = identityState(s, 'patientId', 'patientIds');
     html += `<div class="study-card">
-      <h3>${esc(s.studyDescription || 'Study')} ${s.patientId ? `· ${esc(s.patientId)}` : ''}</h3>
+      <h3>${desc.conflict ? identityClash(desc.values) : esc(desc.value || 'Study')} `
+      + `${pid.conflict ? `· ${identityClash(pid.values)}` : (pid.value ? `· ${esc(pid.value)}` : '')}</h3>
       <div class="uid">${esc(s.studyInstanceUid)}</div>
       <div class="study-meta">
         <span><b>${(s.modalities || []).join(', ') || '—'}</b> modality</span>
@@ -4360,6 +4401,583 @@ function wireTags() {
     setStatus('tags', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
     try { renderTags(JSON.parse(stdout)); }
     catch { revealConsole('tags'); appendConsole('tags', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
+  });
+}
+
+// --------------------------------------------------------------------------
+// View: RENAME (the four fields that say whose study this is)
+// --------------------------------------------------------------------------
+/**
+ * Renaming a study is `dcm edit --set` with the keywords already known.
+ *
+ * Edit asks which tag. This asks which patient, which is the question anyone
+ * actually has, and it answers three things Edit cannot:
+ *
+ *  - what the study currently says, read with `dcm info --json` before any
+ *    field is offered, so the operator can see they are about to rename the
+ *    study they meant rather than the one next to it;
+ *  - that PatientName is `Family^Given^Middle^Prefix^Suffix` and not a
+ *    free-text field, so Family and Given are separate boxes that compose —
+ *    and that it can hold that five-part name three times over, once per
+ *    script, which the boxes cannot edit and must not therefore destroy;
+ *  - that a folder holding two studies cannot have one of them renamed.
+ *
+ * `--force` is never passed from here. UIDs are what tie a study together;
+ * this screen changes what a study is called, never what it is.
+ */
+const renameState = {
+  /** The folder the loaded values were read from — '' until a scan lands. */
+  path: '',
+  /** The single study `dcm info` found there, or null. */
+  study: null,
+  /**
+   * PatientName components past Family and Given (middle, prefix, suffix).
+   * Carried through untouched: an operator correcting a surname has not asked
+   * for "DOE^JANE^Q^DR^III" to lose its last three components, and silently
+   * dropping them would be a second, unannounced edit.
+   */
+  extras: [],
+  /**
+   * The name's component groups after the first — its ideographic and phonetic
+   * spellings, `=`-separated in the value `dcm info` reports.
+   *
+   * The same argument as `extras`, one level up and with more at stake. A
+   * Japanese name is one DICOM value holding three writings of itself, and the
+   * two boxes on this screen can only edit the Latin one. Composing the new
+   * name out of those boxes alone would write "YAMADA^Tarou" over
+   * "Yamada^Tarou=<kanji>=<kana>" and delete two thirds of the patient's name
+   * from every instance, to repair a typo in the third — which is what this
+   * screen did before these were carried.
+   *
+   * They ride along untouched and are shown in the echo below the boxes, so
+   * what is preserved is preserved in view rather than behind the operator's
+   * back. Almost every name has none of these and the array stays empty.
+   */
+  groups: [],
+  /**
+   * Current values, keyed by the keyword each will be written to. A field is
+   * '' when the study's instances disagree about it — `dcm info` withholds the
+   * singular in that case rather than picking one, and so do we.
+   */
+  current: null,
+  /**
+   * keyword -> the values a disagreement is between, for the fields that have
+   * one. Absent keyword means the study speaks with one voice about it (or
+   * says nothing at all, which is not the same thing and is not a conflict).
+   */
+  conflicts: {},
+};
+
+/**
+ * The four fields, in the order they render.
+ *
+ * `one` / `many` are the pair `dcm info --json` reports each field as. Both
+ * keys are always present: the singular is a string only when every instance
+ * that carries the field agrees, and is null both when they disagree and when
+ * no instance carries one — the plural is the only thing that tells those two
+ * apart. Reading the singular alone is exactly the bug this screen must not
+ * have, so nothing here reads it alone.
+ */
+const RENAME_FIELDS = [
+  { keyword: 'PatientName', label: 'Patient name', one: 'patientName', many: 'patientNames', miss: 'no name' },
+  { keyword: 'PatientID', label: 'Patient ID', one: 'patientId', many: 'patientIds', miss: 'no ID', input: 'rename-patientid' },
+  { keyword: 'StudyDescription', label: 'Study description', one: 'studyDescription', many: 'studyDescriptions', miss: 'no description', input: 'rename-desc' },
+  { keyword: 'AccessionNumber', label: 'Accession number', one: 'accessionNumber', many: 'accessionNumbers', miss: 'none', input: 'rename-accession' },
+];
+
+/** This screen's four fields, through the shared reader. */
+function renameFieldState(s, field) {
+  return identityState(s, field.one, field.many);
+}
+
+/**
+ * A PatientName taken apart into the two things this screen edits and the two
+ * it only carries.
+ *
+ * A DICOM Person Name nests twice. The outer level is up to three component
+ * GROUPS separated by `=` — the same name written in Latin script, in
+ * ideographs, and phonetically. Each group is then five `^` components,
+ * Family^Given^Middle^Prefix^Suffix. `dcm info` reports the whole thing, so
+ * "Yamada^Tarou=<kanji>=<kana>" arrives here as one string.
+ *
+ * Family and Given come out of the FIRST group, because that is the group the
+ * two boxes can meaningfully hold. `extras` is the rest of that group;
+ * `groups` is every later group, kept whole. Both are carried, neither is
+ * edited, and `joinPn` puts them back exactly where they were.
+ */
+function splitPn(value) {
+  const groups = String(value ?? '').split('=');
+  const parts = groups[0].split('^');
+  return {
+    family: parts[0] || '',
+    given: parts[1] || '',
+    extras: parts.slice(2),
+    groups: groups.slice(1),
+  };
+}
+
+/**
+ * Family + Given + the preserved tail + the preserved groups, back into one PN.
+ *
+ * Trailing empties are dropped at both levels, because "DOE^JANE^^^" and
+ * "DOE^JANE" are the same name and only one of them looks like a name, and
+ * "DOE^JANE==" is the same again with two empty scripts announced.
+ *
+ * An interior empty group is NOT dropped: a name with a phonetic spelling and
+ * no ideographic one is "A^B==C^D", and closing that gap would file the
+ * phonetic spelling as the ideographic one. That is why the groups are joined
+ * positionally rather than filtered.
+ *
+ * A name with a single group — nearly all of them — composes to exactly what
+ * it composed to before there were groups at all: no `=`, byte for byte the
+ * old behaviour.
+ */
+function joinPn(family, given, extras, groups = []) {
+  const parts = [family, given, ...extras].map((p) => String(p ?? ''));
+  while (parts.length && parts[parts.length - 1] === '') parts.pop();
+  const all = [parts.join('^'), ...groups.map((g) => String(g ?? ''))];
+  while (all.length > 1 && all[all.length - 1] === '') all.pop();
+  return all.join('=');
+}
+
+function renameComposed() {
+  return joinPn(
+    $('#rename-family').value.trim(),
+    $('#rename-given').value.trim(),
+    renameState.extras,
+    renameState.groups
+  );
+}
+
+/** 'copy' (the default) or 'inplace'. */
+function renameDest() {
+  const active = $('#rename-dest-row .chip.active');
+  return active ? active.dataset.dest : 'copy';
+}
+
+/** What the operator has typed, keyed the way the engine wants it. */
+function renameWanted() {
+  return {
+    PatientName: renameComposed(),
+    PatientID: $('#rename-patientid').value.trim(),
+    StudyDescription: $('#rename-desc').value.trim(),
+    AccessionNumber: $('#rename-accession').value.trim(),
+  };
+}
+
+/**
+ * Only the fields that actually differ, as [keyword, value].
+ *
+ * Rewriting a field to the value it already holds is not free — it is an
+ * instance touched, a line in the report, and a difference between the copy
+ * and the source that has to be explained later — so an unchanged field
+ * produces no --set at all.
+ */
+function renamePairs() {
+  if (!renameState.study || !renameState.current) return [];
+  const wanted = renameWanted();
+  const pairs = [];
+  for (const { keyword } of RENAME_FIELDS) {
+    if (wanted[keyword] !== renameState.current[keyword]) pairs.push([keyword, wanted[keyword]]);
+  }
+  return pairs;
+}
+
+BUILDERS.rename = () => {
+  const argv = ['edit'];
+  const folder = $('#rename-folder').value.trim();
+  if (folder) argv.push(folder);
+  for (const [keyword, value] of renamePairs()) argv.push('--set', `${keyword}=${value}`);
+  if (renameDest() === 'inplace') {
+    argv.push('--in-place');
+  } else {
+    const out = $('#rename-out').value.trim();
+    if (out) argv.push('--out', out);
+  }
+  // No --force, ever: nothing this screen can set is a UID.
+  if (rehearsal()) argv.push('--dry-run');
+  return argv;
+};
+
+/**
+ * One identity field on the card.
+ *
+ * A disagreement is drawn as the disagreement — every value, amber — because
+ * the alternative is the card stating a fact the study does not contain. It
+ * is deliberately not collapsed to "2 values": an operator who can see
+ * SYNTH0001 / WRONG-ID can usually tell at a glance which one is the mistake,
+ * and a count tells them only that they must go and look somewhere else.
+ */
+function renameFieldHtml(s, field) {
+  const st = renameFieldState(s, field);
+  if (st.value) return `<b>${esc(st.value)}</b>`;
+  if (st.conflict) return identityClash(st.values);
+  return `<b class="miss">${esc(field.miss)}</b>`;
+}
+
+/** One study, as the scan found it. Same shape the Inventory tab draws. */
+function renameStudyCard(s) {
+  const [name, pid, desc, acc] = RENAME_FIELDS.map((f) => renameFieldHtml(s, f));
+  return `<div class="study-card">
+    <h3>${name} · ${pid}</h3>
+    <div class="uid">${esc(s.studyInstanceUid)}</div>
+    <div class="study-meta">
+      <span>${desc}</span>
+      <span>accession ${acc}</span>
+      <span>date ${s.studyDate ? `<b>${esc(s.studyDate)}</b>` : '<b class="miss">none</b>'}</span>
+      <span><b>${(s.modalities || []).join(', ') || '—'}</b></span>
+      <span><b>${s.seriesCount ?? '—'}</b> series</span>
+      <span><b>${s.instanceCount ?? '—'}</b> instances</span>
+    </div>
+  </div>`;
+}
+
+/**
+ * Draws the scan panel: what is there, or why this folder cannot be renamed.
+ *
+ * The refusal is the reason this tab exists as something other than a shortcut
+ * to Edit. `dcm edit` applies to every instance under the path it is given and
+ * has no way to be pointed at one study inside it, so "rename this study" in a
+ * folder of three is not a thing that can be done — it would write one identity
+ * over all three, which is a merge. There is no "do it anyway": the option
+ * would only ever be pressed by someone who had misread the sentence above it.
+ */
+function renderRenameFound(html) {
+  const box = $('#rename-found');
+  box.innerHTML = html;
+  box.hidden = !html;
+}
+
+/**
+ * The composed PatientName, spelled out, so nothing is written unseen.
+ *
+ * This line is the whole guarantee. Everything the two boxes do not edit — the
+ * middle name, the suffix, the kanji and kana spellings — is composed into the
+ * value here first, and the value here is character-for-character the one that
+ * goes after `--set PatientName=`. An operator who reads this line has read
+ * the name that will be written.
+ *
+ * The counts after it name what is being carried rather than describing it.
+ * Two words each: an operator who can already see "山田^太郎" in the value does
+ * not need a sentence telling them it is there, they need to know it is kept
+ * rather than about to be overwritten.
+ */
+function renderRenamePn() {
+  const el = $('#rename-pn');
+  const value = renameComposed();
+  const notes = [];
+  if (renameState.extras.length) {
+    notes.push(`keeping ${renameState.extras.length} further component(s) the name already had`);
+  }
+  if (renameState.groups.length) {
+    notes.push(`${renameState.groups.length} other spelling(s) kept`);
+  }
+  const kept = notes.length ? ` <span class="pn-kept">${esc(notes.join(', '))}</span>` : '';
+  el.innerHTML = value
+    ? `<b>PatientName</b> <span class="pn-value">${esc(value)}</span>${kept}`
+    : '<b>PatientName</b> <span class="pn-value empty">(empty)</span>';
+}
+
+/** A value as it should read in the change list, blanks named rather than blank. */
+function renameValueText(v) {
+  return v ? `<span class="rn-b">${esc(v)}</span>` : '<span class="rn-b rn-none">(empty)</span>';
+}
+
+/**
+ * One panel for every field that disagrees, rather than one panel per field.
+ *
+ * Four amber blocks down a screen is not four times the warning; it is a
+ * screen that has gone amber, and the fourth block is read the way the first
+ * three were — which is to say skipped. They would also be saying one thing
+ * four times: these instances do not agree about what this study is. That is a
+ * single fact about a single study, and the repair is a single press, so it
+ * gets a single panel with a row per field.
+ *
+ * The per-field reasoning — what a disagreeing AccessionNumber costs versus a
+ * disagreeing PatientID — is real, and it already exists in full in `dcm info`,
+ * which prints a paragraph written for the particular field. Reprinting those
+ * four paragraphs here would spend the whole screen on text an operator has to
+ * scroll past to reach the boxes that fix it.
+ *
+ * Each value is a button because the repair is a choice between values that
+ * are already on screen. Re-typing "ACC0000001" by eye is how a repair invents
+ * a third value, and the buttons cost no words to explain.
+ */
+function renameConflictPanel() {
+  const rows = RENAME_FIELDS.filter((f) => renameState.conflicts[f.keyword]);
+  if (!rows.length) return '';
+  const body = rows.map((f) => {
+    const picks = renameState.conflicts[f.keyword].map((v) => `<button type="button" class="rn-pick" `
+      + `data-adopt="${esc(f.keyword)}" data-value="${esc(v)}">${esc(v)}</button>`).join('');
+    return `<div class="rn-cf-row"><span class="rn-cf-k">${esc(f.label)}</span>`
+      + `<span class="rn-cf-v">${picks}</span></div>`;
+  }).join('');
+  return `<div class="caution rn-conflicts">`
+    + `<strong>These instances disagree about what this study is.</strong> `
+    + `One Study Instance UID has one identity, so nothing below is prefilled. `
+    + `Pick or type a value and the rename writes it to every instance.`
+    + `<div class="rn-cf">${body}</div></div>`;
+}
+
+/**
+ * Taking one of the values a conflict is between.
+ *
+ * It fills the box; it does not rename anything. The operator still reads the
+ * change list and still presses the button, so a mis-click is a mis-click and
+ * not a rewritten study.
+ */
+function adoptConflictValue(keyword, value) {
+  if (keyword === 'PatientName') {
+    const pn = splitPn(value);
+    // The adopted name brings its own tail and its own other scripts: taking
+    // "DOE^JANE^Q" and then keeping the extras of the name we did not take
+    // would compose a fifth name out of two the study already disagrees about,
+    // and keeping its kanji under the other name's romaji would be the same
+    // mistake in a script the operator cannot read to catch it.
+    renameState.extras = pn.extras;
+    renameState.groups = pn.groups;
+    $('#rename-family').value = pn.family;
+    $('#rename-given').value = pn.given;
+  } else {
+    const field = RENAME_FIELDS.find((f) => f.keyword === keyword);
+    if (!field || !field.input) return;
+    $(`#${field.input}`).value = value;
+  }
+  refreshRename();
+}
+
+/**
+ * Marks the value the boxes currently hold, so the panel shows what was
+ * chosen. Typing one of them by hand lights the same button: what is marked is
+ * the state of the form, not the memory of a click.
+ */
+function syncConflictPicks() {
+  const wanted = renameState.study ? renameWanted() : {};
+  for (const btn of $$('#rename-found .rn-pick')) {
+    btn.classList.toggle('chosen', wanted[btn.dataset.adopt] === btn.dataset.value);
+  }
+}
+
+/** Only what differs, current -> new. Nothing to show is itself the answer. */
+function renderRenameDiff() {
+  const box = $('#rename-diff');
+  const pairs = renamePairs();
+  if (!pairs.length) { box.hidden = true; box.innerHTML = ''; return; }
+  const labels = new Map(RENAME_FIELDS.map((f) => [f.keyword, f.label]));
+  box.innerHTML = pairs.map(([keyword, value]) => {
+    const was = renameState.current[keyword];
+    const conflict = renameState.conflicts[keyword];
+    let from;
+    // A conflict is not an empty "before". Struck-through nothing would read
+    // as "this study had no accession number", which is the same lie the card
+    // is not allowed to tell.
+    if (conflict) {
+      from = `<span class="rn-a conflict">${conflict.map(esc).join(' / ')}</span>`;
+    } else if (was) {
+      from = `<span class="rn-a">${esc(was)}</span>`;
+    } else {
+      from = '<span class="rn-a rn-none">(empty)</span>';
+    }
+    return `<div class="rn-diff-row"><span class="rn-k">${esc(labels.get(keyword))}</span>`
+      + `${from}<span class="rn-arrow"> → </span>${renameValueText(value)}</div>`;
+  }).join('');
+  box.hidden = false;
+}
+
+/**
+ * The button, and the one thing it is allowed to say.
+ *
+ * An unchanged form is not an error to be discovered after pressing; the
+ * button goes inert and relabels itself, so the screen answers the question
+ * before it is asked.
+ */
+function syncRenameButton() {
+  const btn = $('#view-rename [data-run]');
+  const loaded = !!renameState.study;
+  const pairs = renamePairs();
+  btn.disabled = !loaded || !pairs.length;
+  btn.textContent = loaded && !pairs.length ? 'Nothing changed yet' : 'Rename study';
+}
+
+/** Everything the loaded study put on screen, taken back off it. */
+function resetRenameStudy() {
+  renameState.path = '';
+  renameState.study = null;
+  renameState.current = null;
+  renameState.extras = [];
+  renameState.groups = [];
+  renameState.conflicts = {};
+  renderRenameFound('');
+  $('#rename-form').hidden = true;
+  $('#rename-diff').hidden = true;
+  syncRenameButton();
+  updateAllPreviews();
+}
+
+/** Fills the four boxes from the study, so an untouched field is visibly untouched. */
+function seedRenameFields(s) {
+  // `dcm info` gives a string only when every instance that carries the field
+  // agrees. Two patient IDs under one Study Instance UID is not a current
+  // value to prefill from — picking one would be inventing the answer — so
+  // that box starts empty and the panel says what the disagreement is between.
+  // Leaving it empty leaves the study alone; putting one value in writes that
+  // value to every instance, which is what repairs it.
+  renameState.conflicts = {};
+  renameState.current = {};
+  for (const field of RENAME_FIELDS) {
+    const st = renameFieldState(s, field);
+    if (st.conflict) renameState.conflicts[field.keyword] = st.values;
+    renameState.current[field.keyword] = st.value;
+  }
+
+  const pn = splitPn(renameState.current.PatientName);
+  renameState.extras = pn.extras;
+  renameState.groups = pn.groups;
+
+  $('#rename-family').value = pn.family;
+  $('#rename-given').value = pn.given;
+  for (const field of RENAME_FIELDS) {
+    if (field.input) $(`#${field.input}`).value = renameState.current[field.keyword];
+  }
+}
+
+/**
+ * Reads the folder with `dcm info --json` and decides whether it can be renamed.
+ *
+ * `keepConsole` is for the re-read that follows an in-place rename. That write
+ * is the destructive one and its report — how many instances were touched, per
+ * tag — is the only account of it there will ever be, so the scan that proves
+ * it worked is not allowed to wipe it off the screen on its way past. Every
+ * other entry point clears, because a failure from the last folder must not sit
+ * under the next one's card.
+ */
+async function scanRenameFolder({ keepConsole = false } = {}) {
+  const folder = $('#rename-folder').value.trim();
+  resetRenameStudy();
+  if (!keepConsole) clearConsole('rename');
+  if (!folder) return;
+
+  setStatus('rename', 'running', 'Reading…');
+  const { code, stdout, stderr } = await runCapture('rename', ['info', folder, '--json']);
+
+  let parsed = null;
+  try { parsed = JSON.parse(stdout); } catch { parsed = null; }
+  if (code !== 0 || !parsed) {
+    setStatus('rename', 'fail', 'Failed');
+    fail('rename', stdout || stderr || 'Could not read that folder.\n');
+    return;
+  }
+
+  const studies = Array.isArray(parsed.studies) ? parsed.studies : [];
+  if (!studies.length) {
+    setStatus('rename', 'fail', 'Nothing there');
+    renderRenameFound('<div class="caution"><strong>No DICOM instances here.</strong> '
+      + `${parsed.filesExamined || 0} file(s) examined and none of them was a DICOM instance.</div>`);
+    return;
+  }
+
+  if (studies.length > 1) {
+    setStatus('rename', 'warn', `${studies.length} studies`);
+    renderRenameFound(
+      `<div class="caution"><strong>This folder holds ${studies.length} studies.</strong> `
+      + 'A rename applies to every instance under the folder and cannot be pointed at one study '
+      + `inside it, so renaming here would write a single identity over all ${studies.length} — `
+      + 'a merge, not a rename. Point at one study\'s own folder instead.</div>'
+      + studies.map(renameStudyCard).join('')
+    );
+    return;
+  }
+
+  const study = studies[0];
+  renameState.path = folder;
+  renameState.study = study;
+  seedRenameFields(study);
+
+  renderRenameFound(renameConflictPanel() + renameStudyCard(study));
+
+  $('#rename-form').hidden = false;
+  renderRenamePn();
+  renderRenameDiff();
+  syncRenameButton();
+  syncConflictPicks();
+  updateAllPreviews();
+  // A loaded study whose instances disagree is loaded and is also a problem;
+  // "Loaded" alone would put a green chip on the one outcome this screen
+  // exists to catch.
+  const clashes = Object.keys(renameState.conflicts).length;
+  if (clashes) setStatus('rename', 'warn', `${clashes} field${clashes === 1 ? '' : 's'} disagree`);
+  else setStatus('rename', 'ok', 'Loaded');
+}
+
+/** Every keystroke in the four boxes ends here. */
+function refreshRename() {
+  renderRenamePn();
+  renderRenameDiff();
+  syncRenameButton();
+  syncConflictPicks();
+  updateAllPreviews();
+}
+
+function renderRenameDest() {
+  const inplace = renameDest() === 'inplace';
+  $('#rename-out-row').hidden = inplace;
+  $('#rename-inplace-note').hidden = !inplace;
+}
+
+function wireRename() {
+  // A typed path is scanned when it is finished with, not per keystroke — each
+  // scan is a child process. Changing it drops the loaded study first, so the
+  // fields on screen can never belong to a folder other than the one named
+  // above them. The picker dispatches `change`, so Browse… lands here too.
+  $('#rename-folder').addEventListener('input', () => {
+    if ($('#rename-folder').value.trim() !== renameState.path) resetRenameStudy();
+  });
+  $('#rename-folder').addEventListener('change', () => scanRenameFolder());
+
+  for (const id of ['rename-family', 'rename-given', 'rename-patientid', 'rename-desc', 'rename-accession']) {
+    $(`#${id}`).addEventListener('input', refreshRename);
+  }
+
+  // Delegated: the conflict panel is redrawn from scratch on every scan.
+  $('#rename-found').addEventListener('click', (e) => {
+    const pick = e.target.closest('.rn-pick');
+    if (pick) adoptConflictValue(pick.dataset.adopt, pick.dataset.value);
+  });
+  $('#rename-out').addEventListener('input', updateAllPreviews);
+
+  for (const chip of $$('#rename-dest-row .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#rename-dest-row .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderRenameDest();
+      updateAllPreviews();
+    });
+  }
+  renderRenameDest();
+
+  $('#view-rename [data-run]').addEventListener('click', async () => {
+    clearConsole('rename');
+    const folder = $('#rename-folder').value.trim();
+    if (!folder) { fail('rename', 'Choose the folder holding the study first.\n'); return; }
+    if (!renameState.study) {
+      fail('rename', 'That folder has not been read yet, or it does not hold exactly one study.\n');
+      return;
+    }
+    const pairs = renamePairs();
+    if (!pairs.length) { fail('rename', 'Nothing differs from what the study already says.\n'); return; }
+
+    const inplace = renameDest() === 'inplace';
+    if (!inplace && !$('#rename-out').value.trim()) {
+      fail('rename', 'Choose where to write the renamed copy.\n');
+      return;
+    }
+
+    setStatus('rename', 'running', rehearsal() ? 'Previewing…' : (inplace ? 'Rewriting…' : 'Writing copy…'));
+    const { code } = await runStreaming('rename', BUILDERS.rename());
+    setStatus('rename', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
+    // The source's own values have moved, so what is on screen as "current" is
+    // now yesterday's. Re-read rather than leave a stale prefill behind.
+    if (code === 0 && inplace) await scanRenameFolder({ keepConsole: true });
   });
 }
 
@@ -4630,7 +5248,12 @@ function wirePickers() {
       const mode = btn.dataset.pickMode || 'folder';
       const res = await window.dcm.pick({ mode, defaultPath: state.info.home });
       if (res && res.path) {
-        $(`#${targetId}`).value = res.path;
+        const field = $(`#${targetId}`);
+        field.value = res.path;
+        // A picked path is a path the operator chose, exactly as if they had
+        // typed it and pressed Enter — so it fires `change` and any screen
+        // that reacts to a folder being settled on (Rename reads it) reacts.
+        field.dispatchEvent(new Event('change', { bubbles: true }));
         updateAllPreviews();
       }
     });
@@ -4993,6 +5616,7 @@ async function boot() {
   wireWebhub();
   wireInventory();
   wireTags();
+  wireRename();
   wireEdit();
   wireAnon();
   wirePickers();

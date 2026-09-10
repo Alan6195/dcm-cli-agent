@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Asteris DICOM — Electron main process.
+ * AscendI DICOM — Electron main process.
  *
  * The whole point of this app is to put a friendly face on the existing CLI
  * engine without forking it. Every action the UI takes runs the exact same
@@ -70,7 +70,7 @@ const gotInstanceLock = SMOKE || app.requestSingleInstanceLock();
 if (!gotInstanceLock) {
   // Say so on stderr: `npm start` while the installed app is open loses this
   // race too, and a silent exit code 0 there looks exactly like a bug.
-  process.stderr.write('Asteris DICOM App is already running; fronting the existing window.\n');
+  process.stderr.write('AscendI DICOM is already running; fronting the existing window.\n');
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -116,18 +116,102 @@ function writeProfiles(data) {
   }
 }
 
-/** v0.5 and earlier ran under the product name "Asteris DICOM", which puts its
- * user data in a different folder. Carry saved connection profiles across the
- * rename so nobody re-types their PACS hosts after an update. */
-function migrateLegacyProfiles() {
+// --- Carrying the operator's data across a product rename ------------------
+//
+// Electron derives userData from productName, so renaming the product moves
+// the whole directory: %APPDATA%\Asteris DICOM App\ becomes
+// %APPDATA%\AscendI DICOM\, and everything the operator saved stays behind in
+// a folder the new build never looks at. From their side that is not a rename,
+// it is a wipe — the PACS peers they typed in are gone.
+//
+// The v0.5 → v0.6 rename got a one-file version of this. The AscendI rename
+// generalised it, because by now there are three files and two older names.
+
+/**
+ * The files this app owns in its user-data directory.
+ *
+ * Named individually rather than copying the directory wholesale. userData
+ * also holds Chromium's own state — Cache, GPUCache, Local Storage, Cookies —
+ * which belongs to the build that wrote it and is worth nothing carried
+ * forward. These three are the app's own, and they are the ones whose absence
+ * an operator notices: their saved PACS peers, their station identity and
+ * defaults, and the window they left the app on.
+ */
+const STATE_FILES = ['profiles.json', 'settings.json', 'app-state.json'];
+
+/**
+ * Product names this app has shipped under, newest first.
+ *
+ * "Asteris DICOM" was v0.5 and earlier; "Asteris DICOM App" was v0.6 through
+ * the AscendI rename. Newest first is deliberate: a machine that has been
+ * through both renames has both directories, and the one to trust is the one
+ * written most recently.
+ */
+const LEGACY_PRODUCT_DIRS = ['Asteris DICOM App', 'Asteris DICOM'];
+
+/**
+ * Copy state files from earlier user-data directories into the current one.
+ *
+ * Takes its paths rather than reading them off `app`, so it can be run against
+ * throwaway directories. The real ones hold the only copy of somebody's peer
+ * list, and a migration nobody can test on a scratch directory is a migration
+ * nobody tests.
+ *
+ * One rule, and it only goes one way: a file is carried only when the current
+ * directory does not already have it. A file that is already there was written
+ * by a run under the current name and is therefore newer than anything an
+ * older name left behind — copying over it would roll the operator back
+ * silently, which is worse than the problem this solves. Each file is decided
+ * on its own, so an install that has already saved settings.json still gets
+ * the old profiles.json.
+ *
+ * @param {string} targetDir the current userData directory
+ * @param {string[]} legacyDirs earlier userData directories, newest first
+ * @returns {{carried: {file: string, from: string}[], failed: {file: string, error: string}[]}}
+ */
+function migrateStateFiles(targetDir, legacyDirs) {
+  const carried = [];
+  const failed = [];
+  for (const file of STATE_FILES) {
+    try {
+      const target = path.join(targetDir, file);
+      if (fs.existsSync(target)) continue; // never overwrite newer data
+      const source = (Array.isArray(legacyDirs) ? legacyDirs : [])
+        .map((dir) => path.join(dir, file))
+        .find((candidate) => fs.existsSync(candidate));
+      if (!source) continue;
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.copyFileSync(source, target);
+      carried.push({ file, from: source });
+    } catch (err) {
+      // One unreadable file must not cost the operator the other two.
+      failed.push({ file, error: String((err && err.message) || err) });
+    }
+  }
+  return { carried, failed };
+}
+
+/**
+ * The launch-time call.
+ *
+ * Never throws. An app that refuses to open is a worse outcome than one that
+ * opens with an empty peer list, and in the failure case the old directory is
+ * still sitting there to be recovered from by hand.
+ */
+function migrateLegacyUserData() {
+  // The smoke harness runs against a throwaway userData directory. Without
+  // this, every smoke run would pull the real installed app's profiles and
+  // settings into the test — a harness reading state it did not create, and
+  // reaching into the operator's own data to do it.
+  if (SMOKE) return { carried: [], failed: [] };
   try {
-    if (fs.existsSync(profilesPath())) return;
-    const legacy = path.join(app.getPath('appData'), 'Asteris DICOM', 'profiles.json');
-    if (!fs.existsSync(legacy)) return;
-    fs.mkdirSync(path.dirname(profilesPath()), { recursive: true });
-    fs.copyFileSync(legacy, profilesPath());
+    const appData = app.getPath('appData');
+    return migrateStateFiles(
+      app.getPath('userData'),
+      LEGACY_PRODUCT_DIRS.map((name) => path.join(appData, name))
+    );
   } catch {
-    /* start fresh rather than fail the launch */
+    return { carried: [], failed: [] };
   }
 }
 
@@ -231,7 +315,7 @@ function createWindow(opts = {}) {
       // not a thing anyone needs.
       closable: false,
       backgroundColor: '#0e1420',
-      title: 'Asteris DICOM App',
+      title: 'AscendI DICOM',
       webPreferences: { contextIsolation: true, sandbox: true },
     });
     splashWindow.loadFile(path.join(__dirname, 'renderer', 'splash.html'));
@@ -248,7 +332,7 @@ function createWindow(opts = {}) {
     minHeight: 620,
     show: !withSplash,
     backgroundColor: '#0e1420',
-    title: 'Asteris DICOM App',
+    title: 'AscendI DICOM',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -695,7 +779,7 @@ async function checkForUpdateViaApi() {
 // is the one running, which Windows will not let it overwrite.
 
 // The suffixes come from electron-builder: the mac artifactName in
-// package.json is Asteris-DICOM-App-${version}-${arch}.${ext}, built for arm64
+// package.json is AscendI-DICOM--., built for arm64
 // and x64. If that name ever changes, this is the other half that has to.
 const MAC_ARCH_SUFFIX = { arm64: '-arm64.dmg', x64: '-x64.dmg' };
 
@@ -1055,7 +1139,14 @@ function initUpdates() {
 app.whenReady().then(() => {
   if (!gotInstanceLock) return;
 
-  migrateLegacyProfiles();
+  const migrated = migrateLegacyUserData();
+  if (migrated.carried.length) {
+    // "Where did my peers go?" gets asked once per rename. This is the line
+    // that answers it, in the log the support team already asks for.
+    process.stderr.write(
+      `carried ${migrated.carried.map((c) => c.file).join(', ')} forward from a previous product name\n`
+    );
+  }
 
   // Record the version each run; a change since last run means an update
   // happened (possibly silently on quit), and the renderer says so once.
@@ -1125,11 +1216,18 @@ app.whenReady().then(() => {
   if (process.env.DCM_SMOKE_DIR && mainWindow) {
     const startSmoke = () => {
       try {
-        // The asset picker and the feed reader are pure, and they are the
-        // half of the macOS update path that can be checked from any machine.
-        // Handed over rather than exported, because requiring main.js from the
-        // harness would run this file a second time.
-        require('./test/smoke').runSmoke(mainWindow, app, { pickMacAsset, macFeedEntry });
+        // The asset picker, the feed reader and the state-file migration are
+        // pure functions over paths and lists, and they are the parts that can
+        // be checked from any machine without a Mac and without touching a
+        // real user-data directory. Handed over rather than exported, because
+        // requiring main.js from the harness would run this file a second time.
+        require('./test/smoke').runSmoke(mainWindow, app, {
+          pickMacAsset,
+          macFeedEntry,
+          migrateStateFiles,
+          STATE_FILES,
+          LEGACY_PRODUCT_DIRS,
+        });
       } catch (err) {
         // The harness is not shipped in packaged builds. Say so loudly rather
         // than leaving the process alive and looking like a hang.

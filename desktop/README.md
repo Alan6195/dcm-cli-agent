@@ -1,10 +1,10 @@
-# Asteris DICOM App
+# AscendI DICOM
 
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,
 shows it, and runs it. Echo, Send (with a live transfer report), a Receiver you
-can start and stop, Query, Inventory, Speed test, Tag inspector, Tag editor and De-identify —
-plus a DICOMweb group: test a server URL, send over STOW-RS, query over QIDO-RS,
+can start and stop, Query, Inventory, Speed test, Tag inspector, Rename, Tag editor
+and De-identify — plus a DICOMweb group: test a server URL, send over STOW-RS, query over QIDO-RS,
 and run a local DICOMweb hub for testing.
 
 **Worklist & perform** is one screen because it is one job: query the worklist,
@@ -17,9 +17,12 @@ closed appears inline the moment it applies. DICOMweb credentials come from the
 environment the app was launched from (`DCM_WEB_TOKEN`, or
 `DCM_WEB_USER`/`DCM_WEB_PASS`) — there is deliberately no token field.
 
-The product name is deliberately "Asteris DICOM App" — typing "asteris" into
-the Windows Start menu finds it, and the trailing "App" separates it from the
-`dcm` CLI when both are installed.
+The product name is "AscendI DICOM". Typing "ascendi" into the Windows Start
+menu finds it, and nothing else on the machine answers to that; the `dcm` CLI
+is only ever found by typing `dcm`, so the two cannot be confused when both
+are installed. It shipped as "Asteris DICOM" through v0.5 and as "Asteris
+DICOM App" from v0.6 — see **Updating from an Asteris build** below for what
+happens to the data those versions saved.
 
 Launch behavior worth knowing, all deliberate:
 
@@ -29,7 +32,48 @@ Launch behavior worth knowing, all deliberate:
   instead of racing the first instance for profiles and receiver ports;
 - window size, position and maximized state are remembered across launches
   (and reset if the monitor they were on is gone);
-- saved connection profiles survive updates and the v0.5 → v0.6 rename.
+- saved peers, settings and window state survive updates and every product
+  rename this app has been through.
+
+## Updating from an Asteris build
+
+The app used to be called Asteris DICOM App, and before that Asteris DICOM.
+The rename to AscendI DICOM is an ordinary update: same installed program,
+new name and new icon in the Start menu. Nothing has to be uninstalled first.
+
+Two things make that true, and both are deliberate.
+
+**The installer still identifies the app the way it always has.** electron-
+builder's `appId` in `desktop/package.json` is unchanged at
+`com.asteris.dcm.desktop`, because that identifier — not the visible name — is
+what Windows and NSIS match on to decide whether an installer is upgrading
+what is already there. A new `appId` would install AscendI beside Asteris,
+leave the old copy receiving no further updates, and make every user find and
+remove it by hand. The old identifier is kept until retiring it is a decision
+someone makes on purpose, with a plan for the copies already installed.
+
+**Your saved data is carried across.** Electron derives the user-data folder
+from the product name, so the rename moves it:
+
+```
+%APPDATA%\Asteris DICOM App\   →   %APPDATA%\AscendI DICOM\
+```
+
+Left alone, that reads as a wipe — the app opens with no PACS peers, no
+station AE Title, none of your defaults. So on first launch under the new
+name, the app copies `profiles.json`, `settings.json` and `app-state.json`
+forward from either older folder, newest name first. It copies, it does not
+move: the old folder is left exactly as it was, so nothing is lost if you go
+back to an older build.
+
+It never overwrites. A file that already exists under the new name was written
+by a newer run and wins, decided file by file — so an install that has already
+saved settings still picks up the old peer list. Chromium's own caches and
+cookies stay where they are; they belong to the build that wrote them.
+
+If any of it fails, the app still opens. Losing a peer list is recoverable —
+the old folder is still there to copy from by hand — and an app that refuses
+to launch is not.
 
 ## Speed, on the Send and Speed test screens
 
@@ -100,6 +144,53 @@ point of the feature:
   effective transfer — same negotiated syntax, same measured width, same
   division of instances into associations — are all badged TIED FASTEST.
 
+## Rename, on the Tools screen
+
+**Rename is `dcm edit --set` with the four keywords already filled in** — patient
+name, patient ID, study description, accession number, and nothing else. It never
+passes `--force`, so no UID is touched: renaming changes what a study is *called*,
+never what it *is*. Anything Rename does, Edit could do; what Rename adds is
+knowing which four keywords those are, reading the folder before it offers a box,
+and refusing the cases Edit would carry out literally.
+
+A folder holding more than one study is one of those. `dcm edit` applies to every
+instance under the path it is given and cannot be scoped to one study inside it,
+so "rename this study" in a folder of three would write one identity over all
+three — a merge. The screen names the studies it found and offers no form.
+
+**A study whose own instances disagree is the other.** The four fields are rolled
+up across every instance by `dcm info`, which reports a value only when the
+instances that carry one agree; on a disagreement it withholds the value and
+lists them. The screen follows that exactly. It will not print one instance's
+patient ID as the study's patient ID, and it will not prefill a box from a value
+it had to choose — the boxes over a disagreeing field start empty, and empty
+means *leave it alone*.
+
+What appears instead is one amber panel, not one per field. Four amber blocks
+down a screen is not four times the warning; it is a screen that has gone amber,
+and they would all be saying the same thing — these instances do not agree about
+what this study is. That is one fact about one study and the repair is one press,
+so it gets one panel with a row per disagreeing field. The per-field reasoning is
+real and it is not lost: `dcm info` on the same folder prints a paragraph written
+for the particular field, since what a disagreeing accession number costs is not
+what a disagreeing patient ID costs.
+
+**The repair is the point of the screen.** Every competing value in the panel is
+a button. Clicking one puts it in the box; renaming then writes it to every
+instance, and the disagreement is gone. The button is offered because the choice
+is between values already on screen and re-typing `ACC0000001` by eye is how a
+repair invents a third value — it fills the box and nothing more, so the change
+list and the primary button still stand between a mis-click and a rewritten
+study. Whichever value the boxes hold is ticked in the panel, including one typed
+by hand that happens to match.
+
+**Study date is deliberately not offered.** A date is not a name. It is when the
+images were made, and rewriting it re-files the study in every date-ordered view
+an archive has while the SeriesDate and AcquisitionDate inside each instance
+still say otherwise. It is also the one identity-adjacent field `dcm info` does
+*not* roll up, because a study spanning midnight would raise a disagreement with
+no repair behind it. The Edit tab will change it if you genuinely need to.
+
 ## Why it's built this way
 
 The engine (`../src`) is reused verbatim. Electron ships its own Node, so with
@@ -160,7 +251,7 @@ A real Developer ID is a later step if this goes past the support team.
 ## Installing on macOS
 
 **First launch will show a warning, and that is expected.** macOS reports
-"Asteris DICOM App can't be opened because Apple cannot check it for malicious
+"AscendI DICOM can't be opened because Apple cannot check it for malicious
 software", or names an unidentified developer. To get past it:
 
 - **right-click (or Control-click) the app → Open**, then click **Open** in the
@@ -170,12 +261,15 @@ software", or names an unidentified developer. To get past it:
   download:
 
   ```bash
-  xattr -cr "/Applications/Asteris DICOM App.app"
+  xattr -cr "/Applications/AscendI DICOM.app"
   ```
 
 **If you downloaded v0.14.1 or earlier, you need one extra step.** Those builds
 say **"Asteris DICOM App is damaged and can't be opened. You should move it to
-the Trash"** on Apple Silicon (M1/M2/M3/M4) Macs. The download is not damaged
+the Trash"** on Apple Silicon (M1/M2/M3/M4) Macs. (The old name is not a typo:
+those releases shipped before the AscendI rename, and the bundle they installed
+is still called `Asteris DICOM App.app` — which is the name the commands below
+have to use.) The download is not damaged
 and it is not malware. Those builds shipped with no code signature at all, and
 Apple Silicon refuses to run an unsigned arm64 binary — "damaged" is just the
 misleading wording macOS uses for it. Intel Macs were unaffected, which is why

@@ -10,7 +10,8 @@ const log = require('../../src/lib/log');
 const { createWebServer, USAGE } = require('../../src/commands/web/serve');
 const { VERBS } = require('../../src/commands/web');
 const { webRequest, buildMultipartRelated, parseMultipartRelated, TAGS } = require('../../src/lib/webdicom');
-const { generate } = require('../../tools/make-fixtures');
+const { generate, writeInstance, uid } = require('../../tools/make-fixtures');
+const { StorageClass, TransferSyntax } = require('dcmjs-dimse').constants;
 const { freePort, withTempDir } = require('../helpers/harness');
 
 // The hub legitimately logs every request; that chatter is for operators,
@@ -407,4 +408,176 @@ test('a malformed multipart body is a 400 charged to the client, not the hub', a
   } finally {
     await hub.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Person Names on the DICOM JSON wire (PS3.18 F.2.2)
+// ---------------------------------------------------------------------------
+
+/** A three-group Japanese name: romaji, kanji, kana. */
+const JP_NAME = 'Yamada^Tarou=山田^太郎=やまだ^たろう';
+
+/** Writes one instance carrying `patientName`, and returns its path. */
+async function instanceNamed(dir, patientName, seed) {
+  const file = path.join(dir, `named-${seed}.dcm`);
+  await writeInstance({
+    filePath: file,
+    studyUid: uid(seed),
+    seriesUid: uid(seed, 1),
+    sopUid: uid(seed, 1, 1),
+    modality: 'CT',
+    sopClassUid: StorageClass.CtImageStorage,
+    seriesNumber: 1,
+    instanceNumber: 1,
+    rows: 8,
+    cols: 8,
+    patientName,
+    patientId: `PN000${seed}`,
+    studyDescription: 'CHEST',
+    seriesDescription: 'CT SERIES 1',
+    // A multi-script name genuinely requires this: the octets go out as UTF-8
+    // either way, but nothing tells a reader to decode them that way.
+    specificCharacterSet: 'ISO_IR 192',
+    transferSyntaxUid: TransferSyntax.ExplicitVRLittleEndian,
+  });
+  return file;
+}
+
+/** The (0010,0010) attribute of the single study a QIDO answer returned. */
+async function qidoPatientName(hub, query = '') {
+  const res = await webRequest({
+    method: 'GET',
+    url: `${hub.base}/studies${query}`,
+    headers: { Accept: 'application/dicom+json' },
+  });
+  assert.equal(res.status, 200, `QIDO answered ${res.status}`);
+  const matches = JSON.parse(res.body.toString('utf8'));
+  assert.equal(matches.length, 1, 'expected exactly one study in the answer');
+  return matches[0]['00100010'];
+}
+
+/**
+ * Checks a PN attribute against PS3.18 F.2.2 rather than against a literal.
+ *
+ * F.2.2 represents a Person Name as an object whose keys are the
+ * component-group names, and that is the whole rule asserted here: every key
+ * is a group name, and no group's string carries the `=` that separates groups
+ * in the Part 10 form. In JSON the key already says which group a string is,
+ * so a separator inside one has nothing left to separate and can only be read
+ * as part of a name.
+ *
+ * Returns the groups rejoined in F.2.2's order, so a caller can go on to check
+ * that what came back is what the file holds.
+ */
+function assertConformantPn(attribute) {
+  assert.equal(attribute.vr, 'PN', 'PatientName must be sent with VR PN');
+  assert.ok(Array.isArray(attribute.Value), 'a present PN carries Value');
+  assert.equal(attribute.Value.length, 1);
+
+  const item = attribute.Value[0];
+  assert.equal(typeof item, 'object', 'PN in DICOM JSON is an object, never a bare string');
+  assert.ok(item !== null && !Array.isArray(item));
+
+  const ORDER = ['Alphabetic', 'Ideographic', 'Phonetic'];
+  for (const key of Object.keys(item)) {
+    assert.ok(ORDER.includes(key), `"${key}" is not a PN component group name`);
+    assert.equal(typeof item[key], 'string');
+    assert.ok(
+      !item[key].includes('='),
+      `the ${key} group carries "=", so the groups were joined into one key ` +
+        `instead of split into three: ${JSON.stringify(item)}`
+    );
+  }
+
+  const groups = ORDER.map((key) => item[key] ?? '');
+  while (groups.length && groups[groups.length - 1] === '') groups.pop();
+  return groups.join('=');
+}
+
+test('QIDO sends a three-script Person Name as three keys, the way PS3.18 F.2.2 requires', async () => {
+  await withTempDir('webserve-pn-multi', async (dir) => {
+    const store = path.join(dir, 'store');
+    const file = await instanceNamed(path.join(dir, 'src'), JP_NAME, 8);
+    const hub = await startHub({ persist: store });
+    try {
+      assert.equal((await stow(hub.base, [file])).status, 200);
+
+      const attribute = await qidoPatientName(hub);
+
+      // The regression this exists to catch: the hub had begun putting the
+      // whole "A=B=C" value into the Alphabetic key, which parses and is
+      // wrong. Checked as the rule rather than as an expected literal, so it
+      // says why the shape is right and not merely that it is this shape.
+      const rejoined = assertConformantPn(attribute);
+
+      assert.deepEqual(attribute.Value[0], {
+        Alphabetic: 'Yamada^Tarou',
+        Ideographic: '山田^太郎',
+        Phonetic: 'やまだ^たろう',
+      });
+
+      // And nothing was lost on the way: rejoining the three keys in F.2.2's
+      // order reproduces the name the instance carries on disk.
+      assert.equal(rejoined, JP_NAME);
+    } finally {
+      await hub.close();
+    }
+  });
+});
+
+test('QIDO sends an ordinary name as exactly {"Alphabetic": "DOE^JANE"}, as it always has', async () => {
+  await withTempDir('webserve-pn-plain', async (dir) => {
+    const store = path.join(dir, 'store');
+    const file = await instanceNamed(path.join(dir, 'src'), 'DOE^JANE', 9);
+    const hub = await startHub({ persist: store });
+    try {
+      assert.equal((await stow(hub.base, [file])).status, 200);
+
+      const attribute = await qidoPatientName(hub);
+      // The requirement the multi-group repair is not allowed to cost
+      // anything: one group in, one key out, nothing new to explain and no
+      // separator anywhere.
+      assert.deepEqual(attribute, { vr: 'PN', Value: [{ Alphabetic: 'DOE^JANE' }] });
+      assert.equal(assertConformantPn(attribute), 'DOE^JANE');
+    } finally {
+      await hub.close();
+    }
+  });
+});
+
+test('QIDO finds a multi-script patient by any one of their spellings', async () => {
+  await withTempDir('webserve-pn-match', async (dir) => {
+    const store = path.join(dir, 'store');
+    const file = await instanceNamed(path.join(dir, 'src'), JP_NAME, 10);
+    const hub = await startHub({ persist: store });
+    try {
+      assert.equal((await stow(hub.base, [file])).status, 200);
+
+      // A client asking for the romaji means this patient and cannot be
+      // expected to know the record also holds two other spellings; a
+      // department asking in kanji means the same patient and could not find
+      // them at all while only the Alphabetic group was compared.
+      const spellings = [
+        'Yamada^Tarou',
+        '山田^太郎',
+        'やまだ^たろう',
+        JP_NAME,
+      ];
+      for (const spelling of spellings) {
+        const attribute = await qidoPatientName(hub, `?PatientName=${encodeURIComponent(spelling)}`);
+        assert.equal(assertConformantPn(attribute), JP_NAME, `no match for ${spelling}`);
+      }
+
+      // A wildcard still works, and a different patient still does not match.
+      assert.equal(assertConformantPn(await qidoPatientName(hub, '?PatientName=Yamada*')), JP_NAME);
+      const miss = await webRequest({
+        method: 'GET',
+        url: `${hub.base}/studies?PatientName=${encodeURIComponent('Suzuki^Ichiro')}`,
+        headers: { Accept: 'application/dicom+json' },
+      });
+      assert.equal(miss.status, 204);
+    } finally {
+      await hub.close();
+    }
+  });
 });

@@ -7,7 +7,7 @@
  *
  * macOS on Apple Silicon will not execute an arm64 Mach-O that carries no code
  * signature at all. The loader rejects it outright, and the Finder reports that
- * as "Asteris DICOM App is damaged and can't be opened" — wording that sounds
+ * as "AscendI DICOM is damaged and can't be opened" — wording that sounds
  * like a corrupt download and is nothing of the sort. Intel builds have no such
  * requirement, which is why the x64 .dmg ran while the arm64 one never did.
  *

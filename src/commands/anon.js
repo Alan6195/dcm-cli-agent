@@ -5,6 +5,7 @@ const path = require('path');
 
 const log = require('../lib/log');
 const args = require('../lib/args');
+const tagLib = require('../lib/tags');
 const { scan } = require('../lib/scan');
 const { deterministicUid } = require('../lib/uid');
 const { dcmjsDimse } = require('../lib/dimse');
@@ -134,11 +135,16 @@ function deidentifyElements(elements, opts) {
   const stats = { uidsRemapped: 0, elementsRemoved: 0, privateRemoved: 0 };
 
   // Patient name: one pseudonym per distinct original, in DICOM PN form.
+  //
+  // The whole name is hashed, not its Latin component group alone. Two
+  // patients whose names are written the same in romaji and differently in
+  // kanji are two patients, and hashing only the romaji would give them one
+  // pseudonym — merging two people into one in the de-identified copy, which
+  // is the opposite of what this command is for. A name carrying a single
+  // group hashes exactly as it always did, so existing pseudonyms are
+  // unchanged.
   if (elements.PatientName !== undefined) {
-    const original =
-      typeof elements.PatientName === 'object' && elements.PatientName !== null
-        ? elements.PatientName.Alphabetic ?? JSON.stringify(elements.PatientName)
-        : String(elements.PatientName);
+    const original = tagLib.personNameText(elements.PatientName);
     elements.PatientName = `${opts.prefix}^${pseudonym('', original).slice(0, 8)}`;
   }
 

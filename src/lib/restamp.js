@@ -219,6 +219,10 @@ async function restampFolder(params) {
     if (unnamed > unnamedElements) unnamedElements = unnamed;
 
     for (const { element, value } of plan) {
+      // Both sides go through textOf, so this compares a name to a name and
+      // not an object to a string. PatientName is in the plan and arrives off
+      // disk as component groups; a comparison that stringified only one side
+      // would rewrite every instance to the value it already holds.
       if (textOf(elements[element]) === value) continue;
       elements[element] = value;
       touched = true;

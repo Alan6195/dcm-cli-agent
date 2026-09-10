@@ -3,3 +3,6 @@ release/
 dist/
 engine/
 *.log
+
+# Smoke-harness output: screenshots and logs from a local run.
+.smokeout/

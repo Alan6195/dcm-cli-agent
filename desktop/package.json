@@ -1,10 +1,10 @@
 {
-  "name": "asteris-dcm-desktop",
-  "productName": "Asteris DICOM App",
-  "version": "0.15.1",
+  "name": "ascendi-dcm-desktop",
+  "productName": "AscendI DICOM",
+  "version": "0.16.0",
   "private": true,
-  "description": "Desktop app for the Asteris DICOM CLI Agent — echo, inventory, send, receive, worklist, tags, edit, de-identify and DICOMweb (STOW/QIDO/WADO), with a live transfer report.",
-  "author": "Asteris",
+  "description": "Desktop app for the AscendI DICOM CLI Agent — echo, inventory, send, receive, worklist, tags, edit, de-identify and DICOMweb (STOW/QIDO/WADO), with a live transfer report.",
+  "author": "AscendI",
   "license": "MIT",
   "repository": "https://github.com/Alan6195/dcm-cli-agent",
   "main": "main.js",
@@ -35,10 +35,24 @@
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8"
   },
+  "//appId": [
+    "build.appId below is deliberately still com.asteris.dcm.desktop, and the",
+    "AscendI rename did not touch it. appId is the application identity Windows",
+    "and NSIS match on to decide whether an installer upgrades what is already",
+    "there or installs a second, unrelated program. Change it and every existing",
+    "install stops seeing updates, the new one lands beside it, and each user has",
+    "to find and uninstall the old app by hand. Keeping it makes the rename",
+    "arrive as an ordinary update: same app, new name.",
+    "Retiring the old identifier is a separate, deliberate clean break — it needs",
+    "a migration plan for installed copies, not a one-line edit here.",
+    "(This lives outside the build object on purpose: electron-builder validates",
+    "build with additionalProperties:false, so a comment key inside it would fail",
+    "the build. npm ignores top-level keys beginning with //.)"
+  ],
   "build": {
     "appId": "com.asteris.dcm.desktop",
-    "productName": "Asteris DICOM App",
-    "copyright": "Copyright © Asteris",
+    "productName": "AscendI DICOM",
+    "copyright": "Copyright © AscendI",
     "publish": [
       {
         "provider": "github",
@@ -82,7 +96,7 @@
           ]
         }
       ],
-      "artifactName": "Asteris-DICOM-App-${version}-${arch}-setup.${ext}"
+      "artifactName": "AscendI-DICOM-${version}-${arch}-setup.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -90,10 +104,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Asteris DICOM App"
+      "shortcutName": "AscendI DICOM"
     },
     "portable": {
-      "artifactName": "Asteris-DICOM-App-${version}-${arch}-portable.${ext}"
+      "artifactName": "AscendI-DICOM-${version}-${arch}-portable.${ext}"
     },
     "mac": {
       "target": [
@@ -106,7 +120,7 @@
         }
       ],
       "category": "public.app-category.medical",
-      "artifactName": "Asteris-DICOM-App-${version}-${arch}.${ext}"
+      "artifactName": "AscendI-DICOM-${version}-${arch}.${ext}"
     }
   }
 }

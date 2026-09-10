@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const log = require('./log');
+const tagLib = require('./tags');
 const { dcmjsDimse } = require('./dimse');
 
 const { Dataset } = dcmjsDimse;
@@ -42,6 +43,29 @@ const DICOM_EXTENSIONS = new Set(['.dcm', '.dicom', '.ima', '.img']);
 
 /** Filenames that are DICOM-related but are not storable instances. */
 const NON_INSTANCE_NAMES = new Set(['dicomdir', 'dicomdir.']);
+
+/**
+ * Study-level fields collected from every instance instead of from whichever
+ * one the walk reached first, as `[singular, plural]` property names.
+ *
+ * These four say what a study *is* — who it belongs to, what it was called,
+ * which order it filled. Instances under a single Study Instance UID can
+ * disagree about any of them: a partial rename that stopped halfway, two
+ * exports merged into one folder, an accession corrected after the first
+ * series was acquired. Reporting one instance's answer as the study's answer
+ * turns each of those into a folder that looks correct, and a tool whose whole
+ * purpose is to show an operator what a study currently says must not do that.
+ *
+ * StudyDate is deliberately not here. It is context rather than identity —
+ * nothing files or renames a study by it — and a study legitimately spanning
+ * midnight would raise a conflict that has no repair.
+ */
+const CONSENSUS_FIELDS = Object.freeze([
+  ['patientName', 'patientNames'],
+  ['patientId', 'patientIds'],
+  ['studyDescription', 'studyDescriptions'],
+  ['accessionNumber', 'accessionNumbers'],
+]);
 
 /**
  * Walks a directory tree, yielding file paths.
@@ -161,6 +185,44 @@ function classifyFile(filePath) {
 }
 
 /**
+ * A Person Name as the file holds it — every component group, `=`-separated.
+ *
+ * dcmjs hands a Person Name back as `[{Alphabetic: 'DOE^JANE'}]` — an array
+ * holding a component-group object — so anything that interpolated it into a
+ * line of output printed `[object Object]` instead of a patient. This is the
+ * normalisation that fixes that, and what it produces is the whole name.
+ *
+ * The whole name, and not the group a Latin reader would recognise, because
+ * reporting is not the only thing done with this value. `dcm info --json` is
+ * read by the desktop Rename tab, which prefills its boxes from the name and
+ * then writes what those boxes compose back with `dcm edit --set`. Whatever
+ * this function dropped would be dropped from the written file, silently, by
+ * an operator who was never shown it existed.
+ *
+ * There is deliberately no display-only sibling that picks a single group.
+ * There was one, and after this became the value `readMetadata` reports,
+ * nothing called it: every place that shows a name to a person — `dcm info`,
+ * `dcm tags`, `dcm find` — shows the whole name too, because a spelling the
+ * record does not hold is the wrong thing to put in front of someone deciding
+ * whether this is the right study. An accessor documented as the display half
+ * of a split, with no display on the other side of it, is a trap for whoever
+ * reaches for it next.
+ *
+ * For the overwhelming majority of data — a single Alphabetic group — this is
+ * character-for-character what it returned before there was any distinction:
+ * no `=`, nothing new to look at, nothing to explain. It differs only for the
+ * names that actually carry more, which are exactly the names that were being
+ * damaged.
+ *
+ * @param {*} value
+ * @returns {string|undefined}
+ */
+function personNameWire(value) {
+  const text = tagLib.personNameText(value);
+  return text === '' ? undefined : text;
+}
+
+/**
  * Reads instance metadata, stopping before the pixel data.
  *
  * @param {string} filePath
@@ -190,7 +252,10 @@ function readMetadata(filePath) {
     transferSyntaxUid: dataset.getTransferSyntaxUid(),
     modality: get('Modality'),
     patientId: get('PatientID'),
-    patientName: get('PatientName'),
+    // The whole name, not the group a reader would recognise. This value is
+    // what a rename is composed from, so it has to be able to reproduce the
+    // name it came from. See personNameWire.
+    patientName: personNameWire(get('PatientName')),
     studyDate: get('StudyDate'),
     studyDescription: get('StudyDescription'),
     seriesDescription: get('SeriesDescription'),
@@ -277,11 +342,17 @@ function scan(target, opts = {}) {
     if (!study) {
       study = {
         studyInstanceUid: meta.studyInstanceUid,
-        patientId: meta.patientId,
-        patientName: meta.patientName,
+        // The CONSENSUS_FIELDS start empty in both halves and are filled in
+        // below from every instance, not from this first one alone.
+        patientName: undefined,
+        patientNames: new Set(),
+        patientId: undefined,
+        patientIds: new Set(),
+        studyDescription: undefined,
+        studyDescriptions: new Set(),
+        accessionNumber: undefined,
+        accessionNumbers: new Set(),
         studyDate: meta.studyDate,
-        studyDescription: meta.studyDescription,
-        accessionNumber: meta.accessionNumber,
         modalities: new Set(),
         transferSyntaxes: new Set(),
         sopClasses: new Set(),
@@ -290,6 +361,32 @@ function scan(target, opts = {}) {
         bytes: 0,
       };
       studies.set(meta.studyInstanceUid, study);
+    }
+
+    // Each identity field is rolled up across the whole study rather than taken
+    // from whichever instance happened to be walked first, and is reported only
+    // when the study speaks with one voice. Taking PatientName as the example:
+    //
+    //   patientNames.size === 0  no instance carries a name; patientName undefined
+    //   patientNames.size === 1  every instance that names a patient agrees
+    //   patientNames.size >= 2   they disagree; patientName is withheld
+    //
+    // An instance carrying no value at all is not a competing identity, so it
+    // does not create a disagreement — it just contributes nothing here. That
+    // is why the guard is on the value being truthy rather than on the key
+    // being present: readMetadata already turns '' and null into undefined.
+    //
+    // Sets, like the modality and transfer syntax roll-ups beside them: a
+    // folder whose instances each carry a distinct pseudonym would otherwise
+    // cost a linear scan per instance, and this runs on every file of every
+    // study. The `has` check keeps the common case — every instance repeating
+    // the same value — from rewriting the singular on every file.
+    for (const [key, plural] of CONSENSUS_FIELDS) {
+      const value = meta[key];
+      if (value && !study[plural].has(value)) {
+        study[plural].add(value);
+        study[key] = study[plural].size === 1 ? value : undefined;
+      }
     }
 
     if (meta.modality) study.modalities.add(meta.modality);
@@ -349,6 +446,8 @@ module.exports = {
   chunk,
   classifyFile,
   readMetadata,
+  personNameWire,
+  CONSENSUS_FIELDS,
   METADATA_READ_OPTIONS,
   PIXEL_DATA_TAG,
 };

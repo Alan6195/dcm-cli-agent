@@ -46,7 +46,7 @@ const SECTIONS = [
 ];
 const TABS = {
   web: ['webping', 'websend', 'webquery', 'webhub'],
-  tools: ['inventory', 'tags', 'edit', 'anon'],
+  tools: ['inventory', 'tags', 'rename', 'edit', 'anon'],
 };
 /** Which section a tab lives in. */
 const TAB_SECTION = {};
@@ -88,6 +88,14 @@ const BUDGET = {
   webhub: 42,
   inventory: 22,
   tags: 36,
+  // Rename is measured twice, like the station: the screen an operator walks
+  // up to (a folder box and nothing else) and the screen they act on, with a
+  // study loaded and the four boxes filled. The second number carries the one
+  // part of this pane that varies with the data rather than the design — the
+  // composed PatientName is echoed back in full, so a five-part name reads as
+  // more words than a two-part one.
+  rename: 20,
+  'rename-loaded': 52,
   edit: 44,
   anon: 44,
   speed: 46,
@@ -395,6 +403,31 @@ function startPeer(label, argv, logBase) {
   });
 }
 
+/**
+ * Runs one engine command to completion and hands back what it said.
+ *
+ * The app's own runs all go through the renderer, which is the point — this is
+ * only for building the material a screen is then pointed at, such as a second
+ * study to make a folder the Rename tab has to refuse. Same spawn shape as the
+ * peers, so it is the vendored engine rather than whatever is on PATH.
+ */
+function runEngine(argv) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [ENGINE_ENTRY, ...argv], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NO_COLOR: '1', DCM_NONINTERACTIVE: '1' },
+      windowsHide: true,
+    });
+    let out = '';
+    let err = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (t) => { out += t; });
+    child.stderr.on('data', (t) => { err += t; });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve({ code, out, err }));
+  });
+}
+
 function stopPeers() {
   for (const p of peers) {
     try { p.child.kill(); } catch { /* already gone */ }
@@ -416,6 +449,11 @@ function stopPeers() {
 // v0.15.0 release and the real latest-mac.yml published with it. They are
 // checked in here rather than fetched so the harness stays offline and so a
 // release that changes shape has to change this file too.
+//
+// They keep the old product name deliberately. v0.15.0 shipped as
+// Asteris-DICOM-App-*, those sha512s belong to those exact files, and editing
+// them to match the AscendI rename would turn a real fixture into a made-up
+// one. The post-rename naming is checked separately, further down.
 // ---------------------------------------------------------------------------
 const V15_ASSET_NAMES = [
   'Asteris-DICOM-App-0.15.0-arm64.dmg',
@@ -1181,7 +1219,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // screen at all — that is checked in the station flow below.
 
       // Every command the engine will take a --dry-run for, and no other.
-      const DRY = ['send', 'mpps', 'mpps.start', 'steps.complete', 'steps.discontinue', 'steps.send', 'websend', 'edit'];
+      const DRY = ['send', 'mpps', 'mpps.start', 'steps.complete', 'steps.discontinue', 'steps.send', 'websend', 'edit', 'rename'];
       const gained = [];
       for (const [k, argv] of Object.entries(on.argvs)) {
         const has = argv.includes('--dry-run');
@@ -1836,7 +1874,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       if (!panel.folderCls.includes('ok')) bad(`a matching folder is not styled as OK: ${panel.folderCls}`);
       for (const needed of ['mpps perform', fixtures.replace(/\\/g, '/'), '--study-uid ' + FIX_STUDY,
-        '--accession ACC-78', '--patient-id P-2002', '--patient-name SMITH^ALAN', '--modality CT',
+        '--accession ACC-78', '--patient-id P-2002', '--patient-name "SMITH^ALAN"', '--modality CT',
         '--scheduled-step-id SPS-2', '--step-id SPS-2', '--station-ae CT01', '--mpps-uid 2.25.',
         `--store-host 127.0.0.1`, `--store-port ${archivePort}`, '--store-called-ae ARCHIVE',
         `--host 127.0.0.1`, `--port ${risPort}`, '--called-ae RISMPPS', '--calling-ae CT01']) {
@@ -2576,7 +2614,634 @@ async function runSmoke(win, app, mainHelpers = {}) {
     if (chord.pane !== 'view-tags') bad(`Ctrl+Enter would leave the open tab: ${JSON.stringify(chord)}`);
 
     // =====================================================================
-    // K. Flood: no output volume, from any source, may wedge this window.
+    // K. The Rename tab: what it refuses, what it composes, what it writes.
+    // =====================================================================
+    if (fixtures) {
+      // This pane is taller than the harness window, so the amber note and the
+      // engine report sit below the fold. Scroll before the frame, or the
+      // screenshot is of a screen nobody would be looking at.
+      const paneScroll = async (to) => {
+        await js(`document.querySelector('.content').scrollTop = ${to}; true`);
+        await wait(300);
+      };
+
+      // ---- The refusal. Two studies under one folder cannot have one of them
+      // renamed, because `dcm edit` has no per-study scope. The second study is
+      // made with `dcm anon`, which remaps UIDs consistently, so the folder
+      // really does hold two distinct Study Instance UIDs rather than the same
+      // one twice.
+      const multi = path.join(work, 'multi');
+      fs.mkdirSync(multi, { recursive: true });
+      fs.cpSync(fixtures, path.join(multi, 'study-a'), { recursive: true });
+      const made = await runEngine(['anon', fixtures, '--out', path.join(multi, 'study-b')]);
+      if (made.code !== 0) bad(`could not build a two-study folder: ${made.err.slice(-400)}`);
+
+      await js(`showView('tools'); showTab('tools', 'rename'); true`);
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(multi)}); true`);
+      await mustWait("!document.querySelector('#rename-found').hidden",
+        RUN_MS, 'the two-study folder to be scanned');
+      const refusal = await jsJSON(`JSON.stringify({
+        text: document.querySelector('#rename-found').textContent.replace(/\\s+/g, ' ').trim(),
+        caution: !!document.querySelector('#rename-found .caution'),
+        cards: document.querySelectorAll('#rename-found .study-card').length,
+        uids: Array.from(document.querySelectorAll('#rename-found .study-card .uid')).map((e) => e.textContent.trim()),
+        formShown: !document.querySelector('#rename-form').hidden,
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+        disabled: document.querySelector('#view-rename [data-run]').disabled,
+        status: document.querySelector('#view-rename [data-status]').textContent,
+      })`);
+      await shot('rename-refused-multi-study');
+      record(`rename: two studies -> "${refusal.text.slice(0, 160)}…"`);
+      if (!refusal.caution || refusal.cards !== 2) {
+        bad(`the two-study folder was not refused with both studies named: ${JSON.stringify(refusal)}`);
+      }
+      if (refusal.uids.length !== 2 || refusal.uids[0] === refusal.uids[1]) {
+        bad(`the harness did not actually build two studies: ${JSON.stringify(refusal.uids)}`);
+      }
+      if (refusal.formShown || !refusal.disabled) {
+        bad(`the rename form was offered for a folder holding two studies: ${JSON.stringify(refusal)}`);
+      }
+      if (!/merge, not a rename/.test(refusal.text)) {
+        bad(`the refusal does not say why renaming two studies at once is a merge: ${refusal.text}`);
+      }
+
+      // ---- One study: what is there, and an inert button until something differs.
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(fixtures)}); true`);
+      await mustWait('renameState.study !== null', RUN_MS, 'the single-study folder to be scanned');
+      const loaded = await jsJSON(`JSON.stringify({
+        found: document.querySelector('#rename-found').textContent.replace(/\\s+/g, ' ').trim(),
+        cards: document.querySelectorAll('#rename-found .study-card').length,
+        family: document.querySelector('#rename-family').value,
+        given: document.querySelector('#rename-given').value,
+        pid: document.querySelector('#rename-patientid').value,
+        desc: document.querySelector('#rename-desc').value,
+        acc: document.querySelector('#rename-accession').value,
+        pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+        disabled: document.querySelector('#view-rename [data-run]').disabled,
+        diffShown: !document.querySelector('#rename-diff').hidden,
+        uid: renameState.study.studyInstanceUid,
+        argv: BUILDERS.rename(),
+        cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+      })`);
+      await shot('rename-loaded');
+      record(`rename: loaded ${loaded.pn} / ${loaded.pid} — ${loaded.found.slice(0, 130)}`);
+      record(`rename: unchanged form — button reads "${loaded.btn}", disabled=${loaded.disabled}`);
+      if (loaded.cards !== 1) bad(`one study did not draw one card: ${loaded.cards}`);
+      if (!loaded.family) {
+        bad('the patient name did not reach the form — is the vendored engine stale '
+          + `(no patientName in dcm info --json)?: ${JSON.stringify(loaded)}`);
+      }
+      if (!loaded.pid || !loaded.desc || !loaded.acc) {
+        bad(`the form was not prefilled from the study: ${JSON.stringify(loaded)}`);
+      }
+      // An unchanged form is inert and says so, and builds a command with no
+      // --set in it at all: an untouched field is not rewritten to itself.
+      if (!loaded.disabled || loaded.btn !== 'Nothing changed yet') {
+        bad(`an unchanged form left the button live: ${JSON.stringify(loaded)}`);
+      }
+      if (loaded.diffShown) bad('an unchanged form showed a change list');
+      if (loaded.argv.includes('--set')) bad(`an unchanged form still set something: ${loaded.argv.join(' ')}`);
+      await measureScreen('rename-loaded', '#view-rename');
+
+      // ---- The composition. Family and Given are separate boxes; what they
+      // compose to is on screen, and it is what reaches the command.
+      const outDir = path.join(work, 'renamed');
+      const typed = await jsJSON(`(() => {
+        __smoke.set('rename-family', 'DOE');
+        __smoke.set('rename-given', 'JANE');
+        __smoke.set('rename-patientid', 'P-RENAMED');
+        __smoke.set('rename-out', ${JSON.stringify(outDir)});
+        return JSON.stringify({
+          pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+          diff: document.querySelector('#rename-diff').textContent.replace(/\\s+/g, ' ').trim(),
+          diffRows: document.querySelectorAll('#rename-diff .rn-diff-row').length,
+          btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+          disabled: document.querySelector('#view-rename [data-run]').disabled,
+          argv: BUILDERS.rename(),
+          cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+        });
+      })()`);
+      await wait(350);
+      await shot('rename-composed');
+      record(`rename: composes to ${typed.pn}`);
+      record(`rename: change list — ${typed.diff}`);
+      record(`rename: ${typed.cmd}`);
+      artefact('rename-cmd.txt', `${typed.cmd}\n\nargv: ${JSON.stringify(typed.argv)}\n`);
+      if (!typed.pn.includes('DOE^JANE')) bad(`Family + Given did not compose to DOE^JANE: ${typed.pn}`);
+      if (!typed.argv.includes('PatientName=DOE^JANE')) {
+        bad(`the composed name did not reach the argv: ${JSON.stringify(typed.argv)}`);
+      }
+      // Quoted in the preview because the preview is copyable and cmd.exe eats
+      // an unquoted caret.
+      if (!typed.cmd.includes('--set "PatientName=DOE^JANE"')) {
+        bad(`the command does not carry the composed name quoted: ${typed.cmd}`);
+      }
+      // Only what differs: two fields were touched, and the untouched
+      // description and accession produce nothing.
+      if (typed.diffRows !== 2) bad(`the change list is not just the changed fields: ${typed.diff}`);
+      if (typed.argv.filter((a) => a === '--set').length !== 2) {
+        bad(`an untouched field was rewritten to itself: ${JSON.stringify(typed.argv)}`);
+      }
+      if (typed.disabled || typed.btn !== 'Rename study') {
+        bad(`a real change left the button inert: ${JSON.stringify(typed)}`);
+      }
+      // UIDs are what tie a study together. Nothing on this screen may reach
+      // for --force, and nothing on it may set a UID.
+      if (typed.argv.includes('--force')) bad(`Rename passed --force: ${JSON.stringify(typed.argv)}`);
+      if (typed.argv.some((a) => /UID=/i.test(a))) bad(`Rename set a UID: ${JSON.stringify(typed.argv)}`);
+
+      // ---- In place: armed, and not fired. The default is a copy; choosing to
+      // overwrite the originals is a separate press that changes the command
+      // and puts the amber note on screen.
+      const armed = await jsJSON(`(() => {
+        document.querySelector('#rename-dest-row .chip[data-dest="inplace"]').click();
+        return JSON.stringify({
+          outRowHidden: document.querySelector('#rename-out-row').hidden,
+          note: document.querySelector('#rename-inplace-note').hidden
+            ? '' : document.querySelector('#rename-inplace-note').textContent.replace(/\\s+/g, ' ').trim(),
+          argv: BUILDERS.rename(),
+          cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+        });
+      })()`);
+      await paneScroll(9999);
+      await shot('rename-in-place-armed');
+      await paneScroll(0);
+      record(`rename: in place — ${armed.cmd}`);
+      record(`rename: in place note — ${armed.note}`);
+      if (!armed.argv.includes('--in-place') || armed.argv.includes('--out')) {
+        bad(`choosing in place did not change the destination: ${JSON.stringify(armed.argv)}`);
+      }
+      if (!armed.note || !/no undo/i.test(armed.note) || !armed.outRowHidden) {
+        bad(`in place was armed without the amber warning: ${JSON.stringify(armed)}`);
+      }
+      if (armed.argv.includes('--force')) bad(`in place reached for --force: ${JSON.stringify(armed.argv)}`);
+      await js(`document.querySelector('#rename-dest-row .chip[data-dest="copy"]').click(); true`);
+      const backToCopy = await jsJSON('JSON.stringify(BUILDERS.rename())');
+      if (backToCopy.includes('--in-place') || !backToCopy.includes('--out')) {
+        bad(`switching back to a copy did not disarm in place: ${JSON.stringify(backToCopy)}`);
+      }
+      say('rename: in place was armed, inspected and disarmed without being pressed');
+
+      // ---- The copy, for real. Then point the tab at what it produced: the
+      // proof a rename worked is that the renamed folder reads back renamed.
+      await js(`document.querySelector('#view-rename [data-run]').click(); true`);
+      await mustWait("!document.querySelector('#view-rename [data-status]').className.includes('running')",
+        RUN_MS, 'the rename to finish');
+      // The status chip settles on the child's exit; the console paints on a
+      // frame. Reading it the instant the chip changes catches the run with
+      // its last chunk still buffered, which is a race in this harness rather
+      // than in the app — wait for the report's closing line instead.
+      await mustWait("/instance\\(s\\) written/.test(__smoke.consoleText('rename'))",
+        20000, "the engine's report to finish painting");
+      const ran = await jsJSON(`JSON.stringify({
+        status: document.querySelector('#view-rename [data-status]').textContent,
+        cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+        console: __smoke.consoleText('rename').slice(-1500),
+      })`);
+      await paneScroll(9999);
+      await shot('rename-written');
+      await paneScroll(0);
+      record(`rename: ${ran.status} — ${ran.cmd}`);
+      artefact('rename-output.txt', ran.console);
+      if (ran.status !== 'Done') bad(`the rename did not finish cleanly: ${ran.status}`);
+      // The engine's own report is what appears, unrewritten: its per-tag
+      // count is the accounting, and reimplementing it here would be a second
+      // answer to the same question, free to disagree with the first.
+      if (!/set PatientName\s+\d+ instance\(s\)/.test(ran.console)
+        || !/instances found\s+\d+/.test(ran.console)) {
+        bad(`the engine's own report did not reach the Output pane: ${ran.console.slice(-400)}`);
+      }
+      if (!fs.existsSync(outDir)) bad(`the rename wrote no copy to ${outDir}`);
+
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(outDir)}); true`);
+      await mustWait(`renameState.study !== null && renameState.path === ${JSON.stringify(outDir)}`,
+        RUN_MS, 'the renamed copy to be read back');
+      const readBack = await jsJSON(`JSON.stringify({
+        name: renameState.study.patientName,
+        pid: renameState.study.patientId,
+        desc: renameState.study.studyDescription,
+        uid: renameState.study.studyInstanceUid,
+        family: document.querySelector('#rename-family').value,
+        given: document.querySelector('#rename-given').value,
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+      })`);
+      await wait(350);
+      await shot('rename-read-back');
+      record(`rename: the copy reads back as ${readBack.name} / ${readBack.pid}, study UID ${readBack.uid}`);
+      if (readBack.name !== 'DOE^JANE' || readBack.pid !== 'P-RENAMED') {
+        bad(`the copy did not come back renamed: ${JSON.stringify(readBack)}`);
+      }
+      if (readBack.desc !== loaded.desc) {
+        bad(`a field nobody touched changed anyway: ${JSON.stringify(readBack)} vs ${loaded.desc}`);
+      }
+      // The whole promise of this screen: the study is called something else
+      // and is still the same study. Anchored to the UID read off the source
+      // before the rename, not to a card's position in the refusal panel —
+      // `dcm info` orders studies however it found them.
+      if (readBack.uid !== loaded.uid) {
+        bad(`the rename changed the Study Instance UID: ${readBack.uid} was ${loaded.uid}`);
+      }
+      if (readBack.btn !== 'Nothing changed yet') {
+        bad(`the renamed copy did not read back as already-correct: ${readBack.btn}`);
+      }
+      if (readBack.family !== 'DOE' || readBack.given !== 'JANE') {
+        bad(`the renamed copy did not split back into Family/Given: ${JSON.stringify(readBack)}`);
+      }
+      // ---- All four identity fields disagreeing under one Study Instance UID.
+      //
+      // The bug this replaces: the scan reported whichever instance the walk
+      // reached first as the study's patient ID, description and accession,
+      // and the card printed it as fact. `dcm info` now withholds all four the
+      // way it always withheld the name, so there is no current value to
+      // prefill from and the boxes stay empty. This builds the worst case —
+      // every field in disagreement at once — because a screen that handled
+      // one conflicting field by special-casing it would pass a one-field test.
+      const conflicted = path.join(work, 'conflict');
+      fs.cpSync(fixtures, conflicted, { recursive: true });
+      const OTHER = {
+        PatientName: 'OTHER^PATIENT',
+        PatientID: 'WRONG-ID',
+        StudyDescription: 'A DIFFERENT STUDY',
+        AccessionNumber: 'ACC-OTHER',
+      };
+      const splitArgv = ['edit', path.join(conflicted, 'series-2')];
+      for (const [k, v] of Object.entries(OTHER)) splitArgv.push('--set', `${k}=${v}`);
+      splitArgv.push('--in-place');
+      const split = await runEngine(splitArgv);
+      if (split.code !== 0) bad(`could not build a four-way conflicted study: ${split.err.slice(-400)}`);
+
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(conflicted)}); true`);
+      await mustWait('renameState.study !== null', RUN_MS, 'the conflicted study to be scanned');
+      const clash = await jsJSON(`JSON.stringify({
+        conflicts: renameState.conflicts,
+        singulars: {
+          PatientName: renameState.study.patientName,
+          PatientID: renameState.study.patientId,
+          StudyDescription: renameState.study.studyDescription,
+          AccessionNumber: renameState.study.accessionNumber,
+        },
+        panels: document.querySelectorAll('#rename-found .caution').length,
+        panelText: (document.querySelector('#rename-found .caution') || {}).textContent || '',
+        rows: document.querySelectorAll('#rename-found .rn-cf-row').length,
+        picks: Array.from(document.querySelectorAll('#rename-found .rn-pick'))
+          .map((b) => b.dataset.adopt + '=' + b.dataset.value),
+        chosen: document.querySelectorAll('#rename-found .rn-pick.chosen').length,
+        cardHtml: document.querySelector('#rename-found .study-card').innerHTML,
+        collisions: Array.from(document.querySelectorAll('#rename-found .study-card .collision'))
+          .map((e) => e.textContent.trim()),
+        family: document.querySelector('#rename-family').value,
+        given: document.querySelector('#rename-given').value,
+        pid: document.querySelector('#rename-patientid').value,
+        desc: document.querySelector('#rename-desc').value,
+        acc: document.querySelector('#rename-accession').value,
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+        disabled: document.querySelector('#view-rename [data-run]').disabled,
+        status: document.querySelector('#view-rename [data-status]').textContent,
+        argv: BUILDERS.rename(),
+      })`);
+      await wait(300);
+      await shot('rename-conflict-four-fields');
+      record(`rename: conflicts — ${Object.entries(clash.conflicts)
+        .map(([k, v]) => `${k}: ${v.join(' / ')}`).join('; ')}`);
+      record(`rename: status chip reads "${clash.status}", panel — ${clash.panelText.replace(/\s+/g, ' ').trim()}`);
+      artefact('rename-conflict-card.html', `${clash.cardHtml}\n`);
+
+      // Every field disagrees, and the screen knows it about every one of them.
+      for (const k of Object.keys(OTHER)) {
+        if (!clash.conflicts[k] || clash.conflicts[k].length !== 2) {
+          bad(`${k} did not read as a conflict — is the vendored engine stale `
+            + `(no ${k} plural in dcm info --json)?: ${JSON.stringify(clash.conflicts)}`);
+        }
+        if (clash.singulars[k] !== null) {
+          bad(`dcm info reported a single ${k} for a study that disagrees: ${JSON.stringify(clash.singulars)}`);
+        }
+      }
+      // The card is the thing that used to lie. Every disagreeing field is
+      // drawn as its disagreement, and neither value appears anywhere on the
+      // card standing on its own as the study's.
+      if (clash.collisions.length !== 4 || clash.collisions.some((t) => !t.includes(' / '))) {
+        bad(`the card did not show all four disagreements: ${JSON.stringify(clash.collisions)}`);
+      }
+      const outsideCollisions = clash.cardHtml.split(/<b class="collision">[\s\S]*?<\/b>/).join('');
+      for (const [k, other] of Object.entries(OTHER)) {
+        if (!clash.collisions.some((t) => t.includes(other))) {
+          bad(`the card dropped one side of the ${k} disagreement: ${JSON.stringify(clash.collisions)}`);
+        }
+        // A value drawn outside a .collision would be the card asserting it.
+        if (outsideCollisions.includes(other)) {
+          bad(`the card presented ${k}=${other} as the study's value: ${outsideCollisions}`);
+        }
+      }
+      // One panel, four rows, both values of each as a button, nothing chosen.
+      if (clash.panels !== 1 || clash.rows !== 4 || clash.picks.length !== 8 || clash.chosen !== 0) {
+        bad(`the conflict panel is not one panel of four unchosen rows: ${JSON.stringify(
+          { panels: clash.panels, rows: clash.rows, picks: clash.picks, chosen: clash.chosen })}`);
+      }
+      if (!/disagree/i.test(clash.panelText) || !/every instance/i.test(clash.panelText)) {
+        bad(`the panel does not say what is wrong or what fixes it: ${clash.panelText}`);
+      }
+      if (!/disagree/i.test(clash.status)) {
+        bad(`a conflicted study still chipped as plain "Loaded": ${clash.status}`);
+      }
+      if (clash.family || clash.given || clash.pid || clash.desc || clash.acc) {
+        bad(`a conflicting value was prefilled from one of the two: ${JSON.stringify(clash)}`);
+      }
+      // Empty boxes over a conflict mean "leave it alone", not "blank all four
+      // fields on every instance" — so nothing is set until something is chosen.
+      if (clash.argv.includes('--set') || !clash.disabled || clash.btn !== 'Nothing changed yet') {
+        bad(`an untouched conflict proposed a change: ${JSON.stringify(clash)}`);
+      }
+
+      // ---- The Inventory tab reads the same JSON and heads its card with the
+      // same two fields. It is not the screen the defect was reported against,
+      // but a card that falls back to "Study" with no ID beside it for a study
+      // that carries two of each is filing a disagreement as an absence — the
+      // engine change made that reachable, so it is checked here while there is
+      // a study on disk that provokes it.
+      await js(`(() => {
+        showView('tools');
+        showTab('tools', 'inventory');
+        __smoke.set('info-folder', ${JSON.stringify(conflicted)});
+        document.querySelector('#view-inventory [data-run]').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#view-inventory [data-status]').className.includes('running')",
+        RUN_MS, 'the inventory of the conflicted study to finish');
+      const invClash = await jsJSON(`JSON.stringify({
+        head: document.querySelector('#view-inventory [data-result] .study-card h3').textContent
+          .replace(/\\s+/g, ' ').trim(),
+        collisions: document.querySelectorAll('#view-inventory [data-result] .study-card .collision').length,
+      })`);
+      await shot('inventory-conflict');
+      record(`inventory: the conflicted study heads its card "${invClash.head}"`);
+      if (invClash.collisions !== 2 || !invClash.head.includes('WRONG-ID')
+        || !invClash.head.includes('A DIFFERENT STUDY')) {
+        bad(`the inventory card filed a disagreement as an absence: ${JSON.stringify(invClash)}`);
+      }
+      await js(`showTab('tools', 'rename'); true`);
+
+      // ---- The repair. One click per field takes the value the fixtures
+      // started with; the command that comes out writes each of them to every
+      // instance under the folder, which is what makes the study one study
+      // again. In place, because a repaired copy leaves the broken original
+      // exactly as broken as it was.
+      const KEEP = {
+        PatientName: 'SYNTHETIC^PATIENT1',
+        PatientID: 'SYNTH0001',
+        StudyDescription: 'SYNTHETIC STUDY 1',
+        AccessionNumber: 'ACC0000001',
+      };
+      const repair = await jsJSON(`(() => {
+        for (const [k, v] of Object.entries(${JSON.stringify(KEEP)})) {
+          const b = document.querySelector('#rename-found .rn-pick[data-adopt="' + k + '"][data-value="' + v + '"]');
+          if (!b) throw new Error('no button offering ' + k + '=' + v);
+          b.click();
+        }
+        document.querySelector('#rename-dest-row .chip[data-dest="inplace"]').click();
+        return JSON.stringify({
+          diff: document.querySelector('#rename-diff').textContent.replace(/\\s+/g, ' ').trim(),
+          rows: document.querySelectorAll('#rename-diff .rn-diff-row').length,
+          conflictFroms: document.querySelectorAll('#rename-diff .rn-a.conflict').length,
+          chosen: Array.from(document.querySelectorAll('#rename-found .rn-pick.chosen'))
+            .map((b) => b.dataset.adopt + '=' + b.dataset.value),
+          pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+          argv: BUILDERS.rename(),
+          cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+          disabled: document.querySelector('#view-rename [data-run]').disabled,
+          btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+        });
+      })()`);
+      await wait(300);
+      await shot('rename-conflict-repaired');
+      record(`rename: repair chose ${repair.chosen.join(', ')}; PatientName composes to ${repair.pn}`);
+      record(`rename: repair change list — ${repair.diff}`);
+      record(`rename: repair command — ${repair.cmd}`);
+      artefact('rename-repair-cmd.txt', `${repair.cmd}\n\nargv: ${JSON.stringify(repair.argv)}\n`);
+      if (repair.chosen.length !== 4) {
+        bad(`the panel did not mark what was chosen: ${JSON.stringify(repair.chosen)}`);
+      }
+      // Four --set pairs, over the originals, so every instance under the
+      // folder is rewritten. Not a copy: this repairs the study that is there.
+      for (const [k, v] of Object.entries(KEEP)) {
+        if (!repair.argv.includes(`${k}=${v}`)) {
+          bad(`choosing ${k}=${v} did not reach the command: ${JSON.stringify(repair.argv)}`);
+        }
+      }
+      if (repair.argv.filter((a) => a === '--set').length !== 4 || !repair.argv.includes('--in-place')) {
+        bad(`the repair is not four fields written over the originals: ${JSON.stringify(repair.argv)}`);
+      }
+      if (repair.argv.includes('--force') || repair.argv.some((a) => /UID=/i.test(a))) {
+        bad(`the repair reached past the four fields: ${JSON.stringify(repair.argv)}`);
+      }
+      if (repair.rows !== 4 || repair.conflictFroms !== 4) {
+        bad(`the change list did not show all four disagreements as the "before": ${repair.diff}`);
+      }
+      for (const other of Object.values(OTHER)) {
+        if (!repair.diff.includes(other)) {
+          bad(`the change list dropped what the conflict was between: ${repair.diff}`);
+        }
+      }
+      if (repair.disabled || repair.btn !== 'Rename study') {
+        bad(`a repair left the button inert: ${JSON.stringify(repair)}`);
+      }
+
+      // ---- Run it, and read the folder back. The proof is not the command:
+      // it is that the study which disagreed with itself no longer does.
+      await js(`document.querySelector('#view-rename [data-run]').click(); true`);
+      await mustWait("!document.querySelector('#view-rename [data-status]').className.includes('running')",
+        RUN_MS, 'the repair to finish');
+      await mustWait("/instance\\(s\\) written/.test(__smoke.consoleText('rename'))",
+        20000, "the repair's report to finish painting");
+      await mustWait('renameState.study !== null && !Object.keys(renameState.conflicts).length',
+        RUN_MS, 'the repaired study to be re-read');
+      const healed = await jsJSON(`JSON.stringify({
+        singulars: {
+          PatientName: renameState.study.patientName,
+          PatientID: renameState.study.patientId,
+          StudyDescription: renameState.study.studyDescription,
+          AccessionNumber: renameState.study.accessionNumber,
+        },
+        plurals: {
+          PatientName: renameState.study.patientNames,
+          PatientID: renameState.study.patientIds,
+          StudyDescription: renameState.study.studyDescriptions,
+          AccessionNumber: renameState.study.accessionNumbers,
+        },
+        uid: renameState.study.studyInstanceUid,
+        instances: renameState.study.instanceCount,
+        panels: document.querySelectorAll('#rename-found .caution').length,
+        collisions: document.querySelectorAll('#rename-found .study-card .collision').length,
+        status: document.querySelector('#view-rename [data-status]').textContent,
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+        found: document.querySelector('#rename-found').textContent.replace(/\\s+/g, ' ').trim(),
+        console: __smoke.consoleText('rename').slice(-900),
+      })`);
+      await wait(300);
+      await shot('rename-conflict-healed');
+      artefact('rename-repair-output.txt', healed.console);
+      record(`rename: repaired study reads back — ${healed.found.slice(0, 170)}`);
+      for (const [k, v] of Object.entries(KEEP)) {
+        if (healed.singulars[k] !== v || (healed.plurals[k] || []).length !== 1) {
+          bad(`${k} did not come back as one agreed value across all `
+            + `${healed.instances} instances: ${JSON.stringify(healed)}`);
+        }
+      }
+      if (healed.panels || healed.collisions) {
+        bad(`the repaired study still shows a disagreement: ${JSON.stringify(healed)}`);
+      }
+      if (healed.status !== 'Loaded' || healed.btn !== 'Nothing changed yet') {
+        bad(`the repaired study did not read back as already-correct: ${JSON.stringify(healed)}`);
+      }
+      // An in-place write is the destructive one and its per-tag report is the
+      // only account of it there will be. The re-read that proves it worked
+      // must not be what wipes it off the screen.
+      if (!/set PatientName\s+\d+ instance\(s\)/.test(healed.console)
+        || !/instance\(s\) written/.test(healed.console)) {
+        bad(`the re-read wiped the repair's own report: ${healed.console.slice(-400)}`);
+      }
+      // The whole promise again: it is called what it is called and it is
+      // still the same study.
+      if (healed.uid !== loaded.uid) {
+        bad(`the repair changed the Study Instance UID: ${healed.uid} was ${loaded.uid}`);
+      }
+      await js(`document.querySelector('#rename-dest-row .chip[data-dest="copy"]').click(); true`);
+      say('rename: four disagreeing fields are shown as disagreements, never as facts, '
+        + 'and one click each repairs every instance');
+
+      // ---- A patient name written in three scripts.
+      //
+      // The defect this replaces: a DICOM Person Name can hold up to three
+      // component GROUPS separated by "=" — the same name in Latin letters, in
+      // ideographs, and phonetically. The engine reported only the first, this
+      // screen prefilled from what it reported, and the name it composed back
+      // was that first group alone. Correcting the capitalisation of a surname
+      // deleted the kanji and the kana from every instance, and `dcm tags` had
+      // the same blind spot, so there was nowhere in the app they could be
+      // seen to have existed.
+      //
+      // A throwaway copy, never the fixtures themselves: this arms --in-place.
+      const jp = path.join(work, 'multiscript');
+      fs.cpSync(fixtures, jp, { recursive: true });
+      // SpecificCharacterSet is not optional here. The octets go out as UTF-8
+      // either way, but without it nothing tells a reader to decode them that
+      // way, and a test built on a file no conforming reader could interpret
+      // would be testing something else.
+      const JP_NAME = 'Yamada^Tarou=山田^太郎=やまだ^たろう';
+      const JP_RENAMED = 'YAMADA^Tarou=山田^太郎=やまだ^たろう';
+      const script = await runEngine([
+        'edit', jp,
+        '--set', 'SpecificCharacterSet=ISO_IR 192',
+        '--set', `PatientName=${JP_NAME}`,
+        '--in-place',
+      ]);
+      if (script.code !== 0) bad(`could not build a multi-script study: ${script.err.slice(-400)}`);
+
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(jp)}); true`);
+      await mustWait(`renameState.study !== null && renameState.path === ${JSON.stringify(jp)}`,
+        RUN_MS, 'the multi-script study to be scanned');
+      const script1 = await jsJSON(`JSON.stringify({
+        name: renameState.study.patientName,
+        family: document.querySelector('#rename-family').value,
+        given: document.querySelector('#rename-given').value,
+        groups: renameState.groups,
+        extras: renameState.extras,
+        pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+      })`);
+      record(`rename: multi-script study loads as ${script1.name}`);
+      record(`rename: composed line reads — ${script1.pn}`);
+      // The engine has to have reported the whole name, or nothing downstream
+      // can preserve it. A stale vendored engine fails here first.
+      if (script1.name !== JP_NAME) {
+        bad('dcm info --json reduced a three-group name to one group — is the vendored '
+          + `engine stale?: ${JSON.stringify(script1)}`);
+      }
+      // The boxes hold the Latin group, which is the group they can edit.
+      if (script1.family !== 'Yamada' || script1.given !== 'Tarou') {
+        bad(`the boxes did not take Family/Given from the Latin group: ${JSON.stringify(script1)}`);
+      }
+      // The other two ride along in state rather than in the boxes.
+      if (script1.groups.length !== 2 || script1.extras.length !== 0) {
+        bad(`the other two spellings were not carried: ${JSON.stringify(script1)}`);
+      }
+      // Nothing preserved invisibly: the composed line is the whole value, and
+      // says in five words that the rest is kept rather than about to go.
+      if (!script1.pn.includes(JP_NAME) || !/other spelling\(s\) kept/.test(script1.pn)) {
+        bad(`the screen did not show what it is about to write: ${script1.pn}`);
+      }
+
+      // ---- Correct the surname in Latin letters only, which is the edit that
+      // used to be a deletion.
+      const jpOut = path.join(work, 'multiscript-renamed');
+      const script2 = await jsJSON(`(() => {
+        __smoke.set('rename-family', 'YAMADA');
+        __smoke.set('rename-out', ${JSON.stringify(jpOut)});
+        return JSON.stringify({
+          pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+          diff: document.querySelector('#rename-diff').textContent.replace(/\\s+/g, ' ').trim(),
+          rows: document.querySelectorAll('#rename-diff .rn-diff-row').length,
+          argv: BUILDERS.rename(),
+          cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+        });
+      })()`);
+      // This window does not composite while the harness drives it, so a frame
+      // asked for too soon is the previous screen. The other new-screen shots pay
+      // the same wait for the same reason.
+      await wait(900);
+      await shot('rename-multiscript');
+      record(`rename: multi-script composes to ${script2.pn}`);
+      record(`rename: multi-script command — ${script2.cmd}`);
+      artefact('rename-multiscript-cmd.txt',
+        `${script2.cmd}\n\nargv: ${JSON.stringify(script2.argv)}\n`);
+      // The one assertion this whole repair exists for: what goes on the
+      // command line carries every group the file had.
+      if (!script2.argv.includes(`PatientName=${JP_RENAMED}`)) {
+        bad(`the rename dropped a component group on its way to the command: ${JSON.stringify(script2.argv)}`);
+      }
+      if (script2.rows !== 1) bad(`one changed field did not make one change row: ${script2.diff}`);
+      // And it was on screen before it was on the command line.
+      if (!script2.pn.includes(JP_RENAMED)) {
+        bad(`the screen would have written a name it did not show: ${script2.pn}`);
+      }
+
+      await js(`document.querySelector('#view-rename [data-run]').click(); true`);
+      await mustWait("!document.querySelector('#view-rename [data-status]').className.includes('running')",
+        RUN_MS, 'the multi-script rename to finish');
+      await mustWait("/instance\\(s\\) written/.test(__smoke.consoleText('rename'))",
+        20000, "the multi-script rename's report to finish painting");
+
+      await js(`__smoke.set('rename-folder', ${JSON.stringify(jpOut)}); true`);
+      await mustWait(`renameState.study !== null && renameState.path === ${JSON.stringify(jpOut)}`,
+        RUN_MS, 'the multi-script copy to be read back');
+      const script3 = await jsJSON(`JSON.stringify({
+        name: renameState.study.patientName,
+        family: document.querySelector('#rename-family').value,
+        given: document.querySelector('#rename-given').value,
+        groups: renameState.groups,
+        btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
+      })`);
+      await wait(900);
+      await shot('rename-multiscript-read-back');
+      record(`rename: the multi-script copy reads back as ${script3.name}`);
+      // Read off disk, not off the form: the surname is corrected and both
+      // other spellings are still there.
+      if (script3.name !== JP_RENAMED) {
+        bad(`the written file lost a component group: ${JSON.stringify(script3)}`);
+      }
+      if (script3.groups.length !== 2 || script3.family !== 'YAMADA' || script3.given !== 'Tarou') {
+        bad(`the renamed copy did not split back into its groups: ${JSON.stringify(script3)}`);
+      }
+      if (script3.btn !== 'Nothing changed yet') {
+        bad(`re-loading the renamed copy proposed a further change: ${JSON.stringify(script3)}`);
+      }
+      say('rename: a name written in three scripts was renamed in one of them and '
+        + 'kept the other two, on screen and on disk');
+
+      await js("__smoke.set('rename-folder', ''); true");
+    }
+
+    // =====================================================================
+    // L. Flood: no output volume, from any source, may wedge this window.
     //
     // The bug this guards against was a hang with a live socket behind it. A
     // CT carrying private tags made dcmjs log per instance; the console grew a
@@ -2955,6 +3620,99 @@ async function runSmoke(win, app, mainHelpers = {}) {
     }
 
     // =====================================================================
+    // Carrying user data across a product rename.
+    //
+    // Electron derives userData from productName, so the AscendI rename moved
+    // %APPDATA%\Asteris DICOM App\ to %APPDATA%\AscendI DICOM\. To the person
+    // updating, an un-migrated rename does not look like a rename — it looks
+    // like the app forgot every PACS peer they ever typed in.
+    //
+    // main.js hands over the migration as a pure function over paths, which is
+    // the only way to test it honestly: it is checked here against throwaway
+    // directories this harness creates, never against a real %APPDATA%.
+    // =====================================================================
+    const { migrateStateFiles, STATE_FILES, LEGACY_PRODUCT_DIRS } = mainHelpers;
+    if (typeof migrateStateFiles !== 'function' || !Array.isArray(STATE_FILES)) {
+      bad('main did not hand the user-data migration to the harness');
+    } else {
+      const appData = path.join(work, 'appdata');
+      const dirFor = (product) => path.join(appData, product);
+      const NEW_PRODUCT = 'AscendI DICOM';
+      const legacyDirs = () => LEGACY_PRODUCT_DIRS.map((n) => dirFor(n));
+      const put = (product, file, body) => {
+        fs.mkdirSync(dirFor(product), { recursive: true });
+        fs.writeFileSync(path.join(dirFor(product), file), JSON.stringify(body));
+      };
+      const get = (product, file) => {
+        try { return JSON.parse(fs.readFileSync(path.join(dirFor(product), file), 'utf8')); } catch { return null; }
+      };
+      const clean = () => { fs.rmSync(appData, { recursive: true, force: true }); };
+
+      // 1. The update everyone will actually perform: the new directory does
+      //    not exist yet, and every file the app owns has to arrive.
+      clean();
+      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'ARCHIVE', host: '10.0.0.9', port: 11112 }] });
+      put('Asteris DICOM App', 'settings.json', { stationAe: 'CT01' });
+      put('Asteris DICOM App', 'app-state.json', { activeView: 'worklist' });
+      // Chromium's own state lives in the same directory and must stay put.
+      fs.writeFileSync(path.join(dirFor('Asteris DICOM App'), 'Cookies'), 'not ours');
+      const first = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
+      record(`rename: carried ${first.carried.map((c) => c.file).join(', ') || 'nothing'} into a fresh ${NEW_PRODUCT} directory`);
+      for (const file of STATE_FILES) {
+        if (!get(NEW_PRODUCT, file)) bad(`the rename lost ${file}: an operator would see this as wiped data`);
+      }
+      if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.host !== '10.0.0.9') {
+        bad('the migrated profiles.json does not contain the peer that was in the old one');
+      }
+      if (fs.existsSync(path.join(dirFor(NEW_PRODUCT), 'Cookies'))) {
+        bad("the migration copied Chromium's own state, which belongs to the build that wrote it");
+      }
+      if (!get('Asteris DICOM App', 'profiles.json')) {
+        bad('the migration moved the old file instead of copying it; a rollback would find nothing');
+      }
+
+      // 2. The direction that loses data if it is wrong. A file already under
+      //    the new name was written by a newer run and must win.
+      clean();
+      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'STALE' }] });
+      put('Asteris DICOM App', 'settings.json', { stationAe: 'OLD-AE' });
+      put(NEW_PRODUCT, 'profiles.json', { profiles: [{ name: 'CURRENT' }] });
+      const second = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
+      if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.name !== 'CURRENT') {
+        bad('an older profiles.json overwrote a newer one; the rename rolled the operator back');
+      }
+      if (!get(NEW_PRODUCT, 'settings.json')) {
+        bad('the migration is all-or-nothing: one file already present stopped the others being carried');
+      }
+      record(`rename: an existing profiles.json survived untouched while ${second.carried.map((c) => c.file).join(', ')} still came across`);
+
+      // 3. Two renames deep, and the empty case. Newest legacy name wins; a
+      //    first-ever install must not so much as create a directory.
+      clean();
+      put('Asteris DICOM', 'profiles.json', { profiles: [{ name: 'V05' }] });
+      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'V06' }] });
+      migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
+      if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.name !== 'V06') {
+        bad('with both old names present the migration took the older one');
+      }
+      clean();
+      const fresh = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
+      if (fresh.carried.length || fs.existsSync(dirFor(NEW_PRODUCT))) {
+        bad('a first-ever install had something migrated into it');
+      }
+      // Never fail a launch: whatever it is handed, it returns a report.
+      for (const junk of [undefined, null, 'not a list', [null, 42]]) {
+        let report = null;
+        try { report = migrateStateFiles(dirFor(NEW_PRODUCT), junk); } catch (err) {
+          bad(`the migration threw on ${JSON.stringify(junk)} — that would fail the launch: ${err.message}`);
+        }
+        if (report && report.carried.length) bad(`the migration carried something from ${JSON.stringify(junk)}`);
+      }
+      record('rename: the newer of two old names wins, a fresh install migrates nothing, and bad input cannot fail the launch');
+      clean();
+    }
+
+    // =====================================================================
     // The macOS update path.
     //
     // Two halves, and this harness can reach both without a Mac.
@@ -3008,6 +3766,28 @@ async function runSmoke(win, app, mainHelpers = {}) {
         if (got !== null) bad(`${label} produced ${JSON.stringify(got)} instead of falling back to the page`);
       }
       record('mac update: an unknown architecture, a missing image and an empty release all fall back to the page');
+
+      // The rename must not break this. The fixtures above are the real
+      // v0.15.0 release, published under the old product name, and they stay
+      // that way — those sha512s belong to those exact files. What changes
+      // after the rename is the artifactName in package.json, so the same
+      // release shape is checked again under the new one. The picker matches
+      // on the architecture suffix and never on the product name, which is
+      // why it survives; this is the check that says so out loud.
+      const renamed = [
+        'AscendI-DICOM-0.15.2-arm64.dmg',
+        'AscendI-DICOM-0.15.2-arm64.dmg.blockmap',
+        'AscendI-DICOM-0.15.2-x64.dmg',
+        'AscendI-DICOM-0.15.2-x64.dmg.blockmap',
+        'AscendI-DICOM-0.15.2-x64-setup.exe',
+        'AscendI-DICOM-0.15.2-x64-portable.exe',
+        'dcm-macos-arm64', 'dcm-macos-x64', 'latest-mac.yml',
+      ].map((name) => ({ name, browser_download_url: `https://example/${name}` }));
+      const renamedPicks = { arm64: pick('arm64', renamed), x64: pick('x64', renamed) };
+      record(`mac update, post-rename assets: arm64 -> ${renamedPicks.arm64}, x64 -> ${renamedPicks.x64}`);
+      if (renamedPicks.arm64 !== 'AscendI-DICOM-0.15.2-arm64.dmg' || renamedPicks.x64 !== 'AscendI-DICOM-0.15.2-x64.dmg') {
+        bad(`the rename broke the macOS asset picker: ${JSON.stringify(renamedPicks)}`);
+      }
 
       // The feed. The x64 case is the one that matters: it is the last entry
       // in the list, and the top-level sha512 that follows it belongs to the

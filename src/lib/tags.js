@@ -36,6 +36,106 @@ const BULK_KEYWORDS = new Set([
 const INTERNAL_KEYS = new Set(['_vrMap', '_meta']);
 
 /**
+ * The component groups of a Person Name, in the fixed order DICOM stores them.
+ *
+ * PS3.5 6.2.1.2: a PN value is up to three groups separated by `=` —
+ * Alphabetic, Ideographic, Phonetic — and each group is itself five `^`
+ * components. `Yamada^Tarou=山田^太郎=やまだ^たろう` is one name, not three.
+ */
+const PN_GROUPS = Object.freeze(['Alphabetic', 'Ideographic', 'Phonetic']);
+
+/** True for the object shape dcmjs hands a Person Name back in. */
+function isPersonName(value) {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    PN_GROUPS.some((group) => group in value)
+  );
+}
+
+/**
+ * A Person Name as the one string DICOM actually stores it as.
+ *
+ * dcmjs splits the groups out into `{Alphabetic, Ideographic, Phonetic}`,
+ * which is convenient and is also how the groups get lost: reading
+ * `.Alphabetic` alone reduces a name that exists in three scripts to the one
+ * an English-speaking reader can pronounce, and anything derived from that
+ * reduced value can no longer reproduce the name it came from.
+ *
+ * Joining is positional, not "the groups that happen to be present". A name
+ * with an Alphabetic and a Phonetic group but no Ideographic one is
+ * `A^B==C^D`, and the empty middle has to be emitted or the phonetic spelling
+ * is read back as an ideographic one. Trailing empties are dropped, because
+ * that is what the standard says and what a writer produces: `DOE^JANE` and
+ * `DOE^JANE==` are the same name and only the first is what is on disk.
+ *
+ * A name that carries only an Alphabetic group — nearly all of them — comes
+ * back as exactly that group, with no `=` anywhere. That is the whole point:
+ * this is the identity function on ordinary data.
+ *
+ * @param {*} value A PN component-group object, an array holding one, or text.
+ * @returns {string}
+ */
+function personNameText(value) {
+  if (value === undefined || value === null) return '';
+  if (Array.isArray(value)) return value.length ? personNameText(value[0]) : '';
+  if (typeof value !== 'object') return String(value);
+  if (!isPersonName(value)) return JSON.stringify(value);
+
+  const groups = PN_GROUPS.map((group) => {
+    const text = value[group];
+    return text === undefined || text === null ? '' : String(text);
+  });
+  while (groups.length && groups[groups.length - 1] === '') groups.pop();
+  return groups.join('=');
+}
+
+/**
+ * A Person Name split back into the component groups DICOM JSON names.
+ *
+ * The inverse of `personNameText`, and the shape PS3.18 F.2.2 requires of a PN
+ * on the DICOM JSON wire: an object whose keys are `Alphabetic`, `Ideographic`
+ * and `Phonetic`, carrying only the groups the name actually has. The `=` that
+ * separates groups in the Part 10 string is the JSON representation's job to
+ * remove — a group's own string may not contain one, because in JSON the key
+ * says which group it is and the separator has nothing left to separate.
+ *
+ * Accepts either form, so a caller can hand over whatever it happens to hold:
+ * the dcmjs object, an array holding one, or the joined string that comes back
+ * from `personNameText`. Empty groups are omitted rather than emitted as `""`,
+ * which is what "only the groups that exist" means: `{Alphabetic: 'DOE^JANE'}`
+ * for an ordinary name, with no second or third key to explain.
+ *
+ * A value with more than three groups cannot come off a DICOM file — the
+ * parser produces three keys at most — so it can only be a string a caller
+ * composed wrongly. The surplus stays attached to the last group rather than
+ * being dropped, because silently deleting part of a name is the exact defect
+ * this whole path exists to prevent, and a malformation that stays visible can
+ * be found and fixed.
+ *
+ * @param {*} value A PN component-group object, an array holding one, or text.
+ * @returns {{Alphabetic?: string, Ideographic?: string, Phonetic?: string}}
+ *   Empty when there is no name.
+ */
+function personNameGroups(value) {
+  const text = personNameText(value);
+  if (text === '') return {};
+
+  const parts = text.split('=');
+  // Everything past the third group belongs to the third group; see above.
+  if (parts.length > PN_GROUPS.length) {
+    parts.splice(PN_GROUPS.length - 1, parts.length, parts.slice(PN_GROUPS.length - 1).join('='));
+  }
+
+  const groups = {};
+  parts.forEach((part, i) => {
+    if (part !== '') groups[PN_GROUPS[i]] = part;
+  });
+  return groups;
+}
+
+/**
  * Resolves a keyword to its tag and value representation.
  *
  * @param {string} keyword
@@ -101,12 +201,7 @@ function isSequence(value, vr) {
   if (vr && vr !== '??') return false;
   // Unknown VR (private tags): fall back to shape, excluding Person Name.
   const first = value[0];
-  return (
-    typeof first === 'object' &&
-    first !== null &&
-    !isBinary(first) &&
-    first.Alphabetic === undefined
-  );
+  return typeof first === 'object' && first !== null && !isBinary(first) && !isPersonName(first);
 }
 
 /**
@@ -158,9 +253,13 @@ function renderValue(keyword, value, opts = {}) {
 function renderScalar(value) {
   if (value === undefined || value === null) return '';
   if (typeof value === 'object') {
-    // Person Name arrives as { Alphabetic: 'DOE^JANE' }.
-    if (value.Alphabetic !== undefined) return String(value.Alphabetic);
-    return JSON.stringify(value);
+    // Person Name arrives as { Alphabetic: 'DOE^JANE' }, and as every group it
+    // carries when it carries more than one. `dcm tags` is the command an
+    // operator reaches for to see what is actually in a file, so it prints the
+    // whole value — printing only the Alphabetic group was the reason the
+    // other groups could be destroyed without anyone being able to see they
+    // had ever been there.
+    return personNameText(value);
   }
   return String(value);
 }
@@ -276,6 +375,10 @@ module.exports = {
   renderValue,
   flatten,
   resolveReference,
+  isPersonName,
+  personNameText,
+  personNameGroups,
   BULK_KEYWORDS,
   INTERNAL_KEYS,
+  PN_GROUPS,
 };

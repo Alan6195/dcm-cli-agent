@@ -1,5 +1,111 @@
 # Changelog
 
+## v0.16.0
+
+**Rename a study without knowing DICOM.** Tools › Rename takes a folder, shows
+what the study actually says — patient, ID, description, accession, date,
+modality, counts — and lets you change the four identity fields with the
+current values already in the boxes. Patient name has Family and Given inputs
+that compose to `DOE^JANE`, with the composed value shown, because the thing
+written must be the thing seen. A change list names only what differs. It
+writes a copy by default; in-place is deliberate and marked. It never passes
+`--force`, so the UIDs that make a study a study cannot move: a full tag diff
+of a real rename differs on exactly the elements asked for and nothing else.
+
+A folder holding more than one study is refused rather than renamed. `dcm edit`
+applies to every instance under the path and has no per-study scoping, so
+renaming one of three would rename all three — three identities merged into
+one. The screen names the studies it found and asks for a single-study folder.
+
+**A study that disagrees with itself now says so.** `dcm info` reports each of
+patientName, patientId, studyDescription and accessionNumber as a string only
+when every instance agrees; when they disagree the singular is `null` and a
+plural array carries every competing value. Previously the first instance won
+silently, which meant a folder holding two patients under one Study Instance
+UID looked like it held one. The Rename tab shows every disagreement and makes
+each competing value a button, so repairing a study is a click rather than
+retyping a value off the screen and inventing a fifth by typo. `dcm mpps
+perform` no longer adopts a conflicting patient ID or accession from the folder
+and asserts it to the RIS.
+
+**Person names keep their non-Latin spellings.** A DICOM name carries up to
+three groups — `Alphabetic=Ideographic=Phonetic`, e.g.
+`Yamada^Tarou=山田^太郎=やまだ^たろう`. Every read collapsed to the Alphabetic
+group, and because the Rename tab wrote back from what it displayed, correcting
+a surname in romaji deleted the kanji and the kana from the file. The display
+value and the value written are now two different things. Correcting the
+surname changes five bytes and leaves every other byte of every group
+untouched; a name with only an Alphabetic group produces a byte-identical file
+to v0.15.1, so ordinary data pays nothing.
+
+Three consequences of that, each worse than the bug reported:
+
+- **`dcm anon` merged two people into one pseudonym.** It hashed the Alphabetic
+  group alone, so two patients sharing romaji and differing in kanji
+  de-identified to the same name. A de-identified export cannot merge two
+  patients. Fixed; single-group names hash exactly as before, so no existing
+  export shifts.
+- **`--adopt-worklist-identity` wrote collapsed names.** The station path — the
+  one used every day — re-stamped images with the Alphabetic group alone. All
+  three groups now travel from worklist item to disk to a completed MPPS
+  transaction.
+- **`dcm web serve` was lossy, and briefly non-conformant.** QIDO-RS now emits
+  the three groups as three keys per PS3.18 F.2.2, with no `=` inside any
+  group. Ordinary names are byte-identical to before across every query level,
+  and a pre-rename client reading only `Alphabetic` still interoperates.
+
+Also: `dcm find` and `dcm web query` printed only the Latin group; `dcm tags`
+and `dcm info` show whole names, which matters because their output is what
+people paste into `dcm edit --set`. `dcm edit --set PatientName=<the value it
+already has>` now reports "already correct" instead of rewriting the files.
+
+**The product is now AscendI DICOM.** The CLI banner, the app window, the
+splash, the sidebar wordmark, the installers and the release assets all say so;
+release files become `AscendI-DICOM-<version>-<arch>.<ext>`.
+
+Two things were kept unchanged on purpose, because a rename that got either of
+them wrong would cost more than the name is worth.
+
+**The installer identity.** electron-builder's `appId` is still
+`com.asteris.dcm.desktop`. That identifier, not the visible name, is what
+Windows and NSIS match on to decide whether an installer upgrades the copy
+already on the machine. Changing it would have installed AscendI beside
+Asteris, left the old one silently receiving no further updates, and made every
+user uninstall it by hand. Keeping it makes the rename arrive as an ordinary
+update. Retiring the old identifier is a separate decision that needs a plan
+for the installed copies, and `desktop/package.json` says so at the field.
+
+**The operator's saved data.** Electron derives the user-data folder from the
+product name, so the rename moves `%APPDATA%\Asteris DICOM App\` to
+`%APPDATA%\AscendI DICOM\` and everything saved in the first one stays there.
+From the other side of the screen that is not a rename, it is a wipe: no PACS
+peers, no station AE Title, no defaults. So the one-file migration written for
+the v0.5 → v0.6 rename was generalised. On first launch under the new name the
+app carries `profiles.json`, `settings.json` and `app-state.json` forward from
+either older folder — "Asteris DICOM App" first, then "Asteris DICOM" — and
+only for files the new folder does not already have.
+
+Never overwriting is the whole rule. A file already under the new name was
+written by a newer run and wins; the decision is made per file, so an install
+that has already saved settings still picks up the old peer list. It copies
+rather than moves, so an older build still finds its own data. Chromium's
+caches and cookies are not carried: they belong to the build that wrote them.
+And it cannot fail a launch — an unreadable file is skipped, the other two
+still arrive, and the worst case opens an app with an empty peer list next to
+a folder you can still copy from by hand, rather than an app that will not
+open at all.
+
+The macOS updater needed no change and got none, which was worth confirming
+rather than assuming: it matches release assets on the architecture suffix
+(`-arm64.dmg`, `-x64.dmg`) and never on the product name, so renamed assets
+resolve exactly as before. The smoke harness now checks that against
+post-rename asset names as well as the real pre-rename release.
+
+Entries for past releases keep the old name throughout. Those versions shipped
+as Asteris, the files they published are still named that way, and the recovery
+steps in `desktop/README.md` still name the `Asteris DICOM App.app` bundle
+because that is what is installed on those Macs.
+
 ## v0.15.1
 
 On a Mac, an update now arrives as the right file rather than as a page with

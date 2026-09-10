@@ -5,6 +5,7 @@ const dcmjs = require('dcmjs');
 const log = require('../../lib/log');
 const args = require('../../lib/args');
 const { validateUid } = require('../../lib/uid');
+const tagLib = require('../../lib/tags');
 const {
   resolveWebOptions,
   webRequest,
@@ -174,8 +175,10 @@ function buildQidoUrl(baseUrl, level, pairs, opts = {}) {
  * Renders one DICOM JSON attribute as printable text.
  *
  * Multi-valued attributes join with a backslash, the delimiter DICOM itself
- * uses. Person Names render as their Alphabetic component group. Sequences
- * are summarised rather than dumped, matching how src/lib/tags.js prints
+ * uses. Person Names render as every component group they carry, joined the
+ * way Part 10 stores them, so a name a server returned in three scripts is
+ * shown as three and not silently reduced to the Latin one. Sequences are
+ * summarised rather than dumped, matching how src/lib/tags.js prints
  * datasets.
  *
  * @param {{vr?: string, Value?: Array<*>, BulkDataURI?: string, InlineBinary?: string}} attribute
@@ -200,7 +203,7 @@ function displayAttribute(attribute) {
     if (typeof item === 'object') {
       // PN in DICOM JSON is { Alphabetic, Ideographic, Phonetic }; some
       // servers send a bare string anyway, which the string branch covers.
-      if (item.Alphabetic !== undefined) return String(item.Alphabetic);
+      if (tagLib.isPersonName(item)) return tagLib.personNameText(item);
       return JSON.stringify(item);
     }
     return String(item);

@@ -49,6 +49,7 @@ function writeInstance(spec) {
     filePath, studyUid, seriesUid, sopUid, modality, sopClassUid,
     seriesNumber, instanceNumber, rows, cols, patientName, patientId,
     studyDescription, seriesDescription, transferSyntaxUid,
+    specificCharacterSet,
   } = spec;
 
   const elements = {
@@ -60,6 +61,13 @@ function writeInstance(spec) {
     SOPInstanceUID: sopUid,
     StudyInstanceUID: studyUid,
     SeriesInstanceUID: seriesUid,
+
+    // Only written when asked for. A default character set is exactly what
+    // ISO_IR 6 means, so an instance that says nothing is already saying it,
+    // and every existing fixture must keep the octets it has always had. A
+    // name in kanji or hangul cannot be written without this: the bytes go out
+    // as UTF-8 either way, but nothing tells a reader to decode them that way.
+    ...(specificCharacterSet ? { SpecificCharacterSet: specificCharacterSet } : {}),
 
     PatientName: patientName,
     PatientID: patientId,

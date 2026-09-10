@@ -46,7 +46,7 @@ const RAW_DESCRIPTION =
   'Return values exactly as they came off the wire instead of rendered for reading (`dcm find --json-raw`). ' +
   'A DICOM parser normally repairs as it reads — PatientWeight sent as "12.5 kg" arrives as the number 12.5 with the unit silently gone — and that repair is correct when consuming a study and wrong when TESTING the peer that sent it, because the violation disappears before anyone can see it. Raw re-reads the received octets and never turns a value into a number. ' +
   'Each match also carries "_elements", a sidecar keyed by tag holding vr, length (the Value Length field including any pad octet, so an odd length is visible), keyword, vm and the value text; a sequence carries "items", and "vrSource": "dictionary" means the peer sent no VR and ours came from the data dictionary. ' +
-  'Two shape changes to expect: a Decimal or Integer String is now text rather than a number, and a Person Name is an object like [{"Alphabetic": "DOE^JANE"}] rather than a string — so a raw PatientName must NOT be copied straight into an MPPS patientName parameter. Leave this off unless the octets are the thing under test.';
+  'Two shape changes to expect: a Decimal or Integer String is now text rather than a number, and a Person Name is an object like [{"Alphabetic": "DOE^JANE"}] rather than a string — so a raw PatientName must NOT be copied straight into an MPPS patientName parameter. Join its groups with "=" in the order Alphabetic, Ideographic, Phonetic; reading .Alphabetic alone deletes the other spellings from every image the step re-stamps. Leave this off unless the octets are the thing under test.';
 
 /**
  * The VR conformance gate, said once for both query tools.
@@ -587,7 +587,9 @@ function register(server, z, rt) {
       notes.push(
         'Values are raw: a Decimal or Integer String is the text that arrived rather than a ' +
           'number, and a Person Name is [{"Alphabetic": "..."}] rather than a string. Do not ' +
-          'copy a raw PatientName into an MPPS patientName parameter — read .Alphabetic first.'
+          'copy a raw PatientName into an MPPS patientName parameter — join its groups with ' +
+          '"=" in the order Alphabetic, Ideographic, Phonetic. Taking .Alphabetic alone drops ' +
+          'the other spellings, and an adopted identity is written back to the images.'
       );
     }
 

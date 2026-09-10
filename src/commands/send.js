@@ -1152,9 +1152,16 @@ async function run(parsed) {
     const studyLedger = ledger.study(studyUid, {
       patientId: study.patientId,
       patientName: study.patientName,
+      // The plural halves are carried through so the report can distinguish a
+      // study with no patient name from one whose instances disagree about it,
+      // and likewise for the ID and the description. See lib/report.patientText.
+      patientNames: [...study.patientNames],
+      patientIds: [...study.patientIds],
       studyDate: study.studyDate,
       studyDescription: study.studyDescription,
+      studyDescriptions: [...study.studyDescriptions],
       accessionNumber: study.accessionNumber,
+      accessionNumbers: [...study.accessionNumbers],
       modalities: [...study.modalities],
       transferSyntaxes: [...study.transferSyntaxes],
       seriesCount: study.series.size,

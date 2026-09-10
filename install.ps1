@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Installs the Asteris DICOM CLI Agent (dcm) for the current user.
+    Installs the AscendI DICOM CLI Agent (dcm) for the current user.
 
 .DESCRIPTION
     Downloads the latest release binary, verifies its checksum against the
@@ -30,7 +30,7 @@ function Write-Step($msg) { Write-Host "  $msg" -ForegroundColor Cyan }
 function Write-Note($msg) { Write-Host "  $msg" -ForegroundColor DarkGray }
 
 Write-Host ''
-Write-Host '  Asteris DICOM CLI Agent - installer' -ForegroundColor Cyan
+Write-Host '  AscendI DICOM CLI Agent - installer' -ForegroundColor Cyan
 Write-Host ''
 
 # --- Work out which release to fetch -----------------------------------------

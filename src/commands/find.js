@@ -5,6 +5,7 @@ const args = require('../lib/args');
 const statusLib = require('../lib/status');
 const json = require('../lib/json');
 const vr = require('../lib/vr');
+const tagLib = require('../lib/tags');
 const { runAssociation, resolveTimeouts, dcmjsDimse } = require('../lib/dimse');
 const { formatOutcome } = require('../lib/reject');
 
@@ -557,13 +558,19 @@ function rawView(dataset, level) {
  *
  * dcmjs returns Person Names as objects and multi-valued elements as arrays,
  * so neither can be interpolated directly.
+ *
+ * A Person Name shows every component group it carries. Printing the
+ * Alphabetic group alone was defensible for a name that has one and a lie for
+ * a name that has three: the operator reads a C-FIND answer to decide whether
+ * the study is the one they want, and a spelling the record does not hold is
+ * the wrong basis for that. For a single-group name — nearly all of them —
+ * this is character-for-character what it always printed.
  */
 function display(value) {
   if (value === undefined || value === null || value === '') return '';
   if (Array.isArray(value)) return value.map(display).filter(Boolean).join('\\');
   if (typeof value === 'object') {
-    // Person Name: { Alphabetic: 'DOE^JANE' }
-    if (value.Alphabetic) return String(value.Alphabetic);
+    if (tagLib.isPersonName(value)) return tagLib.personNameText(value);
     return JSON.stringify(value);
   }
   return String(value);

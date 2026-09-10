@@ -20,6 +20,23 @@ Reads DICOM metadata only (stopping before the pixel data), so it is fast and
 memory-light even on large trees. Reports what is there, how it is grouped, and
 anything that would prevent it being sent.
 
+A study's patient name, patient ID, description and accession number are each
+reported only when every instance in it agrees. When they do not, the value is
+withheld and all the distinct ones are listed — naming one of two patients
+found under a single Study Instance UID would hide the defect rather than
+report it. An instance carrying no value at all is an absence rather than a
+competing answer, so it never creates a disagreement. Under --json each of the
+four is a string or null, beside a plural array holding every distinct value
+found; a disagreement is not a failure, so the exit code stays 0.
+
+A patient name is reported as the file holds it. A name written in more than
+one script is a single DICOM value whose component groups are separated by "="
+— Yamada^Tarou=<kanji>=<kana> — and the whole value is what is printed and what
+--json carries, because it is also what you would paste back into a
+"dcm edit --set PatientName=...". Printing only the romaji would hand you a
+value that deletes the rest of the name on write. Almost every name has one
+group and reads exactly as it always did.
+
 Usage:
   dcm info <folder|file> [options]
 
@@ -41,6 +58,83 @@ Examples:
   dcm info ./study --json
   dcm info ./out --expect-count 12
 `.trimStart();
+
+/** Column geometry shared by the identity lines and their continuations. */
+const LABEL_WIDTH = 15;
+const INDENT = ' '.repeat(2 + LABEL_WIDTH);
+
+/**
+ * What to tell an operator about each kind of disagreement.
+ *
+ * These are not one defect wearing four hats, so they do not get one line of
+ * advice. Two patient names, or two patient IDs, under a single Study Instance
+ * UID is a safety problem: an archive files every instance under one patient
+ * record, so one of the two patients is about to absorb the other's images.
+ * Two descriptions is usually cosmetic — the same exam labelled twice — and
+ * the repair is a rename, not a recall. Two accession numbers is the most
+ * often benign of the four: an order corrected after acquisition began, or one
+ * acquisition filling two orders, both of which happen in working departments
+ * and neither of which loses an image. Advice pitched at the worst case would
+ * cry wolf three times out of four, and an operator who learns to skip the
+ * yellow paragraph will skip it on the day it means a mis-filed patient.
+ */
+const CONFLICT_ADVICE = Object.freeze({
+  PatientName: [
+    'One Study Instance UID cannot belong to two patients. An archive will file',
+    'every instance under one record, so repair this before sending:',
+    '`dcm tags <folder> --filter PatientName` shows which files carry which name.',
+  ],
+  PatientID: [
+    'This is the key an archive files the patient record under, so sending as it',
+    'stands puts some of these instances on the wrong patient. Repair it first:',
+    '`dcm tags <folder> --filter PatientID` shows which files carry which ID.',
+  ],
+  StudyDescription: [
+    'Nothing routes on the description, so the transfer itself is unaffected — the',
+    'study will simply show up under whichever one the archive keeps. Worth',
+    'settling if the two describe genuinely different exams, which would mean this',
+    'folder holds two studies sharing a UID: `dcm info --series` shows the split.',
+  ],
+  AccessionNumber: [
+    'Often benign: an order corrected after acquisition began, or one acquisition',
+    'filling two orders. No image is lost either way, but the archive files the',
+    'study under a single accession and the other order will look unfilled. Ask',
+    'the RIS which order this study answers before sending.',
+  ],
+});
+
+/**
+ * Prints one identity line, in whichever of the three states its field is in.
+ *
+ * A disagreement always prints, and prints loudly, whatever the field. This
+ * report is what an operator reads to learn what a study currently says, and
+ * presenting one instance's answer as the study's answer is the one thing it
+ * must not do.
+ *
+ * Absence keeps the quieter, older rule. The patient name says so in words,
+ * because it is the line an operator looks for and a line that is simply
+ * missing cannot be told apart from a tool that never looked; for the other
+ * three an absent line is unremarkable, and `--json` carries the distinction
+ * for anything that needs it.
+ *
+ * @param {{label: string, element: string, value?: string,
+ *          values: Set<string>, plural: string, absent?: string}} spec
+ */
+function identityLine({ label, element, value, values, plural, absent }) {
+  if (values.size > 1) {
+    log.out(log.color.yellow(
+      `  ${label.padEnd(LABEL_WIDTH)}${values.size} DIFFERENT ${plural} across this study's instances`
+    ));
+    for (const one of values) log.out(log.color.yellow(`${INDENT}  ${one}`));
+    log.out(log.color.dim(CONFLICT_ADVICE[element].map((line) => `${INDENT}${line}`).join('\n')));
+    return;
+  }
+  if (value) {
+    log.out(`  ${label.padEnd(LABEL_WIDTH)}${value}`);
+    return;
+  }
+  if (absent) log.out(`  ${label.padEnd(LABEL_WIDTH)}${log.color.dim(absent)}`);
+}
 
 /**
  * @param {{flags: Map, positionals: string[]}} parsed
@@ -102,10 +196,32 @@ async function execute(parsed) {
       totalBytes: scanned.totalBytes,
       studies: [...scanned.studies.values()].map((study) => ({
         studyInstanceUid: study.studyInstanceUid,
-        patientId: study.patientId,
+        // The four identity fields, each as the same pair of keys: always
+        // present, always these two shapes, so a consumer never has to branch
+        // on a missing key. The singular is a string or null; the plural is an
+        // array of every distinct value found, in first-seen order, which says
+        // which of the two reasons a null has — empty for "no instance carries
+        // one", two or more entries for "they disagree". A single-entry plural
+        // beside a non-null singular is the ordinary case. See the grouping
+        // comment in lib/scan.js.
+        //
+        // patientName is the complete Person Name, component groups and all.
+        // Two instances whose names differ only in a group a Latin reader
+        // cannot see — same romaji, different kanji — are therefore two names
+        // and raise a conflict. That is deliberate. This pair is what the
+        // desktop Rename tab prefills from and writes back to every instance,
+        // so calling them one name would let it choose one instance's kanji
+        // and overwrite the other's without ever having shown either. A
+        // disagreement no one can see is the worst kind to resolve silently.
+        patientName: study.patientName ?? null,
+        patientNames: [...study.patientNames],
+        patientId: study.patientId ?? null,
+        patientIds: [...study.patientIds],
+        studyDescription: study.studyDescription ?? null,
+        studyDescriptions: [...study.studyDescriptions],
+        accessionNumber: study.accessionNumber ?? null,
+        accessionNumbers: [...study.accessionNumbers],
         studyDate: study.studyDate,
-        studyDescription: study.studyDescription,
-        accessionNumber: study.accessionNumber,
         modalities: [...study.modalities],
         transferSyntaxes: [...study.transferSyntaxes],
         sopClasses: [...study.sopClasses],
@@ -217,10 +333,27 @@ async function execute(parsed) {
 
     log.out('');
     log.out(`Study ${index}/${scanned.studies.size}  ${log.color.bold(study.studyInstanceUid)}`);
-    if (study.patientId) log.out(`  patient ID     ${study.patientId}`);
+    // The four fields the scan reaches agreement on before reporting. Each is
+    // a value, an absence, or a disagreement, and identityLine renders all
+    // three without either of the last two being able to pass for the other.
+    identityLine({
+      label: 'patient', element: 'PatientName', plural: 'NAMES',
+      value: study.patientName, values: study.patientNames,
+      absent: '(no PatientName in any instance)',
+    });
+    identityLine({
+      label: 'patient ID', element: 'PatientID', plural: 'PATIENT IDS',
+      value: study.patientId, values: study.patientIds,
+    });
     if (study.studyDate) log.out(`  study date     ${study.studyDate}`);
-    if (study.studyDescription) log.out(`  description    ${study.studyDescription}`);
-    if (study.accessionNumber) log.out(`  accession      ${study.accessionNumber}`);
+    identityLine({
+      label: 'description', element: 'StudyDescription', plural: 'DESCRIPTIONS',
+      value: study.studyDescription, values: study.studyDescriptions,
+    });
+    identityLine({
+      label: 'accession', element: 'AccessionNumber', plural: 'ACCESSION NUMBERS',
+      value: study.accessionNumber, values: study.accessionNumbers,
+    });
     log.out(`  modalities     ${[...study.modalities].join(', ') || '(none recorded)'}`);
     log.out(`  series         ${study.series.size}`);
     log.out(`  instances      ${study.instances.length}`);

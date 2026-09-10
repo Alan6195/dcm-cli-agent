@@ -31,6 +31,7 @@ const fs = require('fs');
 const path = require('path');
 
 const args = require('./args');
+const tagLib = require('./tags');
 
 /**
  * Worklist keys that belong inside the Scheduled Procedure Step Sequence.
@@ -73,6 +74,9 @@ const SUPPORTED_KEYS = Object.freeze([
 /** Matched as a DICOM date, single value or `YYYYMMDD-YYYYMMDD` range. */
 const DATE_KEYS = Object.freeze(['ScheduledProcedureStepStartDate']);
 
+/** Matched as a Person Name: the whole value, and each component group. */
+const PN_KEYS = Object.freeze(['PatientName']);
+
 /**
  * Identifier entries that are protocol furniture, not matching keys.
  *
@@ -92,6 +96,12 @@ const NON_MATCHING_KEYS = new Set(['QueryRetrieveLevel', 'SpecificCharacterSet']
  * not implement list-of-values matching, and pretending to would be worse than
  * saying so.
  *
+ * A Person Name comes back whole, every component group `=`-separated. The
+ * receiver hands its items to `dcm mpps` and to the re-stamp, which write
+ * them, so a name reduced here is a name reduced on disk. Matching is what
+ * has to absorb that, and `matchesPersonName` does — see it for why the
+ * reduction was never the right place to make a query forgiving.
+ *
  * @param {unknown} value
  * @returns {string}
  */
@@ -99,10 +109,7 @@ function textOf(value) {
   if (value === undefined || value === null) return '';
   if (Array.isArray(value)) return value.length ? textOf(value[0]) : '';
   if (typeof value === 'object') {
-    if (value.Alphabetic !== undefined) return String(value.Alphabetic);
-    if (value.Ideographic !== undefined) return String(value.Ideographic);
-    if (value.Phonetic !== undefined) return String(value.Phonetic);
-    return '';
+    return tagLib.isPersonName(value) ? tagLib.personNameText(value) : '';
   }
   return String(value);
 }
@@ -122,9 +129,7 @@ function isUniversal(value) {
   if (value === undefined || value === null) return true;
   if (Array.isArray(value)) return value.length === 0 || value.every(isUniversal);
   if (typeof value === 'object') {
-    if ('Alphabetic' in value || 'Ideographic' in value || 'Phonetic' in value) {
-      return textOf(value).trim() === '';
-    }
+    if (tagLib.isPersonName(value)) return textOf(value).trim() === '';
     return Object.values(value).every(isUniversal);
   }
 
@@ -179,6 +184,33 @@ function matchesText(value, criterion) {
     return wildcardToRegExp(pattern).test(value.trim());
   }
   return value.trim().toUpperCase() === pattern.toUpperCase();
+}
+
+/**
+ * Person Name matching: the whole name, or any one of its component groups.
+ *
+ * A modality asking for `PatientName=Yamada^Tarou` means that patient. It does
+ * not know that this receiver's worklist file also records the kanji and the
+ * kana, and requiring it to send all three would be requiring it to already
+ * know the answer. Equally, a Japanese department querying with the kanji has
+ * to find the item too.
+ *
+ * So the criterion is tried against the joined value and then against each
+ * group. Both directions of that were previously served by reducing the item
+ * to its Alphabetic group before comparing, which made the query work and left
+ * the reduced name on the item — and the item is what gets written. Being
+ * forgiving belongs in the comparison, not in the value.
+ *
+ * For a name with one group this is one comparison against one string, exactly
+ * as before.
+ *
+ * @param {string} value
+ * @param {string} criterion
+ * @returns {boolean}
+ */
+function matchesPersonName(value, criterion) {
+  if (matchesText(value, criterion)) return true;
+  return value.split('=').some((group) => group !== '' && matchesText(group, criterion));
 }
 
 /**
@@ -491,9 +523,9 @@ function selectItems(items, criteria) {
     const flat = flattenItem(item);
     return criteria.every(({ key, value }) => {
       const actual = textOf(flat[key]);
-      return DATE_KEYS.includes(key)
-        ? matchesDate(actual, value)
-        : matchesText(actual, value);
+      if (DATE_KEYS.includes(key)) return matchesDate(actual, value);
+      if (PN_KEYS.includes(key)) return matchesPersonName(actual, value);
+      return matchesText(actual, value);
     });
   });
 }

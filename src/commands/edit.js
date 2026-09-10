@@ -24,7 +24,9 @@ Usage:
 Options:
   --set <Key=Value>  Set a tag. Repeatable. The key may be a keyword
                      (PatientID), a punctuated tag ((0010,0020)) or a bare hex
-                     tag (00100020).
+                     tag (00100020). Only the first = separates key from value,
+                     so a Person Name written in several scripts goes in whole:
+                     --set "PatientName=Yamada^Tarou=<kanji>=<kana>".
   --remove <Key>     Remove a tag. Repeatable.
   --out <dir>        Write modified copies here, mirroring the source layout.
                      The source is not touched.
@@ -74,6 +76,17 @@ function asArray(value) {
 /**
  * Parses `--set Key=Value` into a resolved edit.
  *
+ * The split is on the FIRST `=` and everything after it is the value, which is
+ * what makes a multi-script Person Name expressible on a command line at all:
+ * `--set PatientName=Yamada^Tarou=山田^太郎=やまだ^たろう` sets one PatientName
+ * to a three-group value rather than being rejected as malformed. dcmjs writes
+ * a plain string into a PN element verbatim, so that string is the element's
+ * octets and reads back as the three groups it was written from.
+ *
+ * `--set` is also the only way to write such a name through this tool, so the
+ * rule is load-bearing rather than incidental — narrowing it to a single `=`
+ * would make multi-group names unwritable and silently un-preservable.
+ *
  * @param {string} raw
  * @returns {{key: string, tag: string, vr: string, keyword: string, value: *}}
  */
@@ -105,6 +118,38 @@ function parseSet(raw) {
   }
 
   return { ...resolved, value };
+}
+
+/**
+ * True when an element already holds exactly what a --set would write.
+ *
+ * Every VR but one compares as JSON, because for every VR but one the value
+ * dcmjs parses off disk has the same shape as the value --set carries: a
+ * string, or — for the numeric VRs parseSet coerces — a number.
+ *
+ * Person Name is the exception. It parses back as component groups,
+ * `[{Alphabetic: 'DOE^JANE'}]`, and --set carries the Part 10 string
+ * `DOE^JANE`; those are the same name and never the same JSON. The visible
+ * effect was that `--set PatientName=<what it already says>` reported "would
+ * change 3 / already correct 0" and rewrote all three files — a no-op edit
+ * that produced new bytes, new mtimes, and a count that told the operator
+ * something had happened. Comparing the two as names is the whole fix.
+ *
+ * A multi-valued PN — an array of more than one name, which is legal and
+ * vanishingly rare — falls through to the JSON comparison. It would report a
+ * change where there may be none, which is the conservative direction: worst
+ * case the file is rewritten with the value it already had.
+ *
+ * @param {*} before The element as parsed off disk.
+ * @param {*} value  The value --set would assign.
+ * @returns {boolean}
+ */
+function alreadyHolds(before, value) {
+  const one = Array.isArray(before) && before.length === 1 ? before[0] : before;
+  if (tagLib.isPersonName(one)) {
+    return tagLib.personNameText(one) === String(value);
+  }
+  return JSON.stringify(before) === JSON.stringify(value);
 }
 
 /**
@@ -233,7 +278,7 @@ async function run(parsed) {
       for (const edit of sets) {
         const before = elements[edit.key];
         elements[edit.key] = edit.value;
-        if (JSON.stringify(before) !== JSON.stringify(edit.value)) {
+        if (!alreadyHolds(before, edit.value)) {
           touched = true;
           changeCounts.set(`set ${edit.keyword}`, (changeCounts.get(`set ${edit.keyword}`) ?? 0) + 1);
         }

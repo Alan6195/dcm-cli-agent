@@ -61,6 +61,59 @@ function shortPath(filePath) {
   return parent ? path.join(parent, path.basename(filePath)) : path.basename(filePath);
 }
 
+/**
+ * The "NAME / ID" identity line for a study, from a scan record or a ledger
+ * meta — either carries the same two fields.
+ *
+ * A study whose instances disagree on PatientName has no single name to print,
+ * and the same goes for PatientID. Falling through to "(no name)" or "(no ID)"
+ * there would report a conflict as an absence, which are different problems
+ * with different repairs, so each is named for what it is. `dcm info` lists
+ * the competing values.
+ *
+ * @param {{patientName?: string, patientNames?: Set<string>|string[],
+ *          patientId?: string, patientIds?: Set<string>|string[]}} source
+ * @returns {string}
+ */
+function patientText(source) {
+  // A scan record holds a Set; a ledger meta holds the array it was serialised
+  // into. Spread covers both, and either is small.
+  const names = [...(source.patientNames ?? [])];
+  const ids = [...(source.patientIds ?? [])];
+  const name = names.length > 1
+    ? `(${names.length} conflicting names — run dcm info)`
+    : source.patientName ?? '(no name)';
+  const id = ids.length > 1
+    ? `(${ids.length} conflicting IDs — run dcm info)`
+    : source.patientId ?? '(no ID)';
+  return `${name} / ${id}`;
+}
+
+/**
+ * The description line for a study, from a scan record or a ledger meta, or
+ * undefined when there is nothing to print.
+ *
+ * Same rule as patientText. A study whose instances disagree has no single
+ * description, and silently printing no line would let that read as a study
+ * nobody ever described.
+ *
+ * @param {{studyDescription?: string, studyDescriptions?: Set<string>|string[]}} source
+ * @returns {string|undefined}
+ */
+function descriptionText(source) {
+  const all = [...(source.studyDescriptions ?? [])];
+  return all.length > 1
+    ? `(${all.length} conflicting descriptions — run dcm info)`
+    : source.studyDescription;
+}
+
+/** True when there is any patient identity worth printing a line for. */
+function hasPatient(source) {
+  const any = (values) => (values instanceof Set ? values.size > 0 : Boolean(values?.length));
+  return Boolean(source.patientName || source.patientId)
+    || any(source.patientNames) || any(source.patientIds);
+}
+
 /** Pads a label so the three headline counts line up. */
 function countLine(label, value, colorFn) {
   const padded = String(value).padStart(6);
@@ -95,10 +148,9 @@ function dryRun({ scanned, chunkSize, rewriteSeriesUid }) {
 
     log.out('');
     log.out(`Study ${studyUid}`);
-    if (study.patientName || study.patientId) {
-      log.out(`  patient        ${study.patientName ?? '(no name)'} / ${study.patientId ?? '(no ID)'}`);
-    }
-    if (study.studyDescription) log.out(`  description    ${study.studyDescription}`);
+    if (hasPatient(study)) log.out(`  patient        ${patientText(study)}`);
+    const description = descriptionText(study);
+    if (description) log.out(`  description    ${description}`);
     if (study.studyDate) log.out(`  study date     ${study.studyDate}`);
     log.out(`  modalities     ${[...study.modalities].join(', ') || '(none recorded)'}`);
     log.out(`  series         ${study.series.size}`);
@@ -170,10 +222,9 @@ function transfer({ result, connection, chunkSize, rewriteSeriesUid }) {
     log.out('');
     log.out(`Study ${study.studyInstanceUid}`);
     const meta = study.meta ?? {};
-    if (meta.patientName || meta.patientId) {
-      log.out(`  patient        ${meta.patientName ?? '(no name)'} / ${meta.patientId ?? '(no ID)'}`);
-    }
-    if (meta.studyDescription) log.out(`  description    ${meta.studyDescription}`);
+    if (hasPatient(meta)) log.out(`  patient        ${patientText(meta)}`);
+    const description = descriptionText(meta);
+    if (description) log.out(`  description    ${description}`);
     if (meta.modalities?.length) log.out(`  modalities     ${meta.modalities.join(', ')}`);
 
     // The three numbers. Kept adjacent and always printed, even when equal.

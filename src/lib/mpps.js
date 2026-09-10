@@ -30,6 +30,7 @@ const fs = require('fs');
 const path = require('path');
 
 const args = require('./args');
+const tagLib = require('./tags');
 const { deterministicUid, validateUid } = require('./uid');
 const { Disposition } = require('./ledger');
 const { runAssociation, dcmjsDimse, constants } = require('./dimse');
@@ -194,6 +195,19 @@ function dicomTime(when = new Date()) {
  * multi-valued elements as arrays, so a value taken off the wire cannot be
  * used as a string without this.
  *
+ * A Person Name comes back whole — every component group, `=`-separated, as
+ * PS3.5 6.2.1.2 stores it. That matters here more than anywhere, because this
+ * is not only a reading path: `worklistToAttributes` builds the patient
+ * identity from it, `buildCreateDataset` puts that identity in the N-CREATE,
+ * and `--adopt-worklist-identity` stamps it onto every image in the study. A
+ * name collapsed to its Alphabetic group here is a name permanently shortened
+ * on disk, at an acquisition station, on the ordinary path an operator takes
+ * every day. It used to pick one group; a worklist item scheduled as
+ * `Yamada^Tarou=山田^太郎=やまだ^たろう` was re-stamped as `Yamada^Tarou`.
+ *
+ * A name with one group — nearly all of them — is byte-for-byte unchanged:
+ * one group in, that group out, no separator introduced anywhere.
+ *
  * @param {unknown} value
  * @returns {string}
  */
@@ -201,10 +215,9 @@ function textOf(value) {
   if (value === undefined || value === null) return '';
   if (Array.isArray(value)) return value.length ? textOf(value[0]) : '';
   if (typeof value === 'object') {
-    if (value.Alphabetic !== undefined) return String(value.Alphabetic);
-    if (value.Ideographic !== undefined) return String(value.Ideographic);
-    if (value.Phonetic !== undefined) return String(value.Phonetic);
-    return '';
+    // Anything that is not a Person Name is not text and has no text form;
+    // saying so with '' is what every caller here already expects.
+    return tagLib.isPersonName(value) ? tagLib.personNameText(value) : '';
   }
   return String(value);
 }

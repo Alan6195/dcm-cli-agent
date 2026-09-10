@@ -17,7 +17,7 @@ const {
   translateHttpFailure,
   attr,
   tagValue,
-  personName,
+  pnAttr,
   TAGS,
 } = require('../../src/lib/webdicom');
 
@@ -332,8 +332,13 @@ test('dicom json helpers build and read attributes the way PS3.18 shapes them', 
   };
   assert.equal(tagValue(dataset, TAGS.STUDY_UID), '1.2.3.4');
   assert.equal(tagValue(dataset, TAGS.SOP_UID), undefined);
-  assert.equal(personName(dataset, '00100010'), 'DOE^JOHN');
-  // Some servers send PN as a bare string; both shapes must read.
-  assert.equal(personName({ '00100010': { vr: 'PN', Value: ['SMITH^A'] } }, '00100010'), 'SMITH^A');
-  assert.equal(personName(dataset, '00080090'), undefined);
+  assert.deepEqual(tagValue(dataset, '00100010'), { Alphabetic: 'DOE^JOHN' });
+
+  // pnAttr builds the attribute rather than reading one: it is what an
+  // outgoing PN has to go through, and the reason there is no longer a reader
+  // that picks a single group.
+  assert.deepEqual(pnAttr('DOE^JOHN'), { vr: 'PN', Value: [{ Alphabetic: 'DOE^JOHN' }] });
+  assert.deepEqual(pnAttr([{ Alphabetic: 'DOE^JOHN' }]), { vr: 'PN', Value: [{ Alphabetic: 'DOE^JOHN' }] });
+  assert.deepEqual(pnAttr(undefined), { vr: 'PN' });
+  assert.deepEqual(pnAttr(''), { vr: 'PN' });
 });

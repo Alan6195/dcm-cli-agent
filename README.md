@@ -118,7 +118,7 @@ It never phones home on its own — a check happens when you ask for one.
 
 ## Prefer a window?
 
-The same engine ships as a desktop app — **Asteris DICOM App** — for the
+The same engine ships as a desktop app — **AscendI DICOM** — for the
 people on the team who won't touch a terminal. Every screen builds the real
 `dcm` command, shows it, and runs it, so what the app does and what the CLI
 does can never drift apart. Download the installer for your platform from
@@ -137,7 +137,7 @@ having to read them first.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ◈ A S T E R I S                                         │
+│  ◈ A S C E N D I                                         │
 │  DICOM CLI Agent · v0.2.0                                │
 └──────────────────────────────────────────────────────────┘
 
@@ -721,8 +721,11 @@ transfer syntaxes:
   1.2.840.10008.1.2.1
 
 Study 1/1  1.2.840.113619.2.55.3.604688.1
+  patient        DOE^JANE
   patient ID     12345
   study date     20260115
+  description    CHEST W CONTRAST
+  accession      A2026-00417
   modalities     CT
   series         7
   instances      823
@@ -730,8 +733,95 @@ Study 1/1  1.2.840.113619.2.55.3.604688.1
   would send in  5 association(s) at --chunk 200
 ```
 
-`--json` for scripting. `--series` for the per-series breakdown, which also
-flags colliding Series Instance UIDs.
+`--series` gives the per-series breakdown, which also flags colliding Series
+Instance UIDs.
+
+#### When the study contradicts itself
+
+Patient name, patient ID, description and accession number are study-level
+facts, but they live on every instance, so a folder can hold instances that
+disagree about them. A partial rename that stopped halfway, two exports merged
+into one directory, an accession corrected after the first series was acquired.
+
+`dcm info` reports each of the four only when every instance agrees. When they
+don't, it withholds the value and lists all of them instead:
+
+```
+Study 1/1  1.2.840.113619.2.55.3.604688.1
+  patient        DOE^JANE
+  patient ID     2 DIFFERENT PATIENT IDS across this study's instances
+                   12345
+                   00012345
+                 This is the key an archive files the patient record under, so sending as it
+                 stands puts some of these instances on the wrong patient. Repair it first:
+                 `dcm tags <folder> --filter PatientID` shows which files carry which ID.
+```
+
+An instance carrying no value at all is an absence, not a competing answer, so
+it never creates a disagreement — the same rule an empty PatientName has always
+followed. And a disagreement isn't a failure: the folder was readable and every
+instance was counted, so the exit code stays 0. What you do about it depends on
+the field, which is why the advice does too. Two patient IDs will mis-file a
+patient; two accession numbers usually means an order was corrected mid-study
+and no image is at risk.
+
+#### `--json`
+
+For scripting. One study, trimmed of the series array:
+
+```json
+{
+  "schema": "dcm.result/1",
+  "schemaVersion": 1,
+  "command": "info",
+  "outcome": "ok",
+  "ok": true,
+  "exitCode": 0,
+  "message": "823 instance(s) across 1 study(ies).",
+  "path": "/data/study",
+  "filesExamined": 824,
+  "dicomInstances": 823,
+  "unreadable": 1,
+  "ignored": 0,
+  "totalBytes": 432717824,
+  "studies": [
+    {
+      "studyInstanceUid": "1.2.840.113619.2.55.3.604688.1",
+      "patientName": "DOE^JANE",
+      "patientNames": ["DOE^JANE"],
+      "patientId": null,
+      "patientIds": ["12345", "00012345"],
+      "studyDescription": "CHEST W CONTRAST",
+      "studyDescriptions": ["CHEST W CONTRAST"],
+      "accessionNumber": "A2026-00417",
+      "accessionNumbers": ["A2026-00417"],
+      "studyDate": "20260115",
+      "modalities": ["CT"],
+      "transferSyntaxes": ["1.2.840.10008.1.2.1"],
+      "sopClasses": ["1.2.840.10008.5.1.4.1.1.2"],
+      "seriesCount": 7,
+      "instanceCount": 823,
+      "bytes": 432717824,
+      "associationsAtChunkSize": 5,
+      "series": []
+    }
+  ],
+  "readErrors": [{ "path": "/data/study/truncated.dcm", "error": "..." }]
+}
+```
+
+Those four fields are always a pair, and both keys are always present, so you
+never have to tell a missing key from a null one:
+
+| singular | plural | means |
+| --- | --- | --- |
+| `"DOE^JANE"` | `["DOE^JANE"]` | every instance that carries one agrees |
+| `null` | `[]` | no instance carries one |
+| `null` | two or more values | they disagree, in first-seen order |
+
+The study above is the third case for `patientId` and the first for the other
+three. `studyDate` is not one of the four: it's context rather than identity,
+and a study spanning midnight would raise a conflict with no repair.
 
 ### dcm tags
 

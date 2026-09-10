@@ -18,6 +18,8 @@ const https = require('node:https');
 const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
 
+const tagLib = require('./tags');
+
 const args = require('./args');
 const log = require('./log');
 
@@ -519,19 +521,28 @@ function tagValue(obj, tag) {
 }
 
 /**
- * Person name as its Alphabetic component group — the form PN takes in
- * DICOM JSON is an object, not a bare string, and some servers send the
- * bare string anyway. Handles both.
+ * Builds a Person Name attribute the way DICOM JSON represents one.
  *
- * @param {object} obj DICOM JSON dataset.
- * @param {string} tag
- * @returns {string|undefined}
+ * PN is the one VR whose JSON form is not a string. PS3.18 F.2.2 requires each
+ * component group to be its own key — `{"Alphabetic": "Yamada^Tarou",
+ * "Ideographic": "山田^太郎"}` — and, because the key already says which group
+ * a string is, a group's string may not contain the `=` that separates groups
+ * in the Part 10 form. Putting a whole `A=B=C` name into the Alphabetic key
+ * produces JSON that parses and is wrong: a conforming reader takes the
+ * separators as part of the family name.
+ *
+ * Takes any of the forms a PN turns up in — the joined Part 10 string, the
+ * dcmjs object, an array holding one — so callers hand over what they have
+ * rather than converting first. An ordinary single-group name comes out as
+ * exactly `{Alphabetic: 'DOE^JANE'}`, and an absent one as a bare `{vr: 'PN'}`
+ * with no Value at all, which is how DICOM JSON spells empty.
+ *
+ * @param {*} value
+ * @returns {{vr: 'PN', Value?: Array<object>}}
  */
-function personName(obj, tag) {
-  const value = tagValue(obj, tag);
-  if (value === undefined || value === null) return undefined;
-  if (typeof value === 'object') return value.Alphabetic;
-  return String(value);
+function pnAttr(value) {
+  const groups = tagLib.personNameGroups(value);
+  return Object.keys(groups).length ? { vr: 'PN', Value: [groups] } : { vr: 'PN' };
 }
 
 /**
@@ -592,6 +603,6 @@ module.exports = {
   translateTransportFailure,
   attr,
   tagValue,
-  personName,
+  pnAttr,
   TAGS,
 };
