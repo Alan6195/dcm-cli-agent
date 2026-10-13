@@ -99,12 +99,15 @@ const BUDGET = {
   send: 24,
   receive: 15,
   query: 13,            // ratcheted when the level became three chips (no Worklist, no "Level")
-  echo: 10,
-  webping: 6,
-  websend: 13,
+  // Ratcheted when the per-screen copies of the Settings defaults went
+  // (timeouts, retries, chunk sizes, recursion) and Hub's root folder and
+  // Speed test's prefix and chunk size moved under Advanced.
+  echo: 6,
+  webping: 2,
+  websend: 7,
   webquery: 17,
-  webhub: 26,
-  inventory: 15,
+  webhub: 25,
+  inventory: 12,
   tags: 22,
   // Rename is measured twice, like the station: the screen an operator walks
   // up to (a folder box and nothing else) and the screen they act on, with a
@@ -116,7 +119,7 @@ const BUDGET = {
   'rename-loaded': 34,
   edit: 30,
   anon: 25,
-  speed: 37,
+  speed: 32,
   mcp: 109,              // instructions, not a command: its own budget
   // Settings has none on purpose. It is the screen the other screens were
   // emptied into — set once, read once — and it runs no command, so there is
@@ -148,6 +151,15 @@ function freePort() {
       const { port } = srv.address();
       srv.close(() => resolve(String(port)));
     });
+  });
+}
+
+/** Whether nothing on this machine is listening on a given loopback port. */
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(false));
+    srv.listen(port, '127.0.0.1', () => srv.close(() => resolve(true)));
   });
 }
 
@@ -1394,40 +1406,59 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`the chip row's own line does not say the preset is off: ${override.hint}`);
       }
 
-      // Everything that moved under Advanced when this screen was trimmed is
-      // still named there the moment it is set, including what it inherits.
-      const advNames = await jsJSON(`(() => {
+      // What Advanced holds is named there the moment it is set. Retries, the
+      // timeout and recursion are not Advanced's any more: they are Settings
+      // values with no copy on this screen, and set once in Settings they
+      // reach the command all the same.
+      const advNames = await jsJSON(`(async () => {
         __smoke.set('send-parallel', '');
         __smoke.set('send-chunk', '');
-        __smoke.set('send-retry', '3');
-        __smoke.set('send-timeout', '45000');
+        __smoke.set('set-retry', '3');
+        __smoke.set('set-timeout', '45000');
+        __smoke.set('set-recurse', false);
         __smoke.set('send-syntax', 'jpeg2000');
-        __smoke.set('send-norecurse', true);
         __smoke.set('send-rewrite', true);
+        const d = () => state.settings.defaults;
+        for (let i = 0; i < 200 && !(d().retry === '3' && d().timeout === '45000' && d().recurse === false); i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
         return JSON.stringify({
+          committed: d(),
           sum: document.querySelector('#send-adv-sum').textContent,
           cmd: document.querySelector('#view-send [data-cmd]').textContent,
+          copies: ['send-retry', 'send-timeout', 'send-norecurse'].filter((id) => document.getElementById(id)),
         });
       })()`);
       say(`send advanced summary: ${advNames.sum}`);
       say(`send advanced command: ${advNames.cmd}`);
-      for (const flag of ['--retry 3', '--timeout 45000', '--transfer-syntax jpeg2000', '--no-recurse', '--rewrite-series-uid']) {
-        if (!advNames.cmd.includes(flag)) bad(`Advanced did not put ${flag} on the command: ${advNames.cmd}`);
-        if (!advNames.sum.includes(flag.split(' ')[0])) {
-          bad(`the folded summary does not name ${flag}: ${advNames.sum}`);
-        }
+      if (advNames.committed.retry !== '3' || advNames.committed.timeout !== '45000' || advNames.committed.recurse !== false) {
+        bad(`Settings did not take the defaults: ${JSON.stringify(advNames.committed)}`);
+      }
+      if (advNames.copies.length) bad(`Send still has its own copy of a Settings default: ${advNames.copies.join(', ')}`);
+      for (const flag of ['--retry 3', '--timeout 45000', '--no-recurse', '--transfer-syntax jpeg2000', '--rewrite-series-uid']) {
+        if (!advNames.cmd.includes(flag)) bad(`${flag} did not reach the send command: ${advNames.cmd}`);
+      }
+      for (const flag of ['--transfer-syntax', '--rewrite-series-uid']) {
+        if (!advNames.sum.includes(flag)) bad(`the folded summary does not name ${flag}: ${advNames.sum}`);
+      }
+      for (const flag of ['--retry', '--timeout', '--no-recurse']) {
+        if (advNames.sum.includes(flag)) bad(`the Advanced summary names ${flag}, which Advanced no longer holds: ${advNames.sum}`);
       }
 
-      // Put the screen back to a clean preset for anything that follows.
-      await js(`(() => {
-        for (const id of ['send-parallel', 'send-chunk', 'send-retry', 'send-timeout']) __smoke.set(id, '');
+      // Put Settings and the screen back to a clean preset for anything that follows.
+      await js(`(async () => {
+        __smoke.set('set-retry', '');
+        __smoke.set('set-timeout', '');
+        __smoke.set('set-recurse', true);
+        for (const id of ['send-parallel', 'send-chunk']) __smoke.set(id, '');
         __smoke.set('send-syntax', '');
-        __smoke.set('send-norecurse', false);
         __smoke.set('send-rewrite', false);
         document.querySelector('#send-adv').open = false;
         document.querySelector('#send-speed .chip[data-speed="insane"]').click();
         return true;
       })()`);
+      await mustWait("state.settings.defaults.retry === '' && state.settings.defaults.timeout === '' && state.settings.defaults.recurse === true",
+        8000, 'the Settings defaults to be cleared again');
 
       // The preset has to survive the whole way to the engine, so insane is
       // actually run — against this harness's own archive. Ten fixture
@@ -1546,6 +1577,45 @@ async function runSmoke(win, app, mainHelpers = {}) {
       record(`rehearsal: --dry-run reached ${gained.length} commands (${gained.join(', ')}); `
         + `the other ${Object.keys(on.argvs).length - gained.length} are byte-identical`);
       artefact('rehearsal-argvs.json', JSON.stringify({ before, after: on.argvs }, null, 2));
+
+      // Speed test has no --dry-run: a sweep is N real sends. Under the banner
+      // that says nothing is sent, it must not send. The button is dead and
+      // says why, and no other way in — the function itself, Ctrl+Enter —
+      // starts an engine child either.
+      const speedOff = await jsJSON(`(async () => {
+        showView('speed');
+        const btn = document.querySelector('#view-speed [data-run]');
+        const spawned = [];
+        const orig = runCapture;
+        runCapture = function (view, argv) { spawned.push(view + ': ' + argv.join(' ')); return orig.apply(null, arguments); };
+        try {
+          btn.click();
+          await runSpeedTest();
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+          await new Promise((r) => setTimeout(r, 400));
+        } finally {
+          runCapture = orig;
+        }
+        const chip = document.querySelector('#view-speed [data-status]');
+        return JSON.stringify({
+          disabled: btn.disabled, label: btn.textContent.trim(), spawned,
+          running: !!state.activeRuns.speed || speedRunning,
+          chip: chip.hidden ? '' : chip.textContent, cls: chip.className,
+        });
+      })()`);
+      await shot('speed-rehearsal-off');
+      record(`rehearsal: Speed test reads "${speedOff.label}" (disabled: ${speedOff.disabled}); `
+        + `${speedOff.spawned.length} engine children started by button, function and Ctrl+Enter`);
+      if (!speedOff.disabled || speedOff.label !== 'Off during rehearsal') {
+        bad(`Speed test is live under rehearsal: ${JSON.stringify(speedOff)}`);
+      }
+      if (speedOff.spawned.length || speedOff.running) {
+        bad(`Speed test sent for real under rehearsal: ${JSON.stringify(speedOff.spawned)}`);
+      }
+      if (!speedOff.cls.includes('warn') || !/rehearsal/i.test(speedOff.chip)) {
+        bad(`a speed test refused under rehearsal did not say why beside the button: ${speedOff.chip} [${speedOff.cls}]`);
+      }
+      await js("setStatus('speed', null); clearConsole('speed'); true");
       await js("showView('send'); true");
       await wait(200);
       await shot('send-rehearsal-banner');
@@ -1581,6 +1651,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad('turning rehearsal off did not restore every command exactly');
       }
       say('rehearsal: turned off from the banner; every command is back to what it was');
+      const speedBack = await jsJSON(`JSON.stringify({
+        disabled: document.querySelector('#view-speed [data-run]').disabled,
+        label: document.querySelector('#view-speed [data-run]').textContent.trim(),
+      })`);
+      if (speedBack.disabled || speedBack.label !== 'Run speed test') {
+        bad(`Speed test did not come back when rehearsal was turned off: ${JSON.stringify(speedBack)}`);
+      }
       await js('__smoke.set("edit-dryrun", true); true');
     }
 
@@ -1588,16 +1665,36 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // G. The speed-test sweep: the plan, and a table with a failed run in it.
     // =====================================================================
     {
+      // A calling AE per run is opt-in now (a prefix under Advanced), so the
+      // distinct-AE checks below type one. Blank, every run calls as the
+      // station — checked further down.
       const sweep = await jsJSON(`(() => {
         showView('speed');
         __smoke.set('speed-folder', ${JSON.stringify(fixtures || 'C:/smoke/study')});
+        __smoke.set('speed-aeprefix', 'AST');
         document.querySelector('#speed-mode .chip[data-mode="parallel"]').click();
         return JSON.stringify({
           hint: document.querySelector('#speed-parallel-hint').textContent,
           cmds: Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent),
           titles: Array.from(document.querySelectorAll('#speed-progress .run-line span:first-child')).map((e) => e.textContent),
+          progressHidden: document.querySelector('#speed-progress').hidden,
+          fold: document.querySelector('#view-speed [data-cmd]').textContent,
+          sum: document.querySelector('#view-speed .cmd-sum').textContent,
+          advSum: document.querySelector('#speed-adv-sum').textContent,
+          advOpen: document.querySelector('#speed-adv').open,
         });
       })()`);
+      // The plan is the fold under the button now — every command, one per
+      // line, and the folded summary is the same text. The progress list is
+      // for a sweep in flight, so it is not on screen before one.
+      if (!sweep.progressHidden) bad('the sweep\'s progress list is on screen before any sweep has run');
+      if (sweep.fold !== sweep.cmds.join('\n')) {
+        bad(`the command fold does not carry every command in the sweep:\n  fold: ${JSON.stringify(sweep.fold)}\n  plan: ${JSON.stringify(sweep.cmds)}`);
+      }
+      if (sweep.sum !== sweep.fold) bad(`the folded summary is not the sweep's commands: ${JSON.stringify(sweep.sum)}`);
+      if (sweep.advOpen || !/calling AE prefix AST/.test(sweep.advSum)) {
+        bad(`Speed test's Advanced folds away the prefix without naming it: ${JSON.stringify(sweep.advSum)}`);
+      }
       await wait(300);
       await shot('speed-preset-sweep');
       sweep.cmds.forEach((c) => say(`sweep run: ${c}`));
@@ -1655,6 +1752,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
 
       // A typed chunk size beats every preset, so the screen has to say so
       // before the benchmark rather than after it.
+      // The chunk size lives under Speed test's Advanced now. Folded, it is
+      // still named on the fold, and the line under the presets still warns.
       const capped = await jsJSON(`(() => {
         __smoke.set('speed-parallels', '');
         __smoke.set('speed-chunk', '200');
@@ -1662,13 +1761,20 @@ async function runSmoke(win, app, mainHelpers = {}) {
           hint: document.querySelector('#speed-parallel-hint').textContent,
           live: document.querySelector('#speed-parallel-hint').classList.contains('live'),
           first: document.querySelector('#speed-progress .run-cmd').textContent,
+          inAdv: !!document.querySelector('#speed-adv #speed-chunk') && !!document.querySelector('#speed-adv #speed-aeprefix'),
+          advSum: document.querySelector('#speed-adv-sum').textContent,
+          advChanged: document.querySelector('#speed-adv-sum').classList.contains('changed'),
         });
       })()`);
       say(`sweep, chunk typed: ${JSON.stringify(capped)}`);
-      if (!capped.live || !capped.hint.includes('override')) {
+      if (!capped.live || !capped.hint.includes('override') || !capped.hint.includes('under Advanced')) {
         bad(`a typed chunk size overrides the presets silently: ${capped.hint}`);
       }
       if (!capped.first.includes('--chunk 200')) bad(`the typed chunk size is not in the command: ${capped.first}`);
+      if (!capped.inAdv) bad('the calling AE prefix and chunk size are not under Speed test\'s Advanced');
+      if (!capped.advSum.includes('--chunk 200') || !capped.advChanged) {
+        bad(`Speed test's folded Advanced does not name the chunk size it holds: ${JSON.stringify(capped.advSum)}`);
+      }
 
       // The listed commands are a preview like any other, so they have to move
       // when the peer moves. Nothing in this box is touched by the peer chip,
@@ -1728,6 +1834,34 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!frozen.restored || frozen.lines !== 4) {
         bad(`the progress list did not come back after the sweep: ${JSON.stringify(frozen)}`);
       }
+
+      // No prefix: every run calls as this station — the calling AE the chip
+      // on this screen names, the one Send uses. The chip used to say one AE
+      // while the sweep sent four others.
+      const truthful = await jsJSON(`(() => {
+        __smoke.set('speed-aeprefix', '');
+        return JSON.stringify({
+          cmds: Array.from(document.querySelectorAll('#speed-progress .run-cmd')).map((e) => e.textContent),
+          chip: __smoke.chips('#view-speed')[0].from,
+          own: state.conn.callingAe,
+          send: BUILDERS.send().join(' '),
+          advSum: document.querySelector('#speed-adv-sum').textContent,
+        });
+      })()`);
+      say(`sweep with no prefix: ${truthful.cmds[0]}`);
+      if (!truthful.own) bad('the archive peer has no calling AE to check the sweep against');
+      if (truthful.chip !== `← ${truthful.own}`) bad(`the Speed test chip does not name the station: ${truthful.chip}`);
+      for (const c of truthful.cmds) {
+        const sent = (c.match(/--calling-ae (\S+)/) || [])[1];
+        if (sent !== truthful.own) bad(`a sweep run calls as ${sent}, not as the chip's ${truthful.own}: ${c}`);
+      }
+      if (!truthful.send.includes(`--calling-ae ${truthful.own}`)) {
+        bad(`Send and Speed test disagree about who this station is: ${truthful.send}`);
+      }
+      if (truthful.advSum !== '') {
+        bad(`the Advanced summary is not blank with nothing set under it: ${truthful.advSum}`);
+      }
+      record(`speed: with no prefix all ${truthful.cmds.length} runs call as ${truthful.own}, as the chip says`);
     }
 
     // ---------------------------------------------------------------------
@@ -1766,7 +1900,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
             megabytesPerSecond: 6.3, instancesPerSecond: 18.79, bytesSent: 35127296,
             studies: [{ instances: 100, chunks: 4 }] }) },
         // No parseable JSON at all: the other way a run can fail.
-        { run: { title: 'insane · 16 associations', callingAe: 'BENCH-4' }, code: 1, data: null },
+        { run: { title: 'insane · 16 associations', callingAe: 'BENCH-4' }, code: 1, data: null,
+          stderr: 'error Association rejected by 127.0.0.1:11112 (reason 2)\n' },
       ];
 
       const m = await jsJSON(`(() => {
@@ -1789,6 +1924,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
             ackWarned: !!tr.querySelector('td.ack .warn-inline'),
           })),
           notes: Array.from(document.querySelectorAll('#view-speed [data-result] .local-note')).map((e) => e.textContent),
+          noteWhy: Array.from(document.querySelectorAll('#view-speed [data-result] .local-note'))
+            .map((e) => !!e.querySelector('.linklike[data-help="speed-help"]')),
+          help: document.querySelector('#speed-help').textContent,
           // The colour each part of the result says "lost" in: the row's badge
           // and the heading of the note that explains it must be one colour.
           lossColours: (() => {
@@ -1868,6 +2006,19 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!m.notes.some((n) => /did not finish/.test(n) && /40 instances/.test(n))) {
         bad(`no note names the lost instances: ${JSON.stringify(m.notes)}`);
       }
+      // 7b. Each note is its one sentence and a Why into the help panel, and
+      //     the paragraph it used to carry is there, not gone.
+      if (!m.noteWhy.length || !m.noteWhy.every(Boolean)) bad(`a result note has no Why: ${JSON.stringify(m.notes)}`);
+      for (const n of m.notes) {
+        if (n.replace(/\s+/g, ' ').trim().length > 140) bad(`a result note is a paragraph again: ${n}`);
+      }
+      for (const needed of [/not eligible for FASTEST/, /fewer bytes over less time/, /N concurrent associations/, /run-to-run variation/]) {
+        if (!needed.test(m.help)) bad(`the speed help panel lost the explanation ${needed}`);
+      }
+      // 7c. A run with no result says why in its own row.
+      if (!/failed — Association rejected/.test(noJson.cells.join(' '))) {
+        bad(`the failed row does not carry the engine's reason: ${JSON.stringify(noJson.cells)}`);
+      }
       // 8. Lost instances read in one colour: the note is not amber under red rows.
       if (!m.lossColours.badge || m.lossColours.noteHead !== m.lossColours.badge) {
         bad(`the incomplete-runs note says the loss in a different colour from its rows: ${JSON.stringify(m.lossColours)}`);
@@ -1884,6 +2035,24 @@ async function runSmoke(win, app, mainHelpers = {}) {
       })()`);
       say(`all-incomplete chip: ${JSON.stringify(allBad)}`);
       if (allBad.kind !== 'fail') bad(`a sweep with nothing completed is not marked failed: ${JSON.stringify(allBad)}`);
+
+      // Every run the same transfer: there is no winner, so nothing is badged
+      // — not even TIED FASTEST — and the note says why.
+      const allTied = await jsJSON(`(() => {
+        const one = ${JSON.stringify(fixture[2])};
+        const results = [1, 2, 3].map((n) => ({ ...one, run: { title: 'run ' + n, callingAe: 'CT01' } }));
+        renderSpeedResults(results);
+        const box = document.querySelector('#view-speed [data-result]');
+        return JSON.stringify({
+          badges: Array.from(box.querySelectorAll('.badge-best')).map((e) => e.textContent),
+          notes: Array.from(box.querySelectorAll('.local-note')).map((e) => e.textContent),
+        });
+      })()`);
+      say(`all-tied sweep: ${JSON.stringify(allTied)}`);
+      if (allTied.badges.length) bad(`a sweep in which every run tied still badges: ${JSON.stringify(allTied.badges)}`);
+      if (!allTied.notes.some((n) => /resolved to the same transfer/.test(n))) {
+        bad(`an all-tied sweep does not say why nothing is badged: ${JSON.stringify(allTied.notes)}`);
+      }
 
       // Put the screen back the way the live run further down expects it.
       await js(`(() => {
@@ -2531,33 +2700,44 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await js(`__smoke.set('mpps-folder', ${JSON.stringify(fixtures)}); true`);
       await waitFolder();
 
-      // Details holds the per-run overrides. Folding them away must not fold
-      // away what they will send, so the summary beside the triangle names
-      // anything set — and the command below the button carries it.
-      const details = await jsJSON(`(() => {
-        __smoke.set('mpps-chunk', '50');
-        __smoke.set('mpps-retrieveae', 'ARCH');
+      // Details holds the three Performed-step fields and nothing else. A
+      // field typed over the row's is named on the folded summary, and the
+      // command carries it. Chunk size and the retrieve AE are Settings
+      // values: set there, they reach the perform all the same.
+      const details = await jsJSON(`(async () => {
+        const until = async (ok) => { for (let i = 0; i < 200 && !ok(); i++) await new Promise((r) => setTimeout(r, 20)); };
         __smoke.set('mpps-stepdesc', 'Desc X');
+        __smoke.set('set-chunk', '50');
+        __smoke.set('set-retrieve-ae', 'ARCH');
+        // state.settings moves on the change event; the previews are rebuilt once
+        // the file is saved, so wait for the command rather than the state.
+        const cmdNow = () => document.querySelector('#mpps-cmd').textContent;
+        await until(() => cmdNow().includes('--chunk 50') && cmdNow().includes('--retrieve-ae ARCH'));
         const out = { sum: document.querySelector('#mpps-adv-sum').textContent,
-          cmd: document.querySelector('#mpps-cmd').textContent };
-        __smoke.set('mpps-chunk', '');
-        __smoke.set('mpps-retrieveae', '');
+          cmd: document.querySelector('#mpps-cmd').textContent,
+          fields: Array.from(document.querySelectorAll('#mpps-adv input, #mpps-adv select')).map((e) => e.id) };
+        __smoke.set('set-chunk', '');
+        __smoke.set('set-retrieve-ae', '');
         __smoke.set('mpps-stepdesc', 'Chest 2 View');
+        await until(() => state.settings.defaults.chunk === '' && state.settings.defaults.retrieveAe === ''
+          && !cmdNow().includes('--chunk') && !cmdNow().includes('--retrieve-ae'));
         out.restored = document.querySelector('#mpps-cmd').textContent;
         return JSON.stringify(out);
       })()`);
       say(`station Details: ${details.sum}`);
-      for (const needed of ['chunk 50', 'retrieve AE ARCH', 'Desc X']) {
-        if (!details.sum.includes(needed)) bad(`the Details summary hides ${needed}: ${details.sum}`);
+      if (JSON.stringify(details.fields) !== JSON.stringify(['mpps-stepid', 'mpps-stationae', 'mpps-stepdesc'])) {
+        bad(`Details holds more than the three Performed-step fields: ${JSON.stringify(details.fields)}`);
       }
+      if (!details.sum.includes('Desc X')) bad(`the Details summary hides Desc X: ${details.sum}`);
+      if (/chunk|retrieve AE/.test(details.sum)) bad(`the Details summary names a Settings value it does not hold: ${details.sum}`);
       for (const needed of ['--chunk 50', '--retrieve-ae ARCH', '--step-description "Desc X"']) {
-        if (!details.cmd.includes(needed)) bad(`Details did not reach the command: ${details.cmd}`);
+        if (!details.cmd.includes(needed)) bad(`${needed} did not reach the perform command: ${details.cmd}`);
       }
       if (!/attributes/.test(details.sum)) {
         bad(`the Details summary does not count what the SCP returned: ${details.sum}`);
       }
       for (const gone of ['--chunk', '--retrieve-ae']) {
-        if (details.restored.includes(gone)) bad(`clearing a Details field left ${gone} on the command`);
+        if (details.restored.includes(gone)) bad(`clearing the Settings default left ${gone} on the command`);
       }
 
       // Rehearsal, on the one screen where the button says what it will do.
@@ -3843,9 +4023,21 @@ async function runSmoke(win, app, mainHelpers = {}) {
           console: __smoke.consoleText('speed'),
           progress: Array.from(document.querySelectorAll('#speed-progress .run-line')).map((e) => e.textContent),
           status: document.querySelector('#view-speed [data-status]').textContent,
+          progressHidden: document.querySelector('#speed-progress').hidden,
+          tableShown: !document.querySelector('#view-speed [data-result]').hidden,
+          own: state.conn.callingAe,
         });
       })()`);
       artefact('speed-table.json', JSON.stringify(t, null, 2));
+      // The table is the result; the progress list was the progress.
+      if (!t.tableShown || !t.progressHidden) {
+        bad(`after the sweep the progress list is still up beside the table: ${JSON.stringify({ table: t.tableShown, progressHidden: t.progressHidden })}`);
+      }
+      // No prefix was typed, so every run called as the station.
+      const aeCol = t.headers.indexOf('Calling AE');
+      if (aeCol < 0 || !t.rows.every((r) => r[aeCol] === t.own)) {
+        bad(`the live sweep did not call as the station (${t.own}): ${JSON.stringify(t.rows.map((r) => r[aeCol]))}`);
+      }
       record(`live sweep: ${t.status}, ${t.rows.length} rows`);
       t.rows.forEach((r) => say(`speed row: ${JSON.stringify(r)}`));
       t.notes.forEach((n) => say(`speed note: ${n}`));
@@ -3877,6 +4069,254 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!t.progress.some((p) => /of \d+ wide/.test(p))) {
         bad(`the progress lines report rates with no width: ${JSON.stringify(t.progress)}`);
       }
+    }
+
+    // =====================================================================
+    // I2. Test buttons that test, servers that say how they stopped, and the
+    //     DICOMweb tabs against the app's own hub.
+    // =====================================================================
+    {
+      // --- Every way into Echo is a button that says Test, and it tests.
+      const echoDone = "(() => { const c = document.querySelector('#view-echo [data-status]'); "
+        + "return !c.hidden && !c.className.includes('running'); })()";
+      const fromSettings = await jsJSON(`(() => {
+        setStatus('echo', null);
+        showView('settings');
+        const btn = Array.from(document.querySelectorAll('[data-peer-test]'))
+          .find((b) => b.dataset.peerTest === ${JSON.stringify(ARCHIVE_PEER)});
+        if (!btn) return JSON.stringify({ missing: true });
+        btn.click();
+        const chip = document.querySelector('#view-echo [data-status]');
+        return JSON.stringify({ view: state.activeView, started: !chip.hidden && chip.className.includes('running'),
+          backLink: !!document.querySelector('#view-echo [data-goto]'),
+          timeout: !!document.querySelector('#echo-timeout') });
+      })()`);
+      if (fromSettings.missing) bad('Settings has no Test button for the archive peer');
+      if (fromSettings.view !== 'echo' || !fromSettings.started) {
+        bad(`Settings' Test opened Echo without testing: ${JSON.stringify(fromSettings)}`);
+      }
+      if (fromSettings.backLink) bad('Echo still carries its "← Settings" link');
+      if (fromSettings.timeout) bad('Echo still has its own copy of the Settings timeout');
+      await mustWait(echoDone, RUN_MS, "Settings' Test to finish");
+      const echo1 = await jsJSON(`JSON.stringify({ text: document.querySelector('#view-echo [data-status]').textContent,
+        cls: document.querySelector('#view-echo [data-status]').className,
+        cmd: document.querySelector('#view-echo [data-cmd]').textContent })`);
+      await shot('echo-from-settings-test');
+      record(`echo: Settings' Test ran it — ${echo1.text}`);
+      if (echo1.text !== 'Reachable' || !echo1.cls.includes('ok')) bad(`Settings' Test did not reach the archive: ${JSON.stringify(echo1)}`);
+      if (!echo1.cmd.includes(`--port ${archivePort}`)) bad(`Settings' Test tested another peer: ${echo1.cmd}`);
+
+      const fromChip = await jsJSON(`(() => {
+        setStatus('echo', null);
+        showView('send');
+        document.querySelector('#view-send .peer-chip-btn').click();
+        document.querySelector('#view-send [data-peer-echo]').click();
+        const chip = document.querySelector('#view-echo [data-status]');
+        return JSON.stringify({ view: state.activeView, started: !chip.hidden && chip.className.includes('running') });
+      })()`);
+      if (fromChip.view !== 'echo' || !fromChip.started) {
+        bad(`the chip's "Test connection…" opened Echo without testing: ${JSON.stringify(fromChip)}`);
+      }
+      await mustWait(echoDone, RUN_MS, "the chip's Test connection to finish");
+      const echo2 = await jsJSON(`JSON.stringify({ text: document.querySelector('#view-echo [data-status]').textContent,
+        cmd: document.querySelector('#view-echo [data-cmd]').textContent })`);
+      if (echo2.text !== 'Reachable' || !echo2.cmd.includes(`--port ${archivePort}`)) {
+        bad(`the chip's Test connection did not test the archive it showed: ${JSON.stringify(echo2)}`);
+      }
+
+      // --- A receiver whose port is taken never says Listening, and ends red
+      //     with the engine's reason (it exits 0, which used to read as a green
+      //     "Stopped"). The harness's own Archive holds archivePort.
+      const watchChip = (pane) => `(() => {
+        const chip = document.querySelector('#view-${pane} [data-status]');
+        if (window.__chipObs) window.__chipObs.disconnect();
+        window.__chipLog = [];
+        window.__chipObs = new MutationObserver(() => window.__chipLog.push(chip.textContent));
+        window.__chipObs.observe(chip, { childList: true, characterData: true, subtree: true });
+        return true;
+      })()`;
+      const chipNow = (pane) => `JSON.stringify({ text: document.querySelector('#view-${pane} [data-status]').textContent,
+        cls: document.querySelector('#view-${pane} [data-status]').className, log: window.__chipLog.slice() })`;
+      const notRunning = (pane) => `!document.querySelector('#view-${pane} [data-status]').className.includes('running')`;
+      await js(`(() => { showView('receive'); __smoke.set('scp-port', ${JSON.stringify(String(archivePort))}); return true; })()`);
+      await js(watchChip('receive'));
+      await js("document.querySelector('#view-receive [data-run]').click(); true");
+      await mustWait(notRunning('receive'), RUN_MS, 'the receiver on a taken port to end');
+      const taken = await jsJSON(chipNow('receive'));
+      await shot('receive-port-taken');
+      record(`receive on a taken port: ${taken.text} [${taken.cls}]`);
+      if (!taken.cls.includes('fail') || !/EADDRINUSE|in use/i.test(taken.text)) {
+        bad(`a receiver whose port was taken did not end red with the reason: ${JSON.stringify(taken)}`);
+      }
+      if (taken.log.includes('Listening')) bad(`a receiver that never bound its port said Listening: ${JSON.stringify(taken.log)}`);
+
+      // --- A receiver that binds says so, and Stop is neutral, not a result.
+      const scpPort = await freePort();
+      await js(`(() => { __smoke.set('scp-port', '${scpPort}'); return true; })()`);
+      await js(watchChip('receive'));
+      await js("document.querySelector('#view-receive [data-run]').click(); true");
+      await mustWait("document.querySelector('#view-receive [data-status]').textContent === 'Listening'", RUN_MS,
+        'the receiver to say it is listening');
+      await js("document.querySelector('#view-receive [data-cancel]').click(); true");
+      await mustWait(notRunning('receive'), 30000, 'the receiver to stop');
+      const stopped = await jsJSON(chipNow('receive'));
+      await shot('receive-stopped');
+      record(`receive stopped by the operator: ${stopped.text} [${stopped.cls}] after ${JSON.stringify(stopped.log)}`);
+      if (stopped.log[0] !== 'Starting…') bad(`the receiver said ${stopped.log[0]} before it was listening`);
+      if (stopped.text !== 'Stopped' || !stopped.cls.includes('idle')) {
+        bad(`a receiver the operator stopped does not read as a neutral Stopped: ${JSON.stringify(stopped)}`);
+      }
+      await js("(() => { __smoke.set('scp-port', ''); setStatus('receive', null); return true; })()");
+
+      // --- The hub: a blank port is 10808, the root folder is under Advanced.
+      const blank = await jsJSON(`(() => {
+        showView('web'); showTab('web', 'webhub');
+        __smoke.set('webhub-port', '');
+        __smoke.set('webhub-root', '');
+        const argv = BUILDERS.webhub();
+        __smoke.set('webhub-root', 'C:/smoke/served');
+        const out = {
+          argv,
+          withRoot: BUILDERS.webhub(),
+          base: document.querySelector('#webhub-baseurl').textContent,
+          rootInAdv: !!document.querySelector('#webhub-adv #webhub-root'),
+          advSum: document.querySelector('#webhub-adv-sum').textContent,
+        };
+        __smoke.set('webhub-root', '');
+        out.advSumAfter = document.querySelector('#webhub-adv-sum').textContent;
+        return JSON.stringify(out);
+      })()`);
+      say(`hub at a blank port: ${blank.argv.join(' ')} — ${blank.base}`);
+      if (blank.argv.join(' ') !== 'web serve --port 10808') bad(`a blank hub port is not 10808 on the command: ${blank.argv.join(' ')}`);
+      if (!blank.base.includes('http://127.0.0.1:10808')) bad(`the hub does not say where clients point: ${blank.base}`);
+      if (!blank.rootInAdv) bad('the hub\'s "Pre-populate index from" is not under Advanced');
+      if (blank.withRoot.join(' ') !== 'web serve --port 10808 --root C:/smoke/served') {
+        bad(`the root folder under Advanced did not reach the command: ${blank.withRoot.join(' ')}`);
+      }
+      if (!blank.advSum.includes('C:/smoke/served') || blank.advSumAfter !== '') {
+        bad(`the hub's folded Advanced does not name the folder it serves: ${JSON.stringify(blank)}`);
+      }
+
+      // The run itself goes to 10808 when nothing else holds it; otherwise a
+      // typed port, and the blank case stands on the command checked above.
+      const hubPort = (await portIsFree(10808)) ? '' : await freePort();
+      const hubUrl = `http://127.0.0.1:${hubPort || '10808'}`;
+      say(hubPort ? `hub: 10808 is taken on this machine, running on ${hubPort}` : 'hub: running at the blank-port default, 10808');
+      const webUrlBefore = await js('state.web.url');
+      const startHub = async (token) => {
+        await js(`(() => { showView('web'); showTab('web', 'webhub');
+          __smoke.set('webhub-port', ${JSON.stringify(hubPort)}); __smoke.set('webhub-token', ${JSON.stringify(token)}); return true; })()`);
+        await js(watchChip('webhub'));
+        await js("document.querySelector('#view-webhub [data-run]').click(); true");
+        await mustWait("document.querySelector('#view-webhub [data-status]').textContent === 'Listening'", RUN_MS,
+          'the hub to say it is listening');
+        const log = await jsJSON(chipNow('webhub'));
+        if (log.log[0] !== 'Starting…') bad(`the hub said ${log.log[0]} before it was listening`);
+        await js("document.querySelector('#webhub-use').click(); true");
+        if ((await js('state.web.url')) !== hubUrl) bad(`"use it on the other tabs" did not point them at ${hubUrl}`);
+      };
+      const stopHub = async () => {
+        await js("(() => { showTab('web', 'webhub'); document.querySelector('#view-webhub [data-cancel]').click(); return true; })()");
+        await mustWait(notRunning('webhub'), 30000, 'the hub to stop');
+        return jsJSON(chipNow('webhub'));
+      };
+      const search = async () => {
+        await js("(() => { showTab('web', 'webquery'); document.querySelector('#view-webquery [data-run]').click(); return true; })()");
+        await mustWait(notRunning('webquery'), RUN_MS, 'the DICOMweb search to answer');
+        return jsJSON(`JSON.stringify({
+          text: document.querySelector('#view-webquery [data-status]').textContent,
+          cls: document.querySelector('#view-webquery [data-status]').className,
+          shown: !document.querySelector('#view-webquery [data-result]').hidden,
+          box: document.querySelector('#view-webquery [data-result]').textContent,
+          said: (document.querySelector('#view-webquery [data-result] .engine-said') || {}).textContent || '',
+          rows: document.querySelectorAll('#view-webquery [data-result] tbody tr').length,
+          button: document.querySelector('#view-webquery [data-run]').textContent.trim(),
+        })`);
+      };
+
+      await startHub('');
+      await shot('webhub-listening');
+      // An empty hub answers properly with nothing: green, "No matches", and
+      // nothing drawn under it saying so a second time.
+      const empty = await search();
+      record(`webquery on an empty hub: ${empty.text}`);
+      if (empty.button !== 'Search') bad(`DICOMweb Query's button is not "Search": ${empty.button}`);
+      if (empty.text !== 'No matches' || !empty.cls.includes('ok') || empty.shown) {
+        bad(`an empty answer does not read as a green "No matches": ${JSON.stringify(empty)}`);
+      }
+
+      if (fixtures) {
+        // DICOMweb Send keeps Send's accounting and Send's words.
+        await js(`(() => { showTab('web', 'websend'); __smoke.set('websend-folder', ${JSON.stringify(fixtures)});
+          document.querySelector('#view-websend [data-run]').click(); return true; })()`);
+        await mustWait(notRunning('websend'), RUN_MS, 'the STOW-RS send to the hub to finish');
+        const stow = await jsJSON(`JSON.stringify({
+          text: document.querySelector('#view-websend [data-status]').textContent,
+          cls: document.querySelector('#view-websend [data-status]').className,
+          totalsShown: !document.querySelector('#view-websend [data-totals]').hidden,
+          nums: Array.from(document.querySelectorAll('#view-websend [data-totals] .num')).map((e) => e.textContent),
+          labels: Array.from(document.querySelectorAll('#view-websend [data-totals] .lbl')).map((e) => e.textContent),
+          copies: ['websend-chunk', 'websend-retry', 'websend-timeout'].filter((id) => document.getElementById(id)),
+        })`);
+        await shot('websend-hub-totals');
+        record(`websend to the hub: ${stow.text} — ${stow.nums.join('/')}`);
+        if (stow.text !== 'All acknowledged' || !stow.cls.includes('ok')) bad(`a complete STOW-RS send does not say All acknowledged: ${JSON.stringify(stow)}`);
+        if (!stow.totalsShown || stow.nums.length !== 3 || new Set(stow.nums).size !== 1 || !(Number(stow.nums[0]) > 0)) {
+          bad(`DICOMweb Send has no found / sent / acknowledged totals: ${JSON.stringify(stow)}`);
+        }
+        if (JSON.stringify(stow.labels) !== JSON.stringify(['files found', 'files sent', 'acknowledged'])) {
+          bad(`DICOMweb Send's totals are not Send's: ${JSON.stringify(stow.labels)}`);
+        }
+        if (stow.copies.length) bad(`DICOMweb Send still has its own copy of a Settings default: ${stow.copies.join(', ')}`);
+
+        const found = await search();
+        await shot('webquery-hub-matches');
+        record(`webquery after the send: ${found.text}, ${found.rows} row(s)`);
+        if (!/^\d+ match(es)?$/.test(found.text) || !found.cls.includes('ok') || !found.rows) {
+          bad(`a search with matches does not read as "N matches" over a table: ${JSON.stringify(found)}`);
+        }
+        if (/match\(es\)/.test(found.box)) bad(`the table still repeats the chip's count: ${found.box.slice(0, 80)}`);
+      }
+
+      const hubStopped = await stopHub();
+      await shot('webhub-stopped');
+      record(`hub stopped by the operator: ${hubStopped.text} [${hubStopped.cls}]`);
+      if (hubStopped.text !== 'Stopped' || !hubStopped.cls.includes('idle')) {
+        bad(`a hub the operator stopped does not read as a neutral Stopped: ${JSON.stringify(hubStopped)}`);
+      }
+
+      // Nothing listening any more: a failure, said where the answer goes, and
+      // never "0 matches" or "No matches".
+      const dead = await search();
+      await shot('webquery-dead');
+      record(`webquery against a server that is gone: ${dead.text} — ${dead.box.slice(0, 80)}`);
+      if (dead.text !== 'Failed' || !dead.cls.includes('fail')) bad(`a search nobody answered is not a red Failed: ${JSON.stringify(dead)}`);
+      if (!dead.shown || !/The server did not answer\./.test(dead.box) || !dead.said.trim()) {
+        bad(`a search nobody answered does not say so with the engine's words: ${JSON.stringify(dead)}`);
+      }
+      if (/0 matches|No matches/.test(dead.box + dead.text)) bad(`a dead server reads as an empty answer: ${JSON.stringify(dead)}`);
+
+      // An HTTP error is not an answer either: a hub that wants a token the
+      // app does not send answers 401.
+      await startHub('smoke-token');
+      const refused = await search();
+      await shot('webquery-401');
+      record(`webquery refused with 401: ${refused.text} — ${refused.box.slice(0, 80)}`);
+      if (refused.text !== 'Failed' || !refused.cls.includes('fail') || !/The search failed \(HTTP 401\)\./.test(refused.box)) {
+        bad(`an HTTP 401 does not read as a failed search: ${JSON.stringify(refused)}`);
+      }
+      if (/0 matches|No matches/.test(refused.box + refused.text)) bad(`an HTTP 401 reads as an empty answer: ${JSON.stringify(refused)}`);
+      await stopHub();
+      await js(`(() => {
+        if (window.__chipObs) window.__chipObs.disconnect();
+        __smoke.set('webhub-port', ''); __smoke.set('webhub-token', ''); __smoke.set('websend-folder', '');
+        state.web.url = ${JSON.stringify(webUrlBefore)}; renderWebChips(); updateAllPreviews();
+        for (const v of ['webhub', 'webquery', 'websend']) setStatus(v, null);
+        document.querySelector('#view-webquery [data-result]').hidden = true;
+        document.querySelector('#view-websend [data-totals]').hidden = true;
+        showTab('web', 'webping');
+        return true;
+      })()`);
     }
 
     // =====================================================================
@@ -5157,7 +5597,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         ['scp-persist', "showView('receive')"],
         ['websend-folder', "showView('web'); showTab('web', 'websend')"],
         ['webhub-persist', "showView('web'); showTab('web', 'webhub')"],
-        ['webhub-root', "showView('web'); showTab('web', 'webhub')"],
+        ['webhub-root', "showView('web'); showTab('web', 'webhub'); document.querySelector('#webhub-adv').open = true"],
         ['info-folder', "showView('tools'); showTab('tools', 'inventory')"],
         ['tags-target', "showView('tools'); showTab('tools', 'tags')"],
         ['rename-folder', "showView('tools'); showTab('tools', 'rename')"],

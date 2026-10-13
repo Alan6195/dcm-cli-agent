@@ -294,9 +294,8 @@ function wirePeerChips() {
     if (e.target.closest('[data-peer-echo]')) {
       // Test the peer this chip shows, whichever role it was shown in.
       const cur = currentProfile();
-      if (cur) state.peerChoice.echo = cur.name; else delete state.peerChoice.echo;
       closePeerMenus();
-      showView('echo');
+      testPeer(cur ? cur.name : '');
       return;
     }
     if (e.target.closest('[data-peer-settings]')) {
@@ -309,6 +308,18 @@ function wirePeerChips() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closePeerMenus();
   });
+}
+
+/**
+ * Opens the Echo screen on a peer and runs the test. Every way into this
+ * screen is a button that says Test, so landing on an idle screen with a
+ * second Test button to press was one click short of what was asked for.
+ */
+function testPeer(name) {
+  if (name) state.peerChoice.echo = name; else delete state.peerChoice.echo;
+  showView('echo');
+  const run = $('#view-echo [data-run]');
+  if (run && !run.disabled) run.click();
 }
 
 function connArgs() {
@@ -518,16 +529,29 @@ function rehearsal() {
 
 /**
  * A screen field's own value, or the Settings default for that flag when the
- * field is blank. Typed always wins, so a per-run override is still one field
- * away; blank everywhere means the flag stays off the command, exactly as it
- * did before Settings existed.
+ * field is blank. Only the speed knobs (Send's and Speed test's chunk size)
+ * still have a field of their own; everything else reads settingDefault().
  */
 function fieldOr(id, key) {
   const el = $(`#${id}`);
   const typed = el ? el.value.trim() : '';
-  if (typed) return typed;
+  return typed || settingDefault(key);
+}
+
+/**
+ * A Settings default, or '' when none is set — and then the flag stays off
+ * the command, exactly as it did before Settings existed. Retries, the
+ * timeout and the retrieve AE have no copy on any screen: they are set once,
+ * in Settings, and the command line says what is in force.
+ */
+function settingDefault(key) {
   const d = state.settings && state.settings.defaults;
   return d && d[key] ? String(d[key]) : '';
+}
+
+/** Whether a folder walk stays at the top level: the one Settings switch, on every screen. */
+function noRecurse() {
+  return !state.settings.defaults.recurse;
 }
 
 /** Paints the Settings form from state.settings. Called once, at boot. */
@@ -581,16 +605,14 @@ async function commitSettings() {
 /**
  * Everything outside the Settings screen that reads Settings, repainted.
  *
- * The station AE is re-derived onto state.conn, the screens' own
- * recurse/modality fields are re-seeded where nobody has typed in them, the
- * placeholders say what a blank field will send, the command folds open or
- * shut, and the banner comes or goes. Then every preview is rebuilt, because
- * every one of those can change a command.
+ * The station AE is re-derived onto state.conn, the placeholders say what a
+ * blank chunk size will send, the command folds open or shut, and the banner
+ * comes or goes. Then every preview is rebuilt, because every one of those
+ * can change a command.
  */
 function applySettings() {
   const cur = currentProfile();
   if (cur) state.conn.callingAe = callingAeFor(cur);
-  seedFromSettings();
   applyDefaultPlaceholders();
   applyCmdFold();
   renderRehearsal();
@@ -605,39 +627,15 @@ function applySettings() {
   updateAllPreviews();
 }
 
-/**
- * The Settings defaults that are checkboxes on a screen are seeded into the
- * screen's own control rather than read around it, so the builder keeps
- * reading one control and the operator can still flip it for one run. A
- * control someone has touched is theirs and is left alone.
- */
-function seedFromSettings() {
-  const noRecurse = !state.settings.defaults.recurse;
-  for (const id of ['send-norecurse', 'mpps-norecurse', 'info-norecurse']) {
-    const el = $(`#${id}`);
-    if (el && !el.dataset.touched) el.checked = noRecurse;
-  }
-}
-
-/** A blank field sends the Settings default, so the placeholder says which. */
+/** A blank chunk size sends the Settings default, so the placeholder says which. */
 function applyDefaultPlaceholders() {
   const d = state.settings.defaults;
   const ph = (id, key, fallback) => {
     const el = $(`#${id}`);
     if (el) el.placeholder = d[key] ? `${d[key]} (from Settings)` : fallback;
   };
-  ph('echo-timeout', 'timeout', '60000');
-  ph('send-retry', 'retry', '1');
-  ph('send-timeout', 'timeout', '60000');
   ph('send-chunk', 'chunk', 'from the preset');
-  ph('mpps-chunk', 'chunk', '200');
-  ph('mpps-retry', 'retry', '1');
-  ph('mpps-retrieveae', 'retrieveAe', 'ARCHIVE');
   ph('speed-chunk', 'chunk', 'each run decides');
-  ph('webping-timeout', 'timeout', '60000');
-  ph('websend-chunk', 'chunk', '50');
-  ph('websend-retry', 'retry', '1');
-  ph('websend-timeout', 'timeout', '60000');
 }
 
 /** The preview is never absent; the engineer option only says whether it starts unfolded. */
@@ -723,11 +721,6 @@ function wireSettings() {
     commitSettings();
   });
 
-  // The screen controls that Settings seeds stop being seeded once touched.
-  for (const id of ['send-norecurse', 'mpps-norecurse', 'info-norecurse']) {
-    $(`#${id}`).addEventListener('change', (e) => { e.target.dataset.touched = '1'; });
-  }
-
   // ----- the peer form -----
   $('#peer-save').addEventListener('click', async () => {
     const host = $('#peer-host').value.trim();
@@ -773,8 +766,7 @@ function wireSettings() {
   $('#set-peers').addEventListener('click', async (e) => {
     const test = e.target.closest('[data-peer-test]');
     if (test) {
-      state.peerChoice.echo = test.dataset.peerTest;
-      showView('echo');
+      testPeer(test.dataset.peerTest);
       return;
     }
     const edit = e.target.closest('[data-peer-edit]');
@@ -1557,7 +1549,7 @@ let consoleRunSeq = 0;
  * Run a command, streaming into the view's console.
  * @returns {Promise<{code:number, stdout:string, stderr:string}>}
  */
-function runStreaming(view, argv, { onExit } = {}) {
+function runStreaming(view, argv, { onExit, onChunk } = {}) {
   return new Promise(async (resolve) => {
     const out = makeBounded(RUN_STDOUT_LIMIT);
     const err = makeBounded(RUN_STDERR_LIMIT);
@@ -1568,6 +1560,7 @@ function runStreaming(view, argv, { onExit } = {}) {
       onChunk: (stream, text, dropped) => {
         if (stream === 'stdout') out.push(text); else err.push(text);
         appendConsole(view, text, stream === 'stdout' ? 'stdout' : 'narration', dropped, tag);
+        if (onChunk) onChunk(stream, text);
       },
       onExit: (code) => {
         // Only its own entry: a later run on the view has replaced it.
@@ -1700,16 +1693,19 @@ function syncRevealButtons() {
 function updateAllPreviews() {
   for (const [view, build] of Object.entries(BUILDERS)) {
     let argv;
-    try { argv = build(); setPreview(view, argv); } catch { continue; /* partial form */ }
+    // The sweep's fold holds every command in it, not just the first, and
+    // renderSpeedPlan below writes it.
+    try { argv = build(); if (view !== 'speed') setPreview(view, argv); } catch { continue; /* partial form */ }
     retireStaleResult(view, argv);
   }
   syncRevealButtons();
-  // The sweep's list of commands is a preview too — it just holds several
-  // commands rather than one, and it is built from the same peer connection.
-  // Refreshed from the same hook so that editing the peer, picking a saved
-  // profile, switching views or choosing a folder with Browse... cannot leave
-  // the listed commands missing flags the single preview above already shows.
+  // The sweep's commands are a preview too — several commands rather than
+  // one, built from the same peer connection. Refreshed from the same hook so
+  // that editing the peer, picking a saved profile, switching views or
+  // choosing a folder with Browse... cannot leave them missing a flag.
   try { renderSpeedPlan(); } catch { /* before the DOM is wired */ }
+  // Rehearsal is a Settings switch, and every change to Settings lands here.
+  try { renderSpeedRunButton(); } catch { /* before the DOM is wired */ }
   // The station's second verb has its own command, and it changes with the
   // same keystrokes the first one does.
   try { if (panelMode()) renderStartPreview(); } catch { /* before the DOM is wired */ }
@@ -1720,13 +1716,12 @@ function updateAllPreviews() {
 // --------------------------------------------------------------------------
 BUILDERS.echo = () => {
   const argv = ['echo', ...connArgs()];
-  const t = fieldOr('echo-timeout', 'timeout');
+  const t = settingDefault('timeout');
   if (t) argv.push('--timeout', t);
   return argv;
 };
 
 function wireEcho() {
-  $('#echo-timeout').addEventListener('input', updateAllPreviews);
   $('#view-echo [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
     clearConsole('echo');
@@ -1841,20 +1836,14 @@ function renderSendAdvSummary() {
     text = `— ${parts.join(' · ')} replaces that half of --speed ${speed}`;
   }
 
-  // Retries, the timeout, the transfer syntax and the two switches moved under
-  // here when this screen was trimmed. A flag folded away is still a flag on
-  // the command line, so each one is named the moment it is set — including
-  // the ones inherited from Settings, which are nobody's typing at all.
+  // The transfer syntax and Rewrite Series UIDs live under here too. A flag
+  // folded away is still a flag on the command line, so each one is named the
+  // moment it is set. Retries, the timeout and recursion are not here: they
+  // are Settings values with no copy on this screen, and the command line
+  // below the button carries them.
   const rest = [];
-  const flag = (id, key, name) => {
-    const v = fieldOr(id, key);
-    if (v) rest.push(`${name} ${v}${$(`#${id}`).value.trim() ? '' : ' (from Settings)'}`);
-  };
-  flag('send-retry', 'retry', '--retry');
-  flag('send-timeout', 'timeout', '--timeout');
   const syntax = $('#send-syntax').value;
   if (syntax) rest.push(`--transfer-syntax ${syntax}`);
-  if ($('#send-norecurse').checked) rest.push('--no-recurse');
   if ($('#send-rewrite').checked) rest.push('--rewrite-series-uid');
   if (rest.length) text += `${text ? ' · ' : '— '}${rest.join(' · ')}`;
 
@@ -1877,14 +1866,14 @@ BUILDERS.send = () => {
   if (!parallel) argv.push('--speed', sendSpeed());
   if (parallel) argv.push('--parallel', parallel);
   if (chunk) argv.push('--chunk', chunk);
-  const retry = fieldOr('send-retry', 'retry');
-  const timeout = fieldOr('send-timeout', 'timeout');
+  const retry = settingDefault('retry');
+  const timeout = settingDefault('timeout');
   if (retry) argv.push('--retry', retry);
   if (timeout) argv.push('--timeout', timeout);
   const syntax = $('#send-syntax').value;
   if (syntax) argv.push('--transfer-syntax', syntax);
   if (rehearsal()) argv.push('--dry-run');
-  if ($('#send-norecurse').checked) argv.push('--no-recurse');
+  if (noRecurse()) argv.push('--no-recurse');
   if ($('#send-rewrite').checked) argv.push('--rewrite-series-uid');
   return argv;
 };
@@ -1904,8 +1893,8 @@ function parseTotals(text) {
   };
 }
 
-function showTotals(t, ok) {
-  const box = $('#view-send [data-totals]');
+function showTotals(t, ok, view = 'send') {
+  const box = $(`#view-${view} [data-totals]`);
   if (t.found == null) { box.hidden = true; box.classList.remove('show'); return; }
   const cell = (n, lbl, cls = '') =>
     `<div class="total-card ${cls}"><div class="num">${n ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
@@ -1917,8 +1906,6 @@ function showTotals(t, ok) {
 
 function wireSend() {
   $('#send-folder').addEventListener('input', updateAllPreviews);
-  ['send-retry', 'send-timeout'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', () => { renderSendAdvSummary(); updateAllPreviews(); }));
   // The two override fields also move the Advanced summary, which is the only
   // thing on screen naming them while the disclosure is shut — and Parallel
   // decides whether the preset is on the command line at all, so the chip row
@@ -1941,8 +1928,7 @@ function wireSend() {
   renderSendSpeed();
   renderSendAdvSummary();
   $('#send-syntax').addEventListener('change', () => { renderSendAdvSummary(); updateAllPreviews(); });
-  ['send-norecurse', 'send-rewrite'].forEach((id) =>
-    $(`#${id}`).addEventListener('change', () => { renderSendAdvSummary(); updateAllPreviews(); }));
+  $('#send-rewrite').addEventListener('change', () => { renderSendAdvSummary(); updateAllPreviews(); });
 
   $('#view-send [data-run]').addEventListener('click', async () => {
     const folder = $('#send-folder').value.trim();
@@ -2008,20 +1994,53 @@ function renderReceiveAdvSummary() {
   el.classList.toggle('changed', parts.length > 0);
 }
 
+/**
+ * A server's chip says "Listening" once the engine says it is: both servers
+ * print a "listening on …" line when the socket is actually bound. Until then
+ * it is starting — and a receiver whose port is already taken never gets
+ * there; it writes the error and exits.
+ */
+function listeningWatch(view) {
+  let seen = false;
+  return (stream, text) => {
+    if (seen || !/\blistening\b/i.test(stripAnsi(String(text)))) return;
+    seen = true;
+    const chip = viewPart(view, 'status');
+    if (chip && chip.classList.contains('running')) setStatus(view, 'running', 'Listening');
+  };
+}
+
+/**
+ * How a server's run ended. Stopped by the operator is not a result, so it is
+ * neutral — unless the engine reported errors while it ran, which stay amber.
+ * Any other ending is a failure with the engine's reason: a receiver whose
+ * port is taken exits 0 with its error on stderr, and a green "Stopped" was
+ * how that used to read.
+ */
+function serverEnded(view, byUser, stderr) {
+  const errors = stripAnsi(String(stderr || '')).split('\n').filter((l) => /^error\s/.test(l)).length;
+  if (!byUser) setStatus(view, 'fail', failLabel(stderr));
+  else if (errors) setStatus(view, 'warn', `Stopped · ${errors} error${errors === 1 ? '' : 's'} in the output`);
+  else setStatus(view, 'idle', 'Stopped');
+}
+
 function wireReceive() {
   ['scp-port', 'scp-ae', 'scp-persist', 'scp-accept', 'scp-rejectafter'].forEach((id) =>
     $(`#${id}`).addEventListener('input', () => { renderReceiveAdvSummary(); updateAllPreviews(); }));
   renderReceiveAdvSummary();
 
+  let stoppedByUser = false;
   $('#view-receive [data-run]').addEventListener('click', async () => {
     clearConsole('receive');
-    setStatus('receive', 'running', 'Listening');
-    const { code } = await runStreaming('receive', BUILDERS.receive());
+    stoppedByUser = false;
+    setStatus('receive', 'running', 'Starting…');
+    const { stderr } = await runStreaming('receive', BUILDERS.receive(), { onChunk: listeningWatch('receive') });
     // Only reached when the receiver stops.
-    setStatus('receive', code === 0 ? 'ok' : 'fail', code === 0 ? 'Stopped' : 'Stopped');
+    serverEnded('receive', stoppedByUser, stderr);
   });
 
   $('#view-receive [data-cancel]').addEventListener('click', (e) => {
+    stoppedByUser = true;
     stopRun('receive', e.currentTarget);
   });
 }
@@ -3733,15 +3752,15 @@ BUILDERS.mpps = () => {
   if (fix === 'adopt') argv.push('--adopt-worklist-identity');
   else if (fix === 'asis') argv.push('--allow-study-mismatch');
 
-  const chunk = fieldOr('mpps-chunk', 'chunk');
+  const chunk = settingDefault('chunk');
   if (chunk) argv.push('--chunk', chunk);
-  const retry = fieldOr('mpps-retry', 'retry');
+  const retry = settingDefault('retry');
   if (retry) argv.push('--retry', retry);
-  const retrieveAe = fieldOr('mpps-retrieveae', 'retrieveAe');
+  const retrieveAe = settingDefault('retrieveAe');
   if (retrieveAe) argv.push('--retrieve-ae', retrieveAe);
   const timeout = state.settings.defaults.timeout;
   if (timeout) argv.push('--timeout', timeout);
-  if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
+  if (noRecurse()) argv.push('--no-recurse');
   if (mppsDryRun()) argv.push('--dry-run');
   return argv;
 };
@@ -3764,7 +3783,7 @@ function mppsDryRun() {
   return rehearsal();
 }
 
-/** The Details summary: what the SCP returned, and any override that is not a default. */
+/** The Details summary: what the SCP returned, and any Performed-step field typed over the row's. */
 function renderMppsAdvSummary() {
   const el = $('#mpps-adv-sum');
   if (!el) return;
@@ -3780,11 +3799,6 @@ function renderMppsAdvSummary() {
   }
   const station = $('#mpps-stationae').value.trim();
   if (station && station !== (state.conn.callingAe || 'DCM-CLI')) parts.push(`station AE ${station}`);
-  for (const [id, label] of [['mpps-chunk', 'chunk'], ['mpps-retry', 'retries'], ['mpps-retrieveae', 'retrieve AE']]) {
-    const v = $(`#${id}`).value.trim();
-    if (v) parts.push(`${label} ${v}`);
-  }
-  if ($('#mpps-norecurse').checked !== !state.settings.defaults.recurse) parts.push($('#mpps-norecurse').checked ? 'no recursion' : 'recursing');
   el.textContent = parts.length ? `· ${parts.join(' · ')}` : '';
   el.classList.toggle('changed', parts.length > 1);
 }
@@ -4313,7 +4327,7 @@ function wireMpps() {
   // clearing the station AE would look like it had not happened.
   ['mpps-stationae', 'mpps-stepid', 'mpps-stepdesc'].forEach((id) =>
     $(`#${id}`).addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
-  const ids = ['mpps-stepid', 'mpps-stationae', 'mpps-stepdesc', 'mpps-chunk', 'mpps-retry', 'mpps-retrieveae'];
+  const ids = ['mpps-stepid', 'mpps-stationae', 'mpps-stepdesc'];
   ids.forEach((id) => $(`#${id}`).addEventListener('input', () => {
     renderMppsAdvSummary();
     updateAllPreviews();
@@ -4322,7 +4336,6 @@ function wireMpps() {
   // and — for the step ID — puts the verbs back.
   $('#mpps-stepid').addEventListener('input', renderMppsPanel);
   $('#mpps-stationae').addEventListener('input', renderMppsPanel);
-  $('#mpps-norecurse').addEventListener('change', () => { renderMppsAdvSummary(); updateAllPreviews(); });
 
   // A different folder is a different study, so re-read it. Debounced because
   // this fires per keystroke when the path is typed rather than picked.
@@ -4496,13 +4509,13 @@ function stepsSendArgv(folder) {
   const e = stepsSelected();
   const calling = (e && e.peer.callingAe) || state.conn.callingAe;
   if (calling) argv.push('--calling-ae', calling);
-  const chunk = fieldOr('mpps-chunk', 'chunk');
+  const chunk = settingDefault('chunk');
   if (chunk) argv.push('--chunk', chunk);
-  const retry = fieldOr('mpps-retry', 'retry');
+  const retry = settingDefault('retry');
   if (retry) argv.push('--retry', retry);
   const timeout = state.settings.defaults.timeout;
   if (timeout) argv.push('--timeout', timeout);
-  if ($('#mpps-norecurse').checked) argv.push('--no-recurse');
+  if (noRecurse()) argv.push('--no-recurse');
   if (stepsDryRun()) argv.push('--dry-run');
   return argv;
 }
@@ -4731,18 +4744,22 @@ function speedMode() {
 /**
  * Builds the list of runs to perform.
  *
- * Each run carries its own calling AE Title so the peer's ingress log can be
- * read per run rather than showing one indistinguishable stream. AE Titles are
- * capped at 16 characters by DICOM, so the label is trimmed to fit rather than
- * being silently truncated by the receiver.
+ * Every run calls as this station — the calling AE the chip on this screen
+ * names, the one Send uses and the one an archive that whitelists callers has
+ * on its list. A prefix under Advanced opts into a calling AE per run, so the
+ * peer's ingress log can be read run by run; AE Titles are capped at 16
+ * characters by DICOM, so that label is trimmed to fit rather than being
+ * silently truncated by the receiver.
  */
 function speedRuns() {
-  const prefix = ($('#speed-aeprefix').value.trim() || 'AST').toUpperCase();
+  const prefix = $('#speed-aeprefix').value.trim().toUpperCase();
+  const own = state.conn.callingAe || '';
   const baseChunk = fieldOr('speed-chunk', 'chunk');
   const mode = speedMode();
   const runs = [];
 
   const ae = (tag, n) => {
+    if (!prefix) return own;
     const suffix = `-${String(n).padStart(2, '0')}`;
     const room = 16 - prefix.length - suffix.length - 1;
     const mid = room > 0 ? `-${tag.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, room)}` : '';
@@ -4825,7 +4842,7 @@ function speedArgv(run) {
   if (state.conn.host) argv.push('--host', state.conn.host);
   if (state.conn.port) argv.push('--port', String(state.conn.port));
   if (state.conn.calledAe) argv.push('--called-ae', state.conn.calledAe);
-  argv.push('--calling-ae', run.callingAe);
+  if (run.callingAe) argv.push('--calling-ae', run.callingAe);
   if (run.speed) argv.push('--speed', run.speed);
   if (run.parallel) argv.push('--parallel', run.parallel);
   if (run.chunk) argv.push('--chunk', run.chunk);
@@ -4838,6 +4855,32 @@ BUILDERS.speed = () => {
   const runs = speedRuns();
   return runs.length ? speedArgv(runs[0]) : ['send'];
 };
+
+/** One line naming whatever Speed test's Advanced holds; blank when it holds nothing. */
+function renderSpeedAdvSummary() {
+  const el = $('#speed-adv-sum');
+  if (!el) return;
+  const prefix = $('#speed-aeprefix').value.trim().toUpperCase();
+  const chunk = $('#speed-chunk').value.trim();
+  const parts = [];
+  if (prefix) parts.push(`calling AE prefix ${prefix}`);
+  if (chunk) parts.push(`--chunk ${chunk}`);
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
+  el.classList.toggle('changed', parts.length > 0);
+}
+
+/**
+ * Speed test is off during rehearsal. A sweep is N real sends — there is no
+ * --dry-run of a benchmark — and the banner across the top of the window says
+ * nothing is sent.
+ */
+function renderSpeedRunButton() {
+  const btn = $('#view-speed [data-run]');
+  if (!btn) return;
+  const off = rehearsal();
+  btn.textContent = off ? 'Off during rehearsal' : 'Run speed test';
+  btn.disabled = off || speedRunning;
+}
 
 /**
  * The line under the preset checkboxes, plus the one caveat that can quietly
@@ -4853,7 +4896,7 @@ function renderSpeedParallelHint() {
   if (!el) return;
   const baseChunk = fieldOr('speed-chunk', 'chunk');
   if (baseChunk) {
-    const from = $('#speed-chunk').value.trim() ? 'below' : 'from Settings';
+    const from = $('#speed-chunk').value.trim() ? 'under Advanced' : 'from Settings';
     el.innerHTML = esc(`Chunk size ${baseChunk} ${from} applies to every run and overrides each preset's own sizing, `
       + 'so a preset may not reach its association count. ')
       + '<button type="button" class="linklike" data-help="speed-help">Why</button>';
@@ -4886,11 +4929,27 @@ function renderSpeedParallelHint() {
 }
 
 /**
- * Every command in the sweep, on screen before any of them runs.
+ * Every command in the sweep, in the fold under the button, before any of
+ * them runs — one per line, and the folded summary carries the same text.
+ * Nothing gets sent that was not written out first.
+ */
+function renderSpeedCmd(list) {
+  const el = viewPart('speed', 'cmd');
+  if (!el) return;
+  const argvs = list.length ? list.map((r) => r.argv || speedArgv(r)) : [['send']];
+  const text = argvs.map((argv) => `dcm ${argv.map(quoteArg).join(' ')}`).join('\n');
+  el.textContent = text;
+  const fold = el.closest('.cmd-fold');
+  const sum = fold && fold.querySelector('.cmd-sum');
+  if (sum) sum.textContent = text;
+}
+
+/**
+ * The sweep's progress list, and the fold that lists its commands.
  *
- * The preview above shows one command, and a sweep is several — so the whole
- * list is laid out here as soon as the options change. Nothing gets sent that
- * was not written out first.
+ * The list is on screen only while a sweep runs; between sweeps its lines are
+ * still built from the form (and are still the commands that would be
+ * spawned), just not shown, because the fold above already says the same.
  */
 function renderSpeedPlan(runs) {
   const progress = $('#speed-progress');
@@ -4905,8 +4964,9 @@ function renderSpeedPlan(runs) {
   // sweep's own explicit-argument call gets through.
   if (!runs && speedRunning) return;
   const list = runs || speedRuns();
+  renderSpeedCmd(list);
   if (!list.length) { progress.hidden = true; progress.innerHTML = ''; return; }
-  progress.hidden = false;
+  progress.hidden = !runs;
   progress.innerHTML =
     `<div class="section-title">${list.length} run${list.length === 1 ? '' : 's'}, in order</div>` +
     list.map((r, i) =>
@@ -4915,7 +4975,7 @@ function renderSpeedPlan(runs) {
         // green "Done" chip beside a finished comparison table, four lines all
         // reading "waiting…" looked like a run that had hung; this list is the
         // plan for the NEXT sweep, and it says so.
-        `<span>${esc(r.title)} · ${esc(r.callingAe)}</span>` +
+        `<span>${esc(r.title)} · ${esc(r.callingAe || 'DCM-CLI')}</span>` +
         `<span class="rate">${speedRunning ? 'waiting…' : 'not run yet'}</span></div>` +
       // r.argv is set once, by runSpeedTest, at the moment the sweep is frozen.
       // Before that there is no sweep to freeze and the current form is the
@@ -5052,6 +5112,8 @@ function renderSpeedResults(results) {
     tied = ok.filter((r) => effectiveRun(r.data) === winningRun);
     isTie = tied.length > 1;
   }
+  // Every row the same transfer: there is no winner, so no row is badged.
+  const allTied = isTie && tied.length === results.length;
   const badge = isTie ? 'TIED FASTEST' : 'FASTEST';
   const short = results.filter((r) => r.data && (achievedWidth(r.data) || {}).short);
   // Both kinds of failure, in run order: a run whose JSON says it lost
@@ -5061,13 +5123,15 @@ function renderSpeedResults(results) {
 
   const rows = results.map((r) => {
     if (!r.data) {
+      // The engine's own first line, so the row says why rather than where to look.
+      const why = engineErrorText(r.stderr).split('\n')[0].trim() || `exit ${r.code}`;
       return `<tr class="incomplete"><td>${esc(r.run.title)}`
         + '<span class="badge-incomplete">INCOMPLETE</span></td>'
-        + '<td colspan="8" class="dim">failed — see output</td></tr>';
+        + `<td colspan="8" class="dim">failed — ${esc(why)}</td></tr>`;
     }
     const d = r.data;
     const miss = ackShortfall(d);
-    const isBest = !miss && d.ok && winningRun !== null && effectiveRun(d) === winningRun;
+    const isBest = !allTied && !miss && d.ok && winningRun !== null && effectiveRun(d) === winningRun;
     const w = achievedWidth(d);
     const width = !w
       ? '—'
@@ -5102,7 +5166,7 @@ function renderSpeedResults(results) {
       <td>${esc(r.run.title)}${miss ? '<span class="badge-incomplete">INCOMPLETE</span>' : ''}${
         isBest ? `<span class="badge-best${isTie ? ' tied' : ''}">${badge}</span>` : ''}</td>
       <td class="num width">${width}</td>
-      <td class="mono">${esc(r.run.callingAe)}</td>
+      <td class="mono">${esc(r.run.callingAe || 'DCM-CLI')}</td>
       <td>${esc(negotiated)}</td>
       <td class="num">${(d.elapsedMs / 1000).toFixed(2)}s</td>
       ${rate}
@@ -5111,6 +5175,9 @@ function renderSpeedResults(results) {
     </tr>`;
   }).join('');
 
+  // Each note is its one sentence and a Why: the paragraphs that used to
+  // follow each one are in the help panel, under the same heads.
+  const why = ' <button type="button" class="linklike" data-help="speed-help">Why</button>';
   const notes = [];
   // First note in the box, above the width caveat: a shortfall outranks
   // everything else the table has to say about the sweep.
@@ -5121,36 +5188,19 @@ function renderSpeedResults(results) {
       : '';
     notes.push(
       `<div class="local-note bad"><b>${incomplete.length} of ${results.length} run` +
-      `${results.length === 1 ? '' : 's'} did not finish${lostPhrase}.</b> ` +
-      'Those rows carry no MB/s and no instances/s, and that is deliberate: a rate over a transfer ' +
-      'that stopped early is fewer bytes over less time, so it is not a slower reading of that ' +
-      'setting — it is not a reading of it, and it often prints faster than the runs that ' +
-      'completed. They are also not eligible for FASTEST. Elapsed and On the wire are what did ' +
-      'happen; Ack is what did not. The engine\'s own report is in the output below. A receiver at ' +
-      'its association limit rejects transiently and the chunk is retried with no backoff, so every ' +
-      'attempt is spent within milliseconds while the accepted associations are still transferring; ' +
-      'when no slot frees inside that window, this is the ending you get.</div>'
+      `${results.length === 1 ? '' : 's'} did not finish${lostPhrase}.</b>${why}</div>`
     );
   }
   if (short.length) {
     notes.push(
       `<div class="local-note"><b>${short.length} run${short.length === 1 ? '' : 's'} did not reach the ` +
-      `width ${short.length === 1 ? 'it' : 'they'} asked for.</b> Where Width reads "N of M", any MB/s ` +
-      'beside it is the rate for N concurrent associations, not for M — it is not a measurement of M ' +
-      'and cannot be compared to one. The engine warned per study in the output below, and that warning ' +
-      'names the reason: either the study did not split into enough chunks to fill the pool, or the peer ' +
-      'never had that many accepted at once. Achieved width is a floor, so it can read low by one on a ' +
-      'run whose last chunks drain early; it never reads high.</div>'
+      `width ${short.length === 1 ? 'it' : 'they'} asked for.</b>${why}</div>`
     );
   }
   if (tied.length > 1) {
     const names = tied.map((r) => r.run.title.split('·')[0].trim());
     notes.push(
-      `<div class="local-note"><b>${esc(names.join(', '))} resolved to the same transfer.</b> The same ` +
-      `instances went in the same number of associations, ${tied[0].data.parallelAchieved} at a time, over ` +
-      'the same negotiated syntax — so the gaps between their rates are run-to-run variation and not a ' +
-      'difference between the settings. Asking for more than this bought nothing here; to tell the wider ' +
-      'settings apart, sweep a folder with enough instances to fill them.</div>'
+      `<div class="local-note"><b>${esc(names.join(', '))} resolved to the same transfer.</b>${why}</div>`
     );
   }
 
@@ -5225,6 +5275,9 @@ function wireSpeed() {
   }
   ['speed-folder', 'speed-aeprefix', 'speed-chunk', 'speed-chunks', 'speed-repeats', 'speed-parallels']
     .forEach((id) => $(`#${id}`).addEventListener('input', refreshSpeed));
+  ['speed-aeprefix', 'speed-chunk'].forEach((id) => $(`#${id}`).addEventListener('input', renderSpeedAdvSummary));
+  renderSpeedAdvSummary();
+  renderSpeedRunButton();
   $$('.ts-opt').forEach((c) => c.addEventListener('change', refreshSpeed));
   $$('.speed-opt').forEach((c) => c.addEventListener('change', refreshSpeed));
   renderSpeedParallelHint();
@@ -5241,6 +5294,8 @@ function wireSpeed() {
 let speedCancelled = false;
 
 async function runSpeedTest() {
+  // The button is dead under rehearsal; this is for every other way in.
+  if (rehearsal()) { fail('speed', 'Off during rehearsal: a speed test sends for real.\n'); return; }
   const folder = $('#speed-folder').value.trim();
   const box = $('#view-speed [data-result]');
   const c = consoleEl('speed');
@@ -5281,6 +5336,8 @@ async function runSpeedTest() {
   const results = [];
   try {
     for (let i = 0; i < runs.length; i++) {
+      // Rehearsal switched on mid-sweep stops it before the next real send.
+      if (rehearsal()) speedCancelled = true;
       if (speedCancelled) break;
       setStatus('speed', 'running', `Running ${i + 1}/${runs.length}…`);
       const line = $(`#speed-line-${i} .rate`);
@@ -5302,7 +5359,7 @@ async function runSpeedTest() {
       if (data && stderr.trim()) {
         appendConsole('speed', `\n--- ${runs[i].title} ---\n${stderr}`, code === 0 ? 'narration' : 'stderr');
       }
-      results.push({ run: runs[i], data, code });
+      results.push({ run: runs[i], data, code, stderr });
 
       if (line) {
         const w = data ? achievedWidth(data) : null;
@@ -5332,11 +5389,15 @@ async function runSpeedTest() {
     speedRunning = false;
   }
 
-  $('#view-speed [data-run]').disabled = false;
+  renderSpeedRunButton();
   $('#view-speed [data-cancel]').hidden = true;
   const outcome = speedOutcome(results, speedCancelled);
   setStatus('speed', outcome.kind, outcome.label);
   renderSpeedResults(results);
+  // The table is the result now; the list was the progress.
+  $('#speed-progress').hidden = true;
+  // A run that failed or fell short has its reason in the engine's report.
+  if (results.some((r) => !r.data || ackShortfall(r.data))) revealConsole('speed');
 }
 
 // --------------------------------------------------------------------------
@@ -5345,13 +5406,12 @@ async function runSpeedTest() {
 BUILDERS.webping = () => {
   const argv = ['web', 'ping'];
   if (state.web.url) argv.push('--url', state.web.url);
-  const t = fieldOr('webping-timeout', 'timeout');
+  const t = settingDefault('timeout');
   if (t) argv.push('--timeout', t);
   return argv;
 };
 
 function wireWebping() {
-  $('#webping-timeout').addEventListener('input', updateAllPreviews);
   $('#view-webping [data-run]').addEventListener('click', async () => {
     clearConsole('webping');
     if (!state.web.url) { fail('webping', 'Pick a server on the chip.\n'); return; }
@@ -5369,30 +5429,36 @@ BUILDERS.websend = () => {
   const folder = $('#websend-folder').value.trim();
   if (folder) argv.push(folder);
   if (state.web.url) argv.push('--url', state.web.url);
-  const chunk = fieldOr('websend-chunk', 'chunk');
+  const chunk = settingDefault('chunk');
   if (chunk) argv.push('--chunk', chunk);
-  const retry = fieldOr('websend-retry', 'retry');
-  if (retry !== '') argv.push('--retry', retry);
-  const timeout = fieldOr('websend-timeout', 'timeout');
+  const retry = settingDefault('retry');
+  if (retry) argv.push('--retry', retry);
+  const timeout = settingDefault('timeout');
   if (timeout) argv.push('--timeout', timeout);
   if (rehearsal()) argv.push('--dry-run');
   return argv;
 };
 
 function wireWebsend() {
-  ['websend-folder', 'websend-chunk', 'websend-retry', 'websend-timeout'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#websend-folder').addEventListener('input', updateAllPreviews);
 
   $('#view-websend [data-run]').addEventListener('click', async () => {
     const folder = $('#websend-folder').value.trim();
     clearConsole('websend');
+    $('#view-websend [data-totals]').hidden = true;
     if (!folder) { fail('websend', 'Choose a folder to send.\n'); return; }
     // A rehearsal opens no connection, so it needs no server.
     const dry = rehearsal();
     if (!dry && !state.web.url) { fail('websend', 'Pick a DICOMweb server on the chip, or add one in Settings.\n'); return; }
     setStatus('websend', 'running', dry ? 'Scanning…' : 'Sending…');
-    const { code, stderr } = await runStreaming('websend', BUILDERS.websend());
-    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Complete') : failLabel(stderr));
+    const { code, stdout, stderr } = await runStreaming('websend', BUILDERS.websend());
+    // The same accounting, and the same words, as Send: the engine prints the
+    // same found / sent / acknowledged report for STOW-RS.
+    const ok = code === 0;
+    const totals = parseTotals(stripAnsi(stdout));
+    setStatus('websend', ok ? 'ok' : 'fail', ok ? (dry ? 'Plan ready' : 'All acknowledged')
+      : (totals.sent > 0 ? 'Incomplete' : failLabel(stderr)));
+    if (!dry) showTotals(totals, ok, 'websend');
   });
 
   $('#view-websend [data-cancel]').addEventListener('click', (e) => {
@@ -5428,13 +5494,37 @@ BUILDERS.webquery = () => {
   return argv;
 };
 
+/**
+ * A search that got no answer, said where the answer would have been: the
+ * server never answered, answered with an HTTP error, or answered with
+ * something that is not a QIDO-RS result. Each of those arrives as count 0
+ * and exit 1 — exactly like a real empty answer — which is how a 401 or a
+ * 500 used to read as a green "Done". The engine's words go under the line,
+ * and into the Output.
+ */
+function renderWebQueryFailure(json, stderr, code) {
+  const box = $('#view-webquery [data-result]');
+  const status = json && json.status;
+  const head = status == null ? 'The server did not answer.'
+    : status === 200 ? 'The server\'s answer could not be read.'
+      : `The search failed (HTTP ${status}).`;
+  const said = (json && Array.isArray(json.error) && json.error.join(' '))
+    || (json && json.message) || engineErrorText(stderr) || `The engine exited ${code}.`;
+  box.hidden = false;
+  box.innerHTML = `<div class="folder-check bad list-error"><b>${esc(head)}</b>`
+    + `<div class="engine-said">${esc(said)}</div></div>`;
+  if (stderr) appendConsole('webquery', stderr, 'stderr');
+}
+
 /** Union-of-keys table over QIDO matches, same shape as renderFindResults. */
 function renderWebQueryResults(json) {
   const box = $('#view-webquery [data-result]');
   const matches = Array.isArray(json?.matches) ? json.matches : [];
+  // The chip beside Search says "No matches"; a line saying it again here
+  // would be the same news twice.
   if (!matches.length) {
-    box.hidden = false;
-    box.innerHTML = '<div class="empty-note">0 matches. (Exit code 1 on zero matches is the CLI convention — the server answered; nothing matched.)</div>';
+    box.hidden = true;
+    box.innerHTML = '';
     return;
   }
   const cols = [];
@@ -5451,7 +5541,6 @@ function renderWebQueryResults(json) {
   // settled on, and the same distinction: the table keeps a width it can be
   // read at, and the page itself still never scrolls sideways.
   box.innerHTML =
-    `<div class="section-title">${matches.length} match(es)</div>` +
     `<div class="table-scroll"><table class="find-table">` +
     `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -5471,34 +5560,39 @@ function wireWebquery() {
     clearConsole('webquery');
     $('#view-webquery [data-result]').hidden = true;
     if (!state.web.url) { fail('webquery', 'Pick a server on the chip.\n'); return; }
-    setStatus('webquery', 'running', 'Querying…');
+    setStatus('webquery', 'running', 'Searching…');
     const { code, stdout, stderr } = await runCapture('webquery', [...BUILDERS.webquery(), '--json']);
 
     let parsed = null;
     try { parsed = JSON.parse(stdout); } catch { /* raw fallback below */ }
-    const matches = parsed && Array.isArray(parsed.matches) ? parsed.matches : null;
-
-    // Exit code 1 with count 0 is the CLI's "no matches" convention, not an
-    // app error — a reachable server that found nothing is still a good run.
-    const ok = code === 0 || (code === 1 && parsed && parsed.count === 0);
-    setStatus('webquery', ok ? 'ok' : 'fail', ok ? 'Done' : 'Failed');
-
-    if (matches) {
-      renderWebQueryResults(parsed);
-    } else {
-      const c = consoleEl('webquery'); c.hidden = false;
-      revealConsole('webquery'); appendConsole('webquery', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+    if (!parsed || typeof parsed !== 'object') {
+      setStatus('webquery', 'fail', 'Failed');
+      revealConsole('webquery');
+      appendConsole('webquery', stdout || stderr || 'No output.\n', 'stderr');
+      return;
     }
+    // Only ok:true is an answer. Zero matches is still one (ok:true, count 0,
+    // exit 1); ok:false is not, whatever its count says.
+    if (parsed.ok !== true) {
+      setStatus('webquery', 'fail', 'Failed');
+      renderWebQueryFailure(parsed, stderr, code);
+      return;
+    }
+    const n = Array.isArray(parsed.matches) ? parsed.matches.length : 0;
+    setStatus('webquery', 'ok', n ? `${n} match${n === 1 ? '' : 'es'}` : 'No matches');
+    renderWebQueryResults(parsed);
   });
 }
 
 // --------------------------------------------------------------------------
 // View: WEB HUB (serve)
 // --------------------------------------------------------------------------
+/** The hub's port when the box is blank: the engine has no default, so the app supplies one. */
+const HUB_DEFAULT_PORT = '10808';
+
 BUILDERS.webhub = () => {
   const argv = ['web', 'serve'];
-  const port = $('#webhub-port').value.trim();
-  if (port) argv.push('--port', port);
+  argv.push('--port', $('#webhub-port').value.trim() || HUB_DEFAULT_PORT);
   const persist = $('#webhub-persist').value.trim();
   if (persist) argv.push('--persist', persist);
   const root = $('#webhub-root').value.trim();
@@ -5510,13 +5604,15 @@ BUILDERS.webhub = () => {
   return argv;
 };
 
-/** One line naming whatever the hub's Advanced holds: both knobs make it refuse things. */
+/** One line naming whatever the hub's Advanced holds: what it serves, and the two knobs that make it refuse things. */
 function renderWebhubAdvSummary() {
   const el = $('#webhub-adv-sum');
   if (!el) return;
+  const root = $('#webhub-root').value.trim();
   const token = $('#webhub-token').value.trim();
   const reject = $('#webhub-rejectafter').value.trim();
   const parts = [];
+  if (root) parts.push(`serves ${root}`);
   if (token) parts.push('a Bearer token is required');
   if (reject) parts.push(`rejects after ${reject}`);
   el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
@@ -5528,12 +5624,8 @@ function wireWebhub() {
   // screens need one. Show the address to point them at, built from the port
   // as it is typed, and offer it as one click into the shared web panel.
   const showBaseUrl = () => {
-    const port = $('#webhub-port').value.trim();
+    const port = $('#webhub-port').value.trim() || HUB_DEFAULT_PORT;
     const hint = $('#webhub-baseurl');
-    if (!port) {
-      hint.textContent = 'Choose a port; the address to point clients at appears here.';
-      return;
-    }
     const url = `http://127.0.0.1:${port}`;
     hint.innerHTML = `Clients point at <code>${esc(url)}</code> — <button class="linklike" id="webhub-use">use it on the other tabs</button>`;
     $('#webhub-use').addEventListener('click', () => {
@@ -5549,17 +5641,18 @@ function wireWebhub() {
   showBaseUrl();
   renderWebhubAdvSummary();
 
+  let stoppedByUser = false;
   $('#view-webhub [data-run]').addEventListener('click', async () => {
     clearConsole('webhub');
-    const port = $('#webhub-port').value.trim();
-    if (!port) { fail('webhub', 'Choose a port to listen on.\n'); return; }
-    setStatus('webhub', 'running', 'Listening');
-    const { code } = await runStreaming('webhub', BUILDERS.webhub());
+    stoppedByUser = false;
+    setStatus('webhub', 'running', 'Starting…');
+    const { stderr } = await runStreaming('webhub', BUILDERS.webhub(), { onChunk: listeningWatch('webhub') });
     // Only reached when the hub stops.
-    setStatus('webhub', code === 0 ? 'ok' : 'fail', 'Stopped');
+    serverEnded('webhub', stoppedByUser, stderr);
   });
 
   $('#view-webhub [data-cancel]').addEventListener('click', (e) => {
+    stoppedByUser = true;
     stopRun('webhub', e.currentTarget);
   });
 }
@@ -5572,7 +5665,7 @@ BUILDERS.inventory = () => {
   const t = $('#info-folder').value.trim();
   if (t) argv.push(t);
   if ($('#info-series').checked) argv.push('--series');
-  if ($('#info-norecurse').checked) argv.push('--no-recurse');
+  if (noRecurse()) argv.push('--no-recurse');
   return argv;
 };
 
@@ -5634,7 +5727,7 @@ function renderInventory(j) {
 
 function wireInventory() {
   $('#info-folder').addEventListener('input', updateAllPreviews);
-  ['info-series', 'info-norecurse'].forEach((id) => $(`#${id}`).addEventListener('change', updateAllPreviews));
+  $('#info-series').addEventListener('change', updateAllPreviews);
   $('#view-inventory [data-run]').addEventListener('click', async () => {
     const t = $('#info-folder').value.trim();
     $('#view-inventory [data-result]').hidden = true;
@@ -6926,7 +7019,7 @@ async function boot() {
   $('#engine-version').textContent = `engine v${state.info.version}`;
 
   $$('.nav-item').forEach((b) => b.addEventListener('click', () => showView(b.dataset.view)));
-  // In-page links to another screen ("← Settings" on the echo screen).
+  // In-page links to another screen ("add it in Settings" on the station).
   document.addEventListener('click', (e) => {
     const go = e.target.closest('[data-goto]');
     if (go) showView(go.dataset.goto);

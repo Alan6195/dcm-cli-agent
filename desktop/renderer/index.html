@@ -244,9 +244,9 @@
               <div class="outcome" id="mpps-outcome" hidden></div>
               <div class="totals" id="mpps-totals" hidden></div>
 
-              <!-- Everything the row returned, and the per-run overrides.
-                   The Type 1 fields are seeded from the row; the transfer
-                   fields fall back to Settings > Defaults when blank. -->
+              <!-- Everything the row returned, and the three Performed-step
+                   fields, seeded from the row. Chunk size, retries, the
+                   retrieve AE and recursion come from Settings > Defaults. -->
               <details class="adv" id="mpps-adv">
                 <summary>Details <span class="adv-sum" id="mpps-adv-sum"></span></summary>
                 <div class="adv-body">
@@ -255,14 +255,6 @@
                     <label>Performed step ID<input type="text" id="mpps-stepid" placeholder="from the scheduled step" /></label>
                     <label>Performed station AE<input type="text" id="mpps-stationae" maxlength="16" placeholder="this station's AE" /></label>
                     <label>Performed step description<input type="text" id="mpps-stepdesc" placeholder="optional" /></label>
-                  </div>
-                  <div class="form-row triple">
-                    <label>Chunk size<input type="number" id="mpps-chunk" placeholder="200" min="1" /></label>
-                    <label>Retries<input type="number" id="mpps-retry" placeholder="1" min="0" /></label>
-                    <label>Retrieve AE <span class="dim">(blank = the archive's AE)</span><input type="text" id="mpps-retrieveae" maxlength="16" placeholder="ARCHIVE" /></label>
-                  </div>
-                  <div class="checks">
-                    <label><input type="checkbox" id="mpps-norecurse" /> Don't recurse into subfolders</label>
                   </div>
                 </div>
               </details>
@@ -305,7 +297,7 @@
           <p><b>Insane is a benchmark setting, against a receiver you own.</b> The receiver decides how many associations it will accept, and going past that limit gets the extras rejected. A rejected association is retried, so this usually does not arrive as a slower run or as a shortfall between instances found and acknowledged: it arrives as a run that reports a narrower parallelism than the sixteen it asked for, at the bottom of the output. A study also has to split into at least sixteen chunks before sixteen associations can run at once, so a small one runs narrower than this no matter what the receiver allows.</p>
           <h4>Chunk size and parallel, under Advanced</h4>
           <p>A preset sets both of these together, because setting one alone caps the other. A chunk size typed there replaces the preset's half of that and leaves its association count in place — the command carries both flags and the engine names what it displaced. An association count typed there replaces the preset outright: the command drops <code>--speed</code>, because a preset that has lost its width would still be sizing the chunks off your number. Clear the field to go back to the preset.</p>
-          <p>Retries, timeout and chunk size fall back to Settings › Defaults when the field is blank. Whatever ends up in force is on the command line below the button.</p>
+          <p>Retries, timeout and recursion come from Settings › Defaults, and so does the chunk size while its field is blank. Whatever ends up in force is on the command line below the button.</p>
         </div>
         <div class="form-row">
           <label class="grow">Folder to send
@@ -340,10 +332,6 @@
           <summary>Advanced <span class="adv-sum" id="send-adv-sum"></span></summary>
           <div class="adv-body">
             <div class="form-row triple">
-              <label>Retries<input type="number" id="send-retry" placeholder="1" min="0" /></label>
-              <label>Timeout (ms)<input type="number" id="send-timeout" placeholder="60000" min="1000" step="1000" /></label>
-            </div>
-            <div class="form-row triple">
               <label>Parallel associations <span class="dim">(1–16)</span>
                 <input type="number" id="send-parallel" placeholder="from the preset" min="1" max="16" />
               </label>
@@ -368,7 +356,6 @@
               </label>
             </div>
             <div class="checks">
-              <label><input type="checkbox" id="send-norecurse" /> Don't recurse into subfolders</label>
               <label><input type="checkbox" id="send-rewrite" /> Rewrite Series UIDs <span class="warn-inline">(changes your data)</span></label>
             </div>
           </div>
@@ -537,12 +524,12 @@
           <h4>Test</h4>
           <p>A QIDO-RS request that asks for nothing: it answers whether there is a DICOMweb service at this URL and whether your credentials open it. Nothing is sent.</p>
           <h4>Send</h4>
-          <p>STOW-RS uploads a folder of DICOM files, with the same found/sent/acknowledged accounting the DIMSE send screen uses. Chunk size, retries and timeout fall back to Settings › Defaults when blank.</p>
+          <p>STOW-RS uploads a folder of DICOM files, with the same found/sent/acknowledged accounting the DIMSE send screen uses. Chunk size, retries and timeout come from Settings › Defaults.</p>
           <h4>Query</h4>
           <p>QIDO-RS searches for studies, series or instances and changes nothing. Blank fields are simply not sent.</p>
           <h4>Hub</h4>
-          <p>A local DICOMweb server (STOW and QIDO) to point the other tabs — or any DICOMweb client — at. <b>Save arriving studies to</b> empty means accept and discard. <b>Pre-populate index from</b> serves an existing folder of DICOM files at startup, so there is something to query straight away.</p>
-          <p>Under Advanced: <b>Require token</b> is a test knob — clients without that Bearer token get 401s, which is how you reproduce an auth failure. It is not real security. <b>Reject after N</b> stops accepting partway through, on purpose, so a client's failure handling can be watched.</p>
+          <p>A local DICOMweb server (STOW and QIDO) to point the other tabs — or any DICOMweb client — at. A blank port means 10808. <b>Save arriving studies to</b> empty means accept and discard.</p>
+          <p>Under Advanced: <b>Pre-populate index from</b> serves an existing folder of DICOM files at startup, so there is something to query straight away. <b>Require token</b> is a test knob — clients without that Bearer token get 401s, which is how you reproduce an auth failure. It is not real security. <b>Reject after N</b> stops accepting partway through, on purpose, so a client's failure handling can be watched.</p>
         </div>
         <div class="chip-row tabs" role="tablist" data-tabs="web">
           <button class="chip active" role="tab" aria-selected="true" data-tab="webping">Test</button>
@@ -554,9 +541,6 @@
         <!-- WEB PING (DICOMweb) -->
         <div class="tab-pane" id="view-webping">
           <div class="conn-host" data-webconn></div>
-          <div class="form-row">
-            <label>Timeout (ms)<input type="number" id="webping-timeout" placeholder="60000" min="1000" step="1000" /></label>
-          </div>
           <div class="actions">
             <button class="btn primary" data-run>Test connection</button>
             <span class="status-chip" data-status hidden></span>
@@ -582,16 +566,12 @@
             </label>
           </div>
           <div class="conn-host" data-webconn></div>
-          <div class="form-row triple">
-            <label>Chunk size<input type="number" id="websend-chunk" placeholder="50" min="1" /></label>
-            <label>Retries<input type="number" id="websend-retry" placeholder="1" min="0" /></label>
-            <label>Timeout (ms)<input type="number" id="websend-timeout" placeholder="60000" min="1000" step="1000" /></label>
-          </div>
           <div class="actions">
             <button class="btn primary" data-run>Send</button>
             <button class="btn danger" data-cancel hidden>Stop</button>
             <span class="status-chip" data-status hidden></span>
           </div>
+          <div class="totals" data-totals hidden></div>
           <details class="cmd-fold">
             <summary>command <span class="cmd-sum"></span></summary>
             <div class="cmd-preview" data-cmd></div>
@@ -620,7 +600,7 @@
             <label>Limit<input type="number" id="webquery-limit" placeholder="all" min="1" /></label>
           </div>
           <div class="actions">
-            <button class="btn primary" data-run>Run QIDO query</button>
+            <button class="btn primary" data-run>Search</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <div class="result-table" data-result hidden></div>
@@ -649,17 +629,17 @@
               </div>
             </label>
           </div>
-          <div class="form-row">
-            <label class="grow">Pre-populate index from
-              <div class="path-pick">
-                <input type="text" id="webhub-root" placeholder="(optional) folder of DICOM files to serve at startup" />
-                <button class="btn ghost" data-pick="webhub-root" data-pick-mode="folder">Browse…</button>
-              </div>
-            </label>
-          </div>
           <details class="adv" id="webhub-adv">
             <summary>Advanced <span class="adv-sum" id="webhub-adv-sum"></span></summary>
             <div class="adv-body">
+              <div class="form-row">
+                <label class="grow">Pre-populate index from
+                  <div class="path-pick">
+                    <input type="text" id="webhub-root" placeholder="(optional) folder of DICOM files to serve at startup" />
+                    <button class="btn ghost" data-pick="webhub-root" data-pick-mode="folder">Browse…</button>
+                  </div>
+                </label>
+              </div>
               <div class="form-row">
                 <label class="grow">Require token <span class="dim">(test only)</span>
                   <input type="text" id="webhub-token" placeholder="(optional) e.g. test-token-123" />
@@ -732,7 +712,6 @@
           </div>
           <div class="checks">
             <label><input type="checkbox" id="info-series" checked /> Break down per series</label>
-            <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
           </div>
           <div class="actions">
             <button class="btn primary" data-run>Read</button>
@@ -985,13 +964,19 @@
         </header>
         <div class="help-panel" id="speed-help" hidden>
           <div class="help-head"><b>How to read a sweep</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>Sends the same study repeatedly and compares. Each run in a sweep uses its own calling AE Title — the prefix with a run number appended — so you can pick any single run out of the peer's ingress logs afterwards.</p>
+          <p>Sends the same study repeatedly and compares. Every run calls as this station's AE, the one on the chip, as Send does. A <b>Calling AE prefix</b> under Advanced gives each run its own — the prefix, the setting and a run number — so any single run can be picked out of the peer's ingress log; a peer that only accepts callers it knows will refuse those.</p>
           <h4>The numbers</h4>
           <p>Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for. Width is measured the same way: it is the associations the peer actually had open at once, not the number the run asked for, and it is a floor — it can read one low on a run whose last chunks drain early, and never reads high.</p>
           <h4>Finding a receiver's ceiling</h4>
           <p>This is how you find the receiver's ceiling — read the Width column and the Ack column afterwards, because neither answers the other's question: a refused association is retried with no backoff, so the attempts burn out in milliseconds, and the run either finishes clean at a width it never reached or ends with instances the receiver never acknowledged. Width says whether it ran as wide as asked; the counts say whether all of it arrived.</p>
+          <h4>A run that did not finish</h4>
+          <p>Its row carries no MB/s and no instances/s, and that is deliberate: a rate over a transfer that stopped early is fewer bytes over less time, so it is not a slower reading of that setting — it is not a reading of it, and it often prints faster than the runs that completed. It is also not eligible for FASTEST. Elapsed and On the wire are what did happen; Ack is what did not. The engine's own report is in the output. A receiver at its association limit rejects transiently and the chunk is retried with no backoff, so every attempt is spent within milliseconds while the accepted associations are still transferring; when no slot frees inside that window, this is the ending you get.</p>
+          <h4>Width "N of M"</h4>
+          <p>Any MB/s beside it is the rate for N concurrent associations, not for M — it is not a measurement of M and cannot be compared to one. The engine warned per study in the output, and that warning names the reason: either the study did not split into enough chunks to fill the pool, or the peer never had that many accepted at once.</p>
+          <h4>Runs that resolved to the same transfer</h4>
+          <p>The same instances went in the same number of associations at a time, over the same negotiated syntax — so the gaps between their rates are run-to-run variation and not a difference between the settings. Asking for more bought nothing; to tell the wider settings apart, sweep a folder with enough instances to fill them. When every run resolved to the same transfer, no run is badged.</p>
           <h4>Chunk size across a sweep</h4>
-          <p>A chunk size in the field below applies to every run and overrides each preset's own sizing, so a preset may not reach its association count. Clear it to compare the presets as they ship. Association counts typed into <b>Also try</b> are each sent as <code>--parallel</code>, which overrides the preset's chunk sizing in the same way.</p>
+          <p>A chunk size under Advanced applies to every run and overrides each preset's own sizing, so a preset may not reach its association count. Clear it to compare the presets as they ship. Association counts typed into <b>Also try</b> are each sent as <code>--parallel</code>, which overrides the preset's chunk sizing in the same way.</p>
         </div>
         <div class="form-row">
           <label class="grow">Study folder
@@ -1052,10 +1037,16 @@
           </div>
         </div>
 
-        <div class="form-row triple">
-          <label>Calling AE prefix<input type="text" id="speed-aeprefix" value="AST" maxlength="10" /></label>
-          <label>Chunk size<input type="number" id="speed-chunk" placeholder="each run decides" min="1" /></label>
-        </div>
+        <!-- Folded, never hidden: the summary names anything set here. -->
+        <details class="adv" id="speed-adv">
+          <summary>Advanced <span class="adv-sum" id="speed-adv-sum"></span></summary>
+          <div class="adv-body">
+            <div class="form-row triple">
+              <label>Calling AE prefix<input type="text" id="speed-aeprefix" maxlength="10" placeholder="none — station AE" /></label>
+              <label>Chunk size<input type="number" id="speed-chunk" placeholder="each run decides" min="1" /></label>
+            </div>
+          </div>
+        </details>
 
         <div class="actions">
           <button class="btn primary" data-run>Run speed test</button>
@@ -1192,7 +1183,7 @@
         <p class="web-auth-hint">Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</p>
 
         <div class="section-title">Defaults</div>
-        <p class="mcp-note">Used wherever a screen leaves the field blank. A screen's own field still wins for that run.</p>
+        <p class="mcp-note">Used wherever a screen leaves the field blank.</p>
         <div class="form-row triple">
           <label>Chunk size<input type="number" id="set-chunk" placeholder="engine default" min="1" /></label>
           <label>Retries<input type="number" id="set-retry" placeholder="engine default" min="0" /></label>
@@ -1243,7 +1234,6 @@
         <header class="view-head">
           <h1>Test a connection</h1>
           <button type="button" class="help-btn" data-help="echo-help" aria-expanded="false" aria-controls="echo-help" title="What C-ECHO proves">?</button>
-          <button class="linklike" data-goto="settings">← Settings</button>
         </header>
         <div class="help-panel" id="echo-help" hidden>
           <div class="help-head"><b>What C-ECHO proves</b><button type="button" class="linklike" data-help-close>Close</button></div>
@@ -1251,9 +1241,6 @@
           <p>It proves nothing about storage. A peer can verify happily and still refuse every image you offer it, because the presentation contexts it accepts for C-STORE are a separate negotiation. A failed echo is conclusive; a successful one is only the first step.</p>
         </div>
         <div class="conn-host" data-conn data-role="any"></div>
-        <div class="form-row">
-          <label>Timeout (ms)<input type="number" id="echo-timeout" placeholder="60000" min="1000" step="1000" /></label>
-        </div>
         <div class="actions">
           <button class="btn primary" data-run>Test connection</button>
           <span class="status-chip" data-status hidden></span>

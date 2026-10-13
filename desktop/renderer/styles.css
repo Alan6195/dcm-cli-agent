@@ -312,6 +312,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
  * chip is the first thing read on the screen, and "Done" over a sweep that
  * lost instances is the whole failure this class exists to prevent. */
 .status-chip.warn { background: var(--amber-soft); color: var(--amber); }
+/* Neither a result nor a fault: a server the operator stopped. */
+.status-chip.idle { background: var(--panel); color: var(--text-dim); border: 1px solid var(--border); }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* ---------------- Console ---------------- */
