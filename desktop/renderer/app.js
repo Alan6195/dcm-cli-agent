@@ -648,26 +648,24 @@ function renderRehearsal() {
   $('#rehearsal-banner').hidden = !rehearsal();
 }
 
-/** The saved peers as Settings lists them: role, name, and the three verbs. */
+/**
+ * The saved peers as Settings lists them: role, name, and the three verbs.
+ *
+ * The role is the badge, and it is changed in the peer's Edit — the form's own
+ * Role select. A second select on every row said the badge again beside it.
+ */
 function renderSettingsPeers() {
   const list = $('#set-peers');
   if (!list) return;
   const peers = dimseProfiles();
-  const option = (value, label, current) =>
-    `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`;
   list.innerHTML = peers.length
     ? peers.map((p) =>
       `<div class="peer-row" data-peer="${esc(p.name)}">` +
-        `<span class="peer-role ${p.role ? '' : 'none'}">${esc(roleTag(p.role) || 'Other')}</span>` +
+        `<span class="peer-role ${p.role ? '' : 'none'}">${esc(roleTag(p.role) || 'Peer')}</span>` +
         `<span class="peer-row-name" title="${esc(p.name)}">${esc(p.name)}</span>` +
         (p.callingAe
           ? `<span class="peer-from override" title="Talked to as this calling AE, not this station's.">← ${esc(p.callingAe)}</span>`
           : '') +
-        `<select data-peer-role-of="${esc(p.name)}" aria-label="Role">` +
-          option('', 'Other', p.role || '') +
-          option('ris', 'RIS (worklist &amp; MPPS)', p.role || '') +
-          option('archive', 'Archive (images)', p.role || '') +
-        '</select>' +
         `<button class="btn ghost small" data-peer-test="${esc(p.name)}">Test</button>` +
         `<button class="btn ghost small" data-peer-edit="${esc(p.name)}">Edit</button>` +
         `<button class="btn ghost small" data-peer-delete="${esc(p.name)}">Delete</button>` +
@@ -679,24 +677,42 @@ function renderSettingsPeers() {
   web.innerHTML = servers.length
     ? servers.map((p) =>
       `<div class="peer-row" data-web="${esc(p.name)}">` +
-        '<span class="peer-role">Web</span>' +
+        '<span class="peer-role">Server</span>' +
         `<span class="peer-row-name" title="${esc(p.url)}">${esc(p.url)}</span>` +
         `<button class="btn ghost small" data-web-delete="${esc(p.name)}">Delete</button>` +
       '</div>').join('')
     : '<div class="empty-note dense">No DICOMweb servers yet.</div>';
+  syncPeerForm();
 }
 
 /** Name of the saved peer the form is editing, or null while adding. */
 let peerEditing = null;
+/** "+ Add a peer" was pressed and the form has not been saved or cancelled since. */
+let peerAdding = false;
+
+/**
+ * The add-peer form is for the screen with no peers on it. Once there are
+ * peers it folds away behind "+ Add a peer", and comes back for that or for a
+ * row's Edit; Save or Cancel puts it away again. With no peers at all it is
+ * simply there, and there is nothing to cancel back to.
+ */
+function syncPeerForm() {
+  const any = dimseProfiles().length > 0;
+  const open = !any || peerAdding || peerEditing !== null;
+  $('#peer-form').hidden = !open;
+  $('#peer-add').hidden = open;
+  $('#peer-cancel').hidden = !(any && open);
+}
 
 function resetPeerForm() {
   peerEditing = null;
+  peerAdding = false;
   for (const id of ['peer-host', 'peer-port', 'peer-ae', 'peer-callingae']) $(`#${id}`).value = '';
   $('#peer-role').value = '';
   $('#peer-form-title').textContent = 'Add a peer';
   $('#peer-save').textContent = 'Save peer';
-  $('#peer-cancel').hidden = true;
   $('#peer-form-note').hidden = true;
+  syncPeerForm();
 }
 
 /** After the saved peers change: the chips, the lists and every command that names a peer. */
@@ -754,15 +770,14 @@ function wireSettings() {
     afterPeersChanged();
   });
   $('#peer-cancel').addEventListener('click', resetPeerForm);
-
-  // ----- the lists (delegated: they are re-rendered from state) -----
-  $('#set-peers').addEventListener('change', async (e) => {
-    const sel = e.target.closest('[data-peer-role-of]');
-    if (!sel) return;
-    setPeerRole(sel.dataset.peerRoleOf, sel.value);
-    await persistProfiles();
-    afterPeersChanged();
+  $('#peer-add').addEventListener('click', () => {
+    resetPeerForm();
+    peerAdding = true;
+    syncPeerForm();
+    $('#peer-host').focus();
   });
+
+  // ----- the list (delegated: it is re-rendered from state) -----
   $('#set-peers').addEventListener('click', async (e) => {
     const test = e.target.closest('[data-peer-test]');
     if (test) {
@@ -781,8 +796,8 @@ function wireSettings() {
       $('#peer-role').value = p.role || '';
       $('#peer-form-title').textContent = `Edit ${p.name}`;
       $('#peer-save').textContent = 'Save changes';
-      $('#peer-cancel').hidden = false;
       $('#peer-form-note').hidden = true;
+      syncPeerForm();
       $('#peer-host').focus();
       return;
     }
@@ -1486,7 +1501,7 @@ const busy = {}; // view -> { n, run, stop, locked }
  */
 const BUSY_LOCKS = {
   rename: '#rename-folder, [data-pick="rename-folder"]',
-  edit: '#edit-target, [data-pick="edit-target"], #edit-load',
+  edit: '#edit-target, [data-pick="edit-target"]',
 };
 
 /** Is a run of this view's own in flight? */
@@ -5660,14 +5675,59 @@ function wireWebhub() {
 // --------------------------------------------------------------------------
 // View: INVENTORY (info)
 // --------------------------------------------------------------------------
+// Always per series: the breakdown is the part that shows colliding Series
+// UIDs, and an inventory without it hides the one finding worth running it for.
 BUILDERS.inventory = () => {
   const argv = ['info'];
   const t = $('#info-folder').value.trim();
   if (t) argv.push(t);
-  if ($('#info-series').checked) argv.push('--series');
+  argv.push('--series');
   if (noRecurse()) argv.push('--no-recurse');
   return argv;
 };
+
+/**
+ * A read of a local path that produced nothing to draw, said where the tiles
+ * or the tag rows would have been: a path that does not exist, or one holding
+ * nothing readable. Both come back as an envelope with ok:false and no counts,
+ * and drawing that is how an inventory used to read "undefined files
+ * examined" and a missing file used to read "No matching tags." The engine's
+ * own words go under the one line, and into the Output.
+ */
+function renderReadFailure(view, json, stderr, code) {
+  const box = $(`#view-${view} [data-result]`);
+  const said = (json && json.message) || engineErrorText(stderr) || `The engine exited ${code}.`;
+  box.hidden = false;
+  box.innerHTML = '<div class="folder-check bad list-error"><b>Nothing could be read there.</b>'
+    + `<div class="engine-said">${esc(said)}</div></div>`;
+  const c = consoleEl(view);
+  if (c) c.hidden = false;
+  if (stderr) appendConsole(view, stderr, 'stderr');
+}
+
+/** The four fields that say whose study it is, as `dcm info --json` pairs them. */
+const IDENTITY_PAIRS = [
+  ['patientName', 'patientNames'], ['patientId', 'patientIds'],
+  ['studyDescription', 'studyDescriptions'], ['accessionNumber', 'accessionNumbers'],
+];
+
+/**
+ * The inventory's chip. Green only for a tree read whole whose studies each
+ * know whose they are: a file that could not be read is an instance that would
+ * not be sent, and a study whose instances disagree about its patient is the
+ * thing Rename exists to repair, so either one turns it amber and names it.
+ */
+function inventoryVerdict(j) {
+  const studies = Array.isArray(j.studies) ? j.studies : [];
+  const notes = [];
+  if (j.unreadable) notes.push(`${j.unreadable} unreadable`);
+  const clashes = studies.filter((s) =>
+    IDENTITY_PAIRS.some(([one, many]) => identityState(s, one, many).conflict)).length;
+  if (clashes) notes.push(`${clashes} identity conflict${clashes === 1 ? '' : 's'}`);
+  if (!studies.length) return { kind: 'warn', label: ['No DICOM found', ...notes].join(' · ') };
+  if (notes.length) return { kind: 'warn', label: ['Done', ...notes].join(' · ') };
+  return { kind: 'ok', label: 'Done' };
+}
 
 function renderInventory(j) {
   const box = $('#view-inventory [data-result]');
@@ -5727,7 +5787,6 @@ function renderInventory(j) {
 
 function wireInventory() {
   $('#info-folder').addEventListener('input', updateAllPreviews);
-  $('#info-series').addEventListener('change', updateAllPreviews);
   $('#view-inventory [data-run]').addEventListener('click', async () => {
     const t = $('#info-folder').value.trim();
     $('#view-inventory [data-result]').hidden = true;
@@ -5735,9 +5794,25 @@ function wireInventory() {
     if (!t) { fail('inventory', 'Choose a folder or file.\n'); return; }
     setStatus('inventory', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('inventory', [...BUILDERS.inventory(), '--json']);
-    setStatus('inventory', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
-    try { renderInventory(JSON.parse(stdout)); }
-    catch { revealConsole('inventory'); appendConsole('inventory', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
+    let json = null;
+    try { json = JSON.parse(stdout); } catch { json = null; }
+    if (!json || typeof json !== 'object') {
+      setStatus('inventory', 'fail', 'Failed');
+      revealConsole('inventory');
+      appendConsole('inventory', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+      return;
+    }
+    // No counts is a path that was never read (ok:false, and nothing to
+    // draw). ok:false WITH counts is an inventory that found unreadable
+    // files: drawn, and amber.
+    if (!Number.isFinite(json.filesExamined)) {
+      setStatus('inventory', 'fail', 'Failed');
+      renderReadFailure('inventory', json, stderr, code);
+      return;
+    }
+    const verdict = inventoryVerdict(json);
+    setStatus('inventory', verdict.kind, verdict.label);
+    renderInventory(json);
   });
 }
 
@@ -5757,10 +5832,25 @@ BUILDERS.tags = () => {
   return argv;
 };
 
+/** One line naming what Advanced holds, blank at its defaults. */
+function renderTagsAdvSummary() {
+  const el = $('#tags-adv-sum');
+  if (!el) return;
+  const value = $('#tags-value').value.trim();
+  const parts = [];
+  if (value) parts.push(`has value ${value}`);
+  if ($('#tags-private').checked) parts.push('private only');
+  if ($('#tags-all').checked) parts.push('every file');
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
+  el.classList.toggle('changed', parts.length > 0);
+}
+
 function renderTags(j) {
   const box = $('#view-tags [data-result]');
   const results = Array.isArray(j?.results) ? j.results : [];
-  if (!results.length) { box.hidden = false; box.innerHTML = '<div class="empty-note">No matching tags.</div>'; return; }
+  // The chip beside Show tags says "No matches"; saying it again here would
+  // be the same news twice.
+  if (!results.length) { box.hidden = true; box.innerHTML = ''; return; }
   let html = `<div class="section-title">${j.files} file(s), ${j.tags} tag(s)</div>`;
   for (const r of results) {
     const rows = (r.tags || []).map((t) =>
@@ -5773,8 +5863,11 @@ function renderTags(j) {
 }
 
 function wireTags() {
-  ['tags-target', 'tags-filter', 'tags-value'].forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
-  ['tags-private', 'tags-all'].forEach((id) => $(`#${id}`).addEventListener('change', updateAllPreviews));
+  ['tags-target', 'tags-filter'].forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
+  $('#tags-value').addEventListener('input', () => { renderTagsAdvSummary(); updateAllPreviews(); });
+  ['tags-private', 'tags-all'].forEach((id) =>
+    $(`#${id}`).addEventListener('change', () => { renderTagsAdvSummary(); updateAllPreviews(); }));
+  renderTagsAdvSummary();
   $('#view-tags [data-run]').addEventListener('click', async () => {
     const t = $('#tags-target').value.trim();
     $('#view-tags [data-result]').hidden = true;
@@ -5782,9 +5875,24 @@ function wireTags() {
     if (!t) { fail('tags', 'Choose a file or folder.\n'); return; }
     setStatus('tags', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('tags', [...BUILDERS.tags(), '--json']);
-    setStatus('tags', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
-    try { renderTags(JSON.parse(stdout)); }
-    catch { revealConsole('tags'); appendConsole('tags', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr'); }
+    let json = null;
+    try { json = JSON.parse(stdout); } catch { json = null; }
+    if (!json || typeof json !== 'object') {
+      setStatus('tags', 'fail', 'Failed');
+      revealConsole('tags');
+      appendConsole('tags', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+      return;
+    }
+    // Only outcome "empty" is a read that found nothing matching. ok:false
+    // otherwise is a path with nothing readable in it, or no path at all.
+    if (json.ok === false && json.outcome !== 'empty') {
+      setStatus('tags', 'fail', 'Failed');
+      renderReadFailure('tags', json, stderr, code);
+      return;
+    }
+    const n = Array.isArray(json.results) ? json.results.length : 0;
+    setStatus('tags', 'ok', n ? 'Done' : 'No matches');
+    renderTags(json);
   });
 }
 
@@ -6045,9 +6153,15 @@ function renderRenameFound(html) {
  * Two words each: an operator who can already see "山田^太郎" in the value does
  * not need a sentence telling them it is there, they need to know it is kept
  * rather than about to be overwritten.
+ *
+ * Shown only for a name written in more than one script — the case where the
+ * boxes hold a third of the value. For any other name the boxes ARE the name,
+ * and a change to it is spelled out in full in the change list below anyway;
+ * a line repeating the two boxes back was only more to read.
  */
 function renderRenamePn() {
   const el = $('#rename-pn');
+  el.hidden = !renameState.groups.length;
   const value = renameComposed();
   const notes = [];
   if (renameState.extras.length) {
@@ -6197,6 +6311,7 @@ function resetRenameStudy() {
   renameState.groups = [];
   renameState.conflicts = {};
   renderRenameFound('');
+  $('#rename-pn').hidden = true;
   $('#rename-form').hidden = true;
   $('#rename-diff').hidden = true;
   syncRenameButton();
@@ -6268,13 +6383,12 @@ async function scanRenameFolder({ keepConsole = false } = {}) {
     return;
   }
 
+  // Why it is refused (a rename here would be a merge) is in the help.
   if (studies.length > 1) {
     setStatus('rename', 'warn', `${studies.length} studies`);
     renderRenameFound(
-      `<div class="caution"><strong>This folder holds ${studies.length} studies.</strong> `
-      + 'A rename applies to every instance under the folder and cannot be pointed at one study '
-      + `inside it, so renaming here would write a single identity over all ${studies.length} — `
-      + 'a merge, not a rename. Point at one study\'s own folder instead.</div>'
+      `<div class="folder-check bad"><b>This folder holds ${studies.length} studies.</b> `
+      + 'Rename one study\'s folder at a time.</div>'
       + studies.map(renameStudyCard).join('')
     );
     return;
@@ -6293,12 +6407,12 @@ async function scanRenameFolder({ keepConsole = false } = {}) {
   syncRenameButton();
   syncConflictPicks();
   updateAllPreviews();
-  // A loaded study whose instances disagree is loaded and is also a problem;
-  // "Loaded" alone would put a green chip on the one outcome this screen
-  // exists to catch.
+  // A study that loads cleanly needs no chip: its card and its four boxes are
+  // the answer. One whose instances disagree is loaded and is also a problem,
+  // the one outcome this screen exists to catch, so that one says so.
   const clashes = Object.keys(renameState.conflicts).length;
   if (clashes) setStatus('rename', 'warn', `${clashes} field${clashes === 1 ? '' : 's'} disagree`);
-  else setStatus('rename', 'ok', 'Loaded');
+  else setStatus('rename', null);
 }
 
 /** Every keystroke in the four boxes ends here. */
@@ -6366,14 +6480,26 @@ function wireRename() {
       return;
     }
 
+    const argv = BUILDERS.rename();
+    // A dry run wrote nothing, so it ends on a plan, never on "Done".
+    const done = argv.includes('--dry-run') ? 'Plan ready' : 'Done';
     setStatus('rename', 'running', rehearsal() ? 'Previewing…' : (inplace ? 'Rewriting…' : 'Writing copy…'));
-    const { code, stderr } = await runStreaming('rename', BUILDERS.rename());
-    setStatus('rename', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
+    const { code, stderr } = await runStreaming('rename', argv);
+    setStatus('rename', code === 0 ? 'ok' : 'fail', code === 0 ? done : failLabel(stderr));
     // The button's own rule ("Nothing changed yet") decides it again, not the busy state.
     syncRenameButton();
     // The source's own values have moved, so what is on screen as "current" is
     // now yesterday's. Re-read rather than leave a stale prefill behind.
-    if (code === 0 && inplace) await scanRenameFolder({ keepConsole: true });
+    if (code === 0 && inplace) {
+      await scanRenameFolder({ keepConsole: true });
+      // A clean re-read leaves no chip of its own, and the verdict on screen
+      // is still the write's. It answers the command the form now builds, so
+      // the next edit retires it like any other green result.
+      if (renameState.study && viewPart('rename', 'status').hidden) {
+        setStatus('rename', 'ok', done);
+        lastRun.rename = argvKey(BUILDERS.rename());
+      }
+    }
   });
 
   $('#view-rename [data-cancel]').addEventListener('click', (e) => {
@@ -6390,6 +6516,7 @@ const editState = {
   changes: new Map(), // keyword -> new value
   removals: new Set(),// keyword
   loadedPath: '',
+  target: '',        // the path in the box when those tags were loaded
   scope: 'study',
 };
 
@@ -6413,9 +6540,10 @@ BUILDERS.edit = () => {
   const out = $('#edit-out').value.trim();
   if (out) argv.push('--out', out);
   if (editScope() === 'one') argv.push('--no-recurse');
-  // Preview-only is this tab's own switch (it is about the disk, not a peer);
-  // rehearsal adds the same flag from the other direction.
-  if ($('#edit-dryrun').checked || rehearsal()) argv.push('--dry-run');
+  // The copy goes to a new folder and the source is never modified, so the
+  // one dry run is rehearsal's. A tab-local "Preview only" that shipped ticked
+  // made "Apply changes" apply nothing, and end green.
+  if (rehearsal()) argv.push('--dry-run');
   if ($('#edit-force').checked) argv.push('--force');
   return argv;
 };
@@ -6447,7 +6575,7 @@ function renderTagEditor() {
       <div class="tg">${esc(t.tag)}</div>
       <div class="kw">${esc(kw)}${isUid ? ' <span class="pill">UID</span>' : ''}</div>
       <div><input type="text" class="tag-val" value="${esc(value)}" ${removing ? 'disabled' : ''} /></div>
-      <div><label class="rm"><input type="checkbox" class="tag-rm" ${removing ? 'checked' : ''} /> remove</label></div>
+      <div><label class="rm"><input type="checkbox" class="tag-rm" aria-label="Remove ${esc(kw)}" ${removing ? 'checked' : ''} /></label></div>
     </div>`;
   }).join('');
 
@@ -6499,6 +6627,27 @@ function renderPending() {
   box.innerHTML = `${bits.join(' · ')} — will apply to ${scopeText}.`;
 }
 
+/**
+ * Everything the last load put on screen, taken back off it.
+ *
+ * The edits typed over one file's tags are edits to that file. Left standing
+ * after the path changed — or after a load of the new path failed — they would
+ * be applied to a folder nobody had looked at.
+ */
+function resetEditLoaded() {
+  editState.tags = [];
+  editState.changes.clear();
+  editState.removals.clear();
+  editState.loadedPath = '';
+  editState.target = '';
+  $('#edit-scope-row').hidden = true;
+  $('#edit-loaded').hidden = true;
+  $('#edit-grid').innerHTML = '';
+  $('#edit-pending').hidden = true;
+  setStatus('edit', null);
+  updateAllPreviews();
+}
+
 async function loadTagsForEditing() {
   // As for Rename's folder scan: never a second run under a write in flight.
   if (viewBusy('edit')) return;
@@ -6509,11 +6658,14 @@ async function loadTagsForEditing() {
     return;
   }
 
+  resetEditLoaded();
   setStatus('edit', 'running', 'Loading…');
   // One representative file is what we edit against: a study shares its tag
   // structure, and dumping every instance would be slow and unreadable.
   const { code, stdout, stderr } = await runCapture('edit', ['tags', target, '--json']);
-  setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Loaded' : failLabel(stderr));
+  // A load that worked needs no chip: the tags on screen are the answer.
+  if (code === 0) setStatus('edit', null);
+  else setStatus('edit', 'fail', failLabel(stderr));
 
   if (code !== 0) {
     revealFailure('edit', stdout || stderr || 'Could not read tags.\n');
@@ -6540,6 +6692,7 @@ async function loadTagsForEditing() {
   editState.changes.clear();
   editState.removals.clear();
   editState.loadedPath = first.path || target;
+  editState.target = target;
 
   $('#edit-scope-row').hidden = false;
   $('#edit-loaded').hidden = false;
@@ -6552,10 +6705,21 @@ async function loadTagsForEditing() {
 }
 
 function wireEdit() {
-  $('#edit-load').addEventListener('click', loadTagsForEditing);
+  // The tags load when the path is chosen — Browse…, File…, or a typed path
+  // once it is finished with — the way Rename reads its folder. Each load is a
+  // child process, so not per keystroke. The box is dead while a write runs
+  // (BUSY_LOCKS); this is for a change that arrives anyway.
+  $('#edit-target').addEventListener('input', () => {
+    if (!viewBusy('edit') && editState.target && $('#edit-target').value.trim() !== editState.target) resetEditLoaded();
+  });
+  $('#edit-target').addEventListener('change', () => {
+    if (viewBusy('edit')) return;
+    if (!$('#edit-target').value.trim()) { resetEditLoaded(); return; }
+    loadTagsForEditing();
+  });
   $('#edit-filter').addEventListener('input', renderTagEditor);
   ['edit-target', 'edit-out'].forEach((id) => $(`#${id}`).addEventListener('input', updateAllPreviews));
-  ['edit-dryrun', 'edit-force'].forEach((id) => $(`#${id}`).addEventListener('change', updateAllPreviews));
+  $('#edit-force').addEventListener('change', updateAllPreviews);
 
   for (const chip of $$('#edit-scope-row .chip')) {
     chip.addEventListener('click', () => {
@@ -6588,9 +6752,12 @@ function wireEdit() {
       return;
     }
 
-    setStatus('edit', 'running', ($('#edit-dryrun').checked || rehearsal()) ? 'Previewing…' : 'Writing…');
-    const { code, stderr } = await runStreaming('edit', BUILDERS.edit());
-    setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
+    const argv = BUILDERS.edit();
+    const dry = argv.includes('--dry-run');
+    setStatus('edit', 'running', dry ? 'Previewing…' : 'Writing…');
+    const { code, stderr } = await runStreaming('edit', argv);
+    // A dry run wrote nothing, so it ends on a plan, never on "Done".
+    setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Done') : failLabel(stderr));
   });
 
   $('#view-edit [data-cancel]').addEventListener('click', (e) => {
@@ -6725,25 +6892,6 @@ function wireCopy() {
       }
     }
   });
-}
-
-async function checkMcpStatus() {
-  // Probe whether `dcm mcp` is runnable from PATH by asking the engine (which we
-  // already run) for its version; if that works, the same command backs `dcm mcp`.
-  const el = $('#mcp-status');
-  const txt = $('#mcp-status-text');
-  try {
-    if (state.info && state.info.version) {
-      el.className = 'mcp-status ok';
-      txt.innerHTML = `Ready — this app runs engine <code>v${esc(state.info.version)}</code>. Once <code>dcm</code> is on your PATH, the commands below connect Claude to it.`;
-    } else {
-      el.className = 'mcp-status bad';
-      txt.textContent = 'Engine not detected.';
-    }
-  } catch {
-    el.className = 'mcp-status bad';
-    txt.textContent = 'Engine not detected.';
-  }
 }
 
 // --------------------------------------------------------------------------
@@ -7056,7 +7204,6 @@ async function boot() {
   wireCopy();
   wireKeyboard();
   wireUpdates();
-  checkMcpStatus();
 
   renderSettingsForm();
   refreshPeerViews();

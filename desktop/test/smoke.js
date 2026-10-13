@@ -63,8 +63,9 @@ const RUN_PANES = ['worklist', 'send', 'receive', 'query', 'speed', 'echo', ...T
  * The word budget, per screen.
  *
  * The design rule is that no screen may put more than 60 visible words above
- * its primary button — Connect to Claude is the one exception, at 120, because
- * it is instructions rather than a command. Under that ceiling each screen has
+ * its primary button. Connect to Claude and Settings have no primary button
+ * (one is instructions, the other is set once), so each is counted whole, and
+ * Settings is the one screen allowed past 60. Under that ceiling each screen has
  * its own, pinned a few words above what the redesign actually landed on, so
  * prose creeping back onto a screen fails here rather than in front of an
  * operator. Anything a screen genuinely needs to say still exists: it lives in
@@ -107,24 +108,31 @@ const BUDGET = {
   websend: 7,
   webquery: 17,
   webhub: 25,
-  inventory: 12,
-  tags: 22,
+  // Ratcheted at the measured count plus three when Inventory lost its
+  // per-series switch (always on), Tags' extra filters went under Advanced,
+  // Edit lost "Load tags" and "Preview only", and Rename stopped echoing a
+  // one-script name back under its boxes.
+  inventory: 8,
+  tags: 10,
   // Rename is measured twice, like the station: the screen an operator walks
   // up to (a folder box and nothing else) and the screen they act on, with a
-  // study loaded and the four boxes filled. The second number carries the one
-  // part of this pane that varies with the data rather than the design — the
-  // composed PatientName is echoed back in full, so a five-part name reads as
-  // more words than a two-part one.
+  // study loaded and the four boxes filled. Only a name written in more than
+  // one script puts its composed value on screen, so that one study reads as
+  // more words than this one-script fixture.
   rename: 8,
-  'rename-loaded': 34,
-  edit: 30,
+  'rename-loaded': 30,
+  edit: 23,
   anon: 25,
   speed: 32,
-  mcp: 109,              // instructions, not a command: its own budget
-  // Settings has none on purpose. It is the screen the other screens were
-  // emptied into — set once, read once — and it runs no command, so there is
-  // no button to be standing in front of. It is still measured and reported,
-  // because a number nobody looks at is how a screen becomes this one twice.
+  // Instructions, not a command: the two copy boxes and their one line each,
+  // now that the "Ready" line and the hand-picked tool cards are gone.
+  mcp: 42,
+  // The screen the others were emptied into. It runs no command, so it is
+  // counted whole: section titles, labels, the saved peers, "+ Add a peer".
+  // Its parentheticals and notes are behind its ?, and the add form folds
+  // away once a peer is saved. A number nobody looks at is how a screen
+  // becomes the one it was, at 222 words.
+  settings: 93,
 };
 
 /**
@@ -897,6 +905,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
     await mustWait('state.settings.stationAe === "CT01" && state.settings.modality === "CT"',
       8000, 'Settings to take the station AE');
 
+    // With no peers saved, the add form is simply there: nothing to fold it
+    // behind and nothing to cancel back to.
+    const noPeers = await jsJSON(`JSON.stringify({
+      form: __smoke.vis(document.querySelector('#peer-form')),
+      add: __smoke.vis(document.querySelector('#peer-add')),
+      cancel: __smoke.vis(document.querySelector('#peer-cancel')),
+    })`);
+    if (!noPeers.form || noPeers.add || noPeers.cancel) {
+      bad(`with no peers saved the add form is not simply on screen: ${JSON.stringify(noPeers)}`);
+    }
+
     const addPeer = async (host, port, ae, role, callingAe = '') => {
       await js(`(() => {
         document.querySelector('#peer-host').value = ${JSON.stringify(host)};
@@ -916,6 +935,72 @@ async function runSmoke(win, app, mainHelpers = {}) {
     const ARCHIVE_PEER = `ARCHIVE @ 127.0.0.1:${archivePort}`;
     record(`peers: RIS ${RIS_PEER}, Archive ${ARCHIVE_PEER}`);
     await shot('settings-peers');
+
+    // Set once. With peers saved the add form folds away behind one button,
+    // and a row is its badge, its name and three verbs: the role is changed in
+    // the row's Edit, not by a second select repeating the badge.
+    const peerAtRest = await jsJSON(`(() => {
+      const q = (s) => document.querySelector(s);
+      const rest = {
+        form: __smoke.vis(q('#peer-form')), add: __smoke.vis(q('#peer-add')),
+        addLabel: q('#peer-add').textContent.trim(),
+        rowSelects: document.querySelectorAll('#set-peers select').length,
+        badges: Array.from(document.querySelectorAll('#set-peers .peer-row .peer-role')).map((b) => b.textContent),
+      };
+      q('#peer-add').click();
+      const adding = {
+        form: __smoke.vis(q('#peer-form')), add: __smoke.vis(q('#peer-add')),
+        cancel: __smoke.vis(q('#peer-cancel')), title: q('#peer-form-title').textContent,
+        host: document.activeElement === q('#peer-host'),
+      };
+      return JSON.stringify({ rest, adding });
+    })()`);
+    await shot('settings-add-peer');
+    const peerFolds = await jsJSON(`(() => {
+      const q = (s) => document.querySelector(s);
+      const vis = (s) => __smoke.vis(q(s));
+      q('#peer-cancel').click();
+      const cancelled = { form: vis('#peer-form'), add: vis('#peer-add') };
+      q('[data-peer-edit="${RIS_PEER}"]').click();
+      const editing = { form: vis('#peer-form'), add: vis('#peer-add'), cancel: vis('#peer-cancel'),
+        title: q('#peer-form-title').textContent, role: q('#peer-role').value };
+      q('#peer-cancel').click();
+      const back = { form: vis('#peer-form'), add: vis('#peer-add') };
+      // A peer that holds no role is badged as a peer, and the form says the same.
+      setPeerRole(${JSON.stringify(ARCHIVE_PEER)}, '');
+      renderSettingsPeers();
+      const roleless = q('[data-peer="${ARCHIVE_PEER}"] .peer-role').textContent;
+      setPeerRole(${JSON.stringify(ARCHIVE_PEER)}, 'archive');
+      refreshPeerViews();
+      return JSON.stringify({ cancelled, editing, back, roleless,
+        noRole: q('#peer-role option[value=""]').textContent });
+    })()`);
+    say(`settings: peers at rest ${JSON.stringify(peerAtRest.rest)}; + Add ${JSON.stringify(peerAtRest.adding)}; `
+      + `${JSON.stringify(peerFolds)}`);
+    if (peerAtRest.rest.form || !peerAtRest.rest.add || peerAtRest.rest.addLabel !== '+ Add a peer') {
+      bad(`with peers saved the add form did not fold behind "+ Add a peer": ${JSON.stringify(peerAtRest.rest)}`);
+    }
+    if (peerAtRest.rest.rowSelects !== 0) bad(`a peer row still carries a role select: ${JSON.stringify(peerAtRest.rest)}`);
+    if (JSON.stringify(peerAtRest.rest.badges) !== JSON.stringify(['RIS', 'Archive'])) {
+      bad(`the rows are not badged by role: ${JSON.stringify(peerAtRest.rest.badges)}`);
+    }
+    if (!peerAtRest.adding.form || peerAtRest.adding.add || !peerAtRest.adding.cancel
+      || peerAtRest.adding.title !== 'Add a peer' || !peerAtRest.adding.host) {
+      bad(`"+ Add a peer" did not open the form ready to type: ${JSON.stringify(peerAtRest.adding)}`);
+    }
+    if (peerFolds.cancelled.form || !peerFolds.cancelled.add) {
+      bad(`Cancel did not fold the add form away: ${JSON.stringify(peerFolds.cancelled)}`);
+    }
+    if (!peerFolds.editing.form || peerFolds.editing.add || !peerFolds.editing.cancel
+      || peerFolds.editing.title !== `Edit ${RIS_PEER}` || peerFolds.editing.role !== 'ris') {
+      bad(`a row's Edit did not open the form on that peer and its role: ${JSON.stringify(peerFolds.editing)}`);
+    }
+    if (peerFolds.back.form || !peerFolds.back.add) {
+      bad(`cancelling an edit did not fold the form away: ${JSON.stringify(peerFolds.back)}`);
+    }
+    if (peerFolds.roleless !== 'Peer' || peerFolds.noRole !== 'Peer') {
+      bad(`a peer with no role is not badged "Peer": ${JSON.stringify(peerFolds)}`);
+    }
 
     // One RIS and one Archive: a role a second peer takes is a role the first
     // one loses, because a screen pre-selects "the" peer for its role and two
@@ -950,6 +1035,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       };
       edit('CT01-ARC');
       await new Promise((r) => setTimeout(r, 300));
+      const savedFolds = !__smoke.vis(document.querySelector('#peer-form'))
+        && __smoke.vis(document.querySelector('#peer-add'));
       showView('send');
       const on = {
         conn: state.conn.callingAe,
@@ -964,8 +1051,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       showView('send');
       const off = { conn: state.conn.callingAe, send: BUILDERS.send().join(' ') };
       showView('settings');
-      return JSON.stringify({ on, off });
+      return JSON.stringify({ on, off, savedFolds });
     })()`);
+    if (!overrideAe.savedFolds) bad('saving an edited peer did not fold the form away again');
     record(`peers: the Archive with its own calling AE sends "--calling-ae ${overrideAe.on.conn}" `
       + `while the worklist still says "--calling-ae ${/--calling-ae (\S+)/.exec(overrideAe.on.worklist)?.[1]}"`);
     if (overrideAe.on.conn !== 'CT01-ARC' || !overrideAe.on.send.includes('--calling-ae CT01-ARC')) {
@@ -1027,7 +1115,55 @@ async function runSmoke(win, app, mainHelpers = {}) {
         // whole station gets counted: this is the screen an operator walks up to.
         await measureScreen('worklist-list', '#view-worklist', '#mpps-run');
       } else if (name === 'settings') {
-        await measureScreen('settings', '#view-settings');
+        const m = await measureScreen('settings', '#view-settings');
+        // Set once, and its prose is behind the ?: every parenthetical and note
+        // the form carried is in the help panel and not on the screen.
+        const st = await jsJSON(`(() => {
+          const titles = Array.from(document.querySelectorAll('#view-settings > .section-title'))
+            .filter(__smoke.vis).map((t) => t.textContent.trim());
+          const ae = document.querySelector('#set-retrieve-ae');
+          const eng = Array.from(document.querySelectorAll('#view-settings > .section-title'))
+            .find((t) => t.textContent.trim() === 'Engineer options');
+          return JSON.stringify({
+            titles,
+            help: document.querySelector('#settings-help').textContent.replace(/\\s+/g, ' '),
+            retrieveAfterEngineer: !!(eng && ae && (eng.compareDocumentPosition(ae) & Node.DOCUMENT_POSITION_FOLLOWING)),
+            retrieveLabel: ae ? ae.closest('label').textContent.trim() : '',
+            rehearsalLabel: document.querySelector('#set-rehearsal').closest('label').textContent.trim(),
+          });
+        })()`);
+        if (st.titles[0] !== 'Rehearsal') bad(`Rehearsal is not the first thing on Settings: ${JSON.stringify(st.titles)}`);
+        if (st.rehearsalLabel !== 'Rehearsal — nothing is sent') bad(`the rehearsal switch reads "${st.rehearsalLabel}"`);
+        if (!st.retrieveAfterEngineer || st.retrieveLabel !== 'Retrieve AE named in MPPS') {
+          bad(`the MPPS retrieve AE is not an engineer option: ${JSON.stringify(st)}`);
+        }
+        for (const [moved, inText] of [
+          ['ScheduledStationAETitle', 'ScheduledStationAETitle'], ['DCM_WEB_TOKEN', 'DCM WEB TOKEN'],
+          ['settings.json', 'settings json'], ['Used wherever a screen leaves the field blank', 'Used wherever'],
+          ['MPPS attributes the step to it', 'MPPS attributes'], ['They may be the same system', 'same system'],
+          ['only if this peer needs a different one', 'needs a different one'],
+        ]) {
+          if (!st.help.includes(moved)) bad(`the Settings help lost "${moved}"`);
+          if (m.text.includes(inText)) bad(`"${moved}" is still on the Settings screen: ${m.text}`);
+        }
+      } else if (name === 'mcp') {
+        await measureScreen(name, `#view-${name}`);
+        // Nothing on it may claim what it does not check or list what it does
+        // not offer. The engine registers a tool per screen's command, MPPS
+        // complete and discontinue among them.
+        const mcp = await jsJSON(`JSON.stringify({
+          status: !!document.querySelector('#mcp-status'),
+          cards: document.querySelectorAll('#view-mcp .tool-card, #view-mcp .tool-grid').length,
+          help: document.querySelector('#mcp-help').textContent.replace(/\\s+/g, ' '),
+        })`);
+        if (mcp.status) bad('Connect to Claude still shows a "Ready" line that never checked PATH');
+        if (mcp.cards) bad('Connect to Claude still lists a hand-picked subset of the tools');
+        if (/Nothing that closes a procedure step/i.test(mcp.help) || /not a copy/i.test(mcp.help)) {
+          bad(`the Claude help still says something false: ${mcp.help}`);
+        }
+        if (!/C-GET and C-MOVE/.test(mcp.help) || !/complete and discontinue/.test(mcp.help)) {
+          bad(`the Claude help does not say what Claude gets: ${mcp.help}`);
+        }
       } else {
         await measureScreen(name, `#view-${name}`);
       }
@@ -1161,7 +1297,6 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const invBusy = await js(`(() => {
         showView('inventory');
         __smoke.set('info-folder', ${JSON.stringify(fixtures)});
-        __smoke.set('info-series', true);
         const btn = document.querySelector('#view-inventory [data-run]');
         btn.click();
         return btn.disabled;
@@ -1175,6 +1310,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await shot('inventory-result');
       const inv = await jsJSON(`JSON.stringify({
         status: document.querySelector('#view-inventory [data-status]').textContent,
+        cls: document.querySelector('#view-inventory [data-status]').className,
+        seriesSwitch: !!document.querySelector('#info-series'),
         cmd: document.querySelector('#view-inventory [data-cmd]').textContent,
         rows: document.querySelectorAll('#view-inventory [data-result] tbody tr').length,
         text: document.querySelector('#view-inventory [data-result]').textContent.slice(0, 200),
@@ -1184,8 +1321,14 @@ async function runSmoke(win, app, mainHelpers = {}) {
       say(`inventory result: ${inv.rows} row(s) — ${inv.text.replace(/\s+/g, ' ').trim()}`);
       artefact('inventory-cmd.txt', inv.cmd);
       if (!/^dcm info /.test(inv.cmd)) bad(`the inventory command is wrong: ${inv.cmd}`);
-      if (inv.status !== 'Done' && inv.status !== 'OK') {
-        if (/fail/i.test(inv.status)) bad(`the inventory run failed: ${inv.status}`);
+      // Always per series: the breakdown is what shows colliding Series UIDs,
+      // so it is not a switch any more.
+      if (inv.seriesSwitch || !/ --series( |$)/.test(inv.cmd)) {
+        bad(`the inventory is not always per series: ${JSON.stringify(inv)}`);
+      }
+      // The fixtures are one clean study: a green Done, and nothing amber.
+      if (inv.status !== 'Done' || !/\bok\b/.test(inv.cls)) {
+        bad(`a clean inventory did not end on a green "Done": ${inv.status} [${inv.cls}]`);
       }
       if (!inv.rows) bad('a real inventory run produced no table rows');
       // A run that worked leaves the Output folded: the result is the table.
@@ -1198,10 +1341,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // command and the chip and the table come down — and a failure does not:
       // it stays on screen until a run replaces it, however the form is edited.
       const retired = await jsJSON(`(() => {
-        __smoke.set('info-series', false);
+        __smoke.set('info-folder', ${JSON.stringify(path.join(work, 'elsewhere'))});
         const chip = document.querySelector('#view-inventory [data-status]');
         const out = { chip: !chip.hidden, result: !document.querySelector('#view-inventory [data-result]').hidden };
-        __smoke.set('info-series', true);
+        __smoke.set('info-folder', ${JSON.stringify(fixtures)});
         return JSON.stringify(out);
       })()`);
       say(`stale result: after the command changed, chip shown ${retired.chip}, table shown ${retired.result}`);
@@ -1215,19 +1358,136 @@ async function runSmoke(win, app, mainHelpers = {}) {
       })()`);
       await mustWait("!document.querySelector('#view-inventory [data-status]').className.includes('running')",
         RUN_MS, 'the inventory of a missing folder to finish');
+      // The engine's own words reach the Output as well as the red line.
+      await mustWait("/ENOENT|no such file/i.test(__smoke.consoleText('inventory'))",
+        10000, "the missing folder's error to reach the Output");
+      await shot('inventory-missing-path');
+      const readFailure = (view) => `(() => {
+        const chip = document.querySelector('#view-${view} [data-status]');
+        const box = document.querySelector('#view-${view} [data-result]');
+        return {
+          text: chip.textContent, cls: chip.className, shown: !box.hidden && __smoke.vis(box),
+          red: !!box.querySelector('.folder-check.bad.list-error'),
+          head: (box.querySelector('.list-error b') || {}).textContent || '',
+          said: (box.querySelector('.list-error .engine-said') || {}).textContent || '',
+          tiles: box.querySelectorAll('.tile, tbody tr').length,
+          body: box.textContent.replace(/\\s+/g, ' ').trim(),
+        };
+      })()`;
+      const checkReadFailure = (view, f) => {
+        record(`${view}: a missing path reads "${f.head}" / "${f.said.slice(0, 90)}" [${f.text}]`);
+        if (!/\bfail\b/.test(f.cls) || f.text !== 'Failed') bad(`${view} of a missing path did not fail: ${JSON.stringify(f)}`);
+        if (!f.shown || !f.red || f.head !== 'Nothing could be read there.') {
+          bad(`${view} of a missing path did not say so in red where the answer goes: ${JSON.stringify(f)}`);
+        }
+        if (!/ENOENT|no such file/i.test(f.said)) bad(`${view} of a missing path dropped the engine's words: ${JSON.stringify(f)}`);
+        if (f.tiles || /undefined|No matching|0 matches/.test(f.body)) {
+          bad(`${view} of a missing path was drawn as an answer: ${JSON.stringify(f)}`);
+        }
+      };
       const kept = await jsJSON(`(() => {
+        const before = ${readFailure('inventory')};
         const chip = document.querySelector('#view-inventory [data-status]');
-        const before = { text: chip.textContent, cls: chip.className };
-        __smoke.set('info-series', false);
-        const after = { shown: !chip.hidden && __smoke.vis(chip), text: chip.textContent, cls: chip.className };
-        __smoke.set('info-series', true);
+        __smoke.set('info-folder', ${JSON.stringify(path.join(work, 'no-such-folder-either'))});
+        const after = { shown: !chip.hidden && __smoke.vis(chip), text: chip.textContent, cls: chip.className,
+          result: !document.querySelector('#view-inventory [data-result]').hidden };
+        __smoke.set('info-folder', ${JSON.stringify(path.join(work, 'no-such-folder'))});
         return JSON.stringify({ before, after });
       })()`);
       say(`stale result: a failed inventory reads "${kept.before.text}" and, after an edit, shown ${kept.after.shown}`);
-      if (!/\bfail\b/.test(kept.before.cls)) bad(`an inventory of a missing folder did not fail: ${JSON.stringify(kept)}`);
-      if (!kept.after.shown || kept.after.cls !== kept.before.cls || kept.after.text !== kept.before.text) {
+      checkReadFailure('inventory', kept.before);
+      if (!kept.after.shown || !kept.after.result || kept.after.cls !== kept.before.cls
+        || kept.after.text !== kept.before.text) {
         bad(`editing the form took a failure off the screen: ${JSON.stringify(kept)}`);
       }
+
+      // A folder with one file that is not DICOM is still inventoried, and
+      // the chip says what is missing from it rather than "Done" or "Failed".
+      const unreadable = path.join(work, 'inv-unreadable');
+      fs.mkdirSync(unreadable, { recursive: true });
+      fs.cpSync(fixtures, path.join(unreadable, 'study'), { recursive: true });
+      fs.writeFileSync(path.join(unreadable, 'junk.dcm'), 'this is not a DICOM file\n');
+      await js(`(() => {
+        __smoke.set('info-folder', ${JSON.stringify(unreadable)});
+        document.querySelector('#view-inventory [data-run]').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#view-inventory [data-status]').className.includes('running')",
+        RUN_MS, 'the inventory with an unreadable file to finish');
+      const partial = await jsJSON(`JSON.stringify({
+        text: document.querySelector('#view-inventory [data-status]').textContent,
+        cls: document.querySelector('#view-inventory [data-status]').className,
+        tiles: Array.from(document.querySelectorAll('#view-inventory [data-result] .tile'))
+          .map((t) => t.querySelector('.num').textContent + ' ' + t.querySelector('.lbl').textContent),
+        rows: document.querySelectorAll('#view-inventory [data-result] tbody tr').length,
+      })`);
+      await shot('inventory-unreadable');
+      record(`inventory: one unreadable file reads "${partial.text}" over ${JSON.stringify(partial.tiles)}`);
+      if (partial.text !== 'Done · 1 unreadable' || !/\bwarn\b/.test(partial.cls)) {
+        bad(`an inventory with an unreadable file did not say so in amber: ${JSON.stringify(partial)}`);
+      }
+      if (!partial.rows || !partial.tiles.some((t) => /^1 unreadable$/.test(t))) {
+        bad(`an inventory with an unreadable file was not drawn: ${JSON.stringify(partial)}`);
+      }
+
+      // Tags reads the same way: a missing path is red with the engine's
+      // words, never "No matching tags."; a filter nothing matches is a green
+      // "No matches" and nothing under it.
+      await js(`(() => {
+        showView('tools'); showTab('tools', 'tags');
+        __smoke.set('tags-target', ${JSON.stringify(path.join(work, 'no-such-folder'))});
+        document.querySelector('#view-tags [data-run]').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#view-tags [data-status]').className.includes('running')",
+        RUN_MS, 'the tags of a missing folder to finish');
+      await mustWait("/ENOENT|no such file/i.test(__smoke.consoleText('tags'))",
+        10000, "the missing path's error to reach the Tags output");
+      await shot('tags-missing-path');
+      checkReadFailure('tags', await jsJSON(`JSON.stringify(${readFailure('tags')})`));
+      await js(`(() => {
+        __smoke.set('tags-target', ${JSON.stringify(fixtures)});
+        __smoke.set('tags-filter', 'NoSuchKeywordAnywhere');
+        document.querySelector('#view-tags [data-run]').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#view-tags [data-status]').className.includes('running')",
+        RUN_MS, 'the tags search that matches nothing to finish');
+      const noTags = await jsJSON(`JSON.stringify({
+        text: document.querySelector('#view-tags [data-status]').textContent,
+        cls: document.querySelector('#view-tags [data-status]').className,
+        result: !document.querySelector('#view-tags [data-result]').hidden,
+      })`);
+      record(`tags: a filter nothing matches reads "${noTags.text}"`);
+      if (noTags.text !== 'No matches' || !/\bok\b/.test(noTags.cls) || noTags.result) {
+        bad(`a tags filter that matched nothing is not a plain green "No matches": ${JSON.stringify(noTags)}`);
+      }
+      // Has value, private-only and every-file are under Advanced, and its
+      // summary names whichever is set.
+      const tagsAdv = await jsJSON(`(() => {
+        const adv = document.querySelector('#tags-adv');
+        const inside = ['tags-value', 'tags-private', 'tags-all']
+          .every((id) => adv.contains(document.querySelector('#' + id)));
+        const sum = document.querySelector('#tags-adv-sum');
+        const blank = sum.textContent;
+        __smoke.set('tags-value', 'DOE^JANE');
+        __smoke.set('tags-all', true);
+        const set = { sum: sum.textContent, changed: sum.classList.contains('changed'),
+          cmd: document.querySelector('#view-tags [data-cmd]').textContent };
+        __smoke.set('tags-value', '');
+        __smoke.set('tags-all', false);
+        __smoke.set('tags-filter', '');
+        __smoke.set('tags-target', '');
+        setStatus('tags', null);
+        return JSON.stringify({ open: adv.open, inside, blank, set, after: sum.textContent });
+      })()`);
+      if (tagsAdv.open || !tagsAdv.inside) bad(`Tags' extra filters are not folded under Advanced: ${JSON.stringify(tagsAdv)}`);
+      if (tagsAdv.blank !== '' || tagsAdv.after !== '') bad(`Tags' Advanced summary is not blank at its defaults: ${JSON.stringify(tagsAdv)}`);
+      if (tagsAdv.set.sum !== '— has value DOE^JANE · every file' || !tagsAdv.set.changed
+        || !/--value "DOE\^JANE"/.test(tagsAdv.set.cmd) || !/ --all( |$)/.test(tagsAdv.set.cmd)) {
+        bad(`Tags' Advanced summary does not name what it holds: ${JSON.stringify(tagsAdv.set)}`);
+      }
+      await js("showTab('tools', 'inventory'); true");
       // Leave the tab the way the rest of the run expects it.
       await js(`(() => {
         __smoke.set('info-folder', ${JSON.stringify(fixtures)});
@@ -1515,20 +1775,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
     //    --dry-run — and nothing else.
     // =====================================================================
     {
-      // Edit ships with its own "Preview only" ticked, and that switch is about
-      // the disk rather than a peer — it was deliberately kept when the
-      // per-screen dry-run controls were replaced by rehearsal. It is turned
-      // off here so the two are not confused, and checked again afterwards.
+      // Edit has no dry-run switch of its own. It writes a new folder and never
+      // touches the source, and a "Preview only" that shipped ticked made
+      // "Apply changes" apply nothing and end green. Rehearsal is the one way
+      // to a dry run — checked for every command just below.
       const editOwn = await jsJSON(`(() => {
         showView('edit');
-        const on = BUILDERS.edit().join(' ');
-        __smoke.set('edit-dryrun', false);
-        return JSON.stringify({ on, off: BUILDERS.edit().join(' ') });
+        return JSON.stringify({ own: !!document.querySelector('#edit-dryrun'), cmd: BUILDERS.edit().join(' ') });
       })()`);
-      if (!editOwn.on.includes('--dry-run') || editOwn.off.includes('--dry-run')) {
-        bad(`Edit's own "Preview only" no longer controls --dry-run: ${JSON.stringify(editOwn)}`);
+      if (editOwn.own || editOwn.cmd.includes('--dry-run')) {
+        bad(`Edit still has a dry run of its own: ${JSON.stringify(editOwn)}`);
       }
-      say('rehearsal: Edit\'s own "Preview only" is a separate switch about the disk; turned off for this check');
 
       const before = await jsJSON('JSON.stringify(__smoke.argvs())');
       const bannerOff = await js('document.querySelector("#rehearsal-banner").hidden');
@@ -1658,7 +1915,6 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (speedBack.disabled || speedBack.label !== 'Run speed test') {
         bad(`Speed test did not come back when rehearsal was turned off: ${JSON.stringify(speedBack)}`);
       }
-      await js('__smoke.set("edit-dryrun", true); true');
     }
 
     // =====================================================================
@@ -4323,24 +4579,32 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // J. A live tag load and edit preview.
     // =====================================================================
     if (fixtures) {
-      await js(`(() => {
+      // The tags load when the path is chosen, the way Rename reads its
+      // folder: there is no "Load tags" to press.
+      const picked = await jsJSON(`(() => {
         showView('edit');
         __smoke.set('edit-target', ${JSON.stringify(fixtures)});
-        document.querySelector('#edit-load').click();
-        return true;
+        return JSON.stringify({ loading: viewBusy('edit'), loadBtn: !!document.querySelector('#edit-load') });
       })()`);
+      if (picked.loadBtn) bad('Edit still has a "Load tags" button');
+      if (!picked.loading) bad('choosing the Edit path did not start loading its tags');
       // Loading the tags is a child process too; wait for the grid, not a guess.
-      await mustWait("document.querySelectorAll('#edit-grid .tag-row[data-kw]').length > 0",
+      await mustWait("!viewBusy('edit') && document.querySelectorAll('#edit-grid .tag-row[data-kw]').length > 0",
         40000, 'the tag editor to load');
       const edit = await jsJSON(`(() => {
-        __smoke.set('edit-target', ${JSON.stringify(fixtures)});
+        const chip = document.querySelector('#view-edit [data-status]');
+        const loadedChip = { shown: !chip.hidden, text: chip.textContent, cls: chip.className };
         const row = document.querySelector('.tag-row[data-kw="PatientID"] .tag-val');
         row.value = 'TEST-999';
         row.dispatchEvent(new Event('input', {bubbles:true}));
         return JSON.stringify({
           tags: document.querySelectorAll('#edit-grid .tag-row[data-kw]').length,
           cmd: document.querySelector('#view-edit [data-cmd]').textContent,
-          loadIsGhost: document.querySelector('#edit-load').classList.contains('ghost'),
+          loadedChip,
+          pickers: Array.from(document.querySelectorAll('[data-pick="edit-target"]')).map((b) => b.textContent.trim()),
+          removeWords: Array.from(document.querySelectorAll('#edit-grid .tag-row[data-kw] .rm'))
+            .filter((l) => l.textContent.trim()).length,
+          removeLabel: document.querySelector('.tag-row[data-kw="PatientID"] .tag-rm').getAttribute('aria-label'),
           primaries: Array.from(document.querySelectorAll('#view-edit .btn.primary'))
             .filter(__smoke.vis).map((b) => b.textContent.trim()),
         });
@@ -4349,10 +4613,59 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await shot('edit-loaded');
       record(`edit: ${edit.tags} tags loaded — ${edit.cmd}`);
       if (!edit.cmd.includes('PatientID=TEST-999')) bad(`the edit did not reach the command: ${edit.cmd}`);
-      // One primary button per screen: Load tags is a ghost now.
-      if (!edit.loadIsGhost || edit.primaries.length !== 1) {
+      // The grid is the answer to a load; a green "Loaded" beside it was the
+      // same news twice. A failed load still says so (below, in the lock check).
+      if (edit.loadedChip.shown) bad(`a tag load that worked still shows a chip: ${JSON.stringify(edit.loadedChip)}`);
+      if (JSON.stringify(edit.pickers) !== JSON.stringify(['Browse…', 'File…'])) {
+        bad(`Edit's pickers are not Browse… and File…: ${JSON.stringify(edit.pickers)}`);
+      }
+      if (edit.removeWords || edit.removeLabel !== 'Remove PatientID') {
+        bad(`a tag row still spells out "remove", or lost its accessible name: ${JSON.stringify(edit)}`);
+      }
+      if (edit.primaries.length !== 1) {
         bad(`the Edit tab has ${edit.primaries.length} primary buttons: ${JSON.stringify(edit.primaries)}`);
       }
+
+      // Rehearsal is the only dry run, and a dry run ends on a plan.
+      const editOut = path.join(work, 'edited');
+      const editRun = async (label) => {
+        await js("document.querySelector('#view-edit [data-run]').click(); true");
+        await mustWait("!viewBusy('edit') && !document.querySelector('#view-edit [data-status]').className.includes('running')",
+          RUN_MS, label);
+        return jsJSON(`JSON.stringify({
+          text: document.querySelector('#view-edit [data-status]').textContent,
+          cls: document.querySelector('#view-edit [data-status]').className,
+          cmd: document.querySelector('#view-edit [data-cmd]').textContent,
+        })`);
+      };
+      await js(`__smoke.set('edit-out', ${JSON.stringify(editOut)}); __smoke.set('set-rehearsal', true); true`);
+      await mustWait('state.settings.rehearsal === true', 8000, 'rehearsal to be committed for the edit');
+      const actionsInView = async () => {
+        await js("document.querySelector('#view-edit .actions').scrollIntoView({ block: 'center' }); true");
+        await wait(300);
+      };
+      const dryEdit = await editRun('the rehearsed edit to finish');
+      await actionsInView();
+      await shot('edit-rehearsed');
+      record(`edit: rehearsed — ${dryEdit.text} — ${dryEdit.cmd}`);
+      if (dryEdit.text !== 'Plan ready' || !/\bok\b/.test(dryEdit.cls) || !dryEdit.cmd.includes('--dry-run')) {
+        bad(`a rehearsed edit did not end on a plan: ${JSON.stringify(dryEdit)}`);
+      }
+      if (fs.existsSync(editOut)) bad(`a rehearsed edit wrote ${editOut}`);
+      await js("__smoke.set('set-rehearsal', false); true");
+      await mustWait('state.settings.rehearsal === false', 8000, 'rehearsal to be turned off after the edit');
+      // With rehearsal off, the first press writes the copy: nothing on this
+      // tab can make "Apply changes" apply nothing.
+      const realEdit = await editRun('the edit to finish');
+      await actionsInView();
+      await shot('edit-written');
+      await js("document.querySelector('.content').scrollTop = 0; true");
+      record(`edit: ${realEdit.text} — ${realEdit.cmd}`);
+      if (realEdit.text !== 'Done' || !/\bok\b/.test(realEdit.cls) || realEdit.cmd.includes('--dry-run')) {
+        bad(`the edit did not write its copy cleanly: ${JSON.stringify(realEdit)}`);
+      }
+      if (!fs.existsSync(editOut) || !fs.readdirSync(editOut).length) bad(`the edit wrote nothing to ${editOut}`);
+      await js("__smoke.set('edit-out', ''); setStatus('edit', null); true");
     }
 
     // Ctrl+Enter reaches the open tab's primary, not the first one in the
@@ -4396,7 +4709,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         RUN_MS, 'the two-study folder to be scanned');
       const refusal = await jsJSON(`JSON.stringify({
         text: document.querySelector('#rename-found').textContent.replace(/\\s+/g, ' ').trim(),
+        refused: (document.querySelector('#rename-found .folder-check.bad') || {}).textContent || '',
         caution: !!document.querySelector('#rename-found .caution'),
+        help: document.querySelector('#tools-help').textContent.replace(/\\s+/g, ' '),
         cards: document.querySelectorAll('#rename-found .study-card').length,
         uids: Array.from(document.querySelectorAll('#rename-found .study-card .uid')).map((e) => e.textContent.trim()),
         formShown: !document.querySelector('#rename-form').hidden,
@@ -4406,7 +4721,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
       })`);
       await shot('rename-refused-multi-study');
       record(`rename: two studies -> "${refusal.text.slice(0, 160)}…"`);
-      if (!refusal.caution || refusal.cards !== 2) {
+      // One red line saying what is wrong and what to do. Why it is a merge
+      // rather than a rename is in the help, where the reasoning lives.
+      if (refusal.refused.replace(/\s+/g, ' ').trim() !== "This folder holds 2 studies. Rename one study's folder at a time."
+        || refusal.caution || refusal.cards !== 2) {
         bad(`the two-study folder was not refused with both studies named: ${JSON.stringify(refusal)}`);
       }
       if (refusal.uids.length !== 2 || refusal.uids[0] === refusal.uids[1]) {
@@ -4415,9 +4733,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (refusal.formShown || !refusal.disabled) {
         bad(`the rename form was offered for a folder holding two studies: ${JSON.stringify(refusal)}`);
       }
-      if (!/merge, not a rename/.test(refusal.text)) {
-        bad(`the refusal does not say why renaming two studies at once is a merge: ${refusal.text}`);
+      if (!/merge, not a rename/.test(refusal.help)) {
+        bad(`the help no longer says why renaming two studies at once is a merge: ${refusal.help}`);
       }
+      if (refusal.status !== '2 studies') bad(`the two-study refusal chip reads "${refusal.status}"`);
 
       // ---- One study: what is there, and an inert button until something differs.
       await js(`__smoke.set('rename-folder', ${JSON.stringify(fixtures)}); true`);
@@ -4431,6 +4750,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         desc: document.querySelector('#rename-desc').value,
         acc: document.querySelector('#rename-accession').value,
         pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+        pnShown: __smoke.vis(document.querySelector('#rename-pn')),
+        chipShown: !document.querySelector('#view-rename [data-status]').hidden,
         btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
         disabled: document.querySelector('#view-rename [data-run]').disabled,
         diffShown: !document.querySelector('#rename-diff').hidden,
@@ -4455,6 +4776,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`an unchanged form left the button live: ${JSON.stringify(loaded)}`);
       }
       if (loaded.diffShown) bad('an unchanged form showed a change list');
+      // A study that loads cleanly is its card and its boxes: no green
+      // "Loaded" beside them, and no line echoing a one-script name back.
+      if (loaded.chipShown) bad(`a cleanly loaded study still shows a chip: ${JSON.stringify(loaded)}`);
+      if (loaded.pnShown) bad(`a one-script name is echoed under the boxes: ${loaded.pn}`);
       if (loaded.argv.includes('--set')) bad(`an unchanged form still set something: ${loaded.argv.join(' ')}`);
       await measureScreen('rename-loaded', '#view-rename');
 
@@ -4536,6 +4861,25 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`switching back to a copy did not disarm in place: ${JSON.stringify(backToCopy)}`);
       }
       say('rename: in place was armed, inspected and disarmed without being pressed');
+
+      // ---- Rehearsed first: a dry run wrote nothing, so it ends on a plan.
+      await js("__smoke.set('set-rehearsal', true); true");
+      await mustWait('state.settings.rehearsal === true', 8000, 'rehearsal to be committed for the rename');
+      await js(`document.querySelector('#view-rename [data-run]').click(); true`);
+      await mustWait("!viewBusy('rename') && !document.querySelector('#view-rename [data-status]').className.includes('running')",
+        RUN_MS, 'the rehearsed rename to finish');
+      const dryRename = await jsJSON(`JSON.stringify({
+        text: document.querySelector('#view-rename [data-status]').textContent,
+        cls: document.querySelector('#view-rename [data-status]').className,
+        cmd: document.querySelector('#view-rename [data-cmd]').textContent,
+      })`);
+      record(`rename: rehearsed — ${dryRename.text}`);
+      if (dryRename.text !== 'Plan ready' || !/\bok\b/.test(dryRename.cls) || !dryRename.cmd.includes('--dry-run')) {
+        bad(`a rehearsed rename did not end on a plan: ${JSON.stringify(dryRename)}`);
+      }
+      if (fs.existsSync(outDir)) bad(`a rehearsed rename wrote ${outDir}`);
+      await js("__smoke.set('set-rehearsal', false); clearConsole('rename'); true");
+      await mustWait('state.settings.rehearsal === false', 8000, 'rehearsal to be turned off after the rename');
 
       // ---- The copy, for real. Then point the tab at what it produced: the
       // proof a rename worked is that the renamed folder reads back renamed.
@@ -4726,12 +5070,18 @@ async function runSmoke(win, app, mainHelpers = {}) {
         head: document.querySelector('#view-inventory [data-result] .study-card h3').textContent
           .replace(/\\s+/g, ' ').trim(),
         collisions: document.querySelectorAll('#view-inventory [data-result] .study-card .collision').length,
+        chip: document.querySelector('#view-inventory [data-status]').textContent,
+        chipCls: document.querySelector('#view-inventory [data-status]').className,
       })`);
       await shot('inventory-conflict');
       record(`inventory: the conflicted study heads its card "${invClash.head}"`);
       if (invClash.collisions !== 2 || !invClash.head.includes('WRONG-ID')
         || !invClash.head.includes('A DIFFERENT STUDY')) {
         bad(`the inventory card filed a disagreement as an absence: ${JSON.stringify(invClash)}`);
+      }
+      // A study whose instances disagree about whose it is was a green "Done".
+      if (invClash.chip !== 'Done · 1 identity conflict' || !/\bwarn\b/.test(invClash.chipCls)) {
+        bad(`the inventory of a conflicted study did not say so in amber: ${JSON.stringify(invClash)}`);
       }
       await js(`showTab('tools', 'rename'); true`);
 
@@ -4827,6 +5177,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         panels: document.querySelectorAll('#rename-found .caution').length,
         collisions: document.querySelectorAll('#rename-found .study-card .collision').length,
         status: document.querySelector('#view-rename [data-status]').textContent,
+        statusCls: document.querySelector('#view-rename [data-status]').className,
+        statusShown: !document.querySelector('#view-rename [data-status]').hidden,
         btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
         found: document.querySelector('#rename-found').textContent.replace(/\\s+/g, ' ').trim(),
         console: __smoke.consoleText('rename').slice(-900),
@@ -4844,8 +5196,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (healed.panels || healed.collisions) {
         bad(`the repaired study still shows a disagreement: ${JSON.stringify(healed)}`);
       }
-      if (healed.status !== 'Loaded' || healed.btn !== 'Nothing changed yet') {
+      // The re-read that proves an in-place write leaves no chip of its own,
+      // so the verdict on screen is still the write's: a green "Done".
+      if (healed.btn !== 'Nothing changed yet') {
         bad(`the repaired study did not read back as already-correct: ${JSON.stringify(healed)}`);
+      }
+      if (!healed.statusShown || healed.status !== 'Done' || !/\bok\b/.test(healed.statusCls)) {
+        bad(`the in-place repair's verdict did not survive the re-read: ${JSON.stringify(healed)}`);
       }
       // An in-place write is the destructive one and its per-tag report is the
       // only account of it there will be. The re-read that proves it worked
@@ -4901,6 +5258,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         groups: renameState.groups,
         extras: renameState.extras,
         pn: document.querySelector('#rename-pn').textContent.replace(/\\s+/g, ' ').trim(),
+        pnShown: __smoke.vis(document.querySelector('#rename-pn')),
       })`);
       record(`rename: multi-script study loads as ${script1.name}`);
       record(`rename: composed line reads — ${script1.pn}`);
@@ -4920,8 +5278,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       // Nothing preserved invisibly: the composed line is the whole value, and
       // says in five words that the rest is kept rather than about to go.
-      if (!script1.pn.includes(JP_NAME) || !/other spelling\(s\) kept/.test(script1.pn)) {
-        bad(`the screen did not show what it is about to write: ${script1.pn}`);
+      if (!script1.pnShown || !script1.pn.includes(JP_NAME) || !/other spelling\(s\) kept/.test(script1.pn)) {
+        bad(`the screen did not show what it is about to write: ${JSON.stringify(script1)}`);
       }
 
       // ---- Correct the surname in Latin letters only, which is the edit that
@@ -5640,6 +5998,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         // folder's Browse… is dead for as long as the scan runs.
         if (id.startsWith('rename')) {
           await waitFor("!viewBusy('rename') && !state.activeRuns.rename", 30000, 'the rename scan to finish');
+        }
+        if (id === 'edit-target') {
+          await waitFor("!viewBusy('edit') && !state.activeRuns.edit", 30000, 'the edit tag load to finish');
         }
         await wait(600);
       };

@@ -675,9 +675,9 @@
           <div class="help-head"><b>What these tools do</b><button type="button" class="linklike" data-help-close>Close</button></div>
           <p>Every tab here works on local files and sends nothing to any peer.</p>
           <h4>Inventory</h4>
-          <p>Reads metadata only — it stops before pixel data, so it is fast on big trees. <b>Break down per series</b> also flags colliding Series UIDs, which is the usual sign that two studies were merged into one folder or that something rewrote UIDs on the way in.</p>
+          <p>Reads metadata only — it stops before pixel data, so it is fast on big trees. It always breaks the inventory down per series, which also flags colliding Series UIDs: the usual sign that two studies were merged into one folder or that something rewrote UIDs on the way in. The chip turns amber when a file could not be read, or when a study's own instances disagree about whose study it is.</p>
           <h4>Tags</h4>
-          <p>Dumps the tags in a file or folder. It reads metadata only and never prints pixel data. The filter takes a keyword, a tag or a value, and <code>/regex/</code> is allowed. By default one file per series is read, because the tags that differ per instance are rarely the ones being looked for; <b>Every file</b> reads all of them.</p>
+          <p>Dumps the tags in a file or folder. It reads metadata only and never prints pixel data. The filter takes a keyword, a tag or a value, and <code>/regex/</code> is allowed. By default one file per series is read, because the tags that differ per instance are rarely the ones being looked for; <b>Every file</b>, under Advanced with <b>Has value</b> and <b>Private / unrecognised tags only</b>, reads all of them.</p>
           <h4>Rename</h4>
           <p>Changes the four fields that say who a study belongs to — patient name, patient ID, study description, accession number — and nothing else. It is <b>Edit</b> underneath with the DICOM keywords filled in for you, and it never passes <code>--force</code>, so no UID is touched. Renaming changes what a study is <i>called</i>, never what it <i>is</i>.</p>
           <p>A folder holding more than one study is refused rather than renamed. <code>dcm edit</code> applies to every instance under the path and cannot be scoped to one study inside it, so renaming one of three would write a single identity over all three — a merge, not a rename.</p>
@@ -686,7 +686,7 @@
           <p><b>What this means downstream.</b> Because the UIDs survive, an archive that already holds this study sees the same study with different demographics, not a new one — and archives differ in what they do about that. Some reconcile the record, some keep the demographics they already had and ignore yours, some file a second copy. Renaming before the first send is unambiguous; renaming after one is a question about that archive, so find out what yours does before relying on it.</p>
           <p><b>Study date is deliberately not offered here.</b> A date is not a name. It is when the images were made, and rewriting it re-files the study in every date-ordered view an archive has while the SeriesDate and AcquisitionDate inside each instance still say otherwise. The Edit tab will change it if you genuinely need to.</p>
           <h4>Edit</h4>
-          <p>Load a study or a single file, change values, then write the result to a new folder. <b>The source is never modified.</b> <b>Preview only</b> shows what would change and writes nothing — it is this tab's own switch, about the disk rather than a peer, and Rehearsal mode adds the same flag from the other direction.</p>
+          <p>Pick a study or a single file and its tags load. Change values, then write the result to a new folder. <b>The source is never modified.</b> Rehearsal mode previews the edit and writes nothing.</p>
           <p>UIDs are structural, so editing one is gated behind <b>Allow editing UIDs</b>. Changing a Series or Study UID on some instances and not others splits a study into pieces no archive will put back together.</p>
           <h4>De-identify</h4>
           <p><b>Best-effort, not certified.</b> It copies a folder with identifiers removed. It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
@@ -709,9 +709,6 @@
                 <button class="btn ghost" data-pick="info-folder" data-pick-mode="file">File…</button>
               </div>
             </label>
-          </div>
-          <div class="checks">
-            <label><input type="checkbox" id="info-series" checked /> Break down per series</label>
           </div>
           <div class="actions">
             <button class="btn primary" data-run>Read</button>
@@ -741,12 +738,19 @@
           </div>
           <div class="form-row">
             <label class="grow">Filter<input type="text" id="tags-filter" placeholder="keyword, tag or value; /regex/ allowed" /></label>
-            <label class="grow">Has value<input type="text" id="tags-value" placeholder="e.g. DOE^JANE" /></label>
           </div>
-          <div class="checks">
-            <label><input type="checkbox" id="tags-private" /> Private / unrecognised tags only</label>
-            <label><input type="checkbox" id="tags-all" /> Every file <span class="dim">(default: one per series)</span></label>
-          </div>
+          <details class="adv" id="tags-adv">
+            <summary>Advanced <span class="adv-sum" id="tags-adv-sum"></span></summary>
+            <div class="adv-body">
+              <div class="form-row">
+                <label class="grow">Has value<input type="text" id="tags-value" placeholder="e.g. DOE^JANE" /></label>
+              </div>
+              <div class="checks">
+                <label><input type="checkbox" id="tags-private" /> Private / unrecognised tags only</label>
+                <label><input type="checkbox" id="tags-all" /> Every file <span class="dim">(default: one per series)</span></label>
+              </div>
+            </div>
+          </details>
           <div class="actions">
             <button class="btn primary" data-run>Show tags</button>
             <span class="status-chip" data-status hidden></span>
@@ -804,7 +808,7 @@
               <label class="grow">Family name<input type="text" id="rename-family" placeholder="DOE" /></label>
               <label class="grow">Given names<input type="text" id="rename-given" placeholder="JANE" /></label>
             </div>
-            <div class="pn-composed" id="rename-pn"></div>
+            <div class="pn-composed" id="rename-pn" hidden></div>
             <div class="form-row">
               <label class="grow">Patient ID<input type="text" id="rename-patientid" /></label>
             </div>
@@ -855,9 +859,8 @@
             <label class="grow">Study folder or single file
               <div class="path-pick">
                 <input type="text" id="edit-target" placeholder="Choose a study folder or one .dcm file…" />
-                <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Folder…</button>
+                <button class="btn ghost" data-pick="edit-target" data-pick-mode="folder">Browse…</button>
                 <button class="btn ghost" data-pick="edit-target" data-pick-mode="file">File…</button>
-                <button class="btn ghost" id="edit-load">Load tags</button>
               </div>
             </label>
           </div>
@@ -886,7 +889,6 @@
             </label>
           </div>
           <div class="checks">
-            <label><input type="checkbox" id="edit-dryrun" checked /> Preview only <span class="dim">(write nothing)</span></label>
             <label><input type="checkbox" id="edit-force" /> Allow editing UIDs <span class="warn-inline">(can split a study)</span></label>
           </div>
 
@@ -1075,12 +1077,9 @@
         </header>
         <div class="help-panel" id="mcp-help" hidden>
           <div class="help-head"><b>What MCP is doing here</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>MCP is how an assistant calls a local program as a tool. Any MCP client can use it, not only Claude. Registering this server hands Claude the same <code>dcm</code> engine this app runs — not a copy, and not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
+          <p>MCP is how an assistant calls a local program as a tool. Any MCP client can use it, not only Claude. Registering this server hands Claude the <code>dcm</code> engine on your PATH — the engine this app is built on, not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
           <p>It requires <code>dcm</code> installed and on your PATH. If <code>claude mcp add</code> is not found, install Claude Code first. The one-line registration is run once; Claude Desktop instead reads the JSON block from its config file, so that one needs a restart to take.</p>
-          <p>The tools are the read-and-send half of this app. Nothing that closes a procedure step is exposed: MPPS is a transaction against a RIS, and it is not a thing to hand to something that cannot see the worklist row it belongs to.</p>
-        </div>
-        <div class="mcp-status" id="mcp-status">
-          <span class="dot"></span><span id="mcp-status-text">Checking whether <code>dcm</code> is on your PATH…</span>
+          <p>Claude gets a tool for the command behind every screen here, including retrieve (C-GET and C-MOVE), the worklist and every MPPS step — complete and discontinue too.</p>
         </div>
 
         <div class="section-title">Claude Code (terminal)</div>
@@ -1104,17 +1103,6 @@
 }</pre>
           <button class="btn ghost small">Copy</button>
         </div>
-
-        <div class="section-title">The tools Claude gets</div>
-        <div class="tool-grid">
-          <div class="tool-card"><b>dcm_echo</b> Test a peer (C-ECHO).</div>
-          <div class="tool-card"><b>dcm_inventory</b> Studies, series, sizes.</div>
-          <div class="tool-card"><b>dcm_query</b> Query a peer (C-FIND).</div>
-          <div class="tool-card"><b>dcm_tags</b> Inspect DICOM tags.</div>
-          <div class="tool-card"><b>dcm_send</b> Send a study (C-STORE).</div>
-          <div class="tool-card"><b>dcm_anon</b> De-identify a folder.</div>
-          <div class="tool-card"><b>dcm_edit</b> Change tags into a new folder.</div>
-        </div>
       </section>
       <!-- SETTINGS — set once. The station's identity, the saved peers and their
            roles, the defaults every command inherits, rehearsal, and the engineer
@@ -1128,40 +1116,61 @@
         <div class="help-panel" id="settings-help" hidden>
           <div class="help-head"><b>How settings work</b><button type="button" class="linklike" data-help-close>Close</button></div>
           <p>Set once. Anything here that changes a command shows up in that command's line.</p>
+          <h4>Rehearsal</h4>
+          <p>Rehearsal mode — every command that can take <code>--dry-run</code> gets it, and a banner says so.</p>
+          <h4>This station</h4>
+          <p><b>Station AE</b> is the calling AE on every command unless a peer below overrides it; MPPS attributes the step to it.</p>
+          <p><b>Worklist modality</b> is the worklist filter. <b>Worklist rows to fetch</b>: blank = all.</p>
+          <p><b>Only this station's worklist</b> adds ScheduledStationAETitle to the query; the engine warns on a mismatch either way.</p>
+          <h4>Peers</h4>
+          <p>One peer can be the <b>RIS</b> (worklist and MPPS) and one the <b>Archive</b> (images). They may be the same system. A peer's role is changed in its <b>Edit</b>.</p>
+          <p><b>Calling AE override</b>: only if this peer needs a different one. Left blank, the peer is called as the Station AE.</p>
+          <h4>DICOMweb servers</h4>
+          <p>Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</p>
+          <h4>Defaults</h4>
+          <p>Used wherever a screen leaves the field blank.</p>
+          <h4>Engineer options</h4>
+          <p><b>Retrieve AE named in MPPS</b> is the AE Title each performed series records as the place its images can be retrieved from. Left blank, it is the archive's AE.</p>
+          <p>Saved to <code>settings.json</code> in this app's data folder. The engine never reads it.</p>
+        </div>
+
+        <div class="section-title">Rehearsal</div>
+        <div class="checks">
+          <label><input type="checkbox" id="set-rehearsal" /> Rehearsal — nothing is sent</label>
         </div>
 
         <div class="section-title">This station</div>
         <div class="form-row triple">
-          <label>This station's AE Title <span class="dim">(the calling AE on every command unless a peer below overrides it; MPPS attributes the step to it)</span>
+          <label>Station AE
             <input type="text" id="set-station-ae" maxlength="16" placeholder="DCM-CLI" />
           </label>
-          <label>Modality <span class="dim">(worklist filter)</span>
+          <label>Worklist modality
             <input type="text" id="set-modality" maxlength="16" placeholder="e.g. CT" />
           </label>
-          <label>Worklist rows to fetch <span class="dim">(blank = all)</span>
+          <label>Worklist rows to fetch
             <input type="number" id="set-mwl-limit" min="1" placeholder="all" />
           </label>
         </div>
         <div class="checks">
-          <label><input type="checkbox" id="set-only-station" /> Only this station's worklist <span class="dim">(adds ScheduledStationAETitle to the query; the engine warns on a mismatch either way)</span></label>
+          <label><input type="checkbox" id="set-only-station" /> Only this station's worklist</label>
           <label><input type="checkbox" id="mwl-auto" checked /> Re-read the worklist every minute</label>
         </div>
 
         <div class="section-title">Peers</div>
-        <p class="mcp-note">One peer can be the <b>RIS</b> (worklist and MPPS) and one the <b>Archive</b> (images). They may be the same system.</p>
         <div class="peer-list" id="set-peers"></div>
+        <button type="button" class="btn ghost small" id="peer-add" hidden>+ Add a peer</button>
         <div class="conn-panel" id="peer-form">
           <div class="conn-title"><span id="peer-form-title">Add a peer</span></div>
           <div class="conn-grid">
             <label>Host <input type="text" id="peer-host" placeholder="pacs.example.org or localhost" /></label>
             <label>Port <input type="number" id="peer-port" placeholder="11112" min="1" max="65535" /></label>
-            <label>Called AE — peer <input type="text" id="peer-ae" maxlength="16" placeholder="ARCHIVE" /></label>
-            <label>Calling AE <span class="dim">(only if this peer needs a different one)</span>
+            <label>Peer AE <input type="text" id="peer-ae" maxlength="16" placeholder="ARCHIVE" /></label>
+            <label>Calling AE override
               <input type="text" id="peer-callingae" maxlength="16" placeholder="this station's AE" />
             </label>
             <label>Role
               <select id="peer-role">
-                <option value="">Other</option>
+                <option value="">Peer</option>
                 <option value="ris">RIS (worklist &amp; MPPS)</option>
                 <option value="archive">Archive (images)</option>
               </select>
@@ -1180,23 +1189,15 @@
           <label class="grow">Base URL<input type="text" id="webserver-url" placeholder="https://pacs.example.org/dicom-web" /></label>
           <button class="btn ghost" id="webserver-add">Add server</button>
         </div>
-        <p class="web-auth-hint">Auth comes from the environment: <code>DCM_WEB_TOKEN</code> (Bearer) or <code>DCM_WEB_USER</code> / <code>DCM_WEB_PASS</code> (Basic) — set before launching the app; there is deliberately no token field.</p>
 
         <div class="section-title">Defaults</div>
-        <p class="mcp-note">Used wherever a screen leaves the field blank.</p>
         <div class="form-row triple">
           <label>Chunk size<input type="number" id="set-chunk" placeholder="engine default" min="1" /></label>
           <label>Retries<input type="number" id="set-retry" placeholder="engine default" min="0" /></label>
           <label>Timeout (ms)<input type="number" id="set-timeout" placeholder="engine default" min="1000" step="1000" /></label>
-          <label>Retrieve AE<input type="text" id="set-retrieve-ae" maxlength="16" placeholder="the archive's AE" /></label>
         </div>
         <div class="checks">
           <label><input type="checkbox" id="set-recurse" checked /> Recurse into subfolders</label>
-        </div>
-
-        <div class="section-title">Rehearsal</div>
-        <div class="checks">
-          <label><input type="checkbox" id="set-rehearsal" /> Rehearsal mode — every command that can take <code>--dry-run</code> gets it, and a banner says so</label>
         </div>
 
         <div class="section-title mac-only" hidden>Updates on this Mac</div>
@@ -1225,7 +1226,9 @@
           <label><input type="checkbox" id="set-cmd-expanded" /> Show commands expanded</label>
           <label><input type="checkbox" id="set-allow-mismatch" /> Allow sending images that carry a different study than the worklist row</label>
         </div>
-        <p class="mcp-note dim">Saved to <code>settings.json</code> in this app's data folder. The engine never reads it.</p>
+        <div class="form-row triple">
+          <label>Retrieve AE named in MPPS<input type="text" id="set-retrieve-ae" maxlength="16" placeholder="the archive's AE" /></label>
+        </div>
       </section>
 
       <!-- ECHO — reached from a peer chip ("Test connection…") or a peer's Test
