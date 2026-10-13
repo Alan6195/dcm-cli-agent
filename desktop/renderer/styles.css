@@ -100,8 +100,6 @@ code { font-family: var(--mono); }
 
 .sidebar-footer { margin-top: auto; padding: 12px 10px 4px; color: var(--text-dim); font-size: 11px; }
 #engine-version { font-family: var(--mono); color: var(--accent); margin-bottom: 6px; }
-.sidebar-hint { line-height: 1.5; color: var(--text-dim); }
-.sidebar-hint code { color: var(--text); }
 
 .update-banner {
   border: 1px solid var(--accent);
@@ -147,9 +145,8 @@ code { font-family: var(--mono); }
 @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
 /* Title, then the ? that opens this screen's help panel, and on the echo
- * screen the way back to Settings. Nothing else: a screen's one-line
- * description is a .pane-lede on the row below, where it keeps its own
- * reading measure. */
+ * screen the way back to Settings. Nothing else, and no description line under
+ * it: what a screen is for is in its help panel. */
 .view-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
 .view-head h1 { margin: 0; font-size: 22px; font-weight: 650; }
 .view-head .linklike { font-size: 12.5px; margin: 0; }
@@ -298,11 +295,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
 }
 .cmd-preview::before { content: "$ "; color: var(--text-dim); }
 
-/* Status chips */
+/* Status chips. A refusal or a failure carries its reason here, beside the
+ * button, so the chip wraps rather than running off the row. */
 .status-chip {
   font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 20px;
   display: inline-flex; align-items: center; gap: 7px;
+  max-width: 70ch; white-space: normal;
 }
+.status-chip::before { flex: none; }
 .status-chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .status-chip.running { background: var(--accent-soft); color: var(--accent); }
 .status-chip.running::before { animation: pulse 1s infinite; }
@@ -343,7 +343,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
   font-size: 11.5px;
   line-height: 1.45;
 }
-.console .err { color: var(--red); }
+/* Standard error is where the engine narrates — progress, warnings, retries —
+ * so it reads dim. Red is for a line that says something failed, and for all
+ * of what a run that exited non-zero wrote (set by runStreaming). */
+.console .err { color: var(--text-dim); }
+.console .err.loud, .console.exit-fail .err { color: var(--red); }
 .console .ok { color: var(--green); }
 .console .warn { color: var(--amber); }
 
@@ -661,18 +665,18 @@ tr.best.tied td { background: var(--bg-3); }
 .badge-best.tied { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-2); }
 /* A run that did not deliver every instance it found.
  *
- * The amber idiom the rest of the app already uses for "this is not what it
- * looks like" — the same tint as .local-note, .caution and .warn-inline — and
- * the same pill shape as the FASTEST badge it sits in place of, because these
- * two are answers to the same question and must be read side by side down the
- * Run column. The tint covers the whole row rather than the Ack cell alone:
- * with no MB/s in it, a row's failure has to be visible from the row's colour
- * before any cell is read. The rail on the first cell survives horizontal
- * scrolling of the table, which a border on the row would not. */
-tr.incomplete td { background: var(--amber-soft); }
-tr.incomplete td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+ * Red, like every other transfer that came up short in this app: a run that
+ * lost instances is a failure, not a caveat. The same pill shape as the
+ * FASTEST badge it sits in place of, because these two are answers to the same
+ * question and must be read side by side down the Run column. The tint covers
+ * the whole row rather than the Ack cell alone: with no MB/s in it, a row's
+ * failure has to be visible from the row's colour before any cell is read. The
+ * rail on the first cell survives horizontal scrolling of the table, which a
+ * border on the row would not. */
+tr.incomplete td { background: var(--red-soft); }
+tr.incomplete td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 .badge-incomplete {
-  background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber);
+  background: var(--red-soft); color: var(--red); border: 1px solid var(--red);
   border-radius: 20px; padding: 1px 9px; font-size: 10.5px; font-weight: 700; margin-left: 8px;
   display: inline-block; white-space: nowrap;
 }
@@ -918,6 +922,21 @@ tr.pick-row { scroll-margin-block: 28px; }
 .chip-row.seg .chip { border-radius: 0; margin: 0; padding: 5px 12px; }
 .chip-row.seg .chip:first-child { border-radius: 20px 0 0 20px; }
 .chip-row.seg .chip:last-child { border-radius: 0 20px 20px 0; border-left: none; }
+/* A choice among a few, on every other screen: one joined control, so it does
+ * not read as a row of tabs or of separate buttons. A row may lead with its
+ * label ("Write", "Apply changes to"), hence of-type rather than child. The
+ * station's own bar keeps the spacing it was designed with. */
+.view:not(#view-worklist) .chip-row.seg { gap: 0; }
+.view:not(#view-worklist) .chip-row.seg .level-label { margin-right: 10px; }
+.view:not(#view-worklist) .chip-row.seg .chip:first-of-type { border-radius: 20px 0 0 20px; }
+.view:not(#view-worklist) .chip-row.seg .chip:last-of-type {
+  border-radius: 0 20px 20px 0; border-left: 1px solid var(--border);
+}
+.view:not(#view-worklist) .chip-row.seg .chip + .chip { margin-left: -1px; }
+.view:not(#view-worklist) .chip-row.seg .chip.active,
+.view:not(#view-worklist) .chip-row.seg .chip.warn { position: relative; }
+.view:not(#view-worklist) .chip-row.seg .chip.active { z-index: 1; }
+.view:not(#view-worklist) .chip-row.seg .chip.warn { border-left-color: var(--amber); }
 .mode-hint { color: var(--text-dim); font-size: 11.5px; margin: 0 0 10px; }
 .mode-hint.live { color: var(--amber); }
 
@@ -1047,9 +1066,18 @@ tr.pick-row { scroll-margin-block: 28px; }
 /* Every screen ends with the same two disclosures: the command that will run,
  * then the output of what did. The command may be folded and the output may be
  * folded; neither may be absent, and nothing that failed is left behind a
- * triangle (see revealConsole). */
+ * triangle (see revealConsole). Both read the same way: a quiet label with a
+ * triangle, not a panel — the station's Output included. */
 .out-fold { margin-bottom: 20px; }
-.out-fold > .adv-body { padding: 10px 12px 12px; }
+.out-fold, #mwl-out { border: none; border-radius: 0; background: transparent; }
+.out-fold > summary, #view-worklist #mwl-out > summary {
+  padding: 4px 0; flex-wrap: nowrap;
+  color: var(--text-dim); font-weight: 400; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.9px;
+}
+.out-fold > summary:hover, #view-worklist #mwl-out > summary:hover { color: var(--accent); }
+#mwl-out .adv-sum { text-transform: none; letter-spacing: 0; }
+.out-fold > .adv-body, #view-worklist #mwl-out > .adv-body { border-top: none; padding: 6px 0 0; }
 .out-fold .console-wrap { border-radius: 7px; }
 
 .cmd-fold { margin-bottom: 16px; }
@@ -1076,9 +1104,16 @@ tr.pick-row { scroll-margin-block: 28px; }
 #view-worklist .cmd-fold { margin-bottom: 10px; }
 #view-worklist .cmd-fold > summary { padding: 2px 0; }
 
-/* ---------------- Tabs (DICOMweb, Tools) ---------------- */
-.chip-row.tabs { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
-.pane-lede { margin: 0 0 16px; color: var(--text-dim); line-height: 1.5; max-width: 680px; }
+/* ---------------- Tabs (DICOMweb, Tools) ----------------
+ * Tabs look like tabs — plain words with the open one underlined — so they are
+ * never mistaken for the choice chips inside a pane. */
+.chip-row.tabs { gap: 4px; margin-bottom: 18px; padding-bottom: 0; border-bottom: 1px solid var(--border); }
+.chip-row.tabs .chip {
+  background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 8px 12px; margin-bottom: -1px; color: var(--text-dim);
+}
+.chip-row.tabs .chip:hover { color: var(--text); }
+.chip-row.tabs .chip.active { background: transparent; color: var(--accent); border-bottom-color: var(--accent); }
 .caution .linklike, .local-note .linklike { font-size: 12.5px; margin-left: 4px; }
 
 /* ---------------- Settings ---------------- */

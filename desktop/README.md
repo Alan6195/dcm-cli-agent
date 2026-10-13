@@ -77,7 +77,7 @@ to launch is not.
 
 ## Speed, on the Send and Speed test screens
 
-**Send a study** asks for a speed, not for two numbers. Normal, Fast, Very fast
+The **Send** screen asks for a speed, not for two numbers. Normal, Fast, Very fast
 and Insane sit in a chip row, in place of the Chunk size and Parallel
 associations boxes, because those two were never independent: the concurrency a
 run reaches is `min(parallel, chunk count)`, so typing a parallel count without

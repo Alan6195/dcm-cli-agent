@@ -217,7 +217,7 @@ function renderPeerChips() {
         '<div class="peer-menu" hidden>' +
           (items || '<div class="peer-menu-note">No saved peers yet.</div>') +
           '<div class="peer-menu-sep"></div>' +
-          (inEcho ? '' : '<button type="button" class="peer-item plain" data-peer-echo>Test connection (C-ECHO)…</button>') +
+          (inEcho ? '' : '<button type="button" class="peer-item plain" data-peer-echo>Test connection…</button>') +
           '<button type="button" class="peer-item plain" data-peer-settings>Edit in Settings…</button>' +
         '</div>' +
       '</div>';
@@ -955,10 +955,40 @@ function revealConsole(view) {
   if (box && !box.open) box.open = true;
 }
 
-/** A refusal the operator has to see: unfold the output, then say why. */
+/**
+ * A refusal: the button was pressed and nothing ran, because something the
+ * command needs is missing.
+ *
+ * Said in the chip beside the button, in amber, because that is where the eye
+ * already is; a disclosure springing open further down the screen was not.
+ * Still written to the output as well, which is the record of the session.
+ */
 function fail(view, msg) {
-  revealConsole(view);
   appendConsole(view, msg, 'stderr');
+  setStatus(view, 'warn', String(msg).trim());
+}
+
+/**
+ * A failure whose words are output rather than one sentence — a run's own
+ * report, or a Stop that did not take. The output is unfolded to show them.
+ */
+function revealFailure(view, text) {
+  revealConsole(view);
+  appendConsole(view, text, 'stderr');
+}
+
+/**
+ * The words on a failure chip: the engine's own first line, or "Failed".
+ *
+ * `lead` is for the two commands that time the failure on stderr ("C-ECHO
+ * failed after 5 ms") and say why on the first line of stdout ("Connection
+ * refused: …"): for those the reason comes first.
+ */
+function failLabel(stderr, lead = '') {
+  const first = stripAnsi(String(lead || '')).split('\n').map((l) => l.trim()).find(Boolean)
+    || engineErrorText(stderr).split('\n')[0].trim();
+  if (!first) return 'Failed';
+  return first.length > 140 ? `${first.slice(0, 139)}…` : first;
 }
 
 // --------------------------------------------------------------------------
@@ -1107,6 +1137,7 @@ function clearConsole(view) {
 
 /** Empties a console and its accounting together, so neither outlives the other. */
 function resetConsole(c) {
+  c.classList.remove('exit-fail');
   const s = consoleStateFor(c);
   if (s.frame) { cancelAnimationFrame(s.frame); s.frame = 0; }
   if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
@@ -1143,8 +1174,10 @@ function appendConsole(view, text, stream, dropped) {
   if (!text) return;
   const err = stream === 'stderr';
   for (const piece of splitConsoleText(stripAnsi(text), CONSOLE_PIECE_LINES)) {
-    s.pending.push({ text: piece.text, lines: piece.lines, err });
-    s.pendingLines += piece.lines;
+    for (const part of err ? loudRuns(piece) : [{ ...piece, loud: false }]) {
+      s.pending.push({ text: part.text, lines: part.lines, err, loud: part.loud });
+      s.pendingLines += part.lines;
+    }
   }
   // The buffer is trimmed too, not just the DOM. requestAnimationFrame does
   // not fire for a minimised or hidden window, so without this a long receive
@@ -1157,6 +1190,33 @@ function appendConsole(view, text, stream, dropped) {
   }
   // Nothing above touched the DOM: arrival stays cheap however fast it comes.
   scheduleConsoleFlush(c, s);
+}
+
+/**
+ * A line of standard error that says something failed.
+ *
+ * Standard error is where the engine narrates — progress, warnings, retries —
+ * so it is drawn dim. Red is kept for a line that says something went wrong,
+ * and for everything a run that exited non-zero wrote (see .exit-fail).
+ */
+const LOUD_LINE = /^(ERR|error|refused|failed)/i;
+const LOUD_ANYWHERE = /^(ERR|error|refused|failed)/im;
+
+/**
+ * Splits a piece of stderr into runs of consecutive loud and quiet lines. A
+ * piece with no loud line in it — nearly all of them, and every line of a
+ * flood — is one scan and goes through whole.
+ */
+function loudRuns(piece) {
+  if (!LOUD_ANYWHERE.test(piece.text)) return [{ text: piece.text, lines: piece.lines, loud: false }];
+  const runs = [];
+  for (const line of piece.text.match(/[^\n]*\n|[^\n]+$/g) || []) {
+    const loud = LOUD_LINE.test(line);
+    const last = runs[runs.length - 1];
+    if (last && last.loud === loud) { last.text += line; last.lines += 1; }
+    else runs.push({ text: line, lines: 1, loud });
+  }
+  return runs;
 }
 
 /**
@@ -1190,7 +1250,7 @@ function flushConsole(c, painting) {
   let written = 0;
   for (const piece of s.pending) {
     const span = document.createElement('span');
-    if (piece.err) span.className = 'err';
+    if (piece.err) span.className = piece.loud ? 'err loud' : 'err';
     span.textContent = piece.text;
     // A plain property, not a data- attribute: an attribute write would
     // invalidate style for every span we add.
@@ -1338,6 +1398,60 @@ function makeBounded(limit) {
 }
 
 /**
+ * Views whose buttons keep their own rules. The station decides for itself
+ * when Perform exam, Start only, Complete and Discontinue are live, and the
+ * retrieve owns its row buttons and its Stop. A generic busy state would
+ * fight both, so it leaves them alone.
+ */
+const OWN_BUSY_RULES = new Set(['worklist', 'mpps', 'steps', 'mpps-scan', 'retrieve']);
+const busy = {}; // view -> { n, run, stop }
+
+/**
+ * One busy state for every runner: while a view's command runs, its button is
+ * dead and its Stop, where it has one, is showing. Afterwards both go back to
+ * exactly what they were before, so a screen that manages them itself — the
+ * Speed test's sweep, Rename's "Nothing changed yet" — is never overruled.
+ */
+function setBusy(view, on) {
+  if (OWN_BUSY_RULES.has(view)) return;
+  const b = busy[view] || (busy[view] = { n: 0, run: null, stop: null });
+  const run = viewPart(view, 'run');
+  const stop = viewPart(view, 'cancel');
+  if (on) {
+    if (b.n++ > 0) return;
+    b.run = run ? run.disabled : null;
+    b.stop = stop ? stop.hidden : null;
+    if (run) run.disabled = true;
+    if (stop) stop.hidden = false;
+    return;
+  }
+  if (b.n === 0 || --b.n > 0) return;
+  if (run && b.run !== null) run.disabled = b.run;
+  if (stop && b.stop !== null) stop.hidden = b.stop;
+}
+
+/**
+ * The command a view's own button last ran, keyed for comparison — what the
+ * result on screen answers. See retireStaleResult(). The station keeps its own
+ * verdicts, and a speed sweep is many commands, so neither is tracked.
+ */
+const lastRun = {};
+const OWN_RESULT_RULES = new Set(['worklist', 'mpps', 'steps', 'speed']);
+const argvKey = (argv) => JSON.stringify((argv || []).filter((a) => a !== '--json'));
+
+function stampRun(view, argv) {
+  if (!BUILDERS[view] || OWN_RESULT_RULES.has(view)) return;
+  let own = null;
+  try { own = argvKey(BUILDERS[view]()); } catch { own = null; }
+  // A run that is not the view's own command (Rename's folder scan, Edit's
+  // tag load) answers nothing the button would run, so it clears the stamp.
+  lastRun[view] = own !== null && own === argvKey(argv) ? own : null;
+}
+
+/** Runs the operator stopped. Stopping is not failing, so they do not turn the output red. */
+const stopAsked = new Set();
+
+/**
  * Run a command, streaming into the view's console.
  * @returns {Promise<{code:number, stdout:string, stderr:string}>}
  */
@@ -1345,6 +1459,10 @@ function runStreaming(view, argv, { onExit } = {}) {
   return new Promise(async (resolve) => {
     const out = makeBounded(RUN_STDOUT_LIMIT);
     const err = makeBounded(RUN_STDERR_LIMIT);
+    setBusy(view, true);
+    stampRun(view, argv);
+    const box = consoleEl(view);
+    if (box) box.classList.remove('exit-fail');
     const runId = await window.dcm.start(argv, state.info.home || null, {
       onChunk: (stream, text, dropped) => {
         if (stream === 'stdout') out.push(text); else err.push(text);
@@ -1352,6 +1470,9 @@ function runStreaming(view, argv, { onExit } = {}) {
       },
       onExit: (code) => {
         delete state.activeRuns[view];
+        setBusy(view, false);
+        const stopped = stopAsked.delete(runId);
+        if (box) box.classList.toggle('exit-fail', code !== 0 && !stopped);
         // A non-zero exit is exactly the case the fold must not swallow.
         if (code !== 0) revealConsole(view);
         const result = { code, stdout: out.value, stderr: err.value };
@@ -1381,6 +1502,7 @@ async function stopRun(view, btn) {
   if (!id) return { stopped: false };
   const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  stopAsked.add(id);
   let result;
   try {
     result = await window.dcm.cancel(id);
@@ -1390,7 +1512,7 @@ async function stopRun(view, btn) {
   if (btn) { btn.disabled = false; btn.textContent = label; }
   // A run that had already finished on its own is not a failure to stop.
   if (result && !result.stopped && result.reason !== 'not running') {
-    fail(view,
+    revealFailure(view,
       `\nStop did not take: ${result.error || 'the engine is still running'}. `
       + `Anything it has open with the peer is still open — close the app window to release it.\n`);
   }
@@ -1402,10 +1524,14 @@ function runCapture(view, argv) {
   return new Promise(async (resolve) => {
     const out = makeBounded(RUN_STDOUT_LIMIT);
     const err = makeBounded(RUN_STDERR_LIMIT);
+    setBusy(view, true);
+    stampRun(view, argv);
     const runId = await window.dcm.start(argv, state.info.home || null, {
       onChunk: (stream, text) => { if (stream === 'stdout') out.push(text); else err.push(text); },
       onExit: (code) => {
         delete state.activeRuns[view];
+        setBusy(view, false);
+        stopAsked.delete(runId);
         resolve({ code, stdout: out.value, stderr: err.value });
       },
     });
@@ -1433,10 +1559,48 @@ function setPreview(view, argv) {
 
 const BUILDERS = {}; // view -> () => argv
 
+/**
+ * A green result answers the command that produced it, not the one now on
+ * screen. Once what the view would run differs from what produced its green
+ * chip, the chip and the numbers under it come down. Only success is retired
+ * this way: a failure, a refusal or a shortfall stays until the next run
+ * replaces it, because those are the results somebody has to act on.
+ *
+ * Only the pane on view is judged, because the peer connection every DIMSE
+ * builder reads follows the screen — Send's command built while Echo is open
+ * names Echo's peer, which says nothing about Send's result.
+ */
+function retireStaleResult(view, argv) {
+  const was = lastRun[view];
+  if (!was || state.activeRuns[view] || argvKey(argv) === was) return;
+  if (view === 'query' && retrieveInFlight()) return;
+  const pane = document.getElementById(`view-${view}`);
+  if (!pane || !pane.getClientRects().length) return;
+  const chip = viewPart(view, 'status');
+  if (!chip || chip.hidden || !chip.classList.contains('ok')) return;
+  lastRun[view] = null;
+  setStatus(view, null);
+  // Rename's data-result blocks are the study it read and the edits typed
+  // over it, not the result of the run, so they stay.
+  if (view === 'rename') return;
+  for (const el of $$('[data-totals], [data-result]', pane)) el.hidden = true;
+}
+
+/** An Open beside an empty box has nothing to open, so it is not shown. */
+function syncRevealButtons() {
+  for (const btn of $$('[data-reveal]')) {
+    const field = document.getElementById(btn.dataset.reveal);
+    btn.hidden = !(field && field.value.trim());
+  }
+}
+
 function updateAllPreviews() {
   for (const [view, build] of Object.entries(BUILDERS)) {
-    try { setPreview(view, build()); } catch { /* partial form */ }
+    let argv;
+    try { argv = build(); setPreview(view, argv); } catch { continue; /* partial form */ }
+    retireStaleResult(view, argv);
   }
+  syncRevealButtons();
   // The sweep's list of commands is a preview too — it just holds several
   // commands rather than one, and it is built from the same peer connection.
   // Refreshed from the same hook so that editing the peer, picking a saved
@@ -1465,8 +1629,8 @@ function wireEcho() {
     clearConsole('echo');
     if (miss.length) { fail('echo', `Fill in: ${miss.join(', ')}.\n`); return; }
     setStatus('echo', 'running', 'Testing…');
-    const { code } = await runStreaming('echo', BUILDERS.echo());
-    setStatus('echo', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : 'Failed');
+    const { code, stdout, stderr } = await runStreaming('echo', BUILDERS.echo());
+    setStatus('echo', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : failLabel(stderr, stdout));
   });
 }
 
@@ -1560,15 +1724,14 @@ function renderSendAdvSummary() {
   const parts = [];
   if (parallel) parts.push(`--parallel ${parallel}`);
   if (chunk) parts.push(`--chunk ${chunk}${inherited ? ' (from Settings)' : ''}`);
-  let text;
-  if (!parts.length) {
-    text = `— nothing set; --speed ${speed} sizes both`;
-  } else if (parallel) {
+  // Nothing set says nothing: the preset is on the screen and on the command.
+  let text = '';
+  if (parallel) {
     // Not "overrides --speed": there is no --speed on the command line to
     // override. Saying otherwise would leave the summary naming a flag the
     // preview below it does not show. See sendPresetInert.
     text = `— ${parts.join(' · ')}; the ${speed} preset is not used`;
-  } else {
+  } else if (parts.length) {
     // A typed chunk size really is half an override: the preset still supplies
     // the association count, so --speed stays on the line and the engine says
     // what it displaced.
@@ -1590,7 +1753,7 @@ function renderSendAdvSummary() {
   if (syntax) rest.push(`--transfer-syntax ${syntax}`);
   if ($('#send-norecurse').checked) rest.push('--no-recurse');
   if ($('#send-rewrite').checked) rest.push('--rewrite-series-uid');
-  if (rest.length) text += ` · ${rest.join(' · ')}`;
+  if (rest.length) text += `${text ? ' · ' : '— '}${rest.join(' · ')}`;
 
   el.textContent = text;
   el.classList.toggle('changed', parts.length > 0 || rest.length > 0);
@@ -1689,16 +1852,15 @@ function wireSend() {
       if (miss.length) { fail('send', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
     }
     setStatus('send', 'running', dry ? 'Scanning…' : 'Sending…');
-    $('#view-send [data-run]').disabled = true;
-    if (!dry) $('#view-send [data-cancel]').hidden = false;
+    const { code, stdout, stderr } = await runStreaming('send', BUILDERS.send());
 
-    const { code, stdout } = await runStreaming('send', BUILDERS.send());
-
-    $('#view-send [data-run]').disabled = false;
-    $('#view-send [data-cancel]').hidden = true;
     const ok = code === 0;
-    setStatus('send', ok ? 'ok' : 'fail', ok ? (dry ? 'Plan ready' : 'All acknowledged') : 'Incomplete');
-    if (!dry) showTotals(parseTotals(stdout), ok);
+    const totals = parseTotals(stdout);
+    // "Incomplete" is for a transfer that got some of the way. One that never
+    // got started says why, in the engine's words.
+    setStatus('send', ok ? 'ok' : 'fail', ok ? (dry ? 'Plan ready' : 'All acknowledged')
+      : (totals.sent > 0 ? 'Incomplete' : failLabel(stderr)));
+    if (!dry) showTotals(totals, ok);
   });
 
   $('#view-send [data-cancel]').addEventListener('click', (e) => {
@@ -1739,7 +1901,7 @@ function renderReceiveAdvSummary() {
   const parts = [];
   if (accept) parts.push(`only ${accept}`);
   if (reject) parts.push(`stops acknowledging after ${reject}`);
-  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— accepts every caller, acknowledges everything';
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
   el.classList.toggle('changed', parts.length > 0);
 }
 
@@ -1751,12 +1913,8 @@ function wireReceive() {
   $('#view-receive [data-run]').addEventListener('click', async () => {
     clearConsole('receive');
     setStatus('receive', 'running', 'Listening');
-    $('#view-receive [data-run]').disabled = true;
-    $('#view-receive [data-cancel]').hidden = false;
     const { code } = await runStreaming('receive', BUILDERS.receive());
     // Only reached when the receiver stops.
-    $('#view-receive [data-run]').disabled = false;
-    $('#view-receive [data-cancel]').hidden = true;
     setStatus('receive', code === 0 ? 'ok' : 'fail', code === 0 ? 'Stopped' : 'Stopped');
   });
 
@@ -2134,6 +2292,8 @@ async function runRetrieve(btn) {
 
   const miss = connMissing();
   if (miss.length) {
+    // The chip lives in the actions row, which has to be on screen to be read.
+    $('#find-retrieve-actions').hidden = false;
     fail('retrieve', `Fill in the peer connection: ${miss.join(', ')}.\n`);
     return;
   }
@@ -2151,12 +2311,9 @@ async function runRetrieve(btn) {
     return;
   }
 
+  // A dismissed picker is a decision not to retrieve, not something to report.
   const out = await ensureRetrieveOut();
-  if (!out) {
-    revealConsole('retrieve');
-    appendConsole('retrieve', 'No folder chosen — nothing was retrieved.\n', 'stderr');
-    return;
-  }
+  if (!out) return;
 
   const argv = retrieveArgv({ study, series, out });
   setPreview('retrieve', argv);
@@ -4742,10 +4899,10 @@ function wireWebping() {
   $('#webping-timeout').addEventListener('input', updateAllPreviews);
   $('#view-webping [data-run]').addEventListener('click', async () => {
     clearConsole('webping');
-    if (!state.web.url) { fail('webping', 'Fill in the server URL.\n'); return; }
+    if (!state.web.url) { fail('webping', 'Pick a server on the chip.\n'); return; }
     setStatus('webping', 'running', 'Testing…');
-    const { code } = await runStreaming('webping', BUILDERS.webping());
-    setStatus('webping', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : 'Failed');
+    const { code, stdout, stderr } = await runStreaming('webping', BUILDERS.webping());
+    setStatus('webping', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : failLabel(stderr, stdout));
   });
 }
 
@@ -4779,10 +4936,12 @@ function wireWebsend() {
     const dry = rehearsal();
     if (!dry && !state.web.url) { fail('websend', 'Pick a DICOMweb server on the chip, or add one in Settings.\n'); return; }
     setStatus('websend', 'running', dry ? 'Scanning…' : 'Sending…');
-    $('#view-websend [data-run]').disabled = true;
-    const { code } = await runStreaming('websend', BUILDERS.websend());
-    $('#view-websend [data-run]').disabled = false;
-    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Complete') : 'Failed');
+    const { code, stderr } = await runStreaming('websend', BUILDERS.websend());
+    setStatus('websend', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : 'Complete') : failLabel(stderr));
+  });
+
+  $('#view-websend [data-cancel]').addEventListener('click', (e) => {
+    stopRun('websend', e.currentTarget);
   });
 }
 
@@ -4856,7 +5015,7 @@ function wireWebquery() {
   $('#view-webquery [data-run]').addEventListener('click', async () => {
     clearConsole('webquery');
     $('#view-webquery [data-result]').hidden = true;
-    if (!state.web.url) { fail('webquery', 'Fill in the server URL.\n'); return; }
+    if (!state.web.url) { fail('webquery', 'Pick a server on the chip.\n'); return; }
     setStatus('webquery', 'running', 'Querying…');
     const { code, stdout, stderr } = await runCapture('webquery', [...BUILDERS.webquery(), '--json']);
 
@@ -4905,7 +5064,7 @@ function renderWebhubAdvSummary() {
   const parts = [];
   if (token) parts.push('a Bearer token is required');
   if (reject) parts.push(`rejects after ${reject}`);
-  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— open, accepts everything';
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
   el.classList.toggle('changed', parts.length > 0);
 }
 
@@ -4940,12 +5099,8 @@ function wireWebhub() {
     const port = $('#webhub-port').value.trim();
     if (!port) { fail('webhub', 'Choose a port to listen on.\n'); return; }
     setStatus('webhub', 'running', 'Listening');
-    $('#view-webhub [data-run]').disabled = true;
-    $('#view-webhub [data-cancel]').hidden = false;
     const { code } = await runStreaming('webhub', BUILDERS.webhub());
     // Only reached when the hub stops.
-    $('#view-webhub [data-run]').disabled = false;
-    $('#view-webhub [data-cancel]').hidden = true;
     setStatus('webhub', code === 0 ? 'ok' : 'fail', 'Stopped');
   });
 
@@ -5549,8 +5704,8 @@ async function scanRenameFolder({ keepConsole = false } = {}) {
   let parsed = null;
   try { parsed = JSON.parse(stdout); } catch { parsed = null; }
   if (code !== 0 || !parsed) {
-    setStatus('rename', 'fail', 'Failed');
-    fail('rename', stdout || stderr || 'Could not read that folder.\n');
+    setStatus('rename', 'fail', failLabel(stderr));
+    revealFailure('rename', stdout || stderr || 'Could not read that folder.\n');
     return;
   }
 
@@ -5661,11 +5816,17 @@ function wireRename() {
     }
 
     setStatus('rename', 'running', rehearsal() ? 'Previewing…' : (inplace ? 'Rewriting…' : 'Writing copy…'));
-    const { code } = await runStreaming('rename', BUILDERS.rename());
-    setStatus('rename', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
+    const { code, stderr } = await runStreaming('rename', BUILDERS.rename());
+    setStatus('rename', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
+    // The button's own rule ("Nothing changed yet") decides it again, not the busy state.
+    syncRenameButton();
     // The source's own values have moved, so what is on screen as "current" is
     // now yesterday's. Re-read rather than leave a stale prefill behind.
     if (code === 0 && inplace) await scanRenameFolder({ keepConsole: true });
+  });
+
+  $('#view-rename [data-cancel]').addEventListener('click', (e) => {
+    stopRun('rename', e.currentTarget);
   });
 }
 
@@ -5799,10 +5960,10 @@ async function loadTagsForEditing() {
   // One representative file is what we edit against: a study shares its tag
   // structure, and dumping every instance would be slow and unreadable.
   const { code, stdout, stderr } = await runCapture('edit', ['tags', target, '--json']);
-  setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Loaded' : 'Failed');
+  setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Loaded' : failLabel(stderr));
 
   if (code !== 0) {
-    fail('edit', stdout || stderr || 'Could not read tags.\n');
+    revealFailure('edit', stdout || stderr || 'Could not read tags.\n');
     return;
   }
 
@@ -5810,7 +5971,8 @@ async function loadTagsForEditing() {
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    fail('edit', stdout || 'Unexpected output.\n');
+    setStatus('edit', 'fail', 'Failed');
+    revealFailure('edit', stdout || 'Unexpected output.\n');
     return;
   }
 
@@ -5866,16 +6028,20 @@ function wireEdit() {
     const touchingUid = [...editState.changes.keys(), ...editState.removals]
       .some((kw) => UID_KEYWORDS.has(kw));
     if (touchingUid && !$('#edit-force').checked) {
+      fail('edit', 'Includes a UID — tick Allow editing UIDs.\n');
       appendConsole('edit',
-        'That includes a UID, which is refused unless you tick "Allow editing UIDs".\n' +
         'Rewriting UIDs on some instances and not others splits a study. To get fresh\n' +
         'UIDs across a whole study consistently, use De-identify instead.\n', 'stderr');
       return;
     }
 
     setStatus('edit', 'running', ($('#edit-dryrun').checked || rehearsal()) ? 'Previewing…' : 'Writing…');
-    const { code } = await runStreaming('edit', BUILDERS.edit());
-    setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
+    const { code, stderr } = await runStreaming('edit', BUILDERS.edit());
+    setStatus('edit', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
+  });
+
+  $('#view-edit [data-cancel]').addEventListener('click', (e) => {
+    stopRun('edit', e.currentTarget);
   });
 }
 
@@ -5904,7 +6070,7 @@ function renderAnonAdvSummary() {
   if (prefix) parts.push(`pseudonyms as ${prefix}…`);
   if ($('#anon-keepdesc').checked) parts.push('keeps descriptions');
   if ($('#anon-keepprivate').checked) parts.push('keeps private tags');
-  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '— removes everything it knows how to remove';
+  el.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
   el.classList.toggle('changed', parts.length > 0);
 }
 
@@ -5921,8 +6087,12 @@ function wireAnon() {
     if (!f) { fail('anon', 'Choose a folder to de-identify.\n'); return; }
     if (!out) { fail('anon', 'Choose an output folder.\n'); return; }
     setStatus('anon', 'running', 'De-identifying…');
-    const { code } = await runStreaming('anon', BUILDERS.anon());
-    setStatus('anon', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
+    const { code, stderr } = await runStreaming('anon', BUILDERS.anon());
+    setStatus('anon', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
+  });
+
+  $('#view-anon [data-cancel]').addEventListener('click', (e) => {
+    stopRun('anon', e.currentTarget);
   });
 }
 
@@ -5963,7 +6133,9 @@ function wirePickers() {
       const val = $(`#${btn.dataset.reveal}`).value.trim();
       if (val) await window.dcm.reveal(val);
     });
+    $(`#${btn.dataset.reveal}`).addEventListener('input', syncRevealButtons);
   }
+  syncRevealButtons();
 }
 
 // --------------------------------------------------------------------------

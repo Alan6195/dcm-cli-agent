@@ -90,28 +90,31 @@ const BUDGET = {
   // redesign moved into the help panel walks back onto the station.
   'worklist-gone': 60,       // a row that left the list, folder fine
   'worklist-repairs': 70,    // and the folder unread on top of it
-  send: 46,
-  receive: 34,
-  query: 27,
-  echo: 16,
-  webping: 22,
-  websend: 22,
-  webquery: 28,
-  webhub: 42,
-  inventory: 22,
-  tags: 36,
+  // Ratcheted when the description line under every title was deleted (its
+  // sentences live in each screen's help panel now), at the measured count
+  // plus four.
+  send: 24,
+  receive: 15,
+  query: 15,
+  echo: 10,
+  webping: 6,
+  websend: 13,
+  webquery: 17,
+  webhub: 26,
+  inventory: 15,
+  tags: 22,
   // Rename is measured twice, like the station: the screen an operator walks
   // up to (a folder box and nothing else) and the screen they act on, with a
   // study loaded and the four boxes filled. The second number carries the one
   // part of this pane that varies with the data rather than the design — the
   // composed PatientName is echoed back in full, so a five-part name reads as
   // more words than a two-part one.
-  rename: 20,
-  'rename-loaded': 52,
-  edit: 44,
-  anon: 44,
-  speed: 46,
-  mcp: 120,              // instructions, not a command: its own budget
+  rename: 8,
+  'rename-loaded': 34,
+  edit: 30,
+  anon: 25,
+  speed: 37,
+  mcp: 109,              // instructions, not a command: its own budget
   // Settings has none on purpose. It is the screen the other screens were
   // emptied into — set once, read once — and it runs no command, so there is
   // no button to be standing in front of. It is still measured and reported,
@@ -1117,13 +1120,18 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // D. A real inventory run: the structured table and the engine spawn.
     // =====================================================================
     if (fixtures) {
-      await js(`(() => {
+      // One busy state for every runner: the button goes dead the moment the
+      // run starts, in the same turn as the click, so a second press cannot
+      // start a second child.
+      const invBusy = await js(`(() => {
         showView('inventory');
         __smoke.set('info-folder', ${JSON.stringify(fixtures)});
         __smoke.set('info-series', true);
-        document.querySelector('#view-inventory [data-run]').click();
-        return true;
+        const btn = document.querySelector('#view-inventory [data-run]');
+        btn.click();
+        return btn.disabled;
       })()`);
+      if (!invBusy) bad('the inventory button stayed live while its run was in flight');
       // Wait for the child engine process to finish, not for a guessed number
       // of milliseconds — a run still in flight competes with the next screen's
       // child for the same machine, which is how this harness used to go flaky.
@@ -1147,9 +1155,55 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!inv.rows) bad('a real inventory run produced no table rows');
       // A run that worked leaves the Output folded: the result is the table.
       if (inv.outOpen) bad('a successful inventory run unfolded the Output pane');
+      if (await js(`document.querySelector('#view-inventory [data-run]').disabled`)) {
+        bad('the inventory button stayed dead after its run finished');
+      }
+
+      // A green result answers the command that produced it. Change the
+      // command and the chip and the table come down — and a failure does not:
+      // it stays on screen until a run replaces it, however the form is edited.
+      const retired = await jsJSON(`(() => {
+        __smoke.set('info-series', false);
+        const chip = document.querySelector('#view-inventory [data-status]');
+        const out = { chip: !chip.hidden, result: !document.querySelector('#view-inventory [data-result]').hidden };
+        __smoke.set('info-series', true);
+        return JSON.stringify(out);
+      })()`);
+      say(`stale result: after the command changed, chip shown ${retired.chip}, table shown ${retired.result}`);
+      if (retired.chip || retired.result) {
+        bad(`a green result outlived the command that produced it: ${JSON.stringify(retired)}`);
+      }
+      await js(`(() => {
+        __smoke.set('info-folder', ${JSON.stringify(path.join(work, 'no-such-folder'))});
+        document.querySelector('#view-inventory [data-run]').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#view-inventory [data-status]').className.includes('running')",
+        RUN_MS, 'the inventory of a missing folder to finish');
+      const kept = await jsJSON(`(() => {
+        const chip = document.querySelector('#view-inventory [data-status]');
+        const before = { text: chip.textContent, cls: chip.className };
+        __smoke.set('info-series', false);
+        const after = { shown: !chip.hidden && __smoke.vis(chip), text: chip.textContent, cls: chip.className };
+        __smoke.set('info-series', true);
+        return JSON.stringify({ before, after });
+      })()`);
+      say(`stale result: a failed inventory reads "${kept.before.text}" and, after an edit, shown ${kept.after.shown}`);
+      if (!/\bfail\b/.test(kept.before.cls)) bad(`an inventory of a missing folder did not fail: ${JSON.stringify(kept)}`);
+      if (!kept.after.shown || kept.after.cls !== kept.before.cls || kept.after.text !== kept.before.text) {
+        bad(`editing the form took a failure off the screen: ${JSON.stringify(kept)}`);
+      }
+      // Leave the tab the way the rest of the run expects it.
+      await js(`(() => {
+        __smoke.set('info-folder', ${JSON.stringify(fixtures)});
+        setStatus('inventory', null);
+        document.querySelector('#view-inventory [data-result]').hidden = true;
+        return true;
+      })()`);
     }
 
-    // A refusal is never folded away.
+    // A refusal is never folded away: it is said in the chip beside the
+    // button, in amber, and it is still written to the output.
     await js(`(() => {
       showView('send');
       __smoke.set('send-folder', '');
@@ -1159,11 +1213,19 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // The console buffers arrivals and writes them on a frame, so wait for the
     // words rather than for a guess at when they land.
     await mustWait('/Choose a folder/.test(__smoke.consoleText("send"))', 10000, 'the refusal to be written');
-    const refusal = await jsJSON(
-      'JSON.stringify({ open: __smoke.outOpen("send"), text: __smoke.consoleText("send").trim() })');
-    say(`refusal: Send with no folder — Output open ${refusal.open}, says "${refusal.text}"`);
-    if (!refusal.open || !/Choose a folder/.test(refusal.text)) {
-      bad(`a refusal did not open the Output disclosure: ${JSON.stringify(refusal)}`);
+    const refusal = await jsJSON(`(() => {
+      const chip = document.querySelector('#view-send [data-status]');
+      return JSON.stringify({
+        chip: chip.textContent, cls: chip.className, shown: !chip.hidden && __smoke.vis(chip),
+        text: __smoke.consoleText('send').trim(),
+      });
+    })()`);
+    say(`refusal: Send with no folder — chip [${refusal.cls}] "${refusal.chip}", output says "${refusal.text}"`);
+    if (!refusal.shown || !/Choose a folder/.test(refusal.chip) || !/\bwarn\b/.test(refusal.cls)) {
+      bad(`a refusal is not said beside the button, in amber: ${JSON.stringify(refusal)}`);
+    }
+    if (!/Choose a folder/.test(refusal.text)) {
+      bad(`a refusal was not written to the output: ${JSON.stringify(refusal)}`);
     }
     await shot('send-refusal');
 
@@ -1350,9 +1412,25 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // the engine warns about, and that warning has to reach the app's
       // console rather than only the engine's own stderr.
       if (fixtures) {
-        await js(`document.querySelector('#view-send [data-run]').click(); true`);
+        const sendBusy = await jsJSON(`(() => {
+          document.querySelector('#view-send [data-run]').click();
+          return JSON.stringify({
+            dead: document.querySelector('#view-send [data-run]').disabled,
+            stop: !document.querySelector('#view-send [data-cancel]').hidden,
+          });
+        })()`);
+        if (!sendBusy.dead || !sendBusy.stop) {
+          bad(`a running send did not kill its button and show Stop: ${JSON.stringify(sendBusy)}`);
+        }
         await mustWait("!document.querySelector('#view-send [data-status]').className.includes('running')",
           RUN_MS, 'the insane send to finish');
+        const sendIdle = await jsJSON(`JSON.stringify({
+          dead: document.querySelector('#view-send [data-run]').disabled,
+          stop: !document.querySelector('#view-send [data-cancel]').hidden,
+        })`);
+        if (sendIdle.dead || sendIdle.stop) {
+          bad(`a finished send left its button dead or Stop showing: ${JSON.stringify(sendIdle)}`);
+        }
         // The run is over when the child exits; the console writes what it was
         // given on the next frame, so the last of the report can still be in
         // flight. Wait for the words rather than reading a buffer mid-write.

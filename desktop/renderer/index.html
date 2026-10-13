@@ -66,7 +66,6 @@
         </div>
         <div id="engine-version">engine …</div>
         <button class="linklike" id="update-check" hidden>Check for updates</button>
-        <div class="sidebar-hint">Every action runs the real <code>dcm</code> command.</div>
       </div>
     </nav>
 
@@ -288,16 +287,16 @@
         </div>
       </section>
 
-      <!-- Every screen below is the same shape, top to bottom: what it acts on,
-           the peer, the few controls that change what is sent, one primary
-           button, status, result, the command, the output. What an operator has
-           to read to act stays on screen; what they need to read to trust it is
-           behind the ? in the header. Nothing was deleted, only moved. -->
+      <!-- Every screen below is the same shape, top to bottom: the title, what
+           it acts on, the peer, the few controls that change what is sent, one
+           primary button, status, result, the command, the output. There is no
+           description line under the title: what an operator needs to read to
+           trust a screen is behind the ? in its header. -->
 
       <!-- SEND -->
       <section class="view" id="view-send">
         <header class="view-head">
-          <h1>Send a study</h1>
+          <h1>Send</h1>
           <button type="button" class="help-btn" data-help="send-help" aria-expanded="false" aria-controls="send-help" title="How sending works">?</button>
         </header>
         <div class="help-panel" id="send-help" hidden>
@@ -311,7 +310,6 @@
           <p>A preset sets both of these together, because setting one alone caps the other. A chunk size typed there replaces the preset's half of that and leaves its association count in place — the command carries both flags and the engine names what it displaced. An association count typed there replaces the preset outright: the command drops <code>--speed</code>, because a preset that has lost its width would still be sizing the chunks off your number. Clear the field to go back to the preset.</p>
           <p>Retries, timeout and chunk size fall back to Settings › Defaults when the field is blank. Whatever ends up in force is on the command line below the button.</p>
         </div>
-        <p class="pane-lede">C-STORE a folder to a peer. A partial transfer is a failure.</p>
         <div class="form-row">
           <label class="grow">Folder to send
             <div class="path-pick">
@@ -323,7 +321,7 @@
         <div class="conn-host" data-conn data-role="archive"></div>
 
         <div class="section-title">Speed</div>
-        <div class="chip-row" id="send-speed">
+        <div class="chip-row seg" id="send-speed">
           <button class="chip active" data-speed="normal">Normal</button>
           <button class="chip" data-speed="fast">Fast</button>
           <button class="chip" data-speed="very-fast">Very fast</button>
@@ -398,17 +396,16 @@
       <!-- RECEIVE -->
       <section class="view" id="view-receive">
         <header class="view-head">
-          <h1>Receive images</h1>
+          <h1>Receive</h1>
           <button type="button" class="help-btn" data-help="receive-help" aria-expanded="false" aria-controls="receive-help" title="How the receiver works">?</button>
         </header>
         <div class="help-panel" id="receive-help" hidden>
           <div class="help-head"><b>How the receiver works</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>A permissive C-STORE SCP: it accepts every presentation context offered, acknowledges what arrives and logs it. It is a test receiver, not an archive — nothing is indexed and nothing is queryable.</p>
+          <p>Accepts any sender and logs what arrives. A permissive C-STORE SCP: it accepts every presentation context offered, acknowledges what arrives and logs it. It is a test receiver, not an archive — nothing is indexed and nothing is queryable.</p>
           <p>Leave <b>Save arriving images to</b> empty and instances are acknowledged and discarded, which is what you want when the question is only whether the sender can reach you. Give it a folder and everything that arrives is written there.</p>
           <p>Under Advanced: an <b>allowlist</b> of calling AE Titles refuses associations from anything else, so you can prove a sender is being rejected for the reason you think. <b>Stop acknowledging after N</b> is a fault injector — the receiver accepts the association and then stops acknowledging, which is how you reproduce a shortfall on the sending side on purpose. Both are test knobs; leave them empty for an ordinary receive.</p>
           <p>The run holds the port until you stop it. The output below is the whole record of what arrived.</p>
         </div>
-        <p class="pane-lede">A C-STORE SCP that accepts everything and logs what arrives.</p>
         <div class="form-row triple">
           <label>Port<input type="number" id="scp-port" placeholder="11112" min="1" max="65535" /></label>
           <label>Our AE Title<input type="text" id="scp-ae" placeholder="any" maxlength="16" /></label>
@@ -452,7 +449,7 @@
       <!-- QUERY -->
       <section class="view" id="view-query">
         <header class="view-head">
-          <h1>Query a peer</h1>
+          <h1>Query</h1>
           <button type="button" class="help-btn" data-help="query-help" aria-expanded="false" aria-controls="query-help" title="How querying works">?</button>
         </header>
         <div class="help-panel" id="query-help" hidden>
@@ -465,7 +462,6 @@
           <p><b>C-GET, and why there is no C-MOVE button.</b> A retrieve here is a C-GET: the images come back down the same association the request went out on, so <b>nothing has to be configured on the peer</b> and nothing has to be listening on this machine. C-MOVE is the other way to ask, and it is a different deal — the peer opens a <i>fresh</i> association to an AE Title it must already have registered for you, at a host and port its administrator typed in. An archive that has never heard of you answers <code>0xA801 Move Destination unknown</code> and not one image moves. So C-MOVE is left off this screen rather than offered as a choice that usually fails first. The cost of C-GET is that the peer has to implement it and many archives do not; one that does not will say <code>0x0122 SOP Class not supported</code>, which is reported as exactly that. When that is the answer, the engine's <code>dcm move</code> does the C-MOVE from a terminal, with <code>--destination</code> and a receiver of its own.</p>
           <p><b>What counts as success.</b> The number of files on disk is the result; the sub-operation counts the peer reports are evidence, never the verdict. If the peer says it sent thirteen and ten arrive, the retrieve has failed and says that three are missing — an accepted transfer can still be an incomplete one. A retrieve also writes files in rehearsal mode, because C-GET has no dry run; it still only reads from the peer.</p>
         </div>
-        <p class="pane-lede">C-FIND. Reads what a peer holds; changes nothing.</p>
         <div class="conn-host" data-conn data-role="archive"></div>
         <div class="form-row">
           <div class="level-row">
@@ -564,7 +560,6 @@
 
         <!-- WEB PING (DICOMweb) -->
         <div class="tab-pane" id="view-webping">
-          <p class="pane-lede">Is a DICOMweb service there, and do your credentials open it? Nothing is sent.</p>
           <div class="conn-host" data-webconn></div>
           <div class="form-row">
             <label>Timeout (ms)<input type="number" id="webping-timeout" placeholder="60000" min="1000" step="1000" /></label>
@@ -585,7 +580,6 @@
 
         <!-- WEB SEND (STOW-RS) -->
         <div class="tab-pane" id="view-websend" hidden>
-          <p class="pane-lede">STOW-RS — upload a folder of DICOM files.</p>
           <div class="form-row">
             <label class="grow">Folder to send
               <div class="path-pick">
@@ -601,7 +595,8 @@
             <label>Timeout (ms)<input type="number" id="websend-timeout" placeholder="60000" min="1000" step="1000" /></label>
           </div>
           <div class="actions">
-            <button class="btn primary" data-run>Send (STOW-RS)</button>
+            <button class="btn primary" data-run>Send</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <details class="cmd-fold">
@@ -616,9 +611,8 @@
 
         <!-- WEB QUERY (QIDO-RS) -->
         <div class="tab-pane" id="view-webquery" hidden>
-          <p class="pane-lede">QIDO-RS — search for studies, series or instances. Changes nothing.</p>
           <div class="conn-host" data-webconn></div>
-          <div class="chip-row" id="webquery-level">
+          <div class="chip-row seg" id="webquery-level">
             <button class="chip active" data-level="studies">Studies</button>
             <button class="chip" data-level="series">Series</button>
             <button class="chip" data-level="instances">Instances</button>
@@ -649,7 +643,6 @@
 
         <!-- WEB HUB (serve) -->
         <div class="tab-pane" id="view-webhub" hidden>
-          <p class="pane-lede">A local DICOMweb server (STOW/QIDO) to point clients at.</p>
           <div class="form-row triple">
             <label>Port<input type="number" id="webhub-port" placeholder="10808" min="1" max="65535" /></label>
           </div>
@@ -713,7 +706,7 @@
           <h4>Tags</h4>
           <p>Dumps the tags in a file or folder. It reads metadata only and never prints pixel data. The filter takes a keyword, a tag or a value, and <code>/regex/</code> is allowed. By default one file per series is read, because the tags that differ per instance are rarely the ones being looked for; <b>Every file</b> reads all of them.</p>
           <h4>Rename</h4>
-          <p>Changes the four fields that say who a study belongs to — patient name, patient ID, study description, accession number — and nothing else. It is <b>Edit</b> underneath with the DICOM keywords filled in for you, and it never passes <code>--force</code>, so no UID is touched. Renaming changes what a study is <i>called</i>, never what it <i>is</i>.</p>
+          <p>Changes the four fields that say who a study belongs to — patient name, patient ID, study description, accession number — and nothing else. Its UIDs are never touched. It is <b>Edit</b> underneath with the DICOM keywords filled in for you, and it never passes <code>--force</code>, so no UID is touched. Renaming changes what a study is <i>called</i>, never what it <i>is</i>.</p>
           <p>A folder holding more than one study is refused rather than renamed. <code>dcm edit</code> applies to every instance under the path and cannot be scoped to one study inside it, so renaming one of three would write a single identity over all three — a merge, not a rename.</p>
           <p><b>When the study&#39;s own instances disagree.</b> The four fields are read across every instance, not off whichever one the scan reaches first, so a study whose two series carry two different patient IDs is shown as carrying two. Nothing is prefilled from one of them &mdash; picking a value would be inventing the answer &mdash; and one amber panel lists every field that disagrees, with each competing value as a button. Choosing one and renaming writes it to all of them, which is the repair. <code>dcm info</code> on the same folder prints a paragraph per disagreeing field on what that particular disagreement costs.</p>
           <p><b>Names written in more than one script.</b> A DICOM patient name can hold the same name three times &mdash; in Latin letters, in ideographs, and phonetically &mdash; as one value with the parts separated by <code>=</code>, so a Japanese or Korean patient may arrive as <code>Yamada^Tarou=山田^太郎=やまだ^たろう</code>. The two boxes here edit the Latin spelling only. The others are carried through unchanged and are shown in the composed line under the boxes, which is exactly the value that gets written &mdash; correcting a surname in Latin letters does not delete the kanji. If the other spellings need correcting too, the <b>Edit</b> tab takes the whole value.</p>
@@ -723,7 +716,7 @@
           <p>Load a study or a single file, change values, then write the result to a new folder. <b>The source is never modified.</b> <b>Preview only</b> shows what would change and writes nothing — it is this tab's own switch, about the disk rather than a peer, and Rehearsal mode adds the same flag from the other direction.</p>
           <p>UIDs are structural, so editing one is gated behind <b>Allow editing UIDs</b>. Changing a Series or Study UID on some instances and not others splits a study into pieces no archive will put back together.</p>
           <h4>De-identify</h4>
-          <p><b>Best-effort, not certified.</b> It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
+          <p><b>Best-effort, not certified.</b> It copies a folder with identifiers removed and UIDs remapped. It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
         </div>
         <div class="chip-row tabs" role="tablist" data-tabs="tools">
           <button class="chip active" role="tab" aria-selected="true" data-tab="inventory">Inventory</button>
@@ -735,7 +728,6 @@
 
         <!-- INVENTORY -->
         <div class="tab-pane" id="view-inventory">
-          <p class="pane-lede">Reads metadata only. Sends nothing.</p>
           <div class="form-row">
             <label class="grow">Folder or file
               <div class="path-pick">
@@ -750,7 +742,7 @@
             <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
           </div>
           <div class="actions">
-            <button class="btn primary" data-run>Inventory</button>
+            <button class="btn primary" data-run>Read folder</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <div class="inventory-result" data-result hidden></div>
@@ -766,7 +758,6 @@
 
         <!-- TAGS -->
         <div class="tab-pane" id="view-tags" hidden>
-          <p class="pane-lede">Dump the tags in a file or folder. Never prints pixel data.</p>
           <div class="form-row">
             <label class="grow">File or folder
               <div class="path-pick">
@@ -785,7 +776,7 @@
             <label><input type="checkbox" id="tags-all" /> Every file <span class="dim">(default: one per series)</span></label>
           </div>
           <div class="actions">
-            <button class="btn primary" data-run>Dump tags</button>
+            <button class="btn primary" data-run>Show tags</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <div class="tags-result" data-result hidden></div>
@@ -824,7 +815,6 @@
           the field that actually disagreed.
         -->
         <div class="tab-pane" id="view-rename" hidden>
-          <p class="pane-lede">Change who a study is filed under. Its UIDs are never touched.</p>
           <div class="form-row">
             <label class="grow">One study's folder
               <div class="path-pick">
@@ -853,7 +843,7 @@
 
             <div class="pending-summary rn-diff" id="rename-diff" data-result hidden></div>
 
-            <div class="chip-row" id="rename-dest-row">
+            <div class="chip-row seg" id="rename-dest-row">
               <span class="level-label">Write</span>
               <button type="button" class="chip active" data-dest="copy">a renamed copy</button>
               <button type="button" class="chip" data-dest="inplace">over the originals</button>
@@ -874,6 +864,7 @@
 
           <div class="actions">
             <button class="btn primary" data-run disabled>Rename study</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <details class="cmd-fold">
@@ -888,8 +879,6 @@
 
         <!-- EDIT -->
         <div class="tab-pane" id="view-edit" hidden>
-          <p class="pane-lede">Change values into a new folder. The source is never modified.</p>
-
           <div class="form-row">
             <label class="grow">Study folder or single file
               <div class="path-pick">
@@ -901,7 +890,7 @@
             </label>
           </div>
 
-          <div id="edit-scope-row" class="chip-row" hidden>
+          <div id="edit-scope-row" class="chip-row seg" hidden>
             <span class="level-label">Apply changes to</span>
             <button class="chip active" data-scope="study">Every instance</button>
             <button class="chip" data-scope="one">Only the loaded file</button>
@@ -931,6 +920,7 @@
 
           <div class="actions">
             <button class="btn primary" data-run>Apply changes</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <details class="cmd-fold">
@@ -945,7 +935,6 @@
 
         <!-- ANON -->
         <div class="tab-pane" id="view-anon" hidden>
-          <p class="pane-lede">Copy a folder with identifiers removed and UIDs remapped.</p>
           <div class="caution">
             <strong>Best-effort, not certified.</strong> Inspect a sample before sharing.
             <button type="button" class="linklike" data-help="tools-help">What survives</button>
@@ -981,6 +970,7 @@
           </details>
           <div class="actions">
             <button class="btn primary" data-run>De-identify</button>
+            <button class="btn danger" data-cancel hidden>Stop</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <details class="cmd-fold">
@@ -1002,7 +992,7 @@
         </header>
         <div class="help-panel" id="speed-help" hidden>
           <div class="help-head"><b>How to read a sweep</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>Each run in a sweep uses its own calling AE Title — the prefix with a run number appended — so you can pick any single run out of the peer's ingress logs afterwards.</p>
+          <p>Sends the same study repeatedly and compares. Each run in a sweep uses its own calling AE Title — the prefix with a run number appended — so you can pick any single run out of the peer's ingress logs afterwards.</p>
           <h4>The numbers</h4>
           <p>Throughput is measured against bytes on disk, so compressing a study does not flatter the number. "On the wire" is what the network actually carried. Which transfer syntax is used is the peer's choice — the table shows what it negotiated, not just what was asked for. Width is measured the same way: it is the associations the peer actually had open at once, not the number the run asked for, and it is a floor — it can read one low on a run whose last chunks drain early, and never reads high.</p>
           <h4>Finding a receiver's ceiling</h4>
@@ -1010,8 +1000,6 @@
           <h4>Chunk size across a sweep</h4>
           <p>A chunk size in the field below applies to every run and overrides each preset's own sizing, so a preset may not reach its association count. Clear it to compare the presets as they ship. Association counts typed into <b>Also try</b> are each sent as <code>--parallel</code>, which overrides the preset's chunk sizing in the same way.</p>
         </div>
-        <p class="pane-lede">Send the same study repeatedly and compare.</p>
-
         <div class="form-row">
           <label class="grow">Study folder
             <div class="path-pick">
@@ -1024,7 +1012,7 @@
         <div class="conn-host" data-conn data-role="archive"></div>
 
         <div class="section-title">What to compare</div>
-        <div class="chip-row" id="speed-mode">
+        <div class="chip-row seg" id="speed-mode">
           <button class="chip active" data-mode="syntax">Syntaxes</button>
           <button class="chip" data-mode="chunk">Chunk sizes</button>
           <button class="chip" data-mode="parallel">Presets</button>
@@ -1103,12 +1091,10 @@
         </header>
         <div class="help-panel" id="mcp-help" hidden>
           <div class="help-head"><b>What MCP is doing here</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>MCP is how an assistant calls a local program as a tool. Registering this server hands Claude the same <code>dcm</code> engine this app runs — not a copy, and not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
+          <p>MCP is how an assistant calls a local program as a tool. Any MCP client can use it, not only Claude. Registering this server hands Claude the same <code>dcm</code> engine this app runs — not a copy, and not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
           <p>It requires <code>dcm</code> installed and on your PATH. If <code>claude mcp add</code> is not found, install Claude Code first. The one-line registration is run once; Claude Desktop instead reads the JSON block from its config file, so that one needs a restart to take.</p>
           <p>The tools are the read-and-send half of this app. Nothing that closes a procedure step is exposed: MPPS is a transaction against a RIS, and it is not a thing to hand to something that cannot see the worklist row it belongs to.</p>
         </div>
-        <p class="pane-lede">Let Claude (or any MCP client) drive these DICOM operations as tools.</p>
-
         <div class="mcp-status" id="mcp-status">
           <span class="dot"></span><span id="mcp-status-text">Checking whether <code>dcm</code> is on your PATH…</span>
         </div>
@@ -1153,8 +1139,12 @@
       <section class="view" id="view-settings">
         <header class="view-head">
           <h1>Settings</h1>
+          <button type="button" class="help-btn" data-help="settings-help" aria-expanded="false" aria-controls="settings-help" title="How settings work">?</button>
         </header>
-        <p class="pane-lede">Set once. Anything here that changes a command shows up in that command's line.</p>
+        <div class="help-panel" id="settings-help" hidden>
+          <div class="help-head"><b>How settings work</b><button type="button" class="linklike" data-help-close>Close</button></div>
+          <p>Set once. Anything here that changes a command shows up in that command's line.</p>
+        </div>
 
         <div class="section-title">This station</div>
         <div class="form-row triple">
@@ -1263,16 +1253,15 @@
         </header>
         <div class="help-panel" id="echo-help" hidden>
           <div class="help-head"><b>What C-ECHO proves</b><button type="button" class="linklike" data-help-close>Close</button></div>
-          <p>C-ECHO opens an association, asks the peer to verify it, and closes. It proves three things together: the host and port are reachable, the peer accepts this station's AE Title as a caller, and it answers to the called AE you typed.</p>
+          <p>C-ECHO opens an association, asks the peer to verify it, and closes. Nothing is sent. It proves three things together: the host and port are reachable, the peer accepts this station's AE Title as a caller, and it answers to the called AE you typed.</p>
           <p>It proves nothing about storage. A peer can verify happily and still refuse every image you offer it, because the presentation contexts it accepts for C-STORE are a separate negotiation. A failed echo is conclusive; a successful one is only the first step.</p>
         </div>
-        <p class="pane-lede">C-ECHO. Nothing is sent.</p>
         <div class="conn-host" data-conn data-role="any"></div>
         <div class="form-row">
           <label>Timeout (ms)<input type="number" id="echo-timeout" placeholder="60000" min="1000" step="1000" /></label>
         </div>
         <div class="actions">
-          <button class="btn primary" data-run>Run C-ECHO</button>
+          <button class="btn primary" data-run>Test connection</button>
           <span class="status-chip" data-status hidden></span>
         </div>
         <details class="cmd-fold">
