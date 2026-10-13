@@ -130,7 +130,7 @@ const BUDGET = {
   // says depends on the machine ("dcm found at <path>", or the 14-word "not
   // on your PATH" sentence and its link), so this is raised by exactly that
   // line's own words, counted on screen at measure time — see measureScreen.
-  mcp: 42,
+  mcp: 28,
   // The screen the others were emptied into. It runs no command, so it is
   // counted whole: section titles, labels, the saved peers, "+ Add a peer".
   // Its parentheticals and notes are behind its ?, and both add forms fold
@@ -355,10 +355,14 @@ function artefact(name, text) {
 const HELPERS = `(() => {
   // Data, not the screen's own words: the peer chip, the command fold, the
   // console, result tables, the attribute grid, the status chip, and the help
-  // panel — which is the place the prose was deliberately moved to.
+  // panel — which is the place the prose was deliberately moved to. A copy box
+  // is a command, the same as the command fold, and a probed path is a path:
+  // both vary with the machine (a full path splits into a word per folder), and
+  // counting them would let a deeper install directory fail a screen whose
+  // own words never changed.
   const SKIP = '[hidden], .help-panel, details.cmd-fold, .console-wrap, [data-result],'
     + ' #mwl-results, #speed-progress, #mpps-attrs, .conn-host, [data-webconn], .peer-menu,'
-    + ' .status-chip, #mpps-outcome, #mpps-totals, [data-totals]';
+    + ' .status-chip, #mpps-outcome, #mpps-totals, [data-totals], .copy-box, .probe-path';
   const WORD = /[A-Za-z0-9][A-Za-z0-9'\\u2019-]*/g;
   const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
 
@@ -1265,36 +1269,70 @@ async function runSmoke(win, app, mainHelpers = {}) {
           const line = document.querySelector('#mcp-dcm');
           const btn = line.querySelector('button');
           return { text: line.textContent.replace(/\\s+/g, ' ').trim(), cls: line.className,
-            path: (line.querySelector('.probe-path') || {}).textContent || '', words: __smoke.words(line),
+            path: (line.querySelector('.probe-path') || {}).textContent || '',
+            // The line's own words, without the path: the screen measure skips
+            // .probe-path, so the allowance has to skip it too or it is slack.
+            words: __smoke.words(line) - __smoke.words(line.querySelector('.probe-path')),
             btn: btn ? { help: btn.dataset.help || '', section: btn.dataset.helpSection || '', text: btn.textContent.trim() } : null,
             beforeFirstTitle: !!(line.compareDocumentPosition(document.querySelector('#view-mcp .section-title'))
               & Node.DOCUMENT_POSITION_FOLLOWING) };
         })())`);
         await measureScreen(name, `#view-${name}`, null, { words: probe.words, what: 'the dcm line' });
+        // Where main says it found it: the app's own PATH, the PATH a program
+        // started now would get, or only the installer's folder.
+        const looked = await jsJSON('(async () => JSON.stringify(await window.dcm.onPath()))()');
         const harness = process.platform === 'win32'
           ? spawnSync('where', ['dcm'], { encoding: 'utf8', windowsHide: true, cwd: OUT })
           : spawnSync('/bin/sh', ['-c', 'command -v dcm'], { encoding: 'utf8', cwd: OUT });
-        const onPath = harness.status === 0
-          ? String(harness.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
+        // Only what a shell-less spawn can run counts, and only the first of
+        // those: a second dcm further down PATH is not the one Claude starts.
+        const runnable = (p) => process.platform !== 'win32' || /\.(exe|com)$/i.test(p);
+        const firstHit = harness.status === 0
+          ? (String(harness.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean).filter(runnable)[0] || '')
+          : '';
         const same = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
-        record(`claude: the screen says "${probe.text}"; the harness's own `
-          + `${process.platform === 'win32' ? 'where dcm' : 'command -v dcm'} found ${onPath.length ? onPath.join(', ') : 'nothing'}`);
+        record(`claude: the screen says "${probe.text}" (via ${looked.via || 'nowhere'}); the harness's own `
+          + `${process.platform === 'win32' ? 'where dcm' : 'command -v dcm'} found ${firstHit || 'nothing'}`);
         const MISSING = 'dcm is not on your PATH, so Claude cannot start it. How to install';
         if (harness.error) bad(`the harness could not run its own PATH check: ${harness.error.message}`);
         if (!probe.beforeFirstTitle) bad('the dcm line is not above both ways of registering it');
-        if (onPath.length) {
-          if (probe.text !== `dcm found at ${probe.path}` || !/\bfound\b/.test(probe.cls) || probe.btn) {
-            bad(`dcm is on PATH and the Claude screen does not say where: ${JSON.stringify(probe)}`);
+        if (looked.path) {
+          const appVersion = await jsJSON('JSON.stringify(state.info.version)');
+          const older = !!looked.version
+            && await jsJSON(`JSON.stringify(versionOlder(${JSON.stringify(looked.version)}, state.info.version))`);
+          const expectText = looked.via === 'install-dir'
+            ? `dcm is installed at ${looked.path} but not on your PATH. The commands below use its full path.`
+            : older
+              ? `dcm ${looked.version} at ${looked.path} is older than this app (${appVersion}). `
+                + 'Run dcm update so Claude gets the same tools.'
+              : `dcm found at ${looked.path}`;
+          record(`claude: the dcm Claude would start reports ${looked.version || 'no version'}; this app is ${appVersion}`
+            + (older ? ' — the screen says it is older' : ''));
+          if (probe.text !== expectText || probe.path !== looked.path || probe.btn) {
+            bad(`the Claude screen does not say what main found: ${JSON.stringify({ probe, looked })}`);
           }
-          // The same file, and named as the disk names it: where prints the
-          // file's own case (dcm.exe), not PATHEXT's (.EXE).
-          const match = onPath.find((p) => same(p, probe.path));
-          if (!match || path.basename(match) !== path.basename(probe.path) || !fs.existsSync(probe.path)) {
-            bad(`the Claude screen names a dcm the platform does not resolve: "${probe.path}" vs ${JSON.stringify(onPath)}`);
+          // The strongest independent check there is: run the file it names.
+          // A dcm that does not start is not one Claude can start either.
+          const ran = spawnSync(looked.path, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+          const reported = (String(ran.stdout || '').trim().match(/^(\d+\.\d+\.\d+)/) || [])[1];
+          if (ran.status !== 0 || !reported) {
+            bad(`the dcm the Claude screen names does not run: ${looked.path} -> exit ${ran.status} ${ran.error ? ran.error.message : ''}`);
+          } else if (reported !== looked.version) {
+            bad(`main says that dcm is ${looked.version}, and it says it is ${reported}`);
+          }
+          // Consistent with this process's own PATH: found there means named
+          // exactly as `where` names it first; found elsewhere means `where`
+          // had nothing, or the app would have found it there.
+          if (looked.via === 'path') {
+            if (!firstHit || !same(firstHit, looked.path) || path.basename(firstHit) !== path.basename(looked.path)) {
+              bad(`the Claude screen names a different dcm from the platform's first: "${looked.path}" vs "${firstHit}"`);
+            }
+          } else if (firstHit) {
+            bad(`main fell back to ${looked.via} although this process's PATH has ${firstHit}`);
           }
         } else if (probe.text !== MISSING || !/\bmissing\b/.test(probe.cls) || !probe.btn
-          || probe.btn.help !== 'mcp-help' || probe.btn.section !== 'mcp-install') {
-          bad(`dcm is not on PATH and the Claude screen does not say so with the way to install it: ${JSON.stringify(probe)}`);
+          || probe.btn.help !== 'mcp-help' || probe.btn.section !== 'mcp-install' || firstHit) {
+          bad(`the Claude screen says dcm is missing, and it should say so with the way to install it — and only when it is: ${JSON.stringify({ probe, firstHit })}`);
         }
         // Both forms, whichever this machine shows: what each says, in which
         // colour, and that the missing form's link opens the help at the
@@ -1321,10 +1359,29 @@ async function runSmoke(win, app, mainHelpers = {}) {
           drawDcmProbe('C:/Tools/dcm.exe');
           const found = { text: line.textContent.replace(/\\s+/g, ' ').trim(), dim: getComputedStyle(line).color === tone('--text-dim'),
             link: !!line.querySelector('button') };
+          const copies = () => ({
+            code: document.querySelector('#mcp-code-box').getAttribute('data-copy'),
+            codeShown: document.querySelector('#mcp-code-box code').textContent,
+            desktop: document.querySelector('#mcp-desktop-box').getAttribute('data-copy'),
+            desktopShown: document.querySelector('#mcp-desktop-box pre').textContent,
+          });
+          found.copies = copies();
+          drawDcmProbe('C:/Tools/dcm.exe', 'path', '0.0.1');
+          const stale = { text: line.textContent.replace(/\\s+/g, ' ').trim(), amber: getComputedStyle(line).color === tone('--amber'),
+            app: state.info.version };
+          drawDcmProbe('C:/Tools/dcm.exe', 'path', '999.0.0');
+          const newer = { text: line.textContent.replace(/\\s+/g, ' ').trim() };
+          found.stale = stale;
+          found.newer = newer;
+          drawDcmProbe('C:/Program Files/dcm/dcm.exe', 'install-dir');
+          const installed = { text: line.textContent.replace(/\\s+/g, ' ').trim(),
+            amber: getComputedStyle(line).color === tone('--amber'), link: !!line.querySelector('button'), copies: copies() };
+          drawDcmProbe(null);
+          missing.copies = copies();
           drawDcmProbe(undefined);
           const unknown = { hidden: line.hidden };
           await renderDcmProbe();
-          return JSON.stringify({ missing, found, unknown, restored: line.textContent.replace(/\\s+/g, ' ').trim() });
+          return JSON.stringify({ missing, found, installed, unknown, restored: line.textContent.replace(/\\s+/g, ' ').trim() });
         })()`);
         say(`claude: the two forms ${JSON.stringify(forms)}`);
         if (forms.missing.text !== MISSING || !forms.missing.amber || !forms.missing.linklike) {
@@ -1336,6 +1393,48 @@ async function runSmoke(win, app, mainHelpers = {}) {
         if (forms.found.text !== 'dcm found at C:/Tools/dcm.exe' || !forms.found.dim || forms.found.link) {
           bad(`the "found" line is not one dim line naming the path: ${JSON.stringify(forms.found)}`);
         }
+        // A dcm older than this app is said in amber with the command that
+        // fixes it; a newer one is not an alarm.
+        const staleWant = `dcm 0.0.1 at C:/Tools/dcm.exe is older than this app (${forms.found.stale.app}). `
+          + 'Run dcm update so Claude gets the same tools.';
+        if (forms.found.stale.text !== staleWant || !forms.found.stale.amber) {
+          bad(`an older dcm on PATH is not called out: ${JSON.stringify(forms.found.stale)}`);
+        }
+        if (forms.found.newer.text !== 'dcm found at C:/Tools/dcm.exe') {
+          bad(`a newer dcm on PATH was treated as a problem: ${JSON.stringify(forms.found.newer)}`);
+        }
+        if (forms.installed.text !== 'dcm is installed at C:/Program Files/dcm/dcm.exe but not on your PATH. The commands below use its full path.'
+          || !forms.installed.amber || forms.installed.link) {
+          bad(`the "installed but not on PATH" line is not one amber sentence naming the path: ${JSON.stringify(forms.installed)}`);
+        }
+        // The commands are written for what was found. Claude Desktop gets the
+        // full path whenever there is one, because Desktop opened from the Dock
+        // or Start menu has a short PATH of its own; Claude Code keeps the bare
+        // name unless dcm is on no PATH at all; a path with a space is quoted;
+        // and what is shown is exactly what is copied.
+        const desk = (cmd) => '{\n  "mcpServers": {\n    "dcm-dicom": { "command": '
+          + JSON.stringify(cmd) + ', "args": ["mcp"] }\n  }\n}';
+        const wantCopies = {
+          found: { code: 'claude mcp add dcm-dicom -- dcm mcp', desktop: desk('C:/Tools/dcm.exe') },
+          installed: {
+            code: 'claude mcp add dcm-dicom -- "C:/Program Files/dcm/dcm.exe" mcp',
+            desktop: desk('C:/Program Files/dcm/dcm.exe'),
+          },
+          missing: { code: 'claude mcp add dcm-dicom -- dcm mcp', desktop: desk('dcm') },
+        };
+        for (const [form, want] of Object.entries(wantCopies)) {
+          const got = forms[form].copies;
+          if (got.code !== want.code || got.codeShown !== want.code
+            || got.desktop !== want.desktop || got.desktopShown !== want.desktop) {
+            bad(`the ${form} form's registration commands are not written for what was found: ${JSON.stringify(got)}`);
+          }
+          try {
+            JSON.parse(got.desktop);
+          } catch (e) {
+            bad(`the ${form} Claude Desktop block is not JSON Claude can read: ${e.message}`);
+          }
+        }
+        record('claude: Desktop config names the full path when one is known; Code keeps "dcm" unless it is on no PATH');
         if (!forms.unknown.hidden) bad('a PATH look that did not happen still drew a status line');
         if (forms.restored !== probe.text) bad(`the line did not come back to what this machine is: ${forms.restored}`);
         // The walker itself, against PATHs made up here: only a file, only
@@ -1352,12 +1451,19 @@ async function runSmoke(win, app, mainHelpers = {}) {
           fs.writeFileSync(path.join(pa, 'dcm.txt'), '');
           fs.writeFileSync(path.join(pb, 'dcm.cmd'), '@echo off\r\n');
           fs.writeFileSync(path.join(pb, 'dcm.exe'), '');
+          const pc = path.join(work, 'path-c');
+          fs.mkdirSync(pc, { recursive: true });
+          fs.writeFileSync(path.join(pc, 'dcm.cmd'), '@echo off\r\n');
+          fs.writeFileSync(path.join(pc, 'dcm.bat'), '@echo off\r\n');
           const win = (p) => findOnPath('dcm', { PATH: p, PATHEXT: '.COM;.EXE;.BAT;.CMD' }, 'win32');
           const walked = {
             none: win(''),
             onlyA: win(pa),
             both: win(`${pa};${pb}`),
             quoted: win(`"${pb}"`),
+            // A shim Claude's shell-less spawn cannot run is not "found".
+            shimOnly: win(pc),
+            shimFirst: win(`${pc};${pb}`),
           };
           if (process.platform !== 'win32') {
             fs.writeFileSync(path.join(pa, 'dcm'), '#!/bin/sh\n');
@@ -1370,6 +1476,36 @@ async function runSmoke(win, app, mainHelpers = {}) {
           if (walked.none !== null || walked.onlyA !== null) bad(`the PATH walker found a dcm that is not a program: ${JSON.stringify(walked)}`);
           if (walked.both !== path.join(pb, 'dcm.exe')) bad(`the PATH walker did not resolve PATHEXT in order: ${JSON.stringify(walked)}`);
           if (walked.quoted !== path.join(pb, 'dcm.exe')) bad(`the PATH walker took a quoted directory literally: ${JSON.stringify(walked)}`);
+          if (walked.shimOnly !== null || walked.shimFirst !== path.join(pb, 'dcm.exe')) {
+            bad(`the PATH walker counted a .cmd/.bat shim Claude cannot start: ${JSON.stringify(walked)}`);
+          }
+          // The three places probeDcm looks, each driven with made-up PATHs and
+          // folders so the answer never depends on what this machine has.
+          const { probeDcm } = mainHelpers;
+          if (typeof probeDcm !== 'function') {
+            bad('main did not hand probeDcm to the harness');
+          } else {
+            const env = (p) => ({ PATH: p, PATHEXT: '.COM;.EXE;.BAT;.CMD' });
+            const none = async () => null;
+            // The made-up dcm.exe files are empty and must not be executed;
+            // the version a real one reports is checked above, by running it.
+            const v = async () => '1.2.3';
+            const cases = {
+              appPath: await probeDcm({ env: env(pb), platform: 'win32', readFreshPath: none, dirs: [], readVersion: v }),
+              terminal: await probeDcm({ env: env(pa), platform: 'win32', readFreshPath: async () => pb, dirs: [], readVersion: none }),
+              installDir: await probeDcm({ env: env(''), platform: 'win32', readFreshPath: none, dirs: [pc, pb], readVersion: none }),
+              nowhere: await probeDcm({ env: env(pc), platform: 'win32', readFreshPath: async () => pc, dirs: [pa, pc], readVersion: v }),
+            };
+            if (cases.appPath.version !== '1.2.3' || cases.terminal.version !== null || cases.nowhere.version !== null) {
+              bad(`probeDcm did not carry the found dcm's version, and only that: ${JSON.stringify(cases)}`);
+            }
+            say(`claude: probeDcm ${JSON.stringify(cases)}`);
+            const exe = path.join(pb, 'dcm.exe');
+            if (cases.appPath.path !== exe || cases.appPath.via !== 'path') bad(`probeDcm missed dcm on the app's PATH: ${JSON.stringify(cases.appPath)}`);
+            if (cases.terminal.path !== exe || cases.terminal.via !== 'terminal') bad(`probeDcm missed dcm on a fresh PATH: ${JSON.stringify(cases.terminal)}`);
+            if (cases.installDir.path !== exe || cases.installDir.via !== 'install-dir') bad(`probeDcm missed dcm in the installer's folder: ${JSON.stringify(cases.installDir)}`);
+            if (cases.nowhere.path !== null) bad(`probeDcm found a dcm where there is only a shim or nothing: ${JSON.stringify(cases.nowhere)}`);
+          }
           if (process.platform !== 'win32' && (walked.notExecutable !== null || walked.executable !== path.join(pa, 'dcm'))) {
             bad(`the PATH walker took a file that cannot be run: ${JSON.stringify(walked)}`);
           }
@@ -2698,8 +2834,15 @@ async function runSmoke(win, app, mainHelpers = {}) {
           dim: getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim(),
           controls: el.querySelectorAll('button, input, select, a').length,
           cmd: document.querySelector('#mwl-cmd').textContent,
-          modalityColumn: Array.from(document.querySelectorAll('#mwl-table thead th')).some((t) => t.textContent === 'Modality'),
         } : null;
+      })())`);
+      // The Modality column and the "CT only" note are one fact said two ways:
+      // the column shows while nothing is filtered and gives way to the note
+      // when something is. Re-rendered on the spot so the answer never depends
+      // on when the next fetch lands.
+      const columnHeads = () => jsJSON(`JSON.stringify((() => {
+        renderWorklistTable();
+        return Array.from(document.querySelectorAll('#mwl-table thead th')).map((t) => t.textContent.trim());
       })())`);
       const bar = await jsJSON(`JSON.stringify({
         autoInSettings: !!document.querySelector('#view-settings #mwl-auto'),
@@ -2736,6 +2879,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!unfiltered || unfiltered.shown || unfiltered.text !== '' || /Modality=/.test(unfiltered.cmd)) {
         bad(`with no modality filter the bar still names one: ${JSON.stringify(unfiltered)}`);
       }
+      const headsUnfiltered = await columnHeads();
+      if (headsUnfiltered.length && !headsUnfiltered.includes('Modality')) {
+        bad(`with no filter the list does not show each row's modality: ${JSON.stringify(headsUnfiltered)}`);
+      }
       await js(`(() => { __smoke.set('set-modality', 'CT'); return true; })()`);
       await mustWait('state.settings.modality === "CT" && document.querySelector("#mwl-cmd").textContent.includes("Modality=CT")',
         8000, 'Settings to put the CT filter back on the query');
@@ -2743,6 +2890,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!refiltered || !refiltered.shown || refiltered.text !== 'CT only' || !/Modality=CT/.test(refiltered.cmd)) {
         bad(`putting the filter back did not say it again: ${JSON.stringify(refiltered)}`);
       }
+      const headsFiltered = await columnHeads();
+      if (headsFiltered.includes('Modality')) {
+        bad(`with the CT filter the list still spends a column on a modality every row shares: ${JSON.stringify(headsFiltered)}`);
+      }
+      if (!headsUnfiltered.length) say('station: the list had no rows to draw headers for, so the column toggle went unchecked');
+      else record(`station: Modality column ${headsUnfiltered.includes('Modality') ? 'shown' : 'MISSING'} unfiltered, `
+        + `${headsFiltered.includes('Modality') ? 'STILL SHOWN' : 'gone'} under the CT filter`);
       if (!bar.statusInRefresh) bad('the last read is not said on the Refresh button');
       if (/\bprimary\b/.test(bar.refreshCls)) bad(`Refresh is a second primary button: ${bar.refreshCls}`);
       if (bar.clear) bad('the "Clear" button is still on the station');

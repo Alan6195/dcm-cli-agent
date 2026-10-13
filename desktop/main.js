@@ -65,6 +65,11 @@ const ENGINE = resolveEngine();
  * order, which is how the shell resolves it, and the file is named as it is
  * on disk (PATHEXT says ".EXE"; the file is dcm.exe); elsewhere the file has
  * to be executable by this user.
+ *
+ * Only .COM and .EXE count on Windows. Claude starts an MCP server with a
+ * plain spawn and no shell, and CreateProcess cannot run a .cmd or .bat shim
+ * that way — so a dcm.cmd on PATH would read "found" here and then fail inside
+ * Claude, which is the exact failure this line exists to catch.
  */
 function findOnPath(name, env = process.env, platform = process.platform) {
   const sep = platform === 'win32' ? ';' : ':';
@@ -73,8 +78,10 @@ function findOnPath(name, env = process.env, platform = process.platform) {
     .map((d) => d.trim().replace(/^"(.*)"$/, '$1'))
     .filter(Boolean);
   const exts = platform === 'win32'
-    ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
+    ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim())
+      .filter((e) => /^\.(com|exe)$/i.test(e))
     : [''];
+  if (!exts.length) exts.push('.EXE');
   // Windows matches names without regard to case; say the one the disk has.
   const onDisk = (dir, file) => {
     if (platform !== 'win32') return file;
@@ -97,6 +104,140 @@ function findOnPath(name, env = process.env, platform = process.platform) {
     }
   }
   return null;
+}
+
+/**
+ * The PATH a program started right now would get, or null if it cannot be read.
+ *
+ * This process's own PATH is the wrong answer in two common cases, in opposite
+ * directions:
+ *
+ *   - macOS and Linux. An app opened from Finder or the Dock does not inherit
+ *     the shell's PATH: it gets launchd's /usr/bin:/bin:/usr/sbin:/sbin and
+ *     nothing a shell rc adds — ~/.local/bin, where install.sh puts dcm, or
+ *     Homebrew. So the user's login shell is asked, which is what a terminal,
+ *     and Claude Code run from one, actually sees.
+ *
+ *   - Windows. install.ps1 adds its folder to the user PATH in the registry,
+ *     but a program already running keeps the PATH it started with. So the
+ *     registry is read, machine then user, which is what Claude gets when it is
+ *     restarted.
+ *
+ * Read fresh on every look, so an install made while this app is open is seen
+ * without restarting it. Bounded by a timeout so a slow rc file or registry
+ * can only cost this one line, never hang the screen.
+ */
+function freshPath() {
+  return process.platform === 'win32' ? registryPath() : loginShellPath();
+}
+
+/** Machine then user PATH from the registry, with %VARS% expanded. */
+function registryPath() {
+  const read = (key) => new Promise((resolve) => {
+    execFile('reg', ['query', key, '/v', 'Path'], { timeout: 4000, windowsHide: true }, (err, stdout) => {
+      if (err) { resolve(''); return; }
+      const m = String(stdout).match(/^\s*Path\s+REG_(?:EXPAND_)?SZ\s+(.*)$/mi);
+      resolve(m ? m[1].trim() : '');
+    });
+  });
+  const expand = (s) => s.replace(/%([^%]+)%/g, (all, name) => process.env[name] ?? all);
+  return Promise.all([
+    read('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'),
+    read('HKCU\\Environment'),
+  ]).then(([machine, user]) => {
+    const joined = [machine, user].map(expand).filter(Boolean).join(';');
+    return joined || null;
+  });
+}
+
+/** The login shell's PATH on macOS and Linux; values fenced against rc-file chatter. */
+function loginShellPath() {
+  const shell = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh');
+  const mark = '__DCM_PATH__';
+  return new Promise((resolve) => {
+    let out = '';
+    let child;
+    try {
+      child = spawn(shell, ['-ilc', `printf '%s%s%s' '${mark}' "$PATH" '${mark}'`], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 4000,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('error', () => resolve(null));
+    child.on('close', () => {
+      const parts = out.split(mark);
+      resolve(parts.length >= 3 && parts[1] ? parts[1] : null);
+    });
+  });
+}
+
+/** Where each installer puts dcm when left to its defaults. */
+function installDirs(platform = process.platform, env = process.env) {
+  return platform === 'win32'
+    ? [env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'dcm-cli') : null].filter(Boolean)
+    : [path.join(app.getPath('home'), '.local', 'bin')];
+}
+
+/**
+ * Where Claude would find dcm, and how sure that is.
+ *
+ *   via 'path'         on this app's own PATH
+ *   via 'terminal'     on the PATH a program started now would get (see
+ *                      freshPath): a terminal's on macOS and Linux, the
+ *                      registry's on Windows after an install this app
+ *                      started too early to inherit
+ *   via 'install-dir'  in the installer's own folder but on no PATH at all —
+ *                      installed, not yet wired up; a command naming the full
+ *                      path still works
+ *   path null          not found anywhere looked
+ *
+ * Every argument has a default so the harness can drive each case with made-up
+ * PATHs and folders, and never has to depend on what this machine happens to
+ * have installed.
+ */
+async function probeDcm({
+  env = process.env,
+  platform = process.platform,
+  readFreshPath = freshPath,
+  dirs = installDirs(platform, env),
+  readVersion = dcmVersion,
+} = {}) {
+  const found = async (file, via) => ({ path: file, via, version: await readVersion(file) });
+  const onApp = findOnPath('dcm', env, platform);
+  if (onApp) return found(onApp, 'path');
+  const fresh = await readFreshPath();
+  if (fresh) {
+    const onFresh = findOnPath('dcm', { ...env, PATH: fresh }, platform);
+    if (onFresh) return found(onFresh, 'terminal');
+  }
+  for (const dir of dirs) {
+    const hit = findOnPath('dcm', { ...env, PATH: dir }, platform);
+    if (hit) return found(hit, 'install-dir');
+  }
+  return { path: null, via: null, version: null };
+}
+
+/**
+ * The version a dcm executable reports, or null.
+ *
+ * Claude runs the dcm on PATH, not this app's bundled engine, and those drift
+ * apart: install once, update the app for months, and Claude is still calling
+ * the old binary — without whatever tools came since. The screen can only say
+ * that if it asks, so it asks: one `--version`, bounded, and nothing claimed if
+ * the answer does not look like a version.
+ */
+function dcmVersion(file) {
+  return new Promise((resolve) => {
+    execFile(file, ['--version'], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+      const m = !err && String(stdout).trim().match(/^(\d+\.\d+\.\d+)/);
+      resolve(m ? m[1] : null);
+    });
+  });
 }
 
 // The smoke harness is automated verification, not somebody launching the app:
@@ -1274,8 +1415,9 @@ app.whenReady().then(() => {
     packaged: app.isPackaged,
   }));
 
-  // Looked up on every visit to the Claude screen: a handful of stat calls.
-  ipcMain.handle('dcm:on-path', () => ({ path: findOnPath('dcm') }));
+  // Looked up on every visit to the Claude screen: a handful of stat calls,
+  // plus one bounded login-shell read on macOS and Linux (see probeDcm).
+  ipcMain.handle('dcm:on-path', () => probeDcm());
 
   ipcMain.handle('dcm:start', startRun);
   ipcMain.handle('dcm:cancel', cancelRun);
@@ -1350,6 +1492,7 @@ app.whenReady().then(() => {
           LEGACY_PRODUCT_DIRS,
           openSteps: () => ({ ...openSteps }),
           findOnPath,
+          probeDcm,
           quitGuardMessage,
           stopEveryChild,
         });

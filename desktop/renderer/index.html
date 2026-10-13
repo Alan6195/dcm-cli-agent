@@ -1086,10 +1086,10 @@
           <p>It requires <code>dcm</code> installed and on your PATH. If <code>claude mcp add</code> is not found, install Claude Code first. The one-line registration is run once; Claude Desktop instead reads the JSON block from its config file, so that one needs a restart to take.</p>
           <p>Claude gets a tool for the command behind every screen here, including retrieve (C-GET and C-MOVE), the worklist and every MPPS step — complete and discontinue too.</p>
           <h4 id="mcp-install">Installing dcm</h4>
-          <p>One line fetches the binary for this machine, checks it against the published SHA256, installs it under your user profile and puts it on your PATH. No admin rights.</p>
+          <p>One line fetches the binary for this machine, checks it against the published SHA256 and installs it under your user profile. No admin rights. On Windows it also adds itself to your PATH; on macOS and Linux it installs to <code>~/.local/bin</code> and prints the line that adds that folder to your PATH.</p>
           <p>Windows (PowerShell): <code>irm https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.ps1 | iex</code></p>
           <p>macOS / Linux: <code>curl -fsSL https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.sh | bash</code></p>
-          <p>A program reads PATH when it starts, so open a new terminal and restart Claude and this app afterwards. The line on this screen looks again each time the screen is opened.</p>
+          <p>A program reads PATH when it starts, so afterwards open a new terminal and restart Claude. This screen looks again each time you open it, at the PATH a newly started program would get. If dcm is installed but not yet on your PATH, the commands on this screen name its full path instead, and work as copied.</p>
         </div>
 
         <!-- Claude starts the dcm on this machine's PATH. Main looks for it each
@@ -1098,14 +1098,14 @@
 
         <div class="section-title">Claude Code (terminal)</div>
         <p class="mcp-note">Run this once.</p>
-        <div class="copy-box" data-copy="claude mcp add dcm-dicom -- dcm mcp">
+        <div class="copy-box" id="mcp-code-box" data-copy="claude mcp add dcm-dicom -- dcm mcp">
           <code>claude mcp add dcm-dicom -- dcm mcp</code>
           <button class="btn ghost small">Copy</button>
         </div>
 
         <div class="section-title">Claude Desktop</div>
         <p class="mcp-note">Add this to <code>claude_desktop_config.json</code> (Settings → Developer → Edit Config), then restart Claude.</p>
-        <div class="copy-box block" data-copy='{
+        <div class="copy-box block" id="mcp-desktop-box" data-copy='{
   "mcpServers": {
     "dcm-dicom": { "command": "dcm", "args": ["mcp"] }
   }

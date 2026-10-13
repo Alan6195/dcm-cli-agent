@@ -3086,7 +3086,7 @@ function renderWorklistTable() {
   box.innerHTML = noRis + failed +
     `<div class="table-scroll${stale ? ' stale' : ''}"><table id="mwl-table">` +
     `<colgroup><col>${showModality ? '<col data-fixed="64">' : ''}` +
-    '<col><col><col data-fixed="140"><col><col></colgroup>' +
+    '<col><col><col data-fixed="146"><col><col></colgroup>' +
     `<thead><tr><th>Scheduled</th>${showModality ? '<th>Modality</th>' : ''}<th>Patient</th>` +
     '<th>Procedure</th><th>Status</th><th>Accession</th><th>Patient ID</th></tr></thead>' +
     `<tbody>${html}</tbody></table></div>`;
@@ -7087,16 +7087,84 @@ function flash(el, cls = 'copied') {
  */
 async function renderDcmProbe() {
   let found;
-  try { found = (await window.dcm.onPath()).path; } catch { found = undefined; }
-  drawDcmProbe(found);
+  let via = null;
+  let version = null;
+  try {
+    const r = await window.dcm.onPath();
+    found = r.path;
+    via = r.via || null;
+    version = r.version || null;
+  } catch {
+    found = undefined;
+  }
+  drawDcmProbe(found, via, version);
 }
 
-/** The line for what the look found: a path, null for nothing, undefined for no look. */
-function drawDcmProbe(found) {
+/** True when dotted version a is lower than b. */
+function versionOlder(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0);
+  }
+  return false;
+}
+
+/**
+ * The two ways to register this server, written for what the look found.
+ *
+ * Claude Desktop gets the full path whenever one is known. Opened from the Dock
+ * or the Start menu it has the same short PATH this app had before freshPath()
+ * went looking, so a bare "dcm" in its config fails there even when every
+ * terminal finds it. Claude Code runs from a terminal and keeps the bare name —
+ * unless dcm is on no PATH at all, when it gets the full path too, so that both
+ * commands work exactly as copied.
+ */
+function drawMcpCommands(found, via) {
+  const arg = (p) => (/\s/.test(p) ? `"${p}"` : p);
+  const code = `claude mcp add dcm-dicom -- ${found && via === 'install-dir' ? arg(found) : 'dcm'} mcp`;
+  const desktop = '{\n  "mcpServers": {\n'
+    + `    "dcm-dicom": { "command": ${JSON.stringify(found || 'dcm')}, "args": ["mcp"] }\n`
+    + '  }\n}';
+  const codeBox = $('#mcp-code-box');
+  const deskBox = $('#mcp-desktop-box');
+  if (codeBox) {
+    codeBox.setAttribute('data-copy', code);
+    codeBox.querySelector('code').textContent = code;
+  }
+  if (deskBox) {
+    deskBox.setAttribute('data-copy', desktop);
+    deskBox.querySelector('pre').textContent = desktop;
+  }
+}
+
+/**
+ * The line for what the look found: a path, null for nothing, undefined for no
+ * look. `via` says where it was found (probeDcm, main.js); a path found only in
+ * the installer's own folder is installed but on no PATH, and says so.
+ */
+function drawDcmProbe(found, via = 'path', version = null) {
   const line = $('#mcp-dcm');
   if (!line) return;
+  drawMcpCommands(found || null, via);
   if (found === undefined) { line.hidden = true; return; }
   line.hidden = false;
+  if (found && via === 'install-dir') {
+    line.className = 'probe-line missing';
+    line.innerHTML = `dcm is installed at <span class="probe-path">${esc(found)}</span> but not on your PATH. `
+      + 'The commands below use its full path.';
+    return;
+  }
+  // Claude runs THAT dcm, not this app's engine. Older means Claude is missing
+  // whatever tools came since — retrieve, say — while this screen's help lists
+  // them, so it is said in amber with the one command that fixes it.
+  const appVersion = state.info && state.info.version;
+  if (found && version && appVersion && versionOlder(version, appVersion)) {
+    line.className = 'probe-line missing';
+    line.innerHTML = `dcm ${esc(version)} at <span class="probe-path">${esc(found)}</span> is older than this `
+      + `app (${esc(appVersion)}). Run <code>dcm update</code> so Claude gets the same tools.`;
+    return;
+  }
   line.className = `probe-line ${found ? 'found' : 'missing'}`;
   line.innerHTML = found
     ? `dcm found at <span class="probe-path">${esc(found)}</span>`
