@@ -98,7 +98,7 @@ const BUDGET = {
   // plus four.
   send: 24,
   receive: 15,
-  query: 15,
+  query: 13,            // ratcheted when the level became three chips (no Worklist, no "Level")
   echo: 10,
   webping: 6,
   websend: 13,
@@ -4699,13 +4699,18 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // the one the archive issued and the files on disk are the ones it sent.
     //
     // Three things are proved. A clean retrieve reads as success and every
-    // file is really there. The Browse… beside the destination box feeds the
+    // file is really there. Change, on the "Into <folder>" line, feeds the
     // next retrieve, which is the picker the generic sweep below does not
     // press. And a peer that over-reports what it sent — the accepted-but-lossy
     // case the engine's accounting exists to catch — reads as INCOMPLETE on
     // screen and never as success. That one gets a receiver of its own,
     // started with --retrieve-overcount, because no correct peer produces it
     // and a harness that waited for one would never test it.
+    //
+    // Around those, the screen's own shape: the results sit directly under
+    // Search with the columns a person reads, one chip is on screen at a time,
+    // a retrieve nobody could verify is amber, an empty answer is not a
+    // failure, and a peer that is not there is never drawn as an answer.
     // =====================================================================
     {
       if (!fixtures) bad('the Query → Retrieve section needs DCM_SMOKE_FIXTURES to serve from');
@@ -4728,11 +4733,70 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const expected = countDcm(fixtures);
       if (!expected) bad(`no DICOM files under ${fixtures} to serve`);
 
+      // What the Query screen shows: every chip that is on screen, the order
+      // of its parts, the result table's headers and first row, and the
+      // destination line. Read the same way after every step below.
+      const SCREEN = `JSON.stringify((() => {
+        const pane = document.querySelector('#view-query');
+        const vis = (el) => !!el && __smoke.vis(el) && !el.closest('[hidden]');
+        const actions = pane.querySelector('[data-run]').closest('.actions');
+        const fold = pane.querySelector('details.cmd-fold:not(#find-retrieve-fold)');
+        const result = pane.querySelector('[data-result]');
+        const area = pane.querySelector('#find-retrieve');
+        const before = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+        const row = pane.querySelector('[data-result] tbody tr');
+        const box = pane.querySelector('#find-retrieve-outcome');
+        return {
+          chips: Array.from(pane.querySelectorAll('.status-chip')).filter(vis)
+            .map((c) => ({ id: c.id || 'search', text: c.textContent, cls: c.className })),
+          searchChip: { text: pane.querySelector('[data-status]').textContent, cls: pane.querySelector('[data-status]').className,
+            hidden: pane.querySelector('[data-status]').hidden },
+          retrieveChip: { text: pane.querySelector('#find-retrieve-status').textContent,
+            cls: pane.querySelector('#find-retrieve-status').className, hidden: !vis(pane.querySelector('#find-retrieve-status')) },
+          order: {
+            foldAfterSearch: actions.nextElementSibling === fold,
+            resultAfterFold: fold.nextElementSibling === result,
+            areaAfterResult: before(result, area),
+            resultAbove: !vis(area) || !vis(result)
+              || result.getBoundingClientRect().bottom <= area.getBoundingClientRect().top + 1,
+          },
+          label: pane.querySelector('[data-run]').textContent.trim(),
+          resultShown: vis(result),
+          resultText: result.textContent,
+          heads: Array.from(pane.querySelectorAll('[data-result] thead th')).map((th) => th.textContent.trim()),
+          cells: row ? Array.from(row.cells).map((td) => td.textContent.trim()) : [],
+          lastCellRetrieve: !!(row && row.cells[row.cells.length - 1].querySelector('[data-retrieve]')),
+          retrieveCls: (pane.querySelector('[data-retrieve]') || {}).className || '',
+          areaShown: vis(area),
+          destShown: vis(pane.querySelector('#find-out-row')),
+          destText: pane.querySelector('#find-out-row').textContent.replace(/\\s+/g, ' ').trim(),
+          change: (() => { const b = pane.querySelector('#find-out-row [data-pick="find-out"]');
+            return b ? { text: b.textContent.trim(), vis: vis(b) } : null; })(),
+          folderBox: vis(pane.querySelector('#find-out')),
+          openButtons: pane.querySelectorAll('[data-reveal="find-out"]').length,
+          box: { shown: vis(box), cls: box.className, text: box.textContent,
+            head: (box.querySelector('.outcome-head') || {}).textContent || '',
+            quoted: !!box.querySelector('.engine-said'), open: !!box.querySelector('[data-open-dest]'),
+            bg: getComputedStyle(box).backgroundColor, border: getComputedStyle(box).borderTopColor },
+          retrieveFold: { shown: vis(pane.querySelector('#find-retrieve-fold')),
+            label: (pane.querySelector('#find-retrieve-fold .cmd-label') || {}).textContent || '',
+            afterBox: before(box, pane.querySelector('#find-retrieve-fold')) },
+          console: pane.querySelector('[data-console]').textContent,
+        };
+      })())`;
+      const screen = () => jsJSON(SCREEN);
+      // One chip at a time: the Search chip says what the search found, and a
+      // retrieve's chip is only there while it runs.
+      const oneChip = (s, label) => {
+        if (s.chips.length !== 1) bad(`${label}: ${s.chips.length} chips on the Query screen: ${JSON.stringify(s.chips)}`);
+        if (!s.retrieveChip.hidden) bad(`${label}: the retrieve chip is still showing after the retrieve: ${JSON.stringify(s.retrieveChip)}`);
+      };
+
       // Runs the Query screen's C-FIND and waits for retrievable rows.
       const query = async (label) => {
         await js(`(() => {
           showView('query');
-          document.querySelector('input[name="find-level"][value="study"]').click();
+          document.querySelector('#find-level .chip[data-level="study"]').click();
           for (const v of document.querySelectorAll('#find-keys input')) v.value = '';
           updateAllPreviews();
           document.querySelector('#view-query [data-run]').click();
@@ -4744,6 +4808,25 @@ async function runSmoke(win, app, mainHelpers = {}) {
           uids: Array.from(document.querySelectorAll('#view-query [data-retrieve]')).map((b) => b.dataset.retrieve),
           cmd: document.querySelector('#view-query [data-cmd]').textContent,
         })`);
+      };
+
+      // Runs a search that is not expected to offer anything, and waits for
+      // its chip to say how it ended.
+      const searchOnly = async (label, key, value) => {
+        await js(`(() => {
+          showView('query');
+          document.querySelector('#find-level .chip[data-level="study"]').click();
+          for (const v of document.querySelectorAll('#find-keys input')) v.value = '';
+          const row = document.querySelector('#find-keys .kv-row');
+          row.querySelector('.kv-k').value = ${JSON.stringify(key)};
+          row.querySelector('.kv-v').value = ${JSON.stringify(value)};
+          updateAllPreviews();
+          document.querySelector('#view-query [data-run]').click();
+          return true;
+        })()`);
+        await mustWait("!state.activeRuns.query && !document.querySelector('#view-query [data-status]').className.includes('running')",
+          RUN_MS, `${label}: the search to end`);
+        return screen();
       };
 
       // Presses the first row's Retrieve and waits for its verdict. The box is
@@ -4766,6 +4849,37 @@ async function runSmoke(win, app, mainHelpers = {}) {
         })`);
       };
 
+      // 0. The level is three joined chips — Study, Series, Image — and the
+      //    Worklist level is gone from this screen (the Worklist screen is
+      //    where a worklist is queried). Each chip moves the command.
+      const levels = await jsJSON(`(() => {
+        showView('query');
+        const chips = Array.from(document.querySelectorAll('#find-level .chip'));
+        const read = () => document.querySelector('#view-query [data-cmd]').textContent;
+        const by = (l) => document.querySelector('#find-level .chip[data-level="' + l + '"]');
+        by('series').click(); const series = read();
+        by('image').click(); const image = read();
+        by('study').click(); const study = read();
+        return JSON.stringify({
+          levels: chips.map((c) => c.dataset.level),
+          seg: document.querySelector('#find-level').className,
+          radios: document.querySelectorAll('#view-query input[type="radio"]').length,
+          series, image, study,
+          active: chips.filter((c) => c.classList.contains('active')).map((c) => c.dataset.level),
+        });
+      })()`);
+      if (JSON.stringify(levels.levels) !== '["study","series","image"]') {
+        bad(`the Query levels are not Study, Series, Image: ${JSON.stringify(levels.levels)}`);
+      }
+      if (!/\bseg\b/.test(levels.seg) || levels.radios !== 0) {
+        bad(`the Query level is not one segmented control: ${JSON.stringify(levels)}`);
+      }
+      if (!/ --series\b/.test(levels.series) || !/ --image\b/.test(levels.image)
+        || / --(series|image|mwl)\b/.test(levels.study) || JSON.stringify(levels.active) !== '["study"]') {
+        bad(`the level chips do not move the command: ${JSON.stringify(levels)}`);
+      }
+      record('query: the level is one control of three chips (no Worklist), and each one moves the command');
+
       // 1. A clean retrieve, with the destination box empty: pressing the row
       //    opens the picker and carries on into whatever it answers.
       await js('delete state.peerChoice.query; true');
@@ -4773,7 +4887,45 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const found = await query('archive');
       say(`retrieve: the archive's C-FIND offered ${found.uids.length} row(s): ${found.cmd}`);
       if (found.uids.length !== 1) bad(`expected one retrievable study, got ${JSON.stringify(found.uids)}`);
+      const listed = await screen();
       await shot('query-results');
+      say(`query: [${listed.heads.join(' | ')}] / [${listed.cells.join(' | ')}]`);
+      // Search, its command, then the results — nothing in between.
+      if (listed.label !== 'Search') bad(`the Query button is not "Search": ${JSON.stringify(listed.label)}`);
+      if (!listed.order.foldAfterSearch) bad('the C-FIND command fold is not directly under Search');
+      if (!listed.order.resultAfterFold) bad('the results are not directly under the C-FIND command fold');
+      if (!listed.order.areaAfterResult || !listed.order.resultAbove) {
+        bad(`the retrieve area is not below the results: ${JSON.stringify(listed.order)}`);
+      }
+      // One chip, and it says what was found.
+      oneChip(listed, 'results');
+      if (listed.searchChip.text !== '1 match' || !/\bok\b/.test(listed.searchChip.cls)) {
+        bad(`the Search chip does not say what was found: ${JSON.stringify(listed.searchChip)}`);
+      }
+      if (/match\(es\)/i.test(listed.resultText)) bad(`the result still carries its own count line: ${listed.resultText.slice(0, 80)}`);
+      // The columns a person reads, in that order, Retrieve last; no UID, no
+      // query level, and nothing the archive left empty (it returns StudyTime
+      // blank).
+      const human = ['Patient', 'Patient ID', 'Date', 'Description', 'Modalities', 'Images'];
+      if (JSON.stringify(listed.heads.slice(0, human.length)) !== JSON.stringify(human)) {
+        bad(`the study columns are not ${human.join(' · ')}: ${JSON.stringify(listed.heads)}`);
+      }
+      if (listed.heads[listed.heads.length - 1] !== '' || !listed.lastCellRetrieve) {
+        bad(`Retrieve is not the last column: ${JSON.stringify(listed.heads)}`);
+      }
+      if (listed.heads.some((h) => /UID|QueryRetrieveLevel|^Time$|StudyTime/i.test(h))) {
+        bad(`a UID, the query level or an empty column is on the table: ${JSON.stringify(listed.heads)}`);
+      }
+      if (listed.cells[0] !== 'SYNTHETIC, PATIENT1' || listed.cells[2] !== '2026-01-15'
+        || listed.cells[4] !== 'MR, CT' || listed.cells[5] !== String(expected)) {
+        bad(`the study row is not drawn for reading: ${JSON.stringify(listed.cells)}`);
+      }
+      if (!/\bghost\b/.test(listed.retrieveCls)) bad(`a row's Retrieve is not a ghost button: ${listed.retrieveCls}`);
+      // No folder box before the first retrieve: the press asks for one.
+      if (listed.destShown || listed.folderBox || listed.openButtons) {
+        bad(`a destination box is on screen before anything was retrieved: ${JSON.stringify(listed)}`);
+      }
+      record(`query: Search · its command · the results (${listed.heads.filter(Boolean).join(' · ')}), one chip "${listed.searchChip.text}"`);
 
       const outA = path.join(work, 'retrieve-a');
       fs.rmSync(outA, { recursive: true, force: true });
@@ -4790,10 +4942,34 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!fs.existsSync(path.join(outA, found.uids[0]))) {
         bad(`retrieved files are not laid out under the study UID in ${outA}`);
       }
+      const done = await screen();
       await shot('query-retrieved');
+      // A short success: the one line with both numbers, and Open. The path is
+      // on the destination line, so the verdict does not repeat it.
+      if (!new RegExp(`^Retrieved ${expected} of ${expected} images\\.`).test(done.box.head)) {
+        bad(`the success head is not "Retrieved ${expected} of ${expected} images.": ${JSON.stringify(done.box.head)}`);
+      }
+      if (done.box.text.replace(done.box.head, '').trim() !== '' || !done.box.open) {
+        bad(`the success box says more than its line and Open: ${JSON.stringify(done.box.text)}`);
+      }
+      if (slashes(done.box.text).includes(slashes(outA))) bad(`the success box repeats the full path: ${done.box.text}`);
+      if (!done.destShown || done.destText !== `Into ${outA} · Change`) {
+        bad(`the destination line does not read "Into <folder> · Change": ${JSON.stringify(done.destText)}`);
+      }
+      if (!done.change || done.change.text !== 'Change' || !done.change.vis || done.folderBox || done.openButtons) {
+        bad(`the destination is not one line with Change: ${JSON.stringify({ change: done.change, box: done.folderBox })}`);
+      }
+      if (!done.retrieveFold.shown || done.retrieveFold.label !== 'command · retrieve' || !done.retrieveFold.afterBox) {
+        bad(`the retrieve command fold is not under the verdict, labelled "command · retrieve": ${JSON.stringify(done.retrieveFold)}`);
+      }
+      oneChip(done, 'clean retrieve');
+      if (!/\bok\b/.test(done.retrieveChip.cls) || done.retrieveChip.text !== 'Done') {
+        bad(`the retrieve's end state was not kept on its hidden chip: ${JSON.stringify(done.retrieveChip)}`);
+      }
       record(`retrieve: the Retrieve row button put ${gotA}/${expected} instance(s) in the picked folder and read as success`);
+      record(`retrieve: "${done.box.head.trim()}" in one line, the folder on "Into … · Change", one chip`);
 
-      // 2. Browse… beside the destination box feeds the next retrieve.
+      // 2. Change, on the destination line, feeds the next retrieve.
       const outB = path.join(work, 'retrieve-b');
       fs.rmSync(outB, { recursive: true, force: true });
       await pressPicker('find-out', outB);
@@ -4801,7 +4977,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/\bok\b/.test(browsed.cls)) bad(`a retrieve into a browsed folder did not succeed: [${browsed.cls}] ${browsed.text}`);
       const gotB = countDcm(outB);
       if (gotB !== expected) bad(`a retrieve into the browsed folder put ${gotB} file(s) there, expected ${expected}`);
-      record(`retrieve: Browse… beside the destination fed the next retrieve (${gotB}/${expected})`);
+      const changed = await screen();
+      if (changed.destText !== `Into ${outB} · Change`) bad(`Change did not move the destination line: ${changed.destText}`);
+      record(`retrieve: Change on the destination line fed the next retrieve (${gotB}/${expected})`);
 
       // 3. A peer that claims more than it sent. Every file arrives — only the
       //    count is a lie — so nothing but the comparison can fail it, and the
@@ -4837,18 +5015,114 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       const gotC = countDcm(outC);
       if (gotC !== expected) bad(`the over-reporting peer delivered ${gotC} file(s), expected all ${expected}`);
+      const lossy = await screen();
       await shot('query-retrieve-shortfall');
+      // Red, and said once: the head with the gap, then where the rest are and
+      // that this is not a complete study. The engine's own sentence says the
+      // same again, so it is in the Output and not in the box.
+      if (!/\bbad\b/.test(lossy.box.cls)) bad(`the shortfall box is not red: ${lossy.box.cls}`);
+      if (lossy.box.head !== `Incomplete — 2 of ${expected + 2} images are missing.`) {
+        bad(`the shortfall head is not "Incomplete — 2 of ${expected + 2} images are missing.": ${JSON.stringify(lossy.box.head)}`);
+      }
+      if (lossy.box.text.replace(lossy.box.head, '').trim() !== `${expected} are in retrieve-c. This is not a complete study.`) {
+        bad(`the shortfall body is not "${expected} are in retrieve-c. This is not a complete study.": ${JSON.stringify(lossy.box.text)}`);
+      }
+      if (lossy.box.quoted) bad('the shortfall box quotes the engine as well, saying it twice');
+      if (!/are not on disk/.test(lossy.console)) bad(`the engine's shortfall sentence is not in the Output: ${lossy.console.slice(-400)}`);
+      if (lossy.box.bg === done.box.bg) bad(`the shortfall box has the success box's colour: ${lossy.box.bg}`);
+      oneChip(lossy, 'shortfall');
+      if (!/\bfail\b/.test(lossy.retrieveChip.cls)) bad(`the shortfall's hidden chip rounds it up: ${JSON.stringify(lossy.retrieveChip)}`);
       record(`retrieve: a peer reporting 2 more than it sent reads "Incomplete — 2 of ${expected + 2}", never success`);
+
+      // 4. A retrieve the peer gave no counts for. No correct peer here leaves
+      //    them out, so the engine's own report is drawn without its "peer
+      //    completed" line, for the folder the shortfall just filled — the
+      //    parse and the box are what is under test, and both are the app's.
+      //    Amber, never green.
+      const unverified = await jsJSON(`(() => {
+        renderRetrieveOutcome({ code: 0, what: 'study', out: ${JSON.stringify(outC)},
+          stdout: 'stored on disk      ${expected}\\ndestination         ${slashes(outC)}\\n', stderr: '' });
+        const box = document.querySelector('#find-retrieve-outcome');
+        const chip = document.querySelector('#find-retrieve-status');
+        return JSON.stringify({ cls: box.className, head: box.querySelector('.outcome-head').textContent,
+          text: box.textContent, bg: getComputedStyle(box).backgroundColor,
+          border: getComputedStyle(box).borderTopColor, chip: { cls: chip.className, text: chip.textContent, hidden: chip.hidden } });
+      })()`);
+      await shot('query-retrieve-unverified');
+      if (!/\bwarn\b/.test(unverified.cls) || /\bok\b/.test(unverified.cls)) {
+        bad(`a retrieve with no counts is not amber: [${unverified.cls}] ${unverified.text}`);
+      }
+      if (unverified.head !== `${expected} images written to retrieve-c.` || !/may not be the whole study/.test(unverified.text)) {
+        bad(`the unverified box does not say what it could not check: ${JSON.stringify(unverified)}`);
+      }
+      if (unverified.bg === done.box.bg || unverified.bg === lossy.box.bg || unverified.border === done.box.border) {
+        bad(`the unverified box shares a colour with success or failure: ${JSON.stringify(unverified)}`);
+      }
+      if (!unverified.chip.hidden || unverified.chip.text !== 'Unverified' || !/\bwarn\b/.test(unverified.chip.cls)) {
+        bad(`the unverified chip is not a hidden amber "Unverified": ${JSON.stringify(unverified.chip)}`);
+      }
+      record('retrieve: a retrieve with no peer counts is amber "written to", never green');
+
+      // 5. An empty answer is an answer: green "No matches", nothing red.
+      const empty = await searchOnly('empty', 'PatientID', 'NO-SUCH-PATIENT-ANYWHERE');
+      await shot('query-empty');
+      if (empty.searchChip.text !== 'No matches' || !/\bok\b/.test(empty.searchChip.cls) || empty.searchChip.hidden) {
+        bad(`an empty answer is not a green "No matches": ${JSON.stringify(empty.searchChip)}`);
+      }
+      if (empty.resultShown && /did not answer|refused|Failed/.test(empty.resultText)) {
+        bad(`an empty answer is drawn as a failure: ${empty.resultText}`);
+      }
+      if (empty.areaShown) bad('an empty answer left the retrieve area on screen');
+      oneChip(empty, 'empty answer');
+      record('query: an empty answer reads "No matches", in green, and offers nothing');
+
+      // 6. A peer that is not there. Nothing listens on this port, so the
+      //    engine never gets to ask — and that must never read as an empty
+      //    answer.
+      const deadPort = await freePort();
+      await addPeer('127.0.0.1', deadPort, 'NOBODY', '');
+      const DEAD_PEER = `NOBODY @ 127.0.0.1:${deadPort}`;
+      await js(`(() => {
+        showView('query');
+        document.querySelector('#view-query .peer-chip-btn').click();
+        const menu = document.querySelector('#view-query .peer-menu');
+        menu.querySelector('[data-peer-pick="' + ${JSON.stringify(DEAD_PEER)}.replace(/"/g, '&quot;') + '"]').click();
+        return true;
+      })()`);
+      const dead = await searchOnly('dead peer', '', '');
+      const deadBlock = await jsJSON(`JSON.stringify((() => {
+        const b = document.querySelector('#view-query [data-result] .folder-check.bad');
+        return b ? { head: (b.querySelector('b') || {}).textContent || '', said: (b.querySelector('.engine-said') || {}).textContent || '',
+          colour: getComputedStyle(b).borderLeftColor, cmd: document.querySelector('#view-query [data-cmd]').textContent } : null;
+      })())`);
+      await shot('query-dead-peer');
+      say(`query: dead peer -> chip "${dead.searchChip.text}" / ${JSON.stringify(deadBlock)}`);
+      if (!deadBlock || !deadBlock.cmd.includes(`--port ${deadPort}`)) bad(`the dead-peer search did not go to the dead port: ${JSON.stringify(deadBlock)}`);
+      if (dead.searchChip.text !== 'Failed' || !/\bfail\b/.test(dead.searchChip.cls)) {
+        bad(`a peer that is not there did not fail the chip: ${JSON.stringify(dead.searchChip)}`);
+      }
+      if (!dead.resultShown || deadBlock.head !== 'The peer did not answer.') {
+        bad(`a peer that is not there is not said as one red line: ${JSON.stringify(deadBlock)}`);
+      }
+      if (!/ECONNREFUSED|Could not talk/.test(deadBlock.said)) bad(`the engine's words are not under the red line: ${deadBlock.said}`);
+      if (/\b0 match|No match/i.test(dead.resultText)) bad(`a dead peer was drawn as an answer: ${dead.resultText}`);
+      if (dead.areaShown) bad('a failed search left the retrieve area on screen');
+      oneChip(dead, 'dead peer');
+      record('query: a peer that is not there reads "The peer did not answer." in red with the engine\'s words, never "0 matches"');
 
       // Put Settings and the chip back the way the rest of the run expects.
       await js('delete state.peerChoice.query; showView("settings"); true');
-      await js(`(() => {
-        const del = document.querySelector('[data-peer-delete="' + ${JSON.stringify(LIAR_PEER)}.replace(/"/g, '&quot;') + '"]');
-        if (del) del.click();
-        return true;
-      })()`);
-      await mustWait(`!state.profiles.some((p) => p.name === ${JSON.stringify(LIAR_PEER)})`, 8000,
-        'the over-reporting peer to be removed again');
+      for (const gone of [LIAR_PEER, DEAD_PEER]) {
+        // eslint-disable-next-line no-await-in-loop
+        await js(`(() => {
+          const del = document.querySelector('[data-peer-delete="' + ${JSON.stringify(gone)}.replace(/"/g, '&quot;') + '"]');
+          if (del) del.click();
+          return true;
+        })()`);
+        // eslint-disable-next-line no-await-in-loop
+        await mustWait(`!state.profiles.some((p) => p.name === ${JSON.stringify(gone)})`, 8000,
+          `the ${gone} peer to be removed again`);
+      }
       await js('showView("worklist"); true');
     }
 

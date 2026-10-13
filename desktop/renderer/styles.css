@@ -404,17 +404,16 @@ td.mono, th.mono { font-family: var(--mono); }
 
 /* The per-row action on the query results — today the Retrieve button.
  *
- * Sticky at the left edge of the scroll box, because the reason the box
- * scrolls is that these rows are twelve columns wide with a 64-character UID
- * among them: reading the Study Description means scrolling the button out of
- * the window, and then pressing it means scrolling back. The background is
- * opaque for the same reason it has to be — scrolled cells pass UNDERNEATH
- * it, and a transparent sticky cell shows them through. The hover rule is
- * repeated here with the class specificity the generic `tr:hover td` cannot
- * reach, so a hovered row stays one continuous row. */
+ * The last column, and sticky at the right edge of the scroll box, so that a
+ * row wider than the window (a long description, a peer that returns a dozen
+ * keys) still has its button in reach without scrolling for it. The
+ * background is opaque for the same reason it has to be — scrolled cells pass
+ * UNDERNEATH it, and a transparent sticky cell shows them through. The hover
+ * rule is repeated here with the class specificity the generic `tr:hover td`
+ * cannot reach, so a hovered row stays one continuous row. */
 .find-table .act-cell {
-  position: sticky; left: 0; z-index: 1;
-  background-color: var(--bg); padding-right: 14px;
+  position: sticky; right: 0; z-index: 1;
+  background-color: var(--bg); padding-left: 14px; text-align: right;
 }
 /* The same 2% white the generic rule paints, laid over the opaque colour
  * instead of mixed into a hard-coded one, so it stays right if --bg moves. */
@@ -523,6 +522,17 @@ input.mirrored { color: var(--text-dim); }
 .outcome.ok .outcome-head, .outcome.ok b { color: var(--green); }
 .outcome.bad { background: var(--red-soft); border-color: var(--red); color: #f3bcbc; }
 .outcome.bad .outcome-head, .outcome.bad b { color: var(--red); }
+/* Nothing contradicted it and nothing confirmed it: a retrieve whose peer gave
+ * no count to check the disk against. Not green, and not a failure. */
+.outcome.warn { background: var(--amber-soft); border-color: var(--amber); color: #f4d58a; }
+.outcome.warn .outcome-head, .outcome.warn b { color: var(--amber); }
+/* A verdict that is one line has nothing under its head to space it from. */
+.outcome .outcome-head:last-child { margin-bottom: 0; }
+/* The folder a verdict names, as a link that opens it. In the box's colour. */
+.outcome .outcome-open {
+  font-size: inherit; font-weight: 600; color: inherit; margin: 0;
+}
+.outcome .outcome-open:hover { color: var(--text); }
 
 /* The engine's own sentence, inside the verdict box.
  *
@@ -1325,3 +1335,20 @@ select {
  * than under it — the same shape the .local-note repairs use. */
 .folder-check .linklike { margin: 0 0 0 4px; font-size: 12px; color: var(--accent); }
 .folder-check .linklike:hover { color: var(--text); }
+
+/* ==========================================================================
+ * QUERY: the level chips beside Limit, and the retrieve area under the results.
+ * ========================================================================== */
+.level-row .chip-row.seg { margin: 0; }
+/* "Into <path> · Change" — where a retrieve writes, once one has been chosen. */
+/* One run of text, not a row of boxes: a long path wraps inside itself and
+ * Change follows its last character, rather than the three parts landing on
+ * three lines. */
+.dest-line {
+  color: var(--text-dim); font-size: 12.5px; line-height: 1.5; margin: 0 0 12px;
+}
+.dest-line .dest-path { font-family: var(--mono); font-size: 12px; color: var(--text); overflow-wrap: anywhere; }
+.dest-line .dest-sep { color: var(--text-faint); }
+.dest-line .linklike { font-size: 12.5px; margin: 0; color: var(--accent); }
+.dest-line .linklike:hover { color: var(--text); }
+#find-retrieve-actions { margin: 0 0 12px; }

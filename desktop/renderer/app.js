@@ -2030,8 +2030,8 @@ function wireReceive() {
 // View: QUERY (find)
 // --------------------------------------------------------------------------
 function findLevel() {
-  const r = $('input[name="find-level"]:checked');
-  return r ? r.value : 'study';
+  const chip = $('#find-level .chip.active');
+  return chip ? chip.dataset.level : 'study';
 }
 
 BUILDERS.query = () => {
@@ -2115,30 +2115,161 @@ function rowUid(match, key) {
   return value.length <= 64 && /^[0-9]+(\.[0-9]+)*$/.test(value) ? value : '';
 }
 
+/**
+ * A Person Name as a person reads it: "DOE, JANE" rather than DOE^JANE.
+ *
+ * Read from the first component group, the one written in Latin script on
+ * nearly every name; a name that only carries a later group (ideographic,
+ * phonetic) is shown with its separators as spaces. The exact value is kept
+ * on the cell's title, because that is the one an operator may need to type.
+ */
+function pnForReading(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const { family, given, extras } = splitPn(raw);
+  const last = family.trim();
+  const rest = [given, ...extras].map((p) => String(p).trim()).filter(Boolean).join(' ');
+  if (last && rest) return `${last}, ${rest}`;
+  if (last || rest) return last || rest;
+  return raw.replace(/[=^]+/g, ' ').trim();
+}
+
+/**
+ * The columns a person reads on a study or series row, in the order they read
+ * them. Each names the keywords it may be read from; the first one a row
+ * carries wins. Anything else the peer returned follows these, under its own
+ * name, unless it is plumbing — the query level, a UID, the character set —
+ * or empty on every row. An image-level answer is shown raw.
+ */
+const FIND_COLUMNS = {
+  study: [
+    { head: 'Patient', keys: ['PatientName'], show: (v) => pnForReading(v), raw: true },
+    { head: 'Patient ID', keys: ['PatientID'], mono: true },
+    { head: 'Date', keys: ['StudyDate'], show: (v) => fmtDate(v), mono: true },
+    { head: 'Description', keys: ['StudyDescription'] },
+    { head: 'Modalities', keys: ['ModalitiesInStudy'], show: (v) => v.split('\\').join(', ') },
+    { head: 'Images', keys: ['NumberOfStudyRelatedInstances'], mono: true },
+  ],
+  series: [
+    { head: 'Patient', keys: ['PatientName'], show: (v) => pnForReading(v), raw: true },
+    { head: 'Patient ID', keys: ['PatientID'], mono: true },
+    { head: 'Date', keys: ['SeriesDate', 'StudyDate'], show: (v) => fmtDate(v), mono: true },
+    { head: 'Description', keys: ['SeriesDescription'] },
+    { head: 'Modality', keys: ['Modality'] },
+    { head: 'Images', keys: ['NumberOfSeriesRelatedInstances'], mono: true },
+  ],
+};
+/** Returned keys that are about the query rather than the patient. */
+const FIND_PLUMBING = /^(?:QueryRetrieveLevel|SpecificCharacterSet|RetrieveAETitle|InstanceAvailability)$|UID$/;
+/** Names for the returned keys common enough to have one. */
+const FIND_HEADS = {
+  AccessionNumber: 'Accession', StudyTime: 'Time', SeriesTime: 'Time', SeriesNumber: 'Series #',
+  NumberOfStudyRelatedSeries: 'Series', StudyID: 'Study ID', PatientBirthDate: 'Birth date',
+  PatientSex: 'Sex', ReferringPhysicianName: 'Referring', BodyPartExamined: 'Body part',
+};
+const FIND_SHOW = {
+  StudyTime: (v) => fmtTime(v), SeriesTime: (v) => fmtTime(v),
+  PatientBirthDate: (v) => fmtDate(v), ReferringPhysicianName: (v) => pnForReading(v),
+};
+
+/** One returned value as text, or '' for a key the row does not carry. */
+function cellText(m, key) {
+  const v = m && m[key];
+  return v == null ? '' : String(v).trim();
+}
+
+/** The matches of a `find --json` answer, whatever shape it arrived in. */
+function findMatches(json) {
+  return Array.isArray(json?.matches) ? json.matches : (Array.isArray(json) ? json : []);
+}
+
+/**
+ * A search that did not get an answer, said where the answer would have been.
+ *
+ * A network failure, a refused association and a usage error all come back
+ * as an envelope with ok:false and no matches, and drawing that as an empty
+ * table is how a down archive used to read as "0 matches". The engine's own
+ * words go under the one line, and into the Output.
+ */
+function renderFindFailure(json, stderr, code) {
+  const box = $('#view-query [data-result]');
+  const outcome = json && json.outcome;
+  const head = outcome === 'usage' ? 'Nothing was sent.'
+    : outcome === 'rejected' ? 'The peer refused the search.'
+      : 'The peer did not answer.';
+  const said = (json && json.message) || engineErrorText(stderr) || `The engine exited ${code}.`;
+  $('#find-retrieve').hidden = !retrieveInFlight();
+  box.hidden = false;
+  box.innerHTML = `<div class="folder-check bad list-error"><b>${esc(head)}</b>`
+    + `<div class="engine-said">${esc(said)}</div></div>`;
+  if (stderr) appendConsole('query', stderr, 'stderr');
+}
+
 function renderFindResults(json) {
   const box = $('#view-query [data-result]');
-  const matches = Array.isArray(json?.matches) ? json.matches : (Array.isArray(json) ? json : []);
+  const matches = findMatches(json);
   if (!matches.length) {
-    box.hidden = false;
-    // Nothing to retrieve, said here as well as in resetRetrieveUi(), so this
-    // function leaves the screen consistent on its own rather than relying on
-    // having been called after the reset.
+    // The chip beside Search says "No matches"; saying it again here would be
+    // the same news twice. Nothing to retrieve either, said here as well as in
+    // resetRetrieveUi(), so this function leaves the screen consistent on its
+    // own rather than relying on having been called after the reset.
+    box.hidden = true;
+    box.innerHTML = '';
     $('#find-retrieve').hidden = !retrieveInFlight();
-    box.innerHTML = '<div class="empty-note">0 matches. (A peer can accept images and still return no matches — storing and indexing are different.)</div>';
     return;
   }
   // The level the ENGINE queried, taken from its own envelope rather than from
-  // the radio button. The radio can be moved after a run — and moving it is
-  // the most natural next thing to do — which would relabel rows with a level
+  // the level chips. They can be moved after a run — and moving them is the
+  // most natural next thing to do — which would relabel rows with a level
   // they did not come from, and that decides whether a row names a study at
   // all. findLevel() is the fallback for a payload without one.
   const level = typeof json?.level === 'string' ? json.level : findLevel();
   const offers = RETRIEVABLE_LEVELS.has(level);
-  const cols = [];
-  for (const m of matches) for (const k of Object.keys(m)) if (!cols.includes(k)) cols.push(k);
-  const head = (offers ? '<th class="act-cell"></th>' : '') + cols.map((c) => `<th>${esc(c)}</th>`).join('');
+  const keys = [];
+  for (const m of matches) for (const k of Object.keys(m)) if (!keys.includes(k)) keys.push(k);
+
+  // The columns: a person's for a study or series, the peer's own for anything else.
+  let cols;
+  let rows = matches;
+  if (offers) {
+    const used = new Set();
+    cols = FIND_COLUMNS[level].map((c) => {
+      for (const k of c.keys) used.add(k);
+      return { ...c, value: (m) => c.keys.map((k) => cellText(m, k)).find(Boolean) || '' };
+    });
+    for (const k of keys) {
+      if (used.has(k) || FIND_PLUMBING.test(k)) continue;
+      cols.push({ head: FIND_HEADS[k] || k, show: FIND_SHOW[k], value: (m) => cellText(m, k) });
+    }
+    cols = cols.filter((c) => matches.some((m) => c.value(m)));
+    // Newest first, by the date (and time) each row carries; undated rows last,
+    // and rows that tie keep the order the peer sent them in.
+    const dateKeys = FIND_COLUMNS[level][2].keys;
+    const timeKey = level === 'series' ? 'SeriesTime' : 'StudyTime';
+    const stamp = (m) => {
+      const d = (dateKeys.map((k) => cellText(m, k)).find(Boolean) || '').replace(/\D/g, '');
+      return d ? d + cellText(m, timeKey).replace(/\D/g, '').padEnd(6, '0') : '';
+    };
+    rows = matches.map((m, i) => ({ m, i, s: stamp(m) }))
+      .sort((a, b) => {
+        if (a.s === b.s) return a.i - b.i;
+        if (!a.s) return 1;
+        if (!b.s) return -1;
+        return a.s < b.s ? 1 : -1;
+      })
+      .map((x) => x.m);
+  } else {
+    cols = keys.map((k) => ({ head: k, mono: true, value: (m) => (m[k] == null ? '' : String(m[k])) }));
+  }
+
   let offered = 0;
-  const rows = matches.map((m) => {
+  const body = rows.map((m) => {
+    const cells = cols.map((c) => {
+      const v = c.value(m);
+      const shown = c.show && v ? c.show(v) : v;
+      const title = c.raw && v && shown !== v ? ` title="${esc(v)}"` : '';
+      return `<td${c.mono ? ' class="mono"' : ''}${title}>${esc(shown)}</td>`;
+    }).join('');
     let act = '';
     if (offers) {
       const study = rowUid(m, 'StudyInstanceUID');
@@ -2150,30 +2281,42 @@ function renderFindResults(json) {
       const series = level === 'series' ? rowUid(m, 'SeriesInstanceUID') : '';
       if (study) offered += 1;
       act = `<td class="act-cell">${study
-        ? `<button class="btn small" data-retrieve="${esc(study)}"${series ? ` data-series="${esc(series)}"` : ''}`
-          + ` title="C-GET this ${series ? 'series' : 'study'} into the folder above">Retrieve</button>`
+        ? `<button class="btn ghost small" data-retrieve="${esc(study)}"${series ? ` data-series="${esc(series)}"` : ''}`
+          + ` title="C-GET this ${series ? 'series' : 'study'}">Retrieve</button>`
         : ''}</td>`;
     }
-    return `<tr>${act}${cols.map((c) => `<td class="mono">${esc(m[c] ?? '')}</td>`).join('')}</tr>`;
+    return `<tr>${cells}${act}</tr>`;
   }).join('');
-  // The folder box, Stop and the verdict only exist while there is something
-  // on screen they could act on. A Worklist or image-level result gets none of
+  const head = cols.map((c) => `<th>${esc(c.head)}</th>`).join('') + (offers ? '<th class="act-cell"></th>' : '');
+  // The destination line, Stop and the verdict only exist while there is
+  // something on screen they could act on. An image-level result gets none of
   // it, and neither does a study-level result whose rows came back without a
   // usable Study Instance UID — unless a retrieve is still running, which
   // keeps its own Stop button on screen.
   $('#find-retrieve').hidden = offered === 0 && !retrieveInFlight();
+  syncRetrieveDest();
   box.hidden = false;
-  // Scrolls inside its own box rather than off the side of the window. A
-  // study-level match carries a 64-character Study Instance UID alongside
-  // eleven other columns, so there is no window width at which this fits, and
-  // with no scroll container the right-hand columns ran past the edge of the
-  // screen with no way to reach them. Same answer the worklist table already
-  // settled on, and the same distinction: the table keeps a width it can be
-  // read at, and the page itself still never scrolls sideways.
+  // Scrolls inside its own box rather than off the side of the window, so the
+  // page itself never scrolls sideways; the Retrieve cell stays pinned to the
+  // right edge of that box.
   box.innerHTML =
-    `<div class="section-title">${matches.length} match(es)</div>` +
     `<div class="table-scroll"><table class="find-table">` +
-    `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+    `<thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+/** "Into <path> · Change", once there is a folder to name. */
+function syncRetrieveDest() {
+  const where = $('#find-out').value.trim();
+  const shown = $('#find-out-path');
+  shown.textContent = where;
+  shown.title = where;
+  $('#find-out-row').hidden = !where;
+}
+
+/** The last part of a path: the folder a verdict can name in a word. */
+function shortFolder(p) {
+  const parts = String(p || '').split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(p || '');
 }
 
 /** Everything the last retrieve left on screen, cleared when a query reruns. */
@@ -2252,7 +2395,7 @@ function retrievePeerMismatch() {
     && was.calledAe === now.calledAe;
   if (same) return '';
   return `These rows came from ${connLabel(was)}, and this screen now points at `
-    + `${connLabel(now)}. Nothing was sent. Run the query again against `
+    + `${connLabel(now)}. Nothing was sent. Search again against `
     + `${connLabel(now)}, or put the chip back.`;
 }
 
@@ -2289,10 +2432,11 @@ function parseRetrieveReport(stdout) {
  *
  * The exit code is the contract — 0 means completed and nothing lost, 1 means
  * it ran and did not fully succeed, INCLUDING accepted-but-lossy — so it is
- * the only thing allowed to decide which box this is. The numbers underneath
- * are the engine's, printed as it printed them, and both are shown on success:
- * "ten on disk" beside "the peer said ten" is the whole claim, and when the
- * peer said nothing at all that absence is the thing to report.
+ * the only thing allowed to decide which box this is. The numbers are the
+ * engine's: on success both are in the one line ("Retrieved 10 of 10" is ten
+ * on disk beside the peer's ten), and when the peer gave no count at all that
+ * absence is the thing to report, in amber. A shortfall says it once, in red;
+ * the engine's own sentence about it stays in the Output.
  */
 function renderRetrieveOutcome({ code, stdout, stderr, cancelled, what, out }) {
   const box = $('#find-retrieve-outcome');
@@ -2300,35 +2444,48 @@ function renderRetrieveOutcome({ code, stdout, stderr, cancelled, what, out }) {
   const dest = r.dest || out;
   const said = engineErrorText(stderr);
   const quote = (text) => `<div class="engine-said">${esc(text)}</div>`;
-  box.hidden = false;
+  const images = (n) => `${n} image${n === 1 ? '' : 's'}`;
+  // The whole path is on the line above ("Into … · Change"), so a verdict
+  // names the folder by its own name — as a link that opens it.
+  const folder = `<button type="button" class="linklike outcome-open" data-open-dest title="${esc(dest)}">`
+    + `${esc(shortFolder(dest))}</button>`;
+  box.dataset.dest = dest;
+  // The chip shows only while a retrieve runs; from here on the box says it.
+  const draw = (cls, kind, label, head, body = '') => {
+    box.hidden = false;
+    box.className = `outcome ${cls}`;
+    box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
+    endChip('retrieve', kind, label);
+    $('#find-retrieve-actions').hidden = true;
+    box.scrollIntoView({ block: 'nearest' });
+  };
 
   if (cancelled) {
     // Stopped by hand. Whatever had already landed is still on disk and is
     // part of a study, which is not the same thing as a study.
-    box.className = 'outcome bad';
-    box.innerHTML = '<span class="outcome-head">Stopped — the retrieve was cancelled.</span>'
-      + `Whatever had already arrived is in <b>${esc(dest)}</b> and is a partial ${esc(what)}. `
-      + 'Retrieve it again to finish it; files that arrive twice are overwritten, not doubled.';
-    setStatus('retrieve', 'fail', 'Stopped');
+    draw('bad', 'fail', 'Stopped', 'Stopped — the retrieve was cancelled.',
+      `Whatever had already arrived is in ${folder} and is a partial ${esc(what)}. `
+      + 'Retrieve it again to finish it; files that arrive twice are overwritten, not doubled.');
+    return;
+  }
+
+  if (code === 0 && r.completed == null) {
+    // Exit 0 and no sub-operation counts: nothing contradicted the disk, and
+    // nothing confirmed it either. So it is not green.
+    draw('warn', 'warn', 'Unverified',
+      `${r.written == null ? 'Images' : images(r.written)} written to ${folder}.`,
+      `The archive gave no count to check against, so this may not be the whole ${esc(what)}.`);
     return;
   }
 
   if (code === 0) {
-    box.className = 'outcome ok';
-    const head = r.written == null
-      ? `Retrieved into ${esc(dest)}.`
-      : `${r.written} instance(s) written to ${esc(dest)}.`;
-    const body = r.completed == null
-      ? 'The peer returned no sub-operation counts, so the number above is only what is on '
-        + 'disk — nothing here says the ' + esc(what) + ' is complete. Compare it against the '
-        + "archive's own count, or query the series level for its instance counts."
-      : `The peer reports ${r.completed} sub-operation(s) completed, and that many are on disk.`;
-    box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
-    setStatus('retrieve', 'ok', 'Done');
+    // The disk and the peer's own count agree. One line, and the folder.
+    draw('ok', 'ok', 'Done',
+      `Retrieved ${r.written ?? r.completed} of ${images(r.completed)}. `
+      + '<button type="button" class="linklike outcome-open" data-open-dest>Open</button>');
     return;
   }
 
-  box.className = 'outcome bad';
   revealConsole('retrieve');
   let head = `The ${esc(what)} was not fully retrieved.`;
   let body = said ? quote(said) : 'The output says why.';
@@ -2338,14 +2495,10 @@ function renderRetrieveOutcome({ code, stdout, stderr, cancelled, what, out }) {
   } else if (r.completed != null && r.written != null && r.completed > r.written) {
     // The case this whole feature is built around. It is not a caveat on a
     // success: images arrived, the peer accepted the request, and the study on
-    // disk is still missing part of itself.
-    const gap = r.completed - r.written;
-    head = `Incomplete — ${gap} of ${r.completed} instance(s) are missing.`;
-    body = `The peer reports it sent ${r.completed}; ${r.written} are in `
-      + `<b>${esc(dest)}</b>. <b>This is not a complete ${esc(what)}</b> — the transfer was `
-      + 'accepted and came up short, which is why the engine exits non-zero rather than '
-      + "reporting the peer's own count as the result."
-      + (said ? quote(said) : '');
+    // disk is still missing part of itself. Said once: the engine's own
+    // sentence says the same thing, and it stays in the Output.
+    head = `Incomplete — ${r.completed - r.written} of ${images(r.completed)} are missing.`;
+    body = `${r.written} are in ${folder}. <b>This is not a complete ${esc(what)}.</b>`;
   } else if (r.written === 0) {
     head = 'Nothing arrived.';
     body = `The request was answered and no images came back. The ${esc(what)} is not on this `
@@ -2356,11 +2509,10 @@ function renderRetrieveOutcome({ code, stdout, stderr, cancelled, what, out }) {
     body = [
       r.unreadable ? `${r.unreadable} instance(s) could not be written` : '',
       r.duplicates ? `${r.duplicates} arrived twice under one SOP Instance UID` : '',
-    ].filter(Boolean).join(', ') + `. ${r.written} are in <b>${esc(dest)}</b>.`
+    ].filter(Boolean).join(', ') + `. ${r.written} are in ${folder}.`
       + (said ? quote(said) : '');
   }
-  box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
-  setStatus('retrieve', 'fail', 'Failed');
+  draw('bad', 'fail', 'Failed', head, body);
 }
 
 /**
@@ -2393,24 +2545,26 @@ async function runRetrieve(btn) {
   const what = series ? 'series' : 'study';
   if (!study) return;
 
+  // Both refusals are drawn in the verdict box, where every end state of a
+  // retrieve is; the chip is only for a retrieve that is running.
+  const refuse = (cls, kind, label, head, body) => {
+    const box = $('#find-retrieve-outcome');
+    box.hidden = false;
+    box.className = `outcome ${cls}`;
+    box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
+    endChip('retrieve', kind, label);
+    box.scrollIntoView({ block: 'nearest' });
+  };
   const miss = connMissing();
   if (miss.length) {
-    // The chip lives in the actions row, which has to be on screen to be read.
-    $('#find-retrieve-actions').hidden = false;
-    fail('retrieve', `Fill in the peer connection: ${miss.join(', ')}.\n`);
+    const msg = `Fill in the peer connection: ${miss.join(', ')}.`;
+    appendConsole('retrieve', `${msg}\n`, 'stderr');
+    refuse('warn', 'warn', msg, 'Not retrieved — nothing was sent.', esc(msg));
     return;
   }
   const mismatch = retrievePeerMismatch();
   if (mismatch) {
-    const box = $('#find-retrieve-outcome');
-    box.hidden = false;
-    box.className = 'outcome bad';
-    box.innerHTML = '<span class="outcome-head">Not retrieved — the peer changed.</span>' + esc(mismatch);
-    // The chip lives in that row, so the row has to be on screen before a
-    // status is put into it: an unhidden chip inside a hidden parent is a
-    // verdict nobody can read.
-    $('#find-retrieve-actions').hidden = false;
-    setStatus('retrieve', 'fail', 'Wrong peer');
+    refuse('bad', 'fail', 'Wrong peer', 'Not retrieved — the peer changed.', esc(mismatch));
     return;
   }
 
@@ -2447,7 +2601,21 @@ async function runRetrieve(btn) {
 
 function wireQuery() {
   $('#find-addkey').addEventListener('click', () => { addKvRow($('#find-keys')); updateAllPreviews(); });
-  $$('input[name="find-level"]').forEach((r) => r.addEventListener('change', updateAllPreviews));
+  for (const chip of $$('#find-level .chip')) {
+    chip.addEventListener('click', () => {
+      $$('#find-level .chip').forEach((c) => c.classList.toggle('active', c === chip));
+      updateAllPreviews();
+    });
+  }
+  // The destination line follows the hidden field, whoever fills it: the
+  // first Retrieve's picker, Change, or a path set from outside.
+  for (const ev of ['input', 'change']) $('#find-out').addEventListener(ev, syncRetrieveDest);
+  // The verdict's folder link opens the folder the retrieve wrote into.
+  $('#find-retrieve-outcome').addEventListener('click', async (e) => {
+    const link = e.target.closest('[data-open-dest]');
+    const dest = e.currentTarget.dataset.dest;
+    if (link && dest) await window.dcm.reveal(dest);
+  });
   $('#find-limit').addEventListener('input', updateAllPreviews);
   addKvRow($('#find-keys'), { k: 'PatientID', keyPh: 'e.g. PatientID', valPh: 'e.g. 12345' });
 
@@ -2459,23 +2627,34 @@ function wireQuery() {
     // report is the accounting for images now on this disk.
     if (!retrieveInFlight()) clearConsole('query');
     $('#view-query [data-result]').hidden = true;
-    // The rows are about to be replaced, so the folder box, the last retrieve
+    // The rows are about to be replaced, so the retrieve area, the last retrieve
     // command and its verdict stop applying to anything on screen. The folder
     // itself is kept: it is a choice the operator made, not a result.
     resetRetrieveUi();
     if (miss.length) { fail('query', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
-    setStatus('query', 'running', 'Querying…');
+    setStatus('query', 'running', 'Searching…');
     const argv = [...BUILDERS.query(), '--json'];
     // Stamped before the run, from the connection the command was built with.
     state.find.peer = { ...state.conn };
     const { code, stdout, stderr } = await runCapture('query', argv);
-    setStatus('query', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
-    try {
-      renderFindResults(JSON.parse(stdout));
-    } catch {
+    let json = null;
+    try { json = JSON.parse(stdout); } catch { json = null; }
+    if (!json || typeof json !== 'object') {
+      setStatus('query', 'fail', 'Failed');
       const c = consoleEl('query'); c.hidden = false;
-      revealConsole('query'); appendConsole('query', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+      revealConsole('query'); appendConsole('query', stdout || stderr || 'No output.\n', 'stderr');
+      return;
     }
+    // ok:false is "never got to ask" — a dead port, a refusal, a usage error.
+    // Only outcome "empty" is a peer that answered with nothing.
+    if (json.ok === false && json.outcome !== 'empty') {
+      setStatus('query', 'fail', 'Failed');
+      renderFindFailure(json, stderr, code);
+      return;
+    }
+    const n = findMatches(json).length;
+    setStatus('query', 'ok', n ? `${n} match${n === 1 ? '' : 'es'}` : 'No matches');
+    renderFindResults(json);
   });
 
   // Delegated: the table is rebuilt from scratch by every query, so a listener
