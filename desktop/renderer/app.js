@@ -106,6 +106,10 @@ const state = {
   mwl: {
     matches: [], selected: null, filterOpen: false, searchKey: null, timer: null,
     fetched: false, at: null, error: null, detached: false,
+    // No RIS peer to ask; and whose words the shared Output is holding —
+    // 'list' (a failed read) or 'exam' (a perform or close), which a list
+    // read may not wipe.
+    noRis: false, consoleOwner: null, queryModality: null,
   },
 
   // The peer the rows on the Query screen came from, and the level that was
@@ -466,6 +470,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   rehearsal: false,     // every command that can take --dry-run gets it
   cmdExpanded: false,   // the "command" fold under each button starts open
   allowMismatch: false, // offer --allow-study-mismatch beside --adopt-worklist-identity
+  autoRefresh: true,    // the worklist re-reads itself every minute while it is on screen
 });
 
 /** Whatever was on disk, coerced into the shape above so no reader has to guard. */
@@ -486,6 +491,7 @@ function normalizeSettings(raw) {
     rehearsal: Boolean(r.rehearsal),
     cmdExpanded: Boolean(r.cmdExpanded),
     allowMismatch: Boolean(r.allowMismatch),
+    autoRefresh: r.autoRefresh !== false,
   };
 }
 
@@ -537,6 +543,7 @@ function renderSettingsForm() {
   $('#set-rehearsal').checked = s.rehearsal;
   $('#set-cmd-expanded').checked = s.cmdExpanded;
   $('#set-allow-mismatch').checked = s.allowMismatch;
+  $('#mwl-auto').checked = s.autoRefresh;
   renderStationPlaceholder();
 }
 
@@ -563,6 +570,7 @@ async function commitSettings() {
     rehearsal: $('#set-rehearsal').checked,
     cmdExpanded: $('#set-cmd-expanded').checked,
     allowMismatch: $('#set-allow-mismatch').checked,
+    autoRefresh: $('#mwl-auto').checked,
   });
   await persistSettings();
   applySettings();
@@ -588,7 +596,6 @@ function applySettings() {
   renderStationPlaceholder();
   renderSendAdvSummary();
   renderSpeedParallelHint();
-  renderModalityPill();
   // Rehearsal relabels the verbs, the Archive role moves the images, and the
   // engineer switch appears or goes: the whole panel is repainted.
   renderMppsPanel();
@@ -608,8 +615,6 @@ function seedFromSettings() {
     const el = $(`#${id}`);
     if (el && !el.dataset.touched) el.checked = noRecurse;
   }
-  const modality = $('#mwl-modality');
-  if (modality && !modality.dataset.touched) modality.value = state.settings.modality;
 }
 
 /** A blank field sends the Settings default, so the placeholder says which. */
@@ -720,7 +725,6 @@ function wireSettings() {
   for (const id of ['send-norecurse', 'mpps-norecurse', 'info-norecurse']) {
     $(`#${id}`).addEventListener('change', (e) => { e.target.dataset.touched = '1'; });
   }
-  $('#mwl-modality').addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
 
   // ----- the peer form -----
   $('#peer-save').addEventListener('click', async () => {
@@ -1388,10 +1392,34 @@ function renderConsoleNotice(c, s) {
 function setStatus(view, kind, label) {
   const chip = viewPart(view, 'status');
   if (!chip) return;
+  // The station's list has no chip: the state of its last read is the label
+  // of its Refresh button — the time it answered, "Fetching…", or "Failed".
+  if (view === 'worklist') {
+    chip.className = kind ? `refresh-state ${kind}` : 'refresh-state';
+    chip.textContent = kind ? label : 'Refresh';
+    $('#mwl-run').classList.toggle('failed', kind === 'fail');
+    return;
+  }
   if (!kind) { chip.hidden = true; return; }
   chip.hidden = false;
   chip.className = `status-chip ${kind}`;
   chip.textContent = label;
+}
+
+/**
+ * A station run's end state: written to the chip, which then goes.
+ *
+ * The station shows a chip only while something runs. Every end state of a
+ * perform, a start or a close is drawn in the verdict box (and the row's
+ * pill) in the right colour, and a chip beside it said the same thing a
+ * second time — in green, beside a red box, when it said IN PROGRESS or
+ * DISCONTINUED. The kind and the words are still set, so they stay true for
+ * anything that reads them.
+ */
+function endChip(view, kind, label) {
+  setStatus(view, kind, label);
+  const chip = viewPart(view, 'status');
+  if (chip) chip.hidden = true;
 }
 
 // --------------------------------------------------------------------------
@@ -2541,7 +2569,7 @@ BUILDERS.worklist = () => {
   // Scheduled Procedure Step Sequence where a conformant SCP expects them.
   const date = mwlDateValue();
   if (date) argv.push(`ScheduledProcedureStepStartDate=${date}`);
-  const modality = $('#mwl-modality').value.trim();
+  const modality = state.settings.modality;
   if (modality) argv.push(`Modality=${modality}`);
   // Only when Settings says "only this station's worklist": the engine warns
   // on a mismatch anyway, so by default the whole list is shown.
@@ -2556,21 +2584,6 @@ BUILDERS.worklist = () => {
   if (limit) argv.push('--limit', limit);
   return argv;
 };
-
-/**
- * The Modality filter as a pill; the field behind it is what the builder reads.
- *
- * Named, because it sits in a row of chips that are verbs — Today, Tomorrow,
- * Pick… — and a bare "any modality" among them reads as a button that would DO
- * something rather than as the filter's current value. "Modality: CT" is the
- * shape the "Open steps: N" chip beside it already uses for the same job.
- */
-function renderModalityPill() {
-  const v = $('#mwl-modality').value.trim();
-  const pill = $('#mwl-modality-pill');
-  pill.textContent = `Modality: ${v || 'any'}`;
-  pill.classList.toggle('active', Boolean(v));
-}
 
 // ---------------- rows and pills ----------------
 
@@ -2682,64 +2695,82 @@ const fmtDate = (d) => {
   return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
 };
 
+/** What an empty answer is called: by the filter Settings set, when there is one. */
+function emptyListNote() {
+  const modality = state.settings.modality;
+  if (!modality || mwlSearchTerm()) return 'Nothing scheduled for this query.';
+  const when = mwlWhen();
+  return `Nothing scheduled for ${modality}${when === 'today' ? ' today' : when === 'tomorrow' ? ' tomorrow' : ''}.`;
+}
+
 /** Draws the list. The selection survives: rows are matched by key, not position. */
 function renderWorklistTable() {
   const box = $('#mwl-results');
   const rows = stationRows();
   const selKey = state.mwl.selected ? state.mwl.selected.key : null;
 
+  // No RIS to ask is not an empty worklist either: it is a setting nobody
+  // made yet, and the way to make it is one click away.
+  const noRis = state.mwl.noRis
+    ? '<div class="empty-note dense">No RIS set — '
+      + '<button type="button" class="linklike" data-goto="settings">add it in Settings</button>.</div>'
+    : '';
+
   // A query that failed is not an empty worklist, and the difference is the
   // whole screen: "nothing scheduled" sends the operator to the patient, and
-  // "the RIS did not answer" sends them to the phone.
+  // "the RIS did not answer" sends them to the phone. One red block: what
+  // happened, which list is still showing (dimmed, below), and the engine's
+  // own words under it.
   const failed = state.mwl.error
-    ? `<div class="folder-check bad list-error"><b>The worklist could not be read.</b> ${esc(state.mwl.error)}</div>`
+    ? '<div class="folder-check bad list-error"><b>The worklist could not be read.</b>'
+      + (rows.length && state.mwl.at ? ` Showing the list from ${esc(fmtClock(state.mwl.at))}.` : '')
+      + `<div class="engine-said">${esc(state.mwl.error)}</div></div>`
     : '';
 
   if (!rows.length) {
-    box.innerHTML = failed || `<div class="empty-note dense">${state.mwl.filterOpen
+    box.innerHTML = noRis || failed || `<div class="empty-note dense">${state.mwl.filterOpen
       ? 'No open steps.'
-      : (state.mwl.fetched ? 'Nothing scheduled for this query.' : '')}</div>`;
+      : (state.mwl.fetched ? esc(emptyListNote()) : '')}</div>`;
     return;
   }
 
-  // Rows survived a failed read: they are the last answer, not this one.
-  const stale = failed
-    ? `<div class="empty-note dense">Showing the last list that was read${state.mwl.at ? `, at ${esc(fmtClock(state.mwl.at))}` : ''}.</div>`
-    : '';
-
-  // The date is printed per row only when the query can span more than one day.
+  // The date is printed per row only when the query can span more than one
+  // day; the Modality column only when no filter already says what it is.
   const showDate = mwlWhen() === 'custom';
+  const showModality = !state.settings.modality;
   const html = rows.map((r) => {
     const m = r.item;
     const procedure = m.RequestedProcedureDescription || m.ScheduledProcedureStepDescription || '';
     const on = r.key === selKey;
     return `<tr class="pick-row ${r.memory ? 'memory' : ''} ${on ? 'row-selected' : ''}" data-key="${esc(r.key)}" tabindex="0" role="button" aria-pressed="${on}"
       ${r.memory ? 'title="Not in the current results — remembered from this session"' : ''}>
-      <td class="pick-cell"><span class="pick-dot"></span></td>
       <td class="when">${showDate ? `${esc(fmtDate(m.ScheduledProcedureStepStartDate))} ` : ''}${esc(fmtTime(m.ScheduledProcedureStepStartTime))}</td>
-      <td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>
+      ${showModality ? `<td><span class="pill ${m.Modality === 'CT' ? 'ct' : ''}">${esc(m.Modality || '?')}</span></td>` : ''}
       <td title="${esc(m.PatientName || '')}">${esc(m.PatientName || '')}</td>
-      <td class="mono">${esc(m.PatientID || '')}</td>
-      <td class="mono">${esc(m.AccessionNumber || '')}</td>
       <td title="${esc(procedure)}">${esc(procedure)}</td>
       <td class="session-cell">${rowPill(m)}</td>
+      <td class="mono">${esc(m.AccessionNumber || '')}</td>
+      <td class="mono">${esc(m.PatientID || '')}</td>
     </tr>`;
   }).join('');
 
-  box.innerHTML = failed + stale +
-    '<div class="table-scroll"><table id="mwl-table">' +
-    '<colgroup><col style="width:26px"><col style="width:100px"><col style="width:80px">' +
-    '<col style="width:150px"><col style="width:96px"><col style="width:96px">' +
-    '<col><col style="width:150px"></colgroup>' +
-    '<thead><tr><th class="pick-cell"></th><th>Scheduled</th><th>Modality</th><th>Patient</th>' +
-    '<th>Patient ID</th><th>Accession</th><th>Procedure</th><th>Status</th></tr></thead>' +
+  // Status sits fourth, before the two ID columns: on a window too narrow for
+  // the whole table it is the IDs that scroll out of view, never the column
+  // that says DISCONTINUED.
+  box.innerHTML = noRis + failed +
+    `<div class="table-scroll${state.mwl.error ? ' stale' : ''}"><table id="mwl-table" class="${showModality ? 'with-modality' : ''}">` +
+    `<colgroup><col style="width:${showDate ? 120 : 88}px">${showModality ? '<col style="width:64px">' : ''}` +
+    '<col style="width:150px"><col><col style="width:140px">' +
+    '<col style="width:90px"><col style="width:90px"></colgroup>' +
+    `<thead><tr><th>Scheduled</th>${showModality ? '<th>Modality</th>' : ''}<th>Patient</th>` +
+    '<th>Procedure</th><th>Status</th><th>Accession</th><th>Patient ID</th></tr></thead>' +
     `<tbody>${html}</tbody></table></div>`;
   for (const tr of $$('#mwl-table tr.pick-row')) tr.classList.toggle('row-selected', tr.dataset.key === selKey);
 }
 
 /**
  * Repaints just the pill column and the open-steps chip. Called after a run
- * and after a close; it touches the last cell of each row and nothing else,
+ * and after a close; it touches the status cell of each row and nothing else,
  * so the SCP's own data in the other columns stays exactly as returned.
  */
 function refreshRowPills() {
@@ -2766,6 +2797,28 @@ function renderOpenChip() {
   chip.textContent = `Open steps: ${open}`;
   chip.classList.toggle('active', state.mwl.filterOpen);
   chip.setAttribute('aria-pressed', state.mwl.filterOpen ? 'true' : 'false');
+  reportOpenSteps();
+}
+
+/**
+ * Tells the main process how many steps are open, and where.
+ *
+ * An open step lives in this window and nowhere else, so closing the window
+ * forgets it. Main asks before it lets the window close, or an update restart
+ * the app, while this count is above zero. Sent on every change, including
+ * back to zero, so a step that was closed stops guarding the quit.
+ */
+let reportedOpen = '';
+function reportOpenSteps() {
+  const open = state.steps.entries.filter((e) => e.status === 'IN PROGRESS');
+  const peers = [...new Set(open.map((e) => (e.peer && e.peer.calledAe) || 'the RIS'))];
+  const msg = { count: open.length, peers };
+  const key = JSON.stringify(msg);
+  if (key === reportedOpen) return;
+  reportedOpen = key;
+  try { window.dcm.steps.open(msg); } catch { /* an older preload: nothing to guard with */ }
+  // "Restart & update" waits while a step is open; redraw it when that changes.
+  if (lastUpdateState && lastUpdateState.status === 'ready') renderUpdateState(lastUpdateState);
 }
 
 /**
@@ -2949,12 +3002,16 @@ function selectRow(key) {
   }
   if (same) return;
 
-  // A new patient: the last run's verdict was about someone else.
+  // A new patient: the last run's verdict was about someone else, and so is
+  // whatever the Output was showing — it is kept, folded. Details folds too;
+  // renderMppsPanel opens it again for a row that is missing what it holds.
   $('#mpps-outcome').hidden = true;
   $('#mpps-totals').hidden = true;
   setStatus('mpps', null);
   setStatus('steps', null);
   state.steps.armed = false;
+  $('#mwl-out').open = false;
+  $('#mpps-adv').open = false;
 
   seedRowFields(row.item);
 
@@ -2976,6 +3033,7 @@ function clearSelection() {
   // folder now — the next `change`, blur included, has to re-read.
   mppsScanFor = null;
   state.steps.armed = false;
+  $('#mwl-out').open = false;
   for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
@@ -2996,14 +3054,15 @@ const MWL_AUTO_MS = 60000;
 async function fetchWorklist({ auto = false } = {}) {
   if (state.activeRuns.worklist) return;
   if (auto && (state.activeRuns.mpps || state.activeRuns.steps)) return;
-  const miss = connMissing();
-  if (miss.length) {
-    if (auto) return;
-    const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
-    revealConsole();
-    appendConsole('worklist', `No RIS peer: give a saved peer the RIS role in Settings, or pick one on the chip (missing ${miss.join(', ')}).\n`, 'stderr');
-    return;
-  }
+  // No RIS peer: said where the list is, with the way to fix it — and
+  // unsaid the moment there is one, rather than when its answer arrives.
+  const hadNoRis = state.mwl.noRis;
+  state.mwl.noRis = connMissing().length > 0;
+  if (state.mwl.noRis) { setStatus('worklist', null); renderWorklistTable(); return; }
+  if (hadNoRis) renderWorklistTable();
+  // The Modality filter is a Settings value now; the list remembers which one
+  // it was read with, so a change there re-reads it (see stationVisibility).
+  state.mwl.queryModality = state.settings.modality;
   setStatus('worklist', 'running', 'Fetching…');
   const { code, stdout, stderr } = await runCapture('worklist', [...BUILDERS.worklist(), '--json']);
   const now = new Date();
@@ -3029,20 +3088,27 @@ async function fetchWorklist({ auto = false } = {}) {
     } catch (err) {
       setStatus('worklist', 'fail', 'Failed');
       const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+      state.mwl.consoleOwner = 'list';
       revealConsole();
       appendConsole('worklist', `The worklist was read but could not be drawn: ${err.message}`, 'stderr');
     }
   } else {
-    // Said where the list is, not only in a console nobody opened.
+    // Said where the list is, in red with the engine's own words, and on
+    // Refresh. The Output is not sprung open over the patient for it.
     state.mwl.error = (json && json.message)
       || stripAnsi(stderr).trim().split('\n').filter(Boolean).pop()
       || 'The worklist could not be read.';
     state.mwl.fetched = true;
     setStatus('worklist', 'fail', 'Failed');
     renderWorklistTable();
-    const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
-    if (!auto) revealConsole();
-    appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+    // The Output is one pane for the whole station. A transfer's report in it
+    // is the record of that exam, and a list read — least of all the timer's —
+    // must not wipe it; the failure is already said where the list is.
+    if (state.mwl.consoleOwner !== 'exam') {
+      const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+      state.mwl.consoleOwner = 'list';
+      appendConsole('worklist', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
+    }
   }
 }
 
@@ -3051,7 +3117,9 @@ function stationVisibility(visible) {
   clearInterval(state.mwl.timer);
   state.mwl.timer = null;
   if (!visible) return;
-  if (!state.mwl.fetched && !connMissing().length) fetchWorklist({ auto: true });
+  // Read on arrival, and again when Settings moved the Modality filter since:
+  // a list read under the old filter is not the list the command now asks for.
+  if (!state.mwl.fetched || state.mwl.queryModality !== state.settings.modality) fetchWorklist({ auto: true });
   if ($('#mwl-auto').checked) {
     state.mwl.timer = setInterval(() => fetchWorklist({ auto: true }), MWL_AUTO_MS);
   }
@@ -3072,27 +3140,6 @@ function wireWorklist() {
   $('#mwl-date').addEventListener('input', updateAllPreviews);
   $('#mwl-date').addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchWorklist(); });
 
-  // The modality pill opens the field; leaving the field closes it.
-  const pill = $('#mwl-modality-pill');
-  const field = $('#mwl-modality');
-  pill.addEventListener('click', () => {
-    pill.hidden = true;
-    field.hidden = false;
-    field.focus();
-    field.select();
-  });
-  const closeModality = () => {
-    field.hidden = true;
-    pill.hidden = false;
-    renderModalityPill();
-    updateAllPreviews();
-    fetchWorklist();
-  };
-  field.addEventListener('blur', closeModality);
-  field.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === 'Escape') field.blur(); });
-  field.addEventListener('input', () => { renderModalityPill(); updateAllPreviews(); });
-  renderModalityPill();
-
   const search = $('#mwl-search');
   search.addEventListener('input', () => {
     if (!search.value.trim()) state.mwl.searchKey = null;
@@ -3109,7 +3156,11 @@ function wireWorklist() {
   });
 
   $('#mwl-run').addEventListener('click', () => fetchWorklist());
-  $('#mwl-auto').addEventListener('change', () => stationVisibility(state.activeView === 'worklist'));
+  // The re-read toggle lives in Settings, so it is saved like the rest of it.
+  $('#mwl-auto').addEventListener('change', () => {
+    stationVisibility(state.activeView === 'worklist');
+    commitSettings();
+  });
   $('#mwl-open-chip').addEventListener('click', () => {
     state.mwl.filterOpen = !state.mwl.filterOpen;
     renderWorklistTable();
@@ -3125,6 +3176,12 @@ function wireWorklist() {
     if (tr) selectRow(tr.dataset.key);
   });
   results.addEventListener('keydown', (e) => {
+    // Esc drops the patient: the way out a "Clear" button used to offer. Not
+    // while a perform or a close is running for them.
+    if (e.key === 'Escape' && state.mwl.selected && !state.activeRuns.mpps && !state.activeRuns.steps) {
+      clearSelection();
+      return;
+    }
     const tr = e.target.closest('tr.pick-row');
     if (!tr) return;
     // Arrowing moves focus only. Selecting on arrow would re-seed the Type 1
@@ -3138,7 +3195,6 @@ function wireWorklist() {
     e.preventDefault();
     selectRow(tr.dataset.key);
   });
-  $('#mwl-clearsel').addEventListener('click', clearSelection);
 }
 
 // --------------------------------------------------------------------------
@@ -3279,7 +3335,12 @@ async function checkMppsFolder() {
     if (studies.length > 1) {
       state.mpps.mismatch = { kind: 'many', studies };
     } else if (declared && declared !== studies[0].studyInstanceUid) {
-      state.mpps.mismatch = { kind: 'one-study', declared, onDisk: studies[0].studyInstanceUid };
+      // Who the folder holds, by name and ID, is what tells stock images apart
+      // from another patient's: the same amber line used to cover both.
+      state.mpps.mismatch = {
+        kind: 'one-study', declared, onDisk: studies[0].studyInstanceUid,
+        folderName: studies[0].patientName || null, folderId: studies[0].patientId || null, count: instances,
+      };
       state.mpps.fix = 'adopt';
     }
   }
@@ -3333,6 +3394,10 @@ function renderFolderLine() {
   const s = state.mpps.scan;
   const m = state.mpps.mismatch;
   sw.hidden = true;
+  // A Discontinue waiting for its reason: the folder is out of the picture,
+  // and so is everything said about it. Complete is hidden too, so no verb
+  // is left live without its line.
+  if (state.steps.armed && stepsSelected()) { box.hidden = true; return; }
 
   // Said BEFORE anything else, and never hidden: while this is set the verbs
   // are dead (verbBlock reads the same function), and a dead button with no
@@ -3362,7 +3427,7 @@ function renderFolderLine() {
   // saved peer holds the Archive role they go to the RIS, and that is said.
   const store = mppsStore();
   const to = store.name === 'Archive' ? `→ ${store.calledAe}` : `→ ${store.calledAe || '?'} (no Archive peer set)`;
-  const what = `${s.instances} instance${s.instances === 1 ? '' : 's'}${s.modalities ? ` ${s.modalities}` : ''}`;
+  const what = `${s.instances} image${s.instances === 1 ? '' : 's'}${s.modalities ? ` ${s.modalities}` : ''}`;
 
   if (m && m.kind === 'many') {
     box.className = 'folder-check bad';
@@ -3370,26 +3435,37 @@ function renderFolderLine() {
     return;
   }
   if (m && m.kind === 'one-study') {
+    // Named: "Folder is SYNTHETIC^PATIENT1 (SYNTH0001)". Stock images and the
+    // wrong patient's images are the same mismatch to the engine and not the
+    // same thing to the person at the console. With no single name on disk
+    // (none, or the instances disagree) the line falls back to the count.
+    const who = m.folderName ? `${m.folderName}${m.folderId ? ` (${m.folderId})` : ''}` : '';
+    const lead = who ? `Folder is <b>${esc(who)}</b> — a different study.` : '';
+    const rowName = worklistAttrs(selectedWorklistItem()).patientName || 'this worklist row';
     // Closing a step is not performing one: `dcm send` has no re-stamping in
     // it, so images added to an open step go to the archive exactly as they
     // are. There is no copy, so the line must not promise one — and the
     // Complete button is blocked while a folder like this is chosen.
     if (panelMode() === 'close') {
       box.className = 'folder-check bad';
-      box.innerHTML = `${esc(what)} ${esc(to)} · <b>a different study.</b> Added to this step they would be filed under their own study, ` +
-        'not this step\'s, and the two would never reconcile. Clear the folder to complete without them, or perform this study as its own exam.';
+      box.innerHTML = (lead ? `${lead} ` : `${esc(what)} ${esc(to)} · <b>a different study.</b> `)
+        + 'Added to this step they would be filed under their own study, not this step\'s, and the two would never reconcile. '
+        + 'Empty the Images box to complete without them, or perform this study as its own exam.';
       return;
     }
     box.className = 'folder-check warn';
+    const asis = state.settings.allowMismatch && mppsFix() === 'asis';
     if (state.settings.allowMismatch) {
       sw.hidden = false;
       for (const c of $$('#mpps-fix-switch .chip')) c.classList.toggle('active', c.dataset.fix === mppsFix());
-      box.innerHTML = `${esc(what)} ${esc(to)} · a different study — ` + (mppsFix() === 'asis'
-        ? '<b>sent as-is: the step names one study, the images another. Nothing reconciles afterwards.</b>'
-        : 'sent carrying this worklist\'s identity (a re-stamped copy; your folder is not modified).');
-    } else {
-      box.innerHTML = `${esc(what)} ${esc(to)} · a different study — sent carrying this worklist's identity (a re-stamped copy; your folder is not modified).`;
     }
+    const how = asis
+      ? '<b>Sent as-is: the step names one study, the images another. Nothing reconciles afterwards.</b>'
+      : (lead ? `Sent as ${esc(rowName)} in a re-stamped copy; your folder is not modified.`
+        : 'sent carrying this worklist\'s identity (a re-stamped copy; your folder is not modified).');
+    box.innerHTML = lead
+      ? `${lead} ${how} ${esc(what)} ${esc(to)}.`
+      : `${esc(what)} ${esc(to)} · a different study — ${how}`;
     return;
   }
   box.className = 'folder-check ok';
@@ -3518,7 +3594,12 @@ function attrCells(a) {
   ];
 }
 
-/** Who, what, when — off the row. One line, one secondary line, the study UID. */
+/**
+ * Who, what, when — off the row. One line, then the patient's own ID, sex and
+ * birth date. The scheduled step, requested procedure, station and study UID
+ * are the row's bookkeeping, not who is on the table: they are in Details,
+ * and a row missing its study UID says so in amber above the folder.
+ */
 function renderPatientBanner() {
   const item = selectedWorklistItem();
   const a = worklistAttrs(item);
@@ -3535,35 +3616,57 @@ function renderPatientBanner() {
   if (a.patientId) sub.push(`<span class="mono">${esc(a.patientId)}</span>`);
   if (a.patientSex) sub.push(esc(a.patientSex));
   if (a.patientBirthDate) sub.push(esc(fmtDate(a.patientBirthDate)));
-  if (a.scheduledStepId) sub.push(`step <span class="mono">${esc(a.scheduledStepId)}</span>`);
-  if (a.requestedProcedureId) sub.push(`<span class="mono">${esc(a.requestedProcedureId)}</span>`);
-  if (a.scheduledStationAe) sub.push(`station <span class="mono">${esc(a.scheduledStationAe)}</span>`);
   $('#mpps-hero-sub').innerHTML = sub.join(sep);
   $('#mpps-hero-uid').innerHTML = a.studyInstanceUid
     ? `<code>${esc(a.studyInstanceUid)}</code>`
     : missingCell('Study Instance UID');
 
-  // In closing mode the banner also says where the step is open, because the
-  // N-SET goes where the N-CREATE went, not wherever the chip points now.
+  // In closing mode the banner says the step is open, since when, and that
+  // only this window holds it. Where it is open is said only when that is not
+  // the RIS on the chip: the N-SET goes where the N-CREATE went.
   const e = stepFor(item);
   const note = $('#mpps-hero-note');
   if (e && e.status === 'IN PROGRESS') {
-    const c = e.counts || {};
     const peer = e.peer && e.peer.host ? `${e.peer.calledAe || '?'} @ ${e.peer.host}:${e.peer.port || '?'}` : '?';
+    const elsewhere = peer !== stationRisLabel();
     note.hidden = false;
-    note.innerHTML = `<span class="pill session warn">IN PROGRESS</span> on <b>${esc(peer)}</b> since ${esc(formatStepWhen(e))}` +
-      (c.acknowledged != null ? ` · ${esc(String(c.acknowledged))}/${esc(String(c.found))} acknowledged` : '');
+    note.innerHTML = `<span class="pill session warn">IN PROGRESS</span> since ${esc(formatStepWhen(e))}`
+      + (elsewhere ? ` on <b>${esc(peer)}</b>` : '')
+      + ' · lost if this app quits';
   } else {
     note.hidden = true;
   }
 }
 
+/** The RIS the station's chip names: the operator's pick there, else the RIS role. */
+function stationRisLabel() {
+  const manual = state.peerChoice.worklist;
+  const p = (manual && dimseProfiles().find((x) => x.name === manual)) || profileForRole('ris');
+  return p ? connLabel({ host: p.host || '', port: String(p.port || ''), calledAe: p.calledAe || '' }) : '';
+}
+
+/** True when the selected row's step was completed from this window: performing it again is a repeat. */
+function performDone() {
+  if (panelMode() !== 'perform') return false;
+  const e = stepFor(selectedWorklistItem());
+  return Boolean(e && e.status === 'COMPLETED');
+}
+
+/** The mode the panel was last drawn in, so a change of mode retires the chips. */
+let lastPanelMode = null;
+
 /** Fills the panel from the selected row, in whichever mode the row's step puts it. */
 function renderMppsPanel() {
   const mode = panelMode();
-  $('#mwl-detail-body').hidden = mode === null;
-  $('#mwl-detail-empty').hidden = mode !== null;
-  $('#mwl-detail').classList.toggle('open', mode !== null);
+  // No patient, no panel: there is no empty box waiting under the list.
+  $('#mwl-detail').hidden = mode === null;
+  // A chip is about the run that set it. Once the row's step opens or closes,
+  // the verdict box and the row's pill carry the result; the chip goes.
+  if (mode !== lastPanelMode) {
+    setStatus('mpps', null);
+    setStatus('steps', null);
+    lastPanelMode = mode;
+  }
   if (mode === null) return;
 
   renderPatientBanner();
@@ -3595,9 +3698,13 @@ function renderMppsPanel() {
   warn.innerHTML = notes.join('<br>');
 
   // The list may no longer say which row this patient is; the panel says so
-  // rather than the selection quietly moving to whoever is there now.
+  // rather than the selection quietly moving to whoever is there now. Not
+  // for a row whose step this window just closed: the RIS dropping it then is
+  // the ordinary thing, the verdict box says what happened, and the dead
+  // Perform still carries the reason on its title.
   const detached = $('#mwl-detached-note');
-  detached.hidden = !state.mwl.detached;
+  const closedHere = e && (e.status === 'COMPLETED' || e.status === 'DISCONTINUED');
+  detached.hidden = !state.mwl.detached || (state.mwl.detached === 'gone' && Boolean(closedHere));
   if (state.mwl.detached === 'gone') {
     // The row was identified and has left the list. Performing is blocked in
     // verbBlock, so this says so; closing is not, because an N-SET goes to the
@@ -3606,7 +3713,7 @@ function renderMppsPanel() {
     // Two sentences, on purpose. This sits above the primary button inside the
     // station's word budget, and WHY a row can leave the answer is prose —
     // it lives in the help panel behind the ?. The time of the read is not
-    // repeated here either; the status chip beside Refresh already carries it.
+    // repeated here either; the Refresh button already carries it.
     detached.innerHTML = '<b>The RIS no longer lists this row.</b> '
       + (closing
         ? 'Closing the open step still works.'
@@ -3617,14 +3724,20 @@ function renderMppsPanel() {
 
   // The verbs. Perform mode: Perform exam / Start only. Close mode: Complete /
   // Discontinue, and the folder is either the one already sent or one to add.
+  // A row this window already COMPLETED keeps one quiet "Perform again": a
+  // press opens a second step and sends the study again, so it is not the
+  // primary any more. A DISCONTINUED row keeps Perform exam: that is the retry.
   const dry = mppsDryRun();
-  $('#mpps-run').hidden = closing;
-  $('#mpps-start').hidden = closing;
+  const done = performDone();
+  const run = $('#mpps-run');
+  run.hidden = closing;
+  run.className = done ? 'btn ghost' : 'btn primary';
+  run.textContent = dry ? 'Rehearse exam' : (done ? 'Perform again' : 'Perform exam');
+  $('#mpps-start').hidden = closing || done;
   $('#mpps-cmd-fold').hidden = closing;
   $('#steps-close-run').hidden = !closing;
   $('#steps-discontinue').hidden = !closing;
   $('#steps-cmd-fold').hidden = !closing;
-  $('#mpps-run').textContent = dry ? 'Rehearse exam' : 'Perform exam';
   $('#mpps-start').textContent = dry ? 'Rehearse start' : 'Start only';
 
   const folder = $('#mpps-folder');
@@ -3650,7 +3763,8 @@ function renderMppsPanel() {
 function renderStartPreview() {
   const fold = $('#mpps-start-cmd-fold');
   if (!fold) return;
-  fold.hidden = panelMode() !== 'perform';
+  // Goes with its button: no Start only on a completed row, so no command for it.
+  fold.hidden = panelMode() !== 'perform' || performDone();
   setPreviewEl($('#mpps-start-cmd'), mppsStartArgv());
 }
 
@@ -3773,8 +3887,12 @@ function renderMppsTotals(r) {
     cell(r.found, 'found') + cell(r.sent, 'sent') +
     cell(r.acknowledged, 'acknowledged', complete ? 'ok' : 'fail') +
     cell(r.referenced, 'listed on the step', complete ? 'ok' : 'fail');
-  box.hidden = false;
-  box.classList.add('show');
+  // Four equal numbers are the verdict's one sentence said four more times,
+  // so the cards stay drawn and stay folded away. Any number that differs is
+  // the thing to read, and then all four are on screen.
+  const allEqual = [r.sent, r.acknowledged, r.referenced].every((n) => n === r.found);
+  box.hidden = allEqual;
+  box.classList.toggle('show', !allEqual);
 }
 
 /**
@@ -3803,36 +3921,40 @@ function renderMppsOutcome({ code, report, dryRun, verb, stderr = '' }) {
       revealConsole();
       box.innerHTML = '<span class="outcome-head">The rehearsal did not get through — nothing was sent.</span>'
         + (said ? quote(said) : 'The output says why. The real run would stop here too.');
-      setStatus('mpps', 'fail', 'Rehearsal failed');
+      endChip('mpps', 'fail', 'Rehearsal failed');
       return;
     }
     box.className = 'outcome';
     box.innerHTML = '<span class="outcome-head">Rehearsal — nothing was sent.</span>' +
       (verb === 'start' ? 'No connection, no step.' : 'No connection, no step, no images. Performed series cannot be previewed.');
-    setStatus('mpps', 'ok', 'Plan ready');
+    endChip('mpps', 'ok', 'Plan ready');
     return;
   }
 
   if (verb === 'start') {
     if (code === 0 && report.status === 'IN PROGRESS') {
-      box.className = 'outcome';
-      box.innerHTML = `<span class="outcome-head">Step opened — IN PROGRESS on ${esc(state.conn.calledAe)}.</span>` +
-        'Complete or discontinue it below. This window is the only place its UID is kept.';
-      setStatus('mpps', 'ok', 'IN PROGRESS');
+      // No box: the panel is now in closing mode and its banner says IN
+      // PROGRESS, since when, and that quitting loses it. A box saying it a
+      // third time, pointing at buttons that sit above it, helped nobody.
+      box.hidden = true;
+      endChip('mpps', 'warn', 'IN PROGRESS');
     } else {
       box.className = 'outcome bad';
       revealConsole();
       box.innerHTML = '<span class="outcome-head">N-CREATE failed — no step was opened.</span>'
         + (said ? quote(said) : 'The output says why.');
-      setStatus('mpps', 'fail', 'Failed');
+      endChip('mpps', 'fail', 'Failed');
     }
     return;
   }
 
   if (report.status === 'COMPLETED' && code === 0) {
+    // Said once. The four totals behind it fold away when they agree.
     box.className = 'outcome ok';
-    box.innerHTML = '<span class="outcome-head">Step COMPLETED.</span>Every instance found on disk was acknowledged and referenced.';
-    setStatus('mpps', 'ok', 'COMPLETED');
+    box.innerHTML = report.acknowledged != null && report.found != null
+      ? `<span class="outcome-head">Completed — ${esc(String(report.acknowledged))} of ${esc(String(report.found))} images acknowledged.</span>`
+      : '<span class="outcome-head">Completed.</span>';
+    endChip('mpps', 'ok', 'COMPLETED');
     return;
   }
 
@@ -3845,7 +3967,7 @@ function renderMppsOutcome({ code, report, dryRun, verb, stderr = '' }) {
     // it stays red, and it is never rounded up to a caveat on a success.
     head = 'Step DISCONTINUED — this is a failure.';
     body = (report.shortfall ? `${esc(report.shortfall)} ` : '') +
-      '<b>There is no override.</b> Resend the outstanding instances and open a new step, or find out why the archive refused them.';
+      '<b>No override:</b> perform the exam again to resend, or call PACS.';
   } else if (report.neverOpened) {
     head = 'N-CREATE failed — no step was opened.';
     body = 'Nothing was sent, the images are untouched. '
@@ -3871,23 +3993,27 @@ function renderMppsOutcome({ code, report, dryRun, verb, stderr = '' }) {
       + (said ? '' : ' The output is the whole story.');
   }
   box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
-  setStatus('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
+  endChip('mpps', 'fail', report.status === 'DISCONTINUED' ? 'DISCONTINUED' : 'Failed');
 }
 
 /** Runs `perform` or `start` for the selected row and remembers what came back. */
 async function runMpps(verb) {
   const item = selectedWorklistItem();
+  const folder = $('#mpps-folder').value.trim();
+  if (item && verb === 'perform' && !folder) {
+    // Nothing to send yet, so the press is taken as "choose them": the same
+    // picker Browse… opens, and the same input/change it announces a path
+    // with, so the folder is read before the verb can go live. Nothing on
+    // screen is touched first, and a dismissed picker does nothing.
+    const browse = $('[data-pick="mpps-folder"]');
+    if (browse) browse.click();
+    return;
+  }
   clearConsole('mpps');
   $('#mpps-outcome').hidden = true;
   $('#mpps-totals').hidden = true;
   if (!item) { revealConsole(); appendConsole('mpps', 'Select a patient first.\n', 'stderr'); return; }
 
-  const folder = $('#mpps-folder').value.trim();
-  if (verb === 'perform' && !folder) {
-    revealConsole();
-    appendConsole('mpps', 'Choose the folder holding this exam\'s images.\n', 'stderr');
-    return;
-  }
   const dryRun = mppsDryRun();
   if (!dryRun) {
     const miss = connMissing();
@@ -3907,10 +4033,10 @@ async function runMpps(verb) {
   setStatus('mpps', 'running', dryRun ? 'Building…' : (verb === 'perform' ? 'Performing…' : 'Opening…'));
   $('#mpps-run').disabled = true;
   $('#mpps-start').disabled = true;
-  if (!dryRun) {
-    $('#mpps-cancel').hidden = false;
-    revealConsole(); // during a real transfer the stream is the interesting thing
-  }
+  // The Output stays as it is: open if the operator opened it, folded if not.
+  // A run that fails unfolds it (runStreaming, and the verdict below).
+  if (!dryRun) $('#mpps-cancel').hidden = false;
+  state.mwl.consoleOwner = 'exam';
   const { code, stdout, stderr } = await runStreaming('mpps', argv);
   $('#mpps-run').disabled = false;
   $('#mpps-start').disabled = false;
@@ -3931,7 +4057,7 @@ async function runMpps(verb) {
       // The engine names both UIDs. Neither is on this screen anywhere else,
       // and they are what a call to the RIS is about.
       + (said ? `<div class="engine-said">${esc(said)}</div>` : '');
-    setStatus('mpps', 'fail', 'Study mismatch');
+    endChip('mpps', 'fail', 'Study mismatch');
     return;
   }
 
@@ -4197,6 +4323,11 @@ function renderStepsClose() {
   const dry = stepsDryRun();
   const adding = stepsFolderToAdd();
 
+  // While a Discontinue waits for its reason the folder has no part in it, so
+  // the Images box and the line under it step out of the way (renderFolderLine
+  // keeps the line hidden for as long as this lasts).
+  const imagesRow = $('#view-worklist .images-row');
+  if (imagesRow) imagesRow.hidden = armed;
   $('#steps-reason-row').hidden = !armed;
   $('#steps-close-run').hidden = !e || armed;
   $('#steps-discontinue').hidden = !e || armed;
@@ -4259,14 +4390,15 @@ async function runClose(verb) {
   // for the case the button was reached some other way.
   if (adding && state.mpps.mismatch) {
     revealConsole();
-    appendConsole('steps', 'These images carry a different study than this step. Clear the folder to complete without them, or perform that study as its own exam.\n', 'stderr');
+    appendConsole('steps', 'These images carry a different study than this step. Empty the Images box to complete without them, or perform that study as its own exam.\n', 'stderr');
     return;
   }
   let argv = stepsCloseArgv(verb);
   let extra = '';
 
   for (const b of ['steps-close-run', 'steps-discontinue', 'steps-discontinue-run']) $(`#${b}`).disabled = true;
-  if (!dry) revealConsole();
+  // Like a perform: the Output unfolds for a close that fails, not for every close.
+  state.mwl.consoleOwner = 'exam';
 
   if (adding) {
     setStatus('steps', 'running', dry ? 'Building…' : 'Sending…');
@@ -4294,7 +4426,10 @@ async function runClose(verb) {
   const { code, stderr } = await runStreaming('steps', argv);
   for (const b of ['steps-close-run', 'steps-discontinue', 'steps-discontinue-run']) $(`#${b}`).disabled = false;
   applyVerbGuards();
-  setStatus('steps', code === 0 ? 'ok' : 'fail', code === 0 ? (dry ? 'Plan ready' : (verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED')) : 'Failed');
+  // DISCONTINUED is a failure, here as everywhere: an exam that was stopped,
+  // or images the archive did not all take (verb was switched above).
+  const kind = code !== 0 ? 'fail' : dry ? 'ok' : (verb === 'complete' ? 'ok' : 'fail');
+  endChip('steps', kind, code === 0 ? (dry ? 'Plan ready' : (verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED')) : 'Failed');
   if (code !== 0) revealConsole();
 
   // The entry moves only when a real N-SET was accepted: the engine exits zero
@@ -4327,12 +4462,17 @@ function wireSteps() {
     $('#steps-reason').value = '';
     $('#steps-reasoncode').value = '';
     $('#steps-reasoncode').hidden = true;
+    // The verdict on screen was about what came before this; the one this
+    // Discontinue produces is drawn when it runs.
+    $('#mpps-outcome').hidden = true;
     renderStepsClose();
+    renderFolderLine();
     $('#steps-reason').focus();
   });
   $('#steps-discontinue-cancel').addEventListener('click', () => {
     state.steps.armed = false;
     renderStepsClose();
+    renderFolderLine();
   });
   $('#steps-discontinue-run').addEventListener('click', () => runClose('discontinue'));
   renderStepsClose();
@@ -6380,8 +6520,11 @@ function wireKeyboard() {
  */
 /** True on packaged builds, where the manual check link makes sense. */
 let updateCheckEligible = false;
+/** The state the banner last drew, so an open step closing can redraw it. */
+let lastUpdateState = null;
 
 function renderUpdateState(s) {
+  lastUpdateState = s || null;
   const banner = $('#update-banner');
   const text = $('#update-text');
   const action = $('#update-action');
@@ -6406,6 +6549,11 @@ function renderUpdateState(s) {
     text.textContent = `Update ${label} is ready.`;
     action.textContent = 'Restart & update';
     action.hidden = false;
+    // A restart forgets every open step, the same as quitting: the button
+    // waits until none is open, and says so.
+    const open = state.steps.entries.some((e) => e.status === 'IN PROGRESS');
+    action.disabled = open;
+    if (open) { note.textContent = 'Restart once the open step is closed.'; note.hidden = false; }
     action.onclick = () => window.dcm.update.install();
   } else if (s.status === 'fetching') {
     // "Getting", not "Installing" and not "Updating". The app is fetching a

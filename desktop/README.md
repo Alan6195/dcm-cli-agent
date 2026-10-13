@@ -33,7 +33,9 @@ Launch behavior worth knowing, all deliberate:
 - window size, position and maximized state are remembered across launches
   (and reset if the monitor they were on is gone);
 - saved peers, settings and window state survive updates and every product
-  rename this app has been through.
+  rename this app has been through;
+- closing the window while a procedure step is still open asks first: an open
+  step lives only in that window, and quitting forgets it.
 
 ## Updating from an Asteris build
 
@@ -314,7 +316,8 @@ electron-builder sign for real.
 The installed Windows app keeps itself current.
 On launch (and every few hours after) the app checks the GitHub release feed,
 downloads a newer version in the background, and shows **Restart & update** in
-the sidebar. Clicking it installs silently and relaunches. If you never click
+the sidebar. Clicking it installs silently and relaunches; while a procedure
+step is open the button waits until it is closed. If you never click
 it, the downloaded update is applied on the next normal quit instead — either
 way you don't visit the releases page again.
 

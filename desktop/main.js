@@ -292,7 +292,32 @@ function restoreWindowBounds() {
 let mainWindow = null;
 let splashWindow = null;
 
+/**
+ * The procedure steps the window holds open, as the renderer last reported
+ * them: { count, peers }.
+ *
+ * An open step lives in the renderer's memory and nowhere else — there are no
+ * record files, and MPPS has no query service — so closing the window forgets
+ * it for good. While any is open, closing the window asks first, and an update
+ * restart is refused (the renderer keeps its button dead and says why).
+ */
+let openSteps = { count: 0, peers: [] };
+/** Set once the operator chose "Quit anyway", so the close that follows is not asked again. */
+let quitConfirmed = false;
+
+/** The question the close asks, or null when nothing is open. */
+function quitGuardMessage(open = openSteps) {
+  if (!open || !(open.count > 0)) return null;
+  const where = open.peers && open.peers.length ? open.peers.join(', ') : 'the RIS';
+  return open.count === 1
+    ? `A step is still open on ${where}. Quitting forgets it.`
+    : `${open.count} steps are still open on ${where}. Quitting forgets them.`;
+}
+
 function createWindow(opts = {}) {
+  // A new window holds no steps until its renderer says otherwise.
+  openSteps = { count: 0, peers: [] };
+  quitConfirmed = false;
   // A packaged cold launch can take a few seconds (asar, engine, first
   // paint), and a silent gap between double-click and window reads exactly
   // like "it didn't work". So a small splash appears immediately and the main
@@ -369,7 +394,28 @@ function createWindow(opts = {}) {
     return { action: 'deny' };
   });
 
-  mainWindow.on('close', () => saveWindowBounds());
+  mainWindow.on('close', (event) => {
+    saveWindowBounds();
+    // The smoke harness ends with app.exit, which closes nothing, and it closes
+    // its own steps first; this keeps a dialog from ever waiting on a screen
+    // nobody is looking at.
+    const ask = !quitConfirmed && !SMOKE ? quitGuardMessage() : null;
+    if (!ask) return;
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Go back', 'Quit anyway'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'AscendI DICOM',
+      message: ask,
+    });
+    if (choice === 0) {
+      event.preventDefault();
+      return;
+    }
+    quitConfirmed = true;
+  });
 
   // If the renderer ever stops answering again, the main process is still fine
   // and is the only place that can say so. Children keep running while a
@@ -1115,6 +1161,8 @@ function initUpdates() {
 
   ipcMain.handle('update:install', () => {
     if (updateState.status !== 'ready') return { ok: false };
+    // A restart forgets an open step exactly as quitting does.
+    if (openSteps.count > 0) return { ok: false, reason: 'open-step' };
     // Silent install, relaunch when done. before-quit still runs, so any
     // receiver or transfer child is killed the same as on a normal quit.
     autoUpdater.quitAndInstall(true, true);
@@ -1166,6 +1214,13 @@ app.whenReady().then(() => {
 
   ipcMain.handle('dcm:start', startRun);
   ipcMain.handle('dcm:cancel', cancelRun);
+
+  // How many procedure steps the window holds open; see openSteps.
+  ipcMain.on('steps:open', (_event, info) => {
+    const count = Math.max(0, Number(info && info.count) || 0);
+    const peers = Array.isArray(info && info.peers) ? info.peers.map(String).slice(0, 8) : [];
+    openSteps = { count, peers };
+  });
 
   ipcMain.handle('dcm:pick', async (_event, opts = {}) => {
     const props = [];
@@ -1227,6 +1282,8 @@ app.whenReady().then(() => {
           migrateStateFiles,
           STATE_FILES,
           LEGACY_PRODUCT_DIRS,
+          openSteps: () => ({ ...openSteps }),
+          quitGuardMessage,
         });
       } catch (err) {
         // The harness is not shipped in packaged builds. Say so loudly rather

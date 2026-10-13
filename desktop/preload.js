@@ -74,6 +74,11 @@ contextBridge.exposeInMainWorld('dcm', {
   /** Stop a running child by its runId. */
   cancel: (runId) => ipcRenderer.invoke('dcm:cancel', runId),
 
+  /** The procedure steps this window holds open, so quitting can ask first. */
+  steps: {
+    open: (info) => ipcRenderer.send('steps:open', info),
+  },
+
   update: {
     /** Current update state, for renderers that boot after an event fired. */
     state: () => ipcRenderer.invoke('update:state'),

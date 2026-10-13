@@ -101,13 +101,13 @@
           <h4>The list</h4>
           <p>The query is a C-FIND at worklist level and changes nothing on the SCP. Scheduling filters go inside the <b>Scheduled Procedure Step Sequence</b>, which is what a conformant MWL SCP expects — a flat query is the usual reason a worklist comes back empty. The worklist SCP keys on the <b>called AE</b>; an MPPS step is attributed to the <b>performed station AE</b>, which is this station's AE Title from Settings — one fact that decides both. The engine warns when a row's scheduled station differs from it.</p>
           <p>The search box sends one key: digits only become <code>PatientID</code>, a name (letters, or <code>^</code>) becomes a <code>PatientName</code> wildcard, anything mixed becomes <code>AccessionNumber</code>. The tag beside the box says which was chosen; click it to pick a different key.</p>
-          <p>A query that fails is not an empty worklist. An unreachable RIS, a refused association or a timeout is said where the list is, in red, with the engine's own sentence — and any rows still on screen are labelled as the last answer that was read, not this one.</p>
-          <p>Only a fresh query changes the list. A row can leave the results for reasons that have nothing to do with the performed step — the date filter, the station AE, or the SCP's own rules — and it can stay in them even after a step was accepted. What the SCP did with a scheduled entry after a performed step is not visible from this side; some SCPs keep the entry, some drop it. The list re-reads itself every minute while this screen is open. The selected patient stays selected across a refresh, matched by study and scheduled step — or, for a row that names no study, by accession, step and patient ID. A row carrying none of those cannot be matched at all: the patient stays on the panel, the panel says the list no longer identifies which row they are, and nothing is re-pointed. <b>Worklist rows to fetch</b> in Settings caps the query with <code>--limit</code>; blank asks for the whole answer.</p>
+          <p>A query that fails is not an empty worklist. An unreachable RIS, a refused association or a timeout is said where the list is, in red, with the engine's own sentence — and any rows still on screen are dimmed and labelled with the time of the last list that was read, not this one.</p>
+          <p>Only a fresh query changes the list. A row can leave the results for reasons that have nothing to do with the performed step — the date filter, the station AE, or the SCP's own rules — and it can stay in them even after a step was accepted. What the SCP did with a scheduled entry after a performed step is not visible from this side; some SCPs keep the entry, some drop it. The list re-reads itself every minute while this screen is open, unless Settings turns that off; the Modality filter is set there too. Refresh shows the time of the last read. The selected patient stays selected across a refresh, matched by study and scheduled step — or, for a row that names no study, by accession, step and patient ID. A row carrying none of those cannot be matched at all: the patient stays on the panel, the panel says the list no longer identifies which row they are, and nothing is re-pointed. <b>Worklist rows to fetch</b> in Settings caps the query with <code>--limit</code>; blank asks for the whole answer. <b>Esc</b> drops the selection.</p>
           <p>A row that <em>was</em> matched and has since left the answer is the same rule seen from the other side. The patient stays on the panel — the outcome and any open step still name them — and the panel says, in amber, that the list read most recently does not hold this row. <b>Perform exam</b> goes dead while that is true: the order may have been cancelled, the date or modality filter may have moved, or the SCP may simply withhold an entry once its step is accepted, and none of those are distinguishable from this side. Completing or discontinuing a step this app opened is <em>not</em> blocked — an N-SET goes to the peer that took the N-CREATE and never consults the worklist. If the next refresh carries the row again, the selection re-attaches by itself and the panel goes quiet.</p>
 
           <h4>Performing an exam</h4>
           <p><b>Perform exam</b> is one <code>dcm mpps perform</code> transaction: N-CREATE opens the step on the RIS, C-STORE sends the images to the archive, N-SET closes it. <b>COMPLETED requires every instance found on disk to have been acknowledged.</b> A shortfall makes the step DISCONTINUED and the run fails; there is no override. The RIS that takes the procedure step and the archive that takes the images are often different systems, so both are written out in full in the command even when they are the same — <b>a default you cannot see is a default nobody can check.</b> The archive is whichever saved peer holds the Archive role in Settings; with none set, the images go to the RIS peer.</p>
-          <p><b>Start only</b> is the same transaction taken apart: <code>dcm mpps start</code> opens the step and leaves it IN PROGRESS, for when the images are sent by something else or the step has to stay open in between. The row then offers <b>Complete</b> and <b>Discontinue</b>. Adding a folder to an open step sends it with <code>dcm send</code> first and then completes the step naming those images — and only if every instance was acknowledged; otherwise the step is discontinued, for the same reason as above.</p>
+          <p><b>Start only</b> is the same transaction taken apart: <code>dcm mpps start</code> opens the step and leaves it IN PROGRESS, for when the images are sent by something else or the step has to stay open in between. The row then offers <b>Complete</b> and <b>Discontinue</b>. A row this window already completed offers <b>Perform again</b> instead, as a plain button: pressing it opens a second step and sends the study again. Adding a folder to an open step sends it with <code>dcm send</code> first and then completes the step naming those images — and only if every instance was acknowledged; otherwise the step is discontinued, for the same reason as above.</p>
           <p>PerformedSeriesSequence is built only from instances the archive positively acknowledged, never from a folder listing. <code>--series-from</code> asserts what is on this disk rather than what the archive acknowledged, so it is only taken by default when every instance found in that folder was acknowledged — otherwise the N-SET would name images the archive may not hold.</p>
           <p>The folder is read before anything is sent — <code>dcm info --json</code>, which opens nothing and changes nothing — and the line under it says what it holds and where it is going. Until that line is there, <b>Perform exam</b> and <b>Start only</b> are dead and say why on the button: the study on disk is what decides whether the command needs <code>--adopt-worklist-identity</code>, so a command built before the folder was read would be the wrong command. That covers every way of not knowing — the read never ran, it was still running, it ran out of time, the folder could not be opened, or nothing DICOM was found in it — and each says which, with <b>Read it again</b> beside it. A rejected run is not a fallback for this: the engine refuses a command it cannot accept with an exit code and one sentence on standard error, which the panel now prints in full rather than pointing at the output.</p>
           <p>The fields the panel calls <b>Performed step ID</b> and <b>Performed station AE</b> are Type 1 in the N-CREATE — the engine refuses to open a step without either, which is why an empty one is said in amber on the panel rather than left to the run. The station AE follows this station's AE Title from Settings unless it is typed over for one patient; picking another patient puts it back.</p>
@@ -121,27 +121,21 @@
 
           <h4>What the status pills mean</h4>
           <p>A pill on a row says what <b>this app</b> sent, from this window, in this session. It is never a statement about what the RIS now shows: MPPS has no query service — there is no C-FIND for performed procedure steps — so no peer was asked. A step shown IN PROGRESS may already have been closed at someone's console, and a step this app did not perform never appears. To see what the SCP now returns, query again.</p>
-          <p>Open steps live in this window and nowhere else. Nothing is written to disk, so <b>quitting forgets them</b>: the MPPS SOP Instance UID printed by <code>start</code> is the only handle on a step, and once this window is gone nothing can hand it back. Close every open step before quitting. A step is closed on the system that took the N-CREATE, not whatever the peer chip says now; if someone else already closed it, that peer refuses the N-SET and says so. Both COMPLETED and DISCONTINUED are final.</p>
+          <p>Open steps live in this window and nowhere else. Nothing is written to disk, so <b>quitting forgets them</b>: the MPPS SOP Instance UID printed by <code>start</code> is the only handle on a step, and once this window is gone nothing can hand it back. Close every open step before quitting; the app asks before it quits while one is open. A step is closed on the system that took the N-CREATE, not whatever the peer chip says now; if someone else already closed it, that peer refuses the N-SET and says so. Both COMPLETED and DISCONTINUED are final.</p>
         </div>
 
         <!-- ---------------- the top bar ---------------- -->
         <div class="station-bar">
           <div class="conn-host" data-conn data-role="ris"></div>
-          <!-- The Modality filter: the pill shows the value, the field edits
-               it. One id (#mwl-modality) so Settings can seed it. -->
-          <span class="modality-edit">
-            <button type="button" class="chip" id="mwl-modality-pill" title="Modality filter (from Settings) — click to change"></button>
-            <input type="text" id="mwl-modality" class="chip-input narrow" maxlength="16" placeholder="modality" hidden />
-          </span>
           <div class="chip-row seg" id="mwl-when">
             <button class="chip active" data-when="today">Today</button>
             <button class="chip" data-when="tomorrow">Tomorrow</button>
             <button class="chip" data-when="custom">Pick…</button>
           </div>
           <input type="text" id="mwl-date" class="chip-input" placeholder="YYYYMMDD or a range; blank = any date" hidden />
-          <button class="btn primary small" data-run id="mwl-run">Refresh</button>
-          <label class="auto-toggle" title="Re-read the list every 60 seconds while this screen is open"><input type="checkbox" id="mwl-auto" checked /> Auto</label>
-          <span class="status-chip" id="mwl-status" hidden></span>
+          <!-- Refresh carries the state of the last read: the time it answered,
+               "Fetching…", or "Failed" in red. -->
+          <button class="btn ghost small refresh-btn" data-run id="mwl-run" title="Read the worklist again"><span aria-hidden="true">↻</span> <span id="mwl-status" class="refresh-state">Refresh</span></button>
           <button type="button" class="chip open-chip" id="mwl-open-chip" hidden aria-pressed="false"></button>
           <span class="search">
             <input type="text" id="mwl-search" placeholder="Patient name, ID or accession" />
@@ -157,15 +151,14 @@
         <div class="station-body">
           <div class="result-table" id="mwl-results"></div>
 
-          <div class="pick-panel" id="mwl-detail">
-            <div class="empty-note dense" id="mwl-detail-empty">Select a patient.</div>
-
-            <div id="mwl-detail-body" hidden>
-              <!-- The patient banner: who, what, when — off the row, verbatim. -->
+          <!-- Only there once a patient is picked: no empty container before. -->
+          <div class="pick-panel" id="mwl-detail" hidden>
+              <!-- The patient banner: who, what, when — off the row, verbatim.
+                   The study UID stays in Details; the element is kept, hidden. -->
               <div class="patient-banner">
                 <div class="hero-main" id="mpps-hero-main"></div>
                 <div class="hero-sub" id="mpps-hero-sub"></div>
-                <div class="hero-uid" id="mpps-hero-uid"></div>
+                <div class="hero-uid" id="mpps-hero-uid" hidden></div>
                 <div class="hero-note" id="mpps-hero-note" hidden></div>
               </div>
 
@@ -208,7 +201,6 @@
                 <button class="btn primary" id="steps-close-run" hidden>Complete</button>
                 <button class="btn ghost" id="steps-discontinue" hidden>Discontinue</button>
                 <span class="status-chip" id="steps-status" hidden></span>
-                <button class="btn ghost small clear-sel" id="mwl-clearsel">Clear</button>
               </div>
               <!-- The reason code exists only once Discontinue is chosen. -->
               <div class="reason-row" id="steps-reason-row" hidden>
@@ -268,7 +260,6 @@
                   </div>
                 </div>
               </details>
-            </div>
           </div>
 
           <!-- Inside the two columns, not under them. On a wide window this
@@ -1160,6 +1151,7 @@
         </div>
         <div class="checks">
           <label><input type="checkbox" id="set-only-station" /> Only this station's worklist <span class="dim">(adds ScheduledStationAETitle to the query; the engine warns on a mismatch either way)</span></label>
+          <label><input type="checkbox" id="mwl-auto" checked /> Re-read the worklist every minute</label>
         </div>
 
         <div class="section-title">Peers</div>

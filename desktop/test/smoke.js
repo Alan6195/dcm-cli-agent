@@ -80,16 +80,19 @@ const RUN_PANES = ['worklist', 'send', 'receive', 'query', 'speed', 'echo', ...T
  * status chip and the help panel.
  */
 const BUDGET = {
-  'worklist-list': 17,   // the station with nothing selected: the whole screen
-  worklist: 60,          // the station with a row selected, above "Perform exam"
+  // The station, ratcheted at the measured count plus four when its toolbar
+  // lost the Modality pill and Auto (both Settings values now), the empty
+  // "Select a patient" box went, and the banner kept only the patient.
+  'worklist-list': 10,   // the station with nothing selected: the whole screen
+  worklist: 32,          // the station with a row selected, above "Perform exam"
   // The station with its repair notes showing — the row has left the list, or
   // the folder could not be read, or both. A repair is allowed to cost words
   // that the ordinary screen is not, because it has to say what is wrong and
   // the button below it is dead anyway. It still has a ceiling: without one,
   // "the screen where it is fine to explain things" is how the prose the
   // redesign moved into the help panel walks back onto the station.
-  'worklist-gone': 60,       // a row that left the list, folder fine
-  'worklist-repairs': 70,    // and the folder unread on top of it
+  'worklist-gone': 51,       // a row that left the list, folder fine
+  'worklist-repairs': 65,    // and the folder unread on top of it
   // Ratcheted when the description line under every title was deleted (its
   // sentences live in each screen's help panel now), at the measured count
   // plus four.
@@ -1880,6 +1883,16 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // meets every day — images that carry a different study than the order.
     // =====================================================================
     if (fixtures) {
+      // A condition in this (main) process rather than in the renderer: what
+      // the window has told main, which is what the quit guard acts on.
+      const waitMain = async (fn, ms, label) => {
+        const deadline = Date.now() + ms;
+        while (!fn()) {
+          if (Date.now() > deadline) bad(`timed out waiting for ${label}`);
+          // eslint-disable-next-line no-await-in-loop
+          await wait(100);
+        }
+      };
       await js(`(() => { showView('worklist'); __smoke.set('mwl-auto', false); return true; })()`);
       await wait(200);
       // Auto is a timer that only runs while this screen is on view.
@@ -1894,17 +1907,44 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // Off for the flow: this harness drives the list itself.
       await js(`(() => { showView('worklist'); __smoke.set('mwl-auto', false); return true; })()`);
 
+      // The bar holds what a technologist touches. The re-read toggle is a
+      // Settings value, saved with the rest; the Modality filter is set there
+      // too; and the state of the last read is the label of Refresh itself,
+      // which is not a second cyan button beside "Perform exam".
+      const bar = await jsJSON(`JSON.stringify({
+        autoInSettings: !!document.querySelector('#view-settings #mwl-auto'),
+        autoSaved: state.settings.autoRefresh,
+        pill: !!document.querySelector('#mwl-modality-pill'),
+        statusInRefresh: !!document.querySelector('#mwl-run #mwl-status'),
+        refreshCls: document.querySelector('#mwl-run').className,
+        clear: !!document.querySelector('#mwl-clearsel'),
+      })`);
+      if (!bar.autoInSettings) bad(`the re-read toggle is not in Settings: ${JSON.stringify(bar)}`);
+      if (bar.autoSaved !== false) bad(`unchecking the re-read toggle was not saved to Settings: ${JSON.stringify(bar)}`);
+      if (bar.pill) bad('the Modality pill is still on the station bar');
+      if (!bar.statusInRefresh) bad('the last read is not said on the Refresh button');
+      if (/\bprimary\b/.test(bar.refreshCls)) bad(`Refresh is a second primary button: ${bar.refreshCls}`);
+      if (bar.clear) bad('the "Clear" button is still on the station');
+      // One cyan button at most on the station, in every state it is checked in.
+      const primaries = (label) => jsJSON(`JSON.stringify(Array.from(document.querySelectorAll('#view-worklist .btn.primary'))
+        .filter((b) => __smoke.vis(b)).map((b) => b.textContent.trim()))`).then((names) => {
+        if (names.length > 1) bad(`the station shows ${names.length} primary buttons (${label}): ${JSON.stringify(names)}`);
+        return names;
+      });
+
       // --- the query ---------------------------------------------------
       await js(`document.querySelector('#mwl-run').click(); true`);
       await mustWait("!document.querySelector('#mwl-status').className.includes('running')",
         RUN_MS, 'the worklist query to answer');
       const list = await jsJSON(`JSON.stringify({
         status: document.querySelector('#mwl-status').textContent,
+        refresh: document.querySelector('#mwl-run').textContent.replace(/\\s+/g, ' ').trim(),
         cmd: document.querySelector('#mwl-cmd').textContent,
         rows: Array.from(document.querySelectorAll('#mwl-table tr.pick-row')).map((tr) => tr.dataset.key),
         columns: Array.from(document.querySelectorAll('#mwl-table thead th')).map((t) => t.textContent),
         cells: Array.from(document.querySelectorAll('#mwl-table tbody tr')).map(
           (tr) => Array.from(tr.children).map((td) => td.textContent.trim())),
+        panel: !document.querySelector('#mwl-detail').hidden,
       })`);
       record(`worklist: ${list.rows.length} rows — ${list.cmd}`);
       list.cells.forEach((c) => say(`  row: ${JSON.stringify(c)}`));
@@ -1922,6 +1962,19 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       if (list.columns.includes('This app')) bad('the old "This app" column is still in the table');
       if (!list.columns.includes('Status')) bad(`the status column is gone: ${JSON.stringify(list.columns)}`);
+      // Status before the IDs, so a narrow window scrolls the IDs away and
+      // never the column that says DISCONTINUED; no decorative pick column;
+      // no Modality column while the filter already names it.
+      const wantCols = ['Scheduled', 'Patient', 'Procedure', 'Status', 'Accession', 'Patient ID'];
+      if (JSON.stringify(list.columns) !== JSON.stringify(wantCols)) {
+        bad(`the station's columns are not ${wantCols.join(' · ')}: ${JSON.stringify(list.columns)}`);
+      }
+      if (!/^\d{2}:\d{2}$/.test(list.status) || !list.refresh.includes(list.status)) {
+        bad(`Refresh does not carry the time of the read: ${JSON.stringify(list)}`);
+      }
+      // Nothing picked: no panel, rather than an empty box under the list.
+      if (list.panel) bad('the patient panel is on screen with nobody picked');
+      await primaries('the list');
 
       // A RIS that does not answer is not an empty worklist.
       //
@@ -1945,6 +1998,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
         list: document.querySelector('#mwl-results').textContent,
         rows: document.querySelectorAll('#mwl-table tr.pick-row').length,
         error: state.mwl.error,
+        stale: !!document.querySelector('#mwl-results .table-scroll.stale'),
+        blocks: document.querySelectorAll('#mwl-results > .folder-check, #mwl-results > .empty-note').length,
+        said: (document.querySelector('#mwl-results .list-error .engine-said') || {}).textContent || '',
+        failedBtn: document.querySelector('#mwl-run').classList.contains('failed'),
       })`);
       record(`worklist, RIS down: chip "${down.status}" (${down.cls.replace('status-chip ', '')}), `
         + `list says "${down.list.slice(0, 90).replace(/\s+/g, ' ')}"`);
@@ -1958,9 +2015,14 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/could not be read/.test(down.list) || !down.error) {
         bad(`the failure is not said where the list is: ${JSON.stringify(down)}`);
       }
-      if (down.rows !== rows.length || !/last list that was read/.test(down.list)) {
-        bad(`the rows left on screen are not labelled as the previous answer: ${JSON.stringify(down)}`);
+      // The rows stay, dimmed, and the one red block names the time of the
+      // list they came from — not a second block saying the same thing.
+      if (down.rows !== rows.length || !/Showing the list from \d{2}:\d{2}\./.test(down.list) || !down.stale) {
+        bad(`the rows left on screen are not marked as the previous answer: ${JSON.stringify(down)}`);
       }
+      if (down.blocks !== 1) bad(`a RIS that is down is said in ${down.blocks} blocks, not one: ${JSON.stringify(down)}`);
+      if (!down.said || !down.said.trim()) bad(`the engine's own words are not under the red line: ${JSON.stringify(down)}`);
+      if (!down.failedBtn) bad('Refresh does not turn red for a read that failed');
       // The failure's own words in the Output are red too, like the chip and
       // the line where the list is. A captured run writes them after it has
       // exited, so they are never drawn as dim narration.
@@ -1984,11 +2046,53 @@ async function runSmoke(win, app, mainHelpers = {}) {
         cls: document.querySelector('#mwl-status').className,
         list: document.querySelector('#mwl-results').textContent,
         error: state.mwl.error,
+        stale: !!document.querySelector('#mwl-results .table-scroll.stale'),
+        failedBtn: document.querySelector('#mwl-run').classList.contains('failed'),
       })`);
-      if (!recovered.cls.includes('ok') || recovered.error || /could not be read/.test(recovered.list)) {
+      if (!recovered.cls.includes('ok') || recovered.error || /could not be read/.test(recovered.list)
+        || recovered.stale || recovered.failedBtn) {
         bad(`a good read did not clear the failure: ${JSON.stringify(recovered)}`);
       }
       say('worklist: a RIS that is not there reads as Failed and says so where the list is');
+
+      // No RIS at all is not an empty worklist either, and not a stale green
+      // clock: the list says what is missing and links to where it is set.
+      await js(`(async () => {
+        delete state.peerChoice.worklist;
+        setPeerRole(${JSON.stringify(RIS_PEER)}, '');
+        await window.dcm.profiles.set({ profiles: state.profiles });
+        afterPeersChanged();
+      })(); true`);
+      await mustWait('!connLabel(state.conn)', 8000, 'the RIS chip to empty');
+      await js(`document.querySelector('#mwl-run').click(); true`);
+      await mustWait('state.mwl.noRis', 8000, 'the station to notice it has no RIS');
+      const noRis = await jsJSON(`JSON.stringify({
+        list: document.querySelector('#mwl-results').textContent.replace(/\\s+/g, ' ').trim(),
+        link: !!document.querySelector('#mwl-results .linklike[data-goto="settings"]'),
+        label: document.querySelector('#mwl-status').textContent,
+        cls: document.querySelector('#mwl-status').className,
+      })`);
+      record(`worklist, no RIS: "${noRis.list.slice(0, 60)}"`);
+      await shot('wl-1c-no-ris');
+      if (!/No RIS set — add it in Settings\./.test(noRis.list) || !noRis.link) {
+        bad(`a station with no RIS does not say so where the list is: ${JSON.stringify(noRis)}`);
+      }
+      if (noRis.label !== 'Refresh' || /ok|fail|running/.test(noRis.cls)) {
+        bad(`Refresh still shows the last read's state with no RIS to read from: ${JSON.stringify(noRis)}`);
+      }
+      await js(`(async () => {
+        setPeerRole(${JSON.stringify(RIS_PEER)}, 'ris');
+        await window.dcm.profiles.set({ profiles: state.profiles });
+        afterPeersChanged();
+      })(); true`);
+      await mustWait(`connLabel(state.conn) === ${JSON.stringify(RIS_PEER)}`, 8000, 'the RIS chip to come back again');
+      await js(`document.querySelector('#mwl-run').click(); true`);
+      await mustWait("!document.querySelector('#mwl-status').className.includes('running') && !state.mwl.noRis"
+        + " && document.querySelector('#mwl-status').className.includes('ok')", RUN_MS, 'the worklist to answer after the RIS came back');
+      if (/No RIS set/.test(await js("document.querySelector('#mwl-results').textContent"))) {
+        bad('the "No RIS set" line outlived the RIS coming back');
+      }
+      say('worklist: no RIS peer says so where the list is, with the way to Settings');
 
       // How many rows to ask for is one Settings field, and it lands on the
       // command line like everything else that changes what is sent.
@@ -2209,6 +2313,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad('the folder check never produced a verdict');
       };
 
+      // Details left open on the last patient is not this patient's Details:
+      // picking another row folds it again (it re-opens itself only for a row
+      // that is missing a field it holds).
+      await js("document.querySelector('#mpps-adv').open = true; true");
       await selectRowFor('SMITH^ALAN');
       const scanStarted = Date.now();
       await js(`__smoke.set('mpps-folder', ${JSON.stringify(fixtures)}); true`);
@@ -2219,7 +2327,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await wait(200);
       await shot('wl-3-row-selected');
       const panel = await jsJSON(`JSON.stringify({
-        open: !document.querySelector('#mwl-detail-body').hidden,
+        open: !document.querySelector('#mwl-detail').hidden,
+        uidHidden: document.querySelector('#mpps-hero-uid').hidden,
+        advOpen: document.querySelector('#mpps-adv').open,
         mode: panelMode(),
         hero: document.querySelector('#mpps-hero-main').textContent,
         sub: document.querySelector('#mpps-hero-sub').textContent,
@@ -2240,6 +2350,18 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/matches this row/.test(panel.folderLine) || !/ARCHIVE/.test(panel.folderLine)) {
         bad(`the folder line does not say the study matches and where it goes: ${panel.folderLine}`);
       }
+      if (!/^10 images /.test(panel.folderLine)) bad(`the folder line does not count images: ${panel.folderLine}`);
+      // The banner is the patient: ID, sex, birth date. The row's step, its
+      // requested procedure and its station are bookkeeping, kept in Details;
+      // the study UID element is kept, hidden, and still holds the UID.
+      if (!panel.sub.includes('P-2002') || /SPS-2|RP-6|station/.test(panel.sub)) {
+        bad(`the banner carries more than the patient: ${panel.sub}`);
+      }
+      if (!panel.uidHidden || !panel.uid.includes(FIX_STUDY)) {
+        bad(`the banner's study UID is on screen, or gone from the page: ${JSON.stringify(panel)}`);
+      }
+      if (panel.advOpen) bad('Details stayed open from the patient before');
+      await primaries('a patient picked');
       if (!panel.folderCls.includes('ok')) bad(`a matching folder is not styled as OK: ${panel.folderCls}`);
       if (!cmdNames(panel.cmd, fixtures)) bad(`the perform command does not name the folder: ${panel.cmd}`);
       for (const needed of ['mpps perform', '--study-uid ' + FIX_STUDY,
@@ -2419,6 +2541,40 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       if (!/COMPLETED 10\/10/.test(performed.pill)) bad(`the row pill does not carry the result: "${performed.pill}"`);
       if (performed.steps !== 1) bad(`the session remembers ${performed.steps} steps after one perform`);
+      // Success is said once: the verdict's head carries the count, the four
+      // equal totals fold away (still drawn, so they stay readable), the chip
+      // goes once the run is over, and the Output stays as the pick left it.
+      // The finished exam's button is a quiet "Perform again", with no Start
+      // only beside it: one more press opens a second step and resends.
+      const afterDone = await jsJSON(`JSON.stringify({
+        head: (document.querySelector('#mpps-outcome .outcome-head') || {}).textContent || '',
+        totalsHidden: document.querySelector('#mpps-totals').hidden,
+        chipHidden: document.querySelector('#mpps-status').hidden,
+        chipCls: document.querySelector('#mpps-status').className,
+        outOpen: __smoke.outOpen('mpps'),
+        run: document.querySelector('#mpps-run').textContent,
+        runCls: document.querySelector('#mpps-run').className,
+        runHidden: document.querySelector('#mpps-run').hidden,
+        start: document.querySelector('#mpps-start').hidden,
+        startFold: document.querySelector('#mpps-start-cmd-fold').hidden,
+        fold: document.querySelector('#mpps-cmd-fold').hidden,
+      })`);
+      record(`perform: "${afterDone.head}" — the button now reads "${afterDone.run}"`);
+      if (afterDone.head !== 'Completed — 10 of 10 images acknowledged.') {
+        bad(`the success verdict is not the one short sentence: "${afterDone.head}"`);
+      }
+      if (!afterDone.totalsHidden) bad('four equal totals are still drawn under a success');
+      if (!afterDone.chipHidden || !afterDone.chipCls.includes('ok')) {
+        bad(`the chip outlived the run, or ended in the wrong colour: ${JSON.stringify(afterDone)}`);
+      }
+      if (afterDone.outOpen) bad('a perform that worked unfolded the Output over the patient');
+      if (afterDone.runHidden || afterDone.run !== 'Perform again' || /\bprimary\b/.test(afterDone.runCls)
+        || !/\bghost\b/.test(afterDone.runCls)) {
+        bad(`a completed exam still offers a primary "Perform exam": ${JSON.stringify(afterDone)}`);
+      }
+      if (!afterDone.start || !afterDone.startFold) bad(`"Start only" is still offered on a completed exam: ${JSON.stringify(afterDone)}`);
+      if (afterDone.fold) bad('the command "Perform again" would run is not on screen');
+      await primaries('a completed exam');
 
       // --- H2: the mismatch case, with stock fixtures ---------------------
       //
@@ -2472,6 +2628,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await shot('wl-5-mismatch');
       const mismatch = await jsJSON(`JSON.stringify({
         kind: state.mpps.mismatch && state.mpps.mismatch.kind,
+        who: state.mpps.mismatch ? [state.mpps.mismatch.folderName, state.mpps.mismatch.folderId] : null,
         line: document.querySelector('#mpps-folder-check').textContent,
         cls: document.querySelector('#mpps-folder-check').className,
         switchHidden: document.querySelector('#mpps-fix-switch').hidden,
@@ -2485,6 +2642,20 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       if (!/re-stamped copy/.test(mismatch.line) || !/not modified/.test(mismatch.line)) {
         bad(`the folder line does not say what will happen to a different study: ${mismatch.line}`);
+      }
+      // Stock images and another patient's images are the same mismatch to the
+      // engine and not to the person at the console: the line names who the
+      // folder holds, and who it will be sent as.
+      if (mismatch.who && mismatch.who[0]) {
+        const who = `${mismatch.who[0]}${mismatch.who[1] ? ` (${mismatch.who[1]})` : ''}`;
+        if (!mismatch.line.startsWith(`Folder is ${who} — a different study.`)) {
+          bad(`the mismatch line does not name who is in the folder (${who}): ${mismatch.line}`);
+        }
+        if (!/Sent as DOE\^JANE in a re-stamped copy/.test(mismatch.line)) {
+          bad(`the mismatch line does not name who the images are sent as: ${mismatch.line}`);
+        }
+      } else {
+        bad(`the fixtures carry no single patient name, so the named line went untested: ${JSON.stringify(mismatch.who)}`);
       }
       if (!mismatch.cmd.includes('--adopt-worklist-identity')) {
         bad(`the mismatch did not put --adopt-worklist-identity on the command: ${mismatch.cmd}`);
@@ -2767,8 +2938,33 @@ async function runSmoke(win, app, mainHelpers = {}) {
         });
       })()`);
 
-      // ---- 1. a folder holding two studies.
+      // ---- 0. no folder at all, and Perform pressed anyway. Nothing can be
+      // sent, so the press asks for the images: the picker Browse… opens, the
+      // path announced the same way, the folder read before the verb is live
+      // again — and no run started.
       await selectRowFor('DOE^JANE');
+      pickAnswer = pickNone;
+      const emptyPress = await jsJSON(`(async () => {
+        const field = document.querySelector('#mpps-folder');
+        const before = field.value;
+        document.querySelector('#mpps-run').click();
+        for (let i = 0; i < 600 && field.value === before; i++) await new Promise((r) => setTimeout(r, 5));
+        return JSON.stringify({ before, value: field.value,
+          reading: !!(state.mpps.scan && state.mpps.scan.reading),
+          dead: document.querySelector('#mpps-run').disabled, ran: !!state.activeRuns.mpps });
+      })()`);
+      if (emptyPress.before !== '') bad(`the empty-box press did not start from an empty box: ${JSON.stringify(emptyPress)}`);
+      if (emptyPress.value !== slashes(pickNone) && emptyPress.value !== pickNone) {
+        bad(`Perform over an empty Images box did not open the picker: ${JSON.stringify(emptyPress)}`);
+      }
+      if (!emptyPress.reading || !emptyPress.dead || emptyPress.ran) {
+        bad(`a folder picked from Perform was not read before anything ran: ${JSON.stringify(emptyPress)}`);
+      }
+      record('station: Perform over an empty Images box opens the picker, and nothing runs');
+      await js(`__smoke.set('mpps-folder', ''); true`);
+      await wait(600);
+
+      // ---- 1. a folder holding two studies.
       const twoAt = await pressPicker('mpps-folder', pickTwo, AT_PRESS);
       if (twoAt.lineHidden || !twoAt.reading) {
         bad(`Browse… changed the folder without the screen disowning the old verdict: ${JSON.stringify(twoAt)}`);
@@ -2920,7 +3116,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       record('station: blurring the folder field over an unchanged path reads nothing again');
 
-      await js(`(() => { clearSelection(); return true; })()`);
+      // Esc drops the patient — there is no Clear button beside the verbs any
+      // more — and with nobody picked there is no panel.
+      const escaped = await jsJSON(`(() => {
+        const tr = document.querySelector('#mwl-table tr.row-selected');
+        if (tr) tr.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        return JSON.stringify({ had: !!tr, selected: !!state.mwl.selected,
+          panel: !document.querySelector('#mwl-detail').hidden });
+      })()`);
+      if (!escaped.had || escaped.selected || escaped.panel) {
+        bad(`Esc did not drop the selected patient: ${JSON.stringify(escaped)}`);
+      }
 
       // --- H3: start only, then add images and complete -------------------
       // This row names the study the fixtures carry, which is the only case in
@@ -2945,9 +3151,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
         openHidden: document.querySelector('#mwl-open-chip').hidden,
         closeLabel: document.querySelector('#steps-close-run').textContent,
         closeCmd: document.querySelector('#steps-close-cmd').textContent,
-        note: document.querySelector('#mpps-hero-note').textContent,
+        note: document.querySelector('#mpps-hero-note').textContent.replace(/\\s+/g, ' ').trim(),
+        outcomeHidden: document.querySelector('#mpps-outcome').hidden,
+        chipHidden: document.querySelector('#mpps-status').hidden,
+        chipCls: document.querySelector('#mpps-status').className,
       })`);
-      record(`start only: ${started.status}; the chip says "${started.openChip}"`);
+      record(`start only: ${started.status}; the chip says "${started.openChip}"; the banner says "${started.note}"`);
       say(`close preview:\n${started.closeCmd}`);
       artefact('steps-close-cmd.txt', started.closeCmd);
       await shot('wl-7-in-progress');
@@ -2955,6 +3164,39 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (started.mode !== 'close') bad('an open step did not put the panel into closing mode');
       if (started.openHidden || !/Open steps: 1/.test(started.openChip)) {
         bad(`the open-steps chip does not count the step: ${JSON.stringify(started)}`);
+      }
+      // An open step is said once, in the banner, in amber: since when, and
+      // that quitting loses it. No green chip, and no box below the buttons
+      // pointing back up at them. The peer is named only when it is not the
+      // RIS on the chip, and here it is.
+      if (!/^IN PROGRESS since \d{2}:\d{2} · lost if this app quits$/.test(started.note)) {
+        bad(`the banner does not say the step is open and only held here: "${started.note}"`);
+      }
+      if (!started.outcomeHidden) bad(`a start that worked drew a verdict box: ${started.outcome}`);
+      if (!started.chipHidden || !started.chipCls.includes('warn')) {
+        bad(`an open step left a chip on screen, or not an amber one: ${JSON.stringify(started)}`);
+      }
+      await primaries('a step open');
+      // The quit guard: main holds the count the window reports, so closing
+      // the window can ask first, and it names where the step is open.
+      await waitMain(() => (mainHelpers.openSteps ? mainHelpers.openSteps().count >= 1 : false), 8000,
+        'the window to report its open step to main');
+      const guard = mainHelpers.quitGuardMessage ? mainHelpers.quitGuardMessage() : '';
+      record(`quit guard: main holds ${mainHelpers.openSteps().count} open step(s) — "${guard}"`);
+      if (!/^A step is still open on RISMPPS\. Quitting forgets it\.$/.test(guard || '')) {
+        bad(`closing the window would not ask first, or asks the wrong thing: ${JSON.stringify(guard)}`);
+      }
+      // An update restart forgets the step too, so its button waits.
+      const restartOpen = await jsJSON(`(() => {
+        const was = lastUpdateState;
+        renderUpdateState({ status: 'ready', version: '9.9.9' });
+        const out = { disabled: document.querySelector('#update-action').disabled,
+          note: document.querySelector('#update-note').hidden ? '' : document.querySelector('#update-note').textContent };
+        renderUpdateState(was || { status: 'idle' });
+        return JSON.stringify(out);
+      })()`);
+      if (!restartOpen.disabled || !/open step is closed/.test(restartOpen.note)) {
+        bad(`"Restart & update" is live while a step is open: ${JSON.stringify(restartOpen)}`);
       }
       if (started.closeLabel !== 'Add images & complete') {
         bad(`a step opened with no images does not offer to add them: "${started.closeLabel}"`);
@@ -2991,6 +3233,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         pill: (document.querySelector('#mwl-table tr.row-selected td.session-cell') || {}).textContent || '',
         openHidden: document.querySelector('#mwl-open-chip').hidden,
         mode: panelMode(),
+        chipHidden: document.querySelector('#steps-status').hidden,
+        chipCls: document.querySelector('#steps-status').className,
       })`);
       record(`add images & complete: ${completed.status} — ${completed.outcome.replace(/\s+/g, ' ').trim()}`);
       await shot('wl-8-completed');
@@ -2999,6 +3243,23 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/COMPLETED/.test(completed.pill)) bad(`the row pill did not follow the close: "${completed.pill}"`);
       if (!completed.openHidden) bad('the open-steps chip still counts a step that was closed');
       if (completed.mode !== 'perform') bad('a closed step still offers a way to close it again');
+      if (!completed.chipHidden || !completed.chipCls.includes('ok')) {
+        bad(`the close left its chip on screen, or ended it in the wrong colour: ${JSON.stringify(completed)}`);
+      }
+      // Closed: nothing left to guard, and the restart button is live again.
+      await waitMain(() => mainHelpers.openSteps().count === 0, 8000, 'the window to report the step closed');
+      if (mainHelpers.quitGuardMessage() !== null) bad('closing the window would still ask with no step open');
+      const restartClosed = await jsJSON(`(() => {
+        const was = lastUpdateState;
+        renderUpdateState({ status: 'ready', version: '9.9.9' });
+        const out = { disabled: document.querySelector('#update-action').disabled,
+          note: document.querySelector('#update-note').hidden ? '' : document.querySelector('#update-note').textContent };
+        renderUpdateState(was || { status: 'idle' });
+        return JSON.stringify(out);
+      })()`);
+      if (restartClosed.disabled || restartClosed.note) {
+        bad(`"Restart & update" stayed dead after the step closed: ${JSON.stringify(restartClosed)}`);
+      }
 
       // --- H4: start only, then discontinue -------------------------------
       await selectRowFor('PARK^SOO');
@@ -3070,6 +3331,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
           cmd: document.querySelector('#steps-close-cmd').textContent,
           picked,
           label: document.querySelector('#steps-discontinue-run').textContent,
+          imagesHidden: document.querySelector('#view-worklist .images-row').hidden,
+          lineHidden: document.querySelector('#mpps-folder-check').hidden,
+          outcomeHidden: document.querySelector('#mpps-outcome').hidden,
         });
       })()`);
       say(`discontinue: ${armed.cmd}`);
@@ -3077,6 +3341,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
         + `— "${armed.reasons[1]}" put ${/--reason-code (".*?"|\S+)/.exec(armed.picked)?.[1] || '(nothing)'} on the command`);
       await shot('wl-9-discontinue-armed');
       if (armed.rowHidden) bad('Discontinue did not ask for a reason');
+      // While it waits for its reason the folder has no part in it.
+      if (!armed.imagesHidden || !armed.lineHidden || !armed.outcomeHidden) {
+        bad(`the Images box, its line or an old verdict stayed beside an armed Discontinue: ${JSON.stringify(armed)}`);
+      }
       if (armed.reasons[0] !== 'No reason given' || armed.reasons.length < 8) {
         bad(`the standard reasons are not offered: ${JSON.stringify(armed.reasons)}`);
       }
@@ -3102,6 +3370,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         outcome: document.querySelector('#mpps-outcome').textContent,
         pill: (document.querySelector('#mwl-table tr.row-selected td.session-cell') || {}).textContent || '',
         open: document.querySelector('#mwl-open-chip').hidden,
+        chipHidden: document.querySelector('#steps-status').hidden,
+        chipCls: document.querySelector('#steps-status').className,
+        imagesBack: !document.querySelector('#view-worklist .images-row').hidden,
       })`);
       record(`discontinue: ${discontinued.status} — ${discontinued.outcome.replace(/\s+/g, ' ').trim()}`);
       await shot('wl-10-discontinued');
@@ -3110,6 +3381,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!discontinued.cls.includes('bad')) bad(`DISCONTINUED is not styled as a failure: ${discontinued.cls}`);
       if (!/DISCONTINUED/.test(discontinued.pill)) bad(`the row pill does not carry it: "${discontinued.pill}"`);
       if (!discontinued.open) bad('a discontinued step is still counted as open');
+      // The chip this used to leave was green. It goes, and what it held is red.
+      if (!discontinued.chipHidden || !discontinued.chipCls.includes('fail')) {
+        bad(`DISCONTINUED left a chip on screen, or not a red one: ${JSON.stringify(discontinued)}`);
+      }
+      if (!discontinued.imagesBack) bad('the Images box did not come back once the Discontinue was done');
+      await waitMain(() => mainHelpers.openSteps().count === 0, 8000, 'the window to report the step discontinued');
 
       // Nothing on this screen may name a file the app wrote: there is no
       // records directory, and the session list lives in this window only.
@@ -3139,6 +3416,23 @@ async function runSmoke(win, app, mainHelpers = {}) {
       record(`worklist re-queried: the SCP now returns ${after.matches} of ${rows.length} rows `
         + `(a completed step leaves the worklist); ${after.rows} on screen`);
       await shot('wl-11-requeried');
+      // The selected row's step was closed from here. If the RIS has dropped
+      // it since, that is the ordinary thing after a close, not a fault: no
+      // amber note — but Perform stays dead, and says why on the button.
+      const leftAfterClose = await jsJSON(`JSON.stringify({
+        detached: state.mwl.detached || false,
+        step: (stepFor(selectedWorklistItem()) || {}).status || '',
+        note: !document.querySelector('#mwl-detached-note').hidden,
+        dead: document.querySelector('#mpps-run').disabled,
+        why: document.querySelector('#mpps-run').title || '',
+      })`);
+      record(`worklist re-queried: the selected row is ${leftAfterClose.detached || 'still listed'} (${leftAfterClose.step})`);
+      if (leftAfterClose.detached === 'gone') {
+        if (leftAfterClose.note) bad(`a row this window closed raised the "no longer lists" alarm: ${JSON.stringify(leftAfterClose)}`);
+        if (!leftAfterClose.dead || !/not in the list/.test(leftAfterClose.why)) {
+          bad(`Perform went live for a row the list no longer holds: ${JSON.stringify(leftAfterClose)}`);
+        }
+      }
 
       // -----------------------------------------------------------------
       // The three reports a live run against a cooperative receiver cannot
@@ -3241,6 +3535,40 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       record('reports: an N-SET failure is read off stderr and stays open, an N-CREATE failure is '
         + 'remembered nowhere, and a shortfall reads as DISCONTINUED with its counts');
+
+      // The Output is one pane for the whole station, and it is holding the
+      // last close's report. A list read that fails — the timer's, or this
+      // press of Refresh — says so where the list is and on Refresh, and
+      // leaves that report exactly as it was.
+      const examText = await js("__smoke.consoleText('mpps')");
+      if (!examText.trim()) bad('the Output holds no exam report, so the check below would prove nothing');
+      const deadPort2 = await freePort();
+      const DEAD_PEER2 = `NOBODY @ 127.0.0.1:${deadPort2}`;
+      await addPeer('127.0.0.1', deadPort2, 'NOBODY', 'ris');
+      await mustWait(`connLabel(state.conn) === ${JSON.stringify(DEAD_PEER2)}`, 8000, 'the RIS chip to move to a dead peer');
+      await js(`document.querySelector('#mwl-run').click(); true`);
+      await mustWait("!document.querySelector('#mwl-status').className.includes('running')",
+        RUN_MS, 'the read against a dead RIS to come back');
+      const kept = await jsJSON(`JSON.stringify({
+        text: __smoke.consoleText('mpps'),
+        cls: document.querySelector('#mwl-status').className,
+        list: document.querySelector('#mwl-results').textContent,
+      })`);
+      if (!kept.cls.includes('fail') || !/could not be read/.test(kept.list)) {
+        bad(`the dead RIS did not read as a failure: ${JSON.stringify({ cls: kept.cls, list: kept.list.slice(0, 200) })}`);
+      }
+      if (kept.text !== examText) bad('a list read that failed wiped the exam report out of the Output');
+      record('station: a failed list read leaves the last exam\'s report in the Output untouched');
+      await js(`(async () => {
+        await deletePeer(${JSON.stringify(DEAD_PEER2)});
+        setPeerRole(${JSON.stringify(RIS_PEER)}, 'ris');
+        await window.dcm.profiles.set({ profiles: state.profiles });
+        afterPeersChanged();
+      })(); true`);
+      await mustWait(`connLabel(state.conn) === ${JSON.stringify(RIS_PEER)}`, 8000, 'the RIS chip to come back after the dead peer');
+      await js(`document.querySelector('#mwl-run').click(); true`);
+      await mustWait("document.querySelector('#mwl-status').className.includes('ok')", RUN_MS,
+        'the worklist to answer from the real RIS again');
     }
 
     // =====================================================================

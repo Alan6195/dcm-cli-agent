@@ -485,14 +485,8 @@ td.when { color: var(--accent); font-family: var(--mono); white-space: nowrap; }
  * only a fresh query is allowed to change what this table says. */
 tr.pick-row { cursor: pointer; }
 tr.pick-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-tr.pick-row td.pick-cell, th.pick-cell { width: 26px; padding-right: 0; }
-.pick-dot {
-  display: inline-block; width: 12px; height: 12px; border-radius: 50%;
-  border: 1px solid var(--border-2); background: transparent; vertical-align: -1px;
-}
 tr.row-selected td { background: var(--accent-soft); }
 tr.row-selected:hover td { background: var(--accent-soft); }
-tr.row-selected .pick-dot { border-color: var(--accent); box-shadow: inset 0 0 0 3px var(--accent); }
 
 /* ---------------- Selected-step panel + attribute grid ---------------- */
 .pick-panel {
@@ -854,7 +848,8 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
   overflow-x: auto;
   border-bottom: 1px solid var(--border);
 }
-#mwl-table { table-layout: fixed; width: 100%; min-width: 820px; }
+#mwl-table { table-layout: fixed; width: 100%; min-width: 720px; }
+#mwl-table.with-modality { min-width: 784px; }
 #mwl-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* border-bottom vanishes under border-collapse on a sticky cell, so the rule
  * under the header is drawn as an inset shadow instead. */
@@ -880,10 +875,12 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
  * pick; the session badge in the last column is a fact about what this app
  * sent. Nothing here is ever derived from what the SCP might now think. */
 #mwl-table tr.pick-row:hover td { background: rgba(255, 255, 255, 0.045); }
-#mwl-table tr.pick-row:hover .pick-dot { border-color: var(--text-dim); }
 #mwl-table tr.row-selected td { background: var(--accent-soft); color: var(--text); }
 #mwl-table tr.row-selected:hover td { background: var(--accent-soft); }
-#mwl-table tr.row-selected td.pick-cell { box-shadow: inset 3px 0 0 var(--accent); }
+/* The selected row's edge: the same accent the patient panel wears. */
+#mwl-table tr.row-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+/* Rows left over from a read that failed: still selectable, visibly not this answer. */
+.table-scroll.stale tbody { opacity: 0.55; }
 tr.pick-row { scroll-margin-block: 28px; }
 
 /* ---------------- Session badge ----------------
@@ -908,13 +905,12 @@ tr.pick-row { scroll-margin-block: 28px; }
 .pill.session.open::before { animation: pulse 1s infinite; }
 
 /* ---------------- The action panel ----------------
- * The panel wears the same accent edge as the selected row's pick cell, so the
- * row and the panel read as one object. */
+ * The panel wears the same accent edge as the selected row, so the row and
+ * the panel read as one object. It is only on screen while a row is picked. */
 #mwl-detail {
   border-color: var(--border-2);
-  border-left: 3px solid var(--border);
+  border-left: 3px solid var(--accent);
 }
-#mwl-detail.open { border-left-color: var(--accent); }
 .empty-note.dense { padding: 6px 0; }
 .step-hero.compact { padding: 10px 12px 2px; margin-bottom: 10px; }
 .step-hero.compact .hero-uid { margin: 4px 0 10px; }
@@ -971,7 +967,6 @@ tr.pick-row { scroll-margin-block: 28px; }
 #view-worklist th { padding: 5px 10px; font-size: 10px; letter-spacing: 0.5px; }
 #view-worklist td { padding: 5px 10px; line-height: 1.35; }
 #view-worklist td .pill { padding: 1px 8px; font-size: 10.5px; line-height: 15px; margin: 0; }
-#view-worklist .pick-dot { width: 10px; height: 10px; }
 #view-worklist td.uid-cell { max-width: none; font-size: 11px; }
 #view-worklist .cmd-preview { padding: 8px 12px; margin-bottom: 10px; line-height: 1.45; }
 #view-worklist .actions { margin: 0 0 10px; gap: 10px; }
@@ -1184,8 +1179,6 @@ select {
 .station-bar .conn-host { margin: 0; }
 .station-bar .chip-row { margin: 0; }
 .station-bar .chip-row.seg .chip { padding: 6px 12px; }
-.modality-edit { display: inline-flex; align-items: center; }
-.chip-input.narrow { width: 110px; }
 .search { position: relative; flex: 1; min-width: 260px; }
 .search input { width: 100%; padding-right: 118px; }
 /* The key the text will be sent as. Pinned once clicked; otherwise the box's own guess. */
@@ -1195,7 +1188,10 @@ select {
   border-radius: 12px; padding: 2px 8px; font-size: 10.5px; font-family: var(--mono); cursor: pointer;
 }
 .search-key:hover, .search-key.pinned { color: var(--accent); border-color: var(--accent); }
-.auto-toggle { flex-direction: row; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); cursor: pointer; }
+/* Refresh carries the last read: its time, "Fetching…", or "Failed" in red. */
+.refresh-btn { font-variant-numeric: tabular-nums; transition: none; }
+.refresh-btn .refresh-state.running { color: var(--accent); }
+#mwl-run.failed { color: var(--red); border-color: var(--red); }
 .open-chip { color: var(--amber); border-color: var(--amber); }
 .open-chip.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 
@@ -1278,9 +1274,8 @@ select {
 .checks.compact label { font-size: 12.5px; color: var(--text-dim); }
 .checks.compact code { font-size: 11px; color: var(--accent); }
 
-/* The verbs. Clear sits at the far end so the primary is always first. */
+/* The verbs: the primary first. */
 #mwl-verbs { margin-bottom: 8px; }
-#mwl-verbs .clear-sel { margin-left: auto; }
 .reason-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
 .reason-row input { flex: 1; }
 #view-worklist .cmd-fold { margin-bottom: 8px; }
@@ -1291,9 +1286,14 @@ select {
  * AE, and the reason an exam was stopped.
  * ========================================================================== */
 
-/* A worklist that could not be read says so where the list would be, and any
- * rows still on screen are labelled as the previous answer. */
+/* A worklist that could not be read says so where the list would be, once:
+ * what happened and which list is still showing, then the engine's own words,
+ * small. The rows under it are dimmed (.table-scroll.stale). */
 .list-error { margin: 0 0 10px; }
+.list-error .engine-said {
+  font-family: var(--mono); font-size: 11px; line-height: 1.45; color: var(--text-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; user-select: text;
+}
 .result-table .empty-note.dense { margin: 0 0 10px; }
 
 /* Five fields on the peer form now: the calling AE override is the fifth. */
