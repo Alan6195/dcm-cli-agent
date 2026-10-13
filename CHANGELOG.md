@@ -1,6 +1,6 @@
 # Changelog
 
-## vX.Y.Z — UNRELEASED (replace this heading with the real version before tagging)
+## v0.17.0
 
 The DIMSE side could ask a peer what it held and never pull it back. Now it
 can, and it does not take the peer's word for what arrived.
@@ -13,10 +13,11 @@ firewall hole, no second port. `--series` and `--instance` narrow it. Files land
 at `<out>/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm`, the
 layout `dcm scp --persist` and `dcm web retrieve` already produce, so however a
 study arrived `dcm info` counts it the same way. The cost is that the peer has
-to implement C-GET and many archives do not — one that does not is reported as
-`0x0122 SOP Class not supported`, not as an empty retrieve, which is the
-difference between knowing to reach for `move` and concluding the study is not
-there.
+to implement C-GET and many archives do not. One that does not is reported as
+what it is — `0x0122 SOP Class not supported`, or the `0x0110` an archive
+answers when it negotiated the context with nothing behind it — and pointed at
+`dcm move`, never as an empty retrieve, which is the difference between knowing
+to reach for `move` and concluding the study is not there.
 
 **`dcm move` — and the reason most C-MOVEs fail.** A C-MOVE carries no address.
 It carries a destination AE *Title*, and the PEER must already resolve it, so
@@ -51,6 +52,43 @@ because a receiver claiming success for a retrieve it served nothing from would
 be a lie told by this end. And `--retrieve-overcount <n>` reports n *more*
 completed sub-operations than were really sent: the deliberate lie that proves a
 retrieve client notices the gap instead of believing the claim.
+
+**The Query screen retrieves.** Every study and series row has a Retrieve
+button that runs `dcm get` for that row into a folder picked once. The verdict
+comes from the engine's exit code, never from numbers read out of its report:
+"Retrieved 10 of 10 images", or in red, "Incomplete — 2 of 12 images are
+missing", or in amber when the archive gave no count to check against. Worklist
+rows get no button, because there is no study behind a scheduled step. C-MOVE
+is left to the command line: it needs an AE Title the archive already knows,
+which is configuration, not a choice to make standing at the console.
+
+**A quieter app that never reads a failure as success.** The fourth pass at
+less — and this time a five-way review found that the worst of it was not the
+words but the states. Fixed: an archive that was down read as "0 matches"; an
+HTTP 401 from a DICOMweb server read as a green Done; Speed test sent the study
+to the real archive under the banner saying "Rehearsal — nothing is sent"; a
+finished exam still offered Perform exam as the one button, and one press
+resent the study; green IN PROGRESS and DISCONTINUED chips sat beside red
+verdicts; dry runs ended "Done". And then the words: every screen opens on its
+title and its fields, with no sentence of protocol first; buttons say Search,
+Send, Show tags, Test connection; refusals sit in the chip beside the button
+instead of in a fold; Settings is a set-once form with Rehearsal at the top.
+Words above the primary button, before and after: Worklist 44 to 31, Query 21
+to 9, Settings 241 to 84, Connect to Claude 117 to 39. The station shows "CT
+only" when its list is filtered, so a patient outside the filter is never read
+as missing. Quitting with an open procedure step asks first. The smoke harness
+holds every screen to those numbers; they only go down.
+
+**Connect to Claude says what is true.** The old "Ready" line never checked
+anything, so it is gone, and the screen now looks for the `dcm` Claude would
+actually start — on this app's PATH, on the PATH a newly started program would
+get (a terminal's on macOS, the registry's on Windows after an install this app
+started too early to see), or only in the installer's folder. It runs it and
+says which version it is, and when that is older than this app it says so,
+with the one command that fixes it: Claude calls the dcm on PATH, not this
+app's engine, and an old one has no retrieve. The Claude Desktop config names
+the full path whenever one is known, because Desktop opened from the Dock has
+the same short PATH this app does.
 
 Also: `dcm_get` and `dcm_move` are drivable over MCP, with the 0xA801 rule and
 the shortfall rule written into the tool descriptions so an assistant reports a
