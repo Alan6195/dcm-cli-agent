@@ -343,11 +343,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
   font-size: 11.5px;
   line-height: 1.45;
 }
-/* Standard error is where the engine narrates — progress, warnings, retries —
- * so it reads dim. Red (.loud) is for a line that says something failed, for
- * all of what a run that exited non-zero wrote, and for the app's own words
- * about a failure or a refusal (see appendConsole). */
+/* Standard error is where the engine narrates — progress, retries — so it
+ * reads dim. Amber (.warn) is a line the engine calls a warning. Red (.loud) is
+ * for a line that says something failed or was refused, rejected or aborted,
+ * for all of what a run that exited non-zero wrote, and for the app's own
+ * words about a failure or a refusal (see appendConsole). */
 .console .err { color: var(--text-dim); }
+.console .err.warn { color: var(--amber); }
 .console .err.loud { color: var(--red); }
 .console .ok { color: var(--green); }
 .console .warn { color: var(--amber); }
@@ -819,6 +821,9 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
   line-height: 1.6;
 }
 .local-note b { color: var(--amber); }
+/* A note about instances that were lost reads in the colour of the rows it explains. */
+.local-note.bad { border-left-color: var(--red); }
+.local-note.bad b { color: var(--red); }
 .pill.ok { color: var(--green); background: var(--green-soft); }
 .pill.warn { color: var(--amber); background: var(--amber-soft); }
 .pill.bad { color: var(--red); background: var(--red-soft); }

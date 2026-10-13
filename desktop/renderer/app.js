@@ -1183,9 +1183,9 @@ function appendConsole(view, text, stream, dropped, run = 0) {
   const narration = stream === 'narration';
   const err = narration || stream === 'stderr';
   for (const piece of splitConsoleText(stripAnsi(text), CONSOLE_PIECE_LINES)) {
-    const parts = narration ? loudRuns(piece) : [{ ...piece, loud: err }];
+    const parts = narration ? loudRuns(piece) : [{ ...piece, tone: err ? 'loud' : '' }];
     for (const part of parts) {
-      s.pending.push({ text: part.text, lines: part.lines, err, loud: part.loud, run });
+      s.pending.push({ text: part.text, lines: part.lines, err, tone: part.tone, run });
       s.pendingLines += part.lines;
     }
   }
@@ -1203,30 +1203,50 @@ function appendConsole(view, text, stream, dropped, run = 0) {
 }
 
 /**
- * A line of standard error that says something failed.
+ * How loud a line of standard error is.
  *
- * Standard error is where the engine narrates — progress, warnings, retries —
- * so it is drawn dim. Red is kept for a line that says something went wrong,
- * and for everything a run that exited non-zero wrote (see markRunFailed).
+ * Standard error is where the engine narrates — progress, retries — so plain
+ * narration is drawn dim. Anything the engine itself calls a warning is amber,
+ * and so is its "Nothing here confirms…" caveat (written as plain info, and
+ * the one line that says a 0 exit did not prove the study complete). Red is
+ * for a line that says something went wrong: an error, or a warning that
+ * something was refused, rejected, aborted or failed. The engine writes every
+ * refusal and rejection with log.warn, so the "warning " prefix is looked past
+ * — a receiver turning a sender away must never look like "<- C-STORE #12".
+ * Everything a run that exited non-zero wrote turns red too (markRunFailed).
  */
-const LOUD_LINE = /^(ERR|error|refused|failed)/i;
-const LOUD_ANYWHERE = /^(ERR|error|refused|failed)/im;
+const LOUD_LINE = /^(?:warning\s+)?(?:->\s*)?(?:ERR|error|refus|reject|fail|abort)|^warning\b.*\b(?:refus|reject|abort|fail)(?:ed|ing)\b/i;
+const CAUTION_LINE = /^(?:warning\b|Nothing here confirms)/i;
+const MARKED_ANYWHERE = /^(?:warning\b|(?:->\s*)?(?:ERR|error|refus|reject|fail|abort)|Nothing here confirms)/im;
+
+/** 'loud', 'caution' or '' for one line. */
+function lineTone(line) {
+  if (LOUD_LINE.test(line)) return 'loud';
+  return CAUTION_LINE.test(line) ? 'caution' : '';
+}
 
 /**
- * Splits a piece of stderr into runs of consecutive loud and quiet lines. A
- * piece with no loud line in it — nearly all of them, and every line of a
+ * Splits a piece of stderr into runs of consecutive lines of the same tone. A
+ * piece with no marked line in it — nearly all of them, and every line of a
  * flood — is one scan and goes through whole.
  */
 function loudRuns(piece) {
-  if (!LOUD_ANYWHERE.test(piece.text)) return [{ text: piece.text, lines: piece.lines, loud: false }];
+  if (!MARKED_ANYWHERE.test(piece.text)) return [{ text: piece.text, lines: piece.lines, tone: '' }];
   const runs = [];
   for (const line of piece.text.match(/[^\n]*\n|[^\n]+$/g) || []) {
-    const loud = LOUD_LINE.test(line);
+    const tone = lineTone(line);
     const last = runs[runs.length - 1];
-    if (last && last.loud === loud) { last.text += line; last.lines += 1; }
-    else runs.push({ text: line, lines: 1, loud });
+    if (last && last.tone === tone) { last.text += line; last.lines += 1; }
+    else runs.push({ text: line, lines: 1, tone });
   }
   return runs;
+}
+
+/** The console class for a piece of output. */
+function consoleClass(piece) {
+  if (!piece.err) return '';
+  if (piece.tone === 'loud') return 'err loud';
+  return piece.tone === 'caution' ? 'err warn' : 'err';
 }
 
 /**
@@ -1239,9 +1259,11 @@ function markRunFailed(view, run) {
   const c = consoleEl(view);
   const s = c && consoleStates.get(c);
   if (!s) return;
-  for (const piece of s.pending) if (piece.run === run && piece.err) piece.loud = true;
+  for (const piece of s.pending) if (piece.run === run && piece.err) piece.tone = 'loud';
   for (const span of c.children) {
-    if (span.consoleRun === run && span.className === 'err') span.className = 'err loud';
+    if (span.consoleRun === run && (span.className === 'err' || span.className === 'err warn')) {
+      span.className = 'err loud';
+    }
   }
 }
 
@@ -1276,7 +1298,8 @@ function flushConsole(c, painting) {
   let written = 0;
   for (const piece of s.pending) {
     const span = document.createElement('span');
-    if (piece.err) span.className = piece.loud ? 'err loud' : 'err';
+    const cls = consoleClass(piece);
+    if (cls) span.className = cls;
     span.textContent = piece.text;
     // A plain property, not a data- attribute: an attribute write would
     // invalidate style for every span we add.
@@ -1431,7 +1454,23 @@ function makeBounded(limit) {
  * fight both, so it leaves them alone.
  */
 const OWN_BUSY_RULES = new Set(['worklist', 'mpps', 'steps', 'mpps-scan', 'retrieve']);
-const busy = {}; // view -> { n, run, stop }
+const busy = {}; // view -> { n, run, stop, locked }
+
+/**
+ * The controls that start a view's OTHER run. Rename reads its folder and Edit
+ * loads its tags as runs of their own, and a view tracks one run for Stop: a
+ * second one started mid-write would take Stop away from the rewrite still in
+ * progress. So while either view runs, these go dead with its button.
+ */
+const BUSY_LOCKS = {
+  rename: '#rename-folder, [data-pick="rename-folder"]',
+  edit: '#edit-target, [data-pick="edit-target"], #edit-load',
+};
+
+/** Is a run of this view's own in flight? */
+function viewBusy(view) {
+  return !!(busy[view] && busy[view].n > 0);
+}
 
 /**
  * One busy state for every runner: while a view's command runs, its button is
@@ -1441,7 +1480,7 @@ const busy = {}; // view -> { n, run, stop }
  */
 function setBusy(view, on) {
   if (OWN_BUSY_RULES.has(view)) return;
-  const b = busy[view] || (busy[view] = { n: 0, run: null, stop: null });
+  const b = busy[view] || (busy[view] = { n: 0, run: null, stop: null, locked: [] });
   const run = viewPart(view, 'run');
   const stop = viewPart(view, 'cancel');
   if (on) {
@@ -1450,11 +1489,16 @@ function setBusy(view, on) {
     b.stop = stop ? stop.hidden : null;
     if (run) run.disabled = true;
     if (stop) stop.hidden = false;
+    b.locked = BUSY_LOCKS[view]
+      ? $$(BUSY_LOCKS[view]).map((el) => { const was = el.disabled; el.disabled = true; return [el, was]; })
+      : [];
     return;
   }
   if (b.n === 0 || --b.n > 0) return;
   if (run && b.run !== null) run.disabled = b.run;
   if (stop && b.stop !== null) stop.hidden = b.stop;
+  for (const [el, was] of b.locked) el.disabled = was;
+  b.locked = [];
 }
 
 /**
@@ -1496,7 +1540,8 @@ function runStreaming(view, argv, { onExit } = {}) {
         appendConsole(view, text, stream === 'stdout' ? 'stdout' : 'narration', dropped, tag);
       },
       onExit: (code) => {
-        delete state.activeRuns[view];
+        // Only its own entry: a later run on the view has replaced it.
+        if (state.activeRuns[view] === runId) delete state.activeRuns[view];
         setBusy(view, false);
         const stopped = stopAsked.delete(runId);
         if (code !== 0 && !stopped) markRunFailed(view, tag);
@@ -1556,7 +1601,8 @@ function runCapture(view, argv) {
     const runId = await window.dcm.start(argv, state.info.home || null, {
       onChunk: (stream, text) => { if (stream === 'stdout') out.push(text); else err.push(text); },
       onExit: (code) => {
-        delete state.activeRuns[view];
+        // Only its own entry: a later run on the view has replaced it.
+        if (state.activeRuns[view] === runId) delete state.activeRuns[view];
         setBusy(view, false);
         stopAsked.delete(runId);
         resolve({ code, stdout: out.value, stderr: err.value });
@@ -4693,7 +4739,7 @@ function renderSpeedResults(results) {
       ? `, leaving ${missing} instance${missing === 1 ? '' : 's'} the receiver never acknowledged`
       : '';
     notes.push(
-      `<div class="local-note"><b>${incomplete.length} of ${results.length} run` +
+      `<div class="local-note bad"><b>${incomplete.length} of ${results.length} run` +
       `${results.length === 1 ? '' : 's'} did not finish${lostPhrase}.</b> ` +
       'Those rows carry no MB/s and no instances/s, and that is deliberate: a rate over a transfer ' +
       'that stopped early is fewer bytes over less time, so it is not a slower reading of that ' +
@@ -5721,6 +5767,9 @@ function seedRenameFields(s) {
  * under the next one's card.
  */
 async function scanRenameFolder({ keepConsole = false } = {}) {
+  // The folder box is dead while a rename runs (BUSY_LOCKS); this is for a
+  // change event that arrives anyway. A scan now would take Stop from the write.
+  if (viewBusy('rename')) return;
   const folder = $('#rename-folder').value.trim();
   resetRenameStudy();
   if (!keepConsole) clearConsole('rename');
@@ -5977,6 +6026,8 @@ function renderPending() {
 }
 
 async function loadTagsForEditing() {
+  // As for Rename's folder scan: never a second run under a write in flight.
+  if (viewBusy('edit')) return;
   const target = $('#edit-target').value.trim();
   clearConsole('edit');
   if (!target) {

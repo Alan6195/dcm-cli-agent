@@ -716,7 +716,7 @@
           <p>Load a study or a single file, change values, then write the result to a new folder. <b>The source is never modified.</b> <b>Preview only</b> shows what would change and writes nothing — it is this tab's own switch, about the disk rather than a peer, and Rehearsal mode adds the same flag from the other direction.</p>
           <p>UIDs are structural, so editing one is gated behind <b>Allow editing UIDs</b>. Changing a Series or Study UID on some instances and not others splits a study into pieces no archive will put back together.</p>
           <h4>De-identify</h4>
-          <p><b>Best-effort, not certified.</b> It copies a folder with identifiers removed and UIDs remapped. It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
+          <p><b>Best-effort, not certified.</b> It copies a folder with identifiers removed. It does not read pixel data, so burned-in annotations survive, and identifiers inside nested sequences (SR, presentation states) can survive. Always inspect a sample before sharing anything this produces. The source is never modified; UIDs are remapped consistently across the copy so the study stays whole.</p>
         </div>
         <div class="chip-row tabs" role="tablist" data-tabs="tools">
           <button class="chip active" role="tab" aria-selected="true" data-tab="inventory">Inventory</button>
@@ -742,7 +742,7 @@
             <label><input type="checkbox" id="info-norecurse" /> Don't recurse</label>
           </div>
           <div class="actions">
-            <button class="btn primary" data-run>Read folder</button>
+            <button class="btn primary" data-run>Read</button>
             <span class="status-chip" data-status hidden></span>
           </div>
           <div class="inventory-result" data-result hidden></div>

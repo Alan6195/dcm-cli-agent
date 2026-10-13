@@ -1766,6 +1766,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
             ackWarned: !!tr.querySelector('td.ack .warn-inline'),
           })),
           notes: Array.from(document.querySelectorAll('#view-speed [data-result] .local-note')).map((e) => e.textContent),
+          // The colour each part of the result says "lost" in: the row's badge
+          // and the heading of the note that explains it must be one colour.
+          lossColours: (() => {
+            const colour = (el) => (el ? getComputedStyle(el).color : '');
+            const note = Array.from(document.querySelectorAll('#view-speed [data-result] .local-note'))
+              .find((e) => /did not finish/.test(e.textContent));
+            return {
+              badge: colour(document.querySelector('#view-speed [data-result] .badge-incomplete')),
+              noteHead: colour(note && note.querySelector('b')),
+            };
+          })(),
         });
       })()`);
       await wait(250);
@@ -1833,6 +1844,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // 7. The table says in words what the blank cells mean.
       if (!m.notes.some((n) => /did not finish/.test(n) && /40 instances/.test(n))) {
         bad(`no note names the lost instances: ${JSON.stringify(m.notes)}`);
+      }
+      // 8. Lost instances read in one colour: the note is not amber under red rows.
+      if (!m.lossColours.badge || m.lossColours.noteHead !== m.lossColours.badge) {
+        bad(`the incomplete-runs note says the loss in a different colour from its rows: ${JSON.stringify(m.lossColours)}`);
       }
       record('speed table: a sweep with 2 of 4 runs incomplete reads as a warning, prints no rate for '
         + 'either, and badges the fastest completed run');
@@ -4344,7 +4359,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // fields set off. Rename is the only one of them that reads the folder,
       // so it is the only one with a child to wait on properly.
       const settle = async (id) => {
-        if (id.startsWith('rename')) await waitFor('!state.activeRuns.rename', 30000, 'the rename scan to finish');
+        // viewBusy as well: it is set the moment the scan is asked for, while
+        // activeRuns waits on the IPC round trip that starts the child, and the
+        // folder's Browse… is dead for as long as the scan runs.
+        if (id.startsWith('rename')) {
+          await waitFor("!viewBusy('rename') && !state.activeRuns.rename", 30000, 'the rename scan to finish');
+        }
         await wait(600);
       };
       const fill = async (id, how) => {
@@ -4689,6 +4709,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
 
     record(`flood: Stop clicked mid-flood, answered in ${stopMs}ms: ${JSON.stringify(stopResult)}`);
     record(`flood: engine pid ${floodPid} alive after Stop: ${alive}`);
+    // After a flood the console is still painting its backlog, so the frame
+    // capturePage returns can predate the button coming back. Wait for frames
+    // painted after the run ended, either side of the .btn transition (0.12s),
+    // so the picture shows the state the idle assertion below reads.
+    const painted = () => js(`new Promise((r) => {
+      const t = setTimeout(() => r(false), 3000);
+      requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(true); }));
+    })`);
+    await painted();
+    await wait(250);
+    await painted();
     await shot('flood-stopped');
 
     // Reality first, then the report — in that order, so a report that
@@ -4713,7 +4744,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         runDisabled: document.querySelector('#view-receive [data-run]').disabled,
         n: busy.receive ? busy.receive.n : 0,
         red: c.querySelectorAll('.err.loud').length
-          + consoleStates.get(c).pending.filter((p) => p.loud).length,
+          + consoleStates.get(c).pending.filter((p) => p.tone === 'loud').length,
       });
     })()`);
     if (idle.runDisabled || idle.n !== 0) bad(`the stopped flood left Receive busy: ${JSON.stringify(idle)}`);
@@ -4834,6 +4865,154 @@ async function runSmoke(win, app, mainHelpers = {}) {
     }
     if (colourOf('third run worked') !== 'err') {
       bad(`a run that worked turned red after an earlier failure: ${JSON.stringify(colours.spans)}`);
+    }
+
+    // --- Colour: a refusal on a screen that runs until Stop. ----------------
+    // Receive and Hub only end when the operator presses Stop, so their runs
+    // never "fail" and markRunFailed never repaints them: each line's own words
+    // are all the colour it gets. The engine writes every refusal, rejection
+    // and abort with log.warn, so each starts "warning ". On Receive the log is
+    // the whole record of what arrived, and a sender turned away must not read
+    // like "<- C-STORE #12". These are the engine's own lines (scp.js, get.js).
+    const refuseScript = path.join(work, 'refuse.js');
+    const REFUSAL_LINES = {
+      loud: [
+        'warning rejecting: calling AE "X" is not in the allowlist [CT01] (A-ASSOCIATE-RJ reason 3)',
+        'warning --reject-after 5 reached; refusing this instance with 0xA700 (out of resources)',
+        'warning -> refused 0x0110: no such step',
+        'warning association aborted by peer (source 0, reason 0)',
+        'error could not read incoming dataset: bad header',
+      ],
+      caution: [
+        'warning --worklist "wl.json" contains no items, so every worklist query will return zero matches.',
+        'Nothing here confirms the study is complete — compare the count against the archive\'s own.',
+      ],
+      dim: ['<- C-STORE #12 1.2.3.4 (CT Image Storage)', 'association accepted from CT01'],
+    };
+    const refusalText = [
+      REFUSAL_LINES.dim[1], REFUSAL_LINES.loud[0], REFUSAL_LINES.dim[0], REFUSAL_LINES.loud[1],
+      REFUSAL_LINES.caution[0], REFUSAL_LINES.loud[2], REFUSAL_LINES.loud[3], REFUSAL_LINES.caution[1],
+      REFUSAL_LINES.loud[4],
+    ].join('\n') + '\n';
+    fs.writeFileSync(refuseScript, [
+      "'use strict';",
+      '// Writes a receiver\'s refusals to stderr, then waits to be stopped.',
+      `process.stderr.write(${JSON.stringify(refusalText)});`,
+      'setInterval(() => {}, 1000);',
+      '',
+    ].join('\n'));
+    const refused = await jsJSON(`(async () => {
+      showView('receive');
+      clearConsole('receive');
+      const done = runStreaming('receive', ['__script__', ${JSON.stringify(refuseScript)}]);
+      const c = document.querySelector('#view-receive [data-console]');
+      const t0 = Date.now();
+      while (!/aborted by peer/.test(c.textContent) && Date.now() - t0 < 15000) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const stop = await stopRun('receive', null);
+      const { code } = await done;
+      await new Promise((r) => setTimeout(r, 600));
+      const lines = [];
+      for (const el of c.children) {
+        for (const line of el.textContent.split('\\n')) if (line.trim()) lines.push({ line, cls: el.className });
+      }
+      return JSON.stringify({ code, stopped: !!(stop && stop.stopped), lines });
+    })()`);
+    artefact('console-refusals.json', JSON.stringify(refused, null, 2));
+    record(`console refusals (stopped, exit ${refused.code}): `
+      + refused.lines.map((x) => `${x.cls || 'plain'}`).join(' · '));
+    if (!refused.stopped) bad(`the refusal probe was not stopped by Stop: ${JSON.stringify(refused)}`);
+    const clsOf = (line) => (refused.lines.find((x) => x.line === line) || {}).cls;
+    for (const line of REFUSAL_LINES.loud) {
+      if (clsOf(line) !== 'err loud') {
+        bad(`a refusal on a run the operator stopped is not red (${clsOf(line)}): ${line}`);
+      }
+    }
+    for (const line of REFUSAL_LINES.caution) {
+      if (clsOf(line) !== 'err warn') {
+        bad(`an engine warning is drawn as ${clsOf(line)}, not amber: ${line}`);
+      }
+    }
+    for (const line of REFUSAL_LINES.dim) {
+      if (clsOf(line) !== 'err') bad(`routine narration is drawn as ${clsOf(line)}, not dim: ${line}`);
+    }
+    const shown = await jsJSON(`(() => {
+      const c = document.querySelector('#view-receive [data-console]');
+      const of = (sel) => { const el = c.querySelector(sel); return el ? getComputedStyle(el).color : ''; };
+      return JSON.stringify({ loud: of('.err.loud'), warn: of('.err.warn'), dim: of('.err:not(.loud):not(.warn)') });
+    })()`);
+    if (!shown.loud || shown.loud === shown.dim || shown.warn === shown.dim || shown.warn === shown.loud) {
+      bad(`refusal, warning and narration are not three colours: ${JSON.stringify(shown)}`);
+    }
+    await shot('console-refusals');
+    await js("clearConsole('receive'); true");
+
+    // --- Stop on Rename and Edit stops the write, not a scan started over it.
+    // Each of these views starts a second kind of run (Rename reads its folder,
+    // Edit loads its tags) and a view tracks one run for Stop. A second run
+    // started mid-write would take Stop from the rewrite still in progress and
+    // leave it untracked. So while one runs, what starts the other is dead,
+    // and a request that arrives anyway starts nothing.
+    for (const [view, tab, field, other] of [
+      ['rename', 'rename', 'rename-folder', "__smoke.set('rename-folder', PATH)"],
+      ['edit', 'edit', 'edit-target', "__smoke.set('edit-target', PATH); loadTagsForEditing()"],
+    ]) {
+      const otherRun = other.replace(/PATH/g, JSON.stringify(fixtures || work));
+      // eslint-disable-next-line no-await-in-loop
+      const during = await jsJSON(`(async () => {
+        showView('tools'); showTab('tools', '${tab}');
+        __smoke.set('${field}', '');
+        window.__lockDone = runStreaming('${view}', ['__script__', ${JSON.stringify(refuseScript)}]);
+        const t0 = Date.now();
+        while (!state.activeRuns['${view}'] && Date.now() - t0 < 15000) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        const writeId = state.activeRuns['${view}'];
+        const locks = Array.from(document.querySelectorAll(BUSY_LOCKS['${view}']));
+        const during = {
+          locks: locks.length,
+          dead: locks.filter((el) => el.disabled).length,
+          stopShown: !document.querySelector('#view-${view} [data-cancel]').hidden,
+        };
+        ${otherRun};
+        await new Promise((r) => setTimeout(r, 400));
+        during.sameRun = !!writeId && state.activeRuns['${view}'] === writeId;
+        return JSON.stringify(during);
+      })()`);
+      // eslint-disable-next-line no-await-in-loop
+      await shot(`${view}-write-in-flight`);
+      // eslint-disable-next-line no-await-in-loop
+      const lock = await jsJSON(`(async () => {
+        const during = ${JSON.stringify(during)};
+        const locks = Array.from(document.querySelectorAll(BUSY_LOCKS['${view}']));
+        const stop = await stopRun('${view}', null);
+        await window.__lockDone;
+        const after = {
+          stopped: !!(stop && stop.stopped),
+          tracked: state.activeRuns['${view}'] || null,
+          dead: locks.filter((el) => el.disabled).length,
+          stopShown: !document.querySelector('#view-${view} [data-cancel]').hidden,
+        };
+        __smoke.set('${field}', '');
+        clearConsole('${view}');
+        return JSON.stringify({ during, after });
+      })()`);
+      record(`${view}: a write in flight locks ${lock.during.dead} of ${lock.during.locks} controls; `
+        + `Stop then ${lock.after.stopped ? 'stopped it' : 'did NOT stop it'}`);
+      if (!lock.during.locks || lock.during.dead !== lock.during.locks) {
+        bad(`${view}: what starts its other run is live while a write runs: ${JSON.stringify(lock)}`);
+      }
+      if (!lock.during.stopShown) bad(`${view}: no Stop while its write runs: ${JSON.stringify(lock)}`);
+      if (!lock.during.sameRun) {
+        bad(`${view}: a second run took Stop from the write in flight: ${JSON.stringify(lock)}`);
+      }
+      if (!lock.after.stopped || lock.after.tracked) {
+        bad(`${view}: Stop did not stop the write it was showing for: ${JSON.stringify(lock)}`);
+      }
+      if (lock.after.dead || lock.after.stopShown) {
+        bad(`${view}: the busy state outlived the stopped write: ${JSON.stringify(lock)}`);
+      }
     }
 
     // =====================================================================
