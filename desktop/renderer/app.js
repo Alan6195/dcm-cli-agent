@@ -121,8 +121,9 @@ const state = {
 
   // The last `mpps` run, the UID the next one will carry, what the chosen
   // folder turned out to hold, and — when the engineer option allows it —
-  // which way past a study mismatch was chosen.
-  mpps: { lastRun: null, nextUid: null, mismatch: null, scan: null, fix: 'adopt' },
+  // which way past a study mismatch was chosen. `running` names the RIS of an
+  // exam being performed right now (see reportOpenSteps).
+  mpps: { lastRun: null, nextUid: null, mismatch: null, scan: null, fix: 'adopt', running: null },
 
   // The steps this app has opened since the window opened, newest first. This
   // lives here and nowhere else: nothing is written to disk, so quitting
@@ -2710,10 +2711,14 @@ function renderWorklistTable() {
   const selKey = state.mwl.selected ? state.mwl.selected.key : null;
 
   // No RIS to ask is not an empty worklist either: it is a setting nobody
-  // made yet, and the way to make it is one click away.
+  // made yet, and the way to make it is one click away. Rows still on screen
+  // are an earlier RIS's answer, so they are dimmed and dated the same way as
+  // when a RIS is down.
+  const stale = Boolean(state.mwl.noRis || state.mwl.error);
+  const listFrom = rows.length && state.mwl.at ? ` Showing the list from ${esc(fmtClock(state.mwl.at))}.` : '';
   const noRis = state.mwl.noRis
     ? '<div class="empty-note dense">No RIS set — '
-      + '<button type="button" class="linklike" data-goto="settings">add it in Settings</button>.</div>'
+      + `<button type="button" class="linklike" data-goto="settings">add it in Settings</button>.${listFrom}</div>`
     : '';
 
   // A query that failed is not an empty worklist, and the difference is the
@@ -2721,9 +2726,11 @@ function renderWorklistTable() {
   // "the RIS did not answer" sends them to the phone. One red block: what
   // happened, which list is still showing (dimmed, below), and the engine's
   // own words under it.
-  const failed = state.mwl.error
+  // With no RIS set, an older read's failure is about a peer that is no
+  // longer asked, so the one line said is the one above.
+  const failed = state.mwl.error && !state.mwl.noRis
     ? '<div class="folder-check bad list-error"><b>The worklist could not be read.</b>'
-      + (rows.length && state.mwl.at ? ` Showing the list from ${esc(fmtClock(state.mwl.at))}.` : '')
+      + listFrom
       + `<div class="engine-said">${esc(state.mwl.error)}</div></div>`
     : '';
 
@@ -2758,7 +2765,7 @@ function renderWorklistTable() {
   // the whole table it is the IDs that scroll out of view, never the column
   // that says DISCONTINUED.
   box.innerHTML = noRis + failed +
-    `<div class="table-scroll${state.mwl.error ? ' stale' : ''}"><table id="mwl-table" class="${showModality ? 'with-modality' : ''}">` +
+    `<div class="table-scroll${stale ? ' stale' : ''}"><table id="mwl-table" class="${showModality ? 'with-modality' : ''}">` +
     `<colgroup><col style="width:${showDate ? 120 : 88}px">${showModality ? '<col style="width:64px">' : ''}` +
     '<col style="width:150px"><col><col style="width:140px">' +
     '<col style="width:90px"><col style="width:90px"></colgroup>' +
@@ -2807,12 +2814,20 @@ function renderOpenChip() {
  * forgets it. Main asks before it lets the window close, or an update restart
  * the app, while this count is above zero. Sent on every change, including
  * back to zero, so a step that was closed stops guarding the quit.
+ *
+ * An exam being performed counts as one: it is not in the session list until
+ * the engine exits, but its N-CREATE may already be on the RIS while its
+ * images are still going, and that is the worst moment to quit.
  */
 let reportedOpen = '';
 function reportOpenSteps() {
   const open = state.steps.entries.filter((e) => e.status === 'IN PROGRESS');
-  const peers = [...new Set(open.map((e) => (e.peer && e.peer.calledAe) || 'the RIS'))];
-  const msg = { count: open.length, peers };
+  const running = state.mpps.running ? 1 : 0;
+  const peers = [...new Set([
+    ...(running ? [state.mpps.running] : []),
+    ...open.map((e) => (e.peer && e.peer.calledAe) || 'the RIS'),
+  ])];
+  const msg = { count: open.length + running, peers, running };
   const key = JSON.stringify(msg);
   if (key === reportedOpen) return;
   reportedOpen = key;
@@ -3012,6 +3027,7 @@ function selectRow(key) {
   state.steps.armed = false;
   $('#mwl-out').open = false;
   $('#mpps-adv').open = false;
+  releaseConsole();
 
   seedRowFields(row.item);
 
@@ -3024,6 +3040,15 @@ function selectRow(key) {
   if (!folder.value.trim()) folder.focus();
 }
 
+/**
+ * The exam report in the Output was about the patient just left, and it is
+ * folded now, so a failed list read may write there again. Not while that
+ * exam is still running: its report is still being written.
+ */
+function releaseConsole() {
+  if (!state.activeRuns.mpps && !state.activeRuns.steps && !state.mpps.running) state.mwl.consoleOwner = null;
+}
+
 function clearSelection() {
   state.mwl.selected = null;
   state.mwl.detached = false;
@@ -3034,6 +3059,7 @@ function clearSelection() {
   mppsScanFor = null;
   state.steps.armed = false;
   $('#mwl-out').open = false;
+  releaseConsole();
   for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
@@ -4037,7 +4063,15 @@ async function runMpps(verb) {
   // A run that fails unfolds it (runStreaming, and the verdict below).
   if (!dryRun) $('#mpps-cancel').hidden = false;
   state.mwl.consoleOwner = 'exam';
+  // Held open from the press, not from the exit: quitting mid-transfer is the
+  // riskiest moment there is, so the quit guard counts it (reportOpenSteps).
+  // A rehearsal sends nothing and opens nothing, so it is not counted.
+  state.mpps.running = dryRun ? null : (state.conn.calledAe || 'the RIS');
+  reportOpenSteps();
   const { code, stdout, stderr } = await runStreaming('mpps', argv);
+  // Cleared at each way out below, after rememberStep has put any step this
+  // run opened into the list: the count may read one high for a moment, never
+  // zero while a step is open.
   $('#mpps-run').disabled = false;
   $('#mpps-start').disabled = false;
   $('#mpps-cancel').hidden = true;
@@ -4058,6 +4092,8 @@ async function runMpps(verb) {
       // and they are what a call to the RIS is about.
       + (said ? `<div class="engine-said">${esc(said)}</div>` : '');
     endChip('mpps', 'fail', 'Study mismatch');
+    state.mpps.running = null;
+    reportOpenSteps();
     return;
   }
 
@@ -4082,6 +4118,8 @@ async function runMpps(verb) {
     renderMppsPanel();
     updateAllPreviews();
   }
+  state.mpps.running = null;
+  reportOpenSteps();
   renderMppsOutcome({ code, report, dryRun, verb, stderr });
 }
 
@@ -4455,6 +4493,10 @@ function wireSteps() {
   });
   $('#steps-series').addEventListener('change', renderStepsClose);
   $('#steps-close-run').addEventListener('click', () => runClose('complete'));
+  // Whether a verdict was on screen when Discontinue was armed. It steps aside
+  // while the reason is picked, and Cancel puts it back: a refused Complete
+  // must not vanish because a Discontinue was thought better of.
+  let outcomeAside = false;
   $('#steps-discontinue').addEventListener('click', () => {
     state.steps.armed = true;
     // A reason belongs to the step it was given for: arming starts blank
@@ -4464,6 +4506,7 @@ function wireSteps() {
     $('#steps-reasoncode').hidden = true;
     // The verdict on screen was about what came before this; the one this
     // Discontinue produces is drawn when it runs.
+    outcomeAside = !$('#mpps-outcome').hidden;
     $('#mpps-outcome').hidden = true;
     renderStepsClose();
     renderFolderLine();
@@ -4471,6 +4514,8 @@ function wireSteps() {
   });
   $('#steps-discontinue-cancel').addEventListener('click', () => {
     state.steps.armed = false;
+    if (outcomeAside) $('#mpps-outcome').hidden = false;
+    outcomeAside = false;
     renderStepsClose();
     renderFolderLine();
   });
@@ -6550,8 +6595,8 @@ function renderUpdateState(s) {
     action.textContent = 'Restart & update';
     action.hidden = false;
     // A restart forgets every open step, the same as quitting: the button
-    // waits until none is open, and says so.
-    const open = state.steps.entries.some((e) => e.status === 'IN PROGRESS');
+    // waits until none is open (an exam being performed included), and says so.
+    const open = Boolean(state.mpps.running) || state.steps.entries.some((e) => e.status === 'IN PROGRESS');
     action.disabled = open;
     if (open) { note.textContent = 'Restart once the open step is closed.'; note.hidden = false; }
     action.onclick = () => window.dcm.update.install();

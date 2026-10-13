@@ -246,6 +246,14 @@ async function mustWait(expr, ms, label) {
  */
 async function shot(name) {
   try {
+    // A change the last executeJavaScript made is in the DOM but not yet on a
+    // frame, and capturePage takes the last frame drawn: a shot taken straight
+    // after a synchronous block showed the screen from before it. Two frames
+    // later it is drawn. Bounded, so a wedged renderer cannot hold the run.
+    await Promise.race([
+      js('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))'),
+      wait(1000),
+    ]).catch(() => {});
     const image = await Promise.race([
       WIN.webContents.capturePage(),
       new Promise((r) => setTimeout(() => r(null), 15000)),
@@ -2071,6 +2079,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         link: !!document.querySelector('#mwl-results .linklike[data-goto="settings"]'),
         label: document.querySelector('#mwl-status').textContent,
         cls: document.querySelector('#mwl-status').className,
+        rows: document.querySelectorAll('#mwl-table tr.pick-row').length,
+        stale: !!document.querySelector('#mwl-results .table-scroll.stale'),
+        blocks: document.querySelectorAll('#mwl-results > .folder-check, #mwl-results > .empty-note').length,
       })`);
       record(`worklist, no RIS: "${noRis.list.slice(0, 60)}"`);
       await shot('wl-1c-no-ris');
@@ -2080,6 +2091,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (noRis.label !== 'Refresh' || /ok|fail|running/.test(noRis.cls)) {
         bad(`Refresh still shows the last read's state with no RIS to read from: ${JSON.stringify(noRis)}`);
       }
+      // The rows still on screen are the answer of a RIS that is no longer
+      // set: dimmed and dated, exactly like the rows under a RIS that is down,
+      // never at full brightness as if they were today's list.
+      if (noRis.rows !== rows.length || !noRis.stale || !/Showing the list from \d{2}:\d{2}\./.test(noRis.list)) {
+        bad(`the rows left with no RIS set are not marked as an earlier answer: ${JSON.stringify(noRis)}`);
+      }
+      if (noRis.blocks !== 1) bad(`no RIS is said in ${noRis.blocks} blocks, not one: ${JSON.stringify(noRis)}`);
       await js(`(async () => {
         setPeerRole(${JSON.stringify(RIS_PEER)}, 'ris');
         await window.dcm.profiles.set({ profiles: state.profiles });
@@ -2091,6 +2109,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         + " && document.querySelector('#mwl-status').className.includes('ok')", RUN_MS, 'the worklist to answer after the RIS came back');
       if (/No RIS set/.test(await js("document.querySelector('#mwl-results').textContent"))) {
         bad('the "No RIS set" line outlived the RIS coming back');
+      }
+      if (await js("!!document.querySelector('#mwl-results .table-scroll.stale')")) {
+        bad('the list is still dimmed after the RIS came back and answered');
       }
       say('worklist: no RIS peer says so where the list is, with the way to Settings');
 
@@ -2518,9 +2539,31 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`turning rehearsal off did not put the station back: ${rehearsed.back} / ${rehearsed.backCmd}`);
       }
 
-      await js(`document.querySelector('#mpps-run').click(); true`);
+      // The exam is held open from the press, before its step is in the
+      // session list: quitting mid-transfer is the riskiest moment there is.
+      // runMpps reaches its first await only after reporting it.
+      // No step is open yet, so the running exam alone keeps "Restart &
+      // update" waiting.
+      const pressed = await jsJSON(`(() => {
+        document.querySelector('#mpps-run').click();
+        const was = lastUpdateState;
+        renderUpdateState({ status: 'ready', version: '9.9.9' });
+        const restart = document.querySelector('#update-action').disabled;
+        renderUpdateState(was || { status: 'idle' });
+        return JSON.stringify({ running: state.mpps.running, reported: reportedOpen, restart,
+          open: state.steps.entries.filter((e) => e.status === 'IN PROGRESS').length });
+      })()`);
+      if (pressed.running !== 'RISMPPS' || !/"count":1\b/.test(pressed.reported)
+        || !/"running":1\b/.test(pressed.reported)) {
+        bad(`an exam being performed is not counted as held open: ${JSON.stringify(pressed)}`);
+      }
+      if (pressed.open !== 0 || !pressed.restart) {
+        bad(`"Restart & update" is live while an exam is being performed: ${JSON.stringify(pressed)}`);
+      }
       await mustWait("!document.querySelector('#mpps-status').className.includes('running')",
         RUN_MS, 'the perform to finish');
+      await mustWait('state.mpps.running === null && /"running":0\\b/.test(reportedOpen)', 8000,
+        'the finished exam to stop being held open');
       const performed = await jsJSON(`JSON.stringify({
         status: document.querySelector('#mpps-status').textContent,
         outcome: document.querySelector('#mpps-outcome').textContent,
@@ -3186,6 +3229,28 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/^A step is still open on RISMPPS\. Quitting forgets it\.$/.test(guard || '')) {
         bad(`closing the window would not ask first, or asks the wrong thing: ${JSON.stringify(guard)}`);
       }
+      // An exam being performed reaches main over the same channel and is
+      // asked about as running, with the open step beside it still counted.
+      await js('(() => { state.mpps.running = "RISMPPS"; reportOpenSteps(); return true; })()');
+      await waitMain(() => mainHelpers.openSteps().running === 1 && mainHelpers.openSteps().count === 2, 8000,
+        'the window to report an exam being performed');
+      const runningGuard = mainHelpers.quitGuardMessage();
+      await js('(() => { state.mpps.running = null; reportOpenSteps(); return true; })()');
+      await waitMain(() => mainHelpers.openSteps().running === 0 && mainHelpers.openSteps().count === 1, 8000,
+        'the window to report the exam finished');
+      record(`quit guard, exam running: "${runningGuard}"`);
+      if (!/^An exam is still running on RISMPPS\. Quitting stops it partway and forgets an open step\.$/.test(runningGuard || '')) {
+        bad(`quitting mid-exam would not ask, or asks the wrong thing: ${JSON.stringify(runningGuard)}`);
+      }
+      // The guard asks before anything is stopped, on every way out. A quit
+      // through app.quit() (Cmd+Q, the macOS app menu) fires before-quit ahead
+      // of the window's close, so a child killed there would already be dead
+      // when the operator picked "Go back".
+      if (typeof mainHelpers.stopEveryChild !== 'function'
+        || app.listeners('before-quit').includes(mainHelpers.stopEveryChild)
+        || !app.listeners('will-quit').includes(mainHelpers.stopEveryChild)) {
+        bad('the engine children are stopped before the quit guard has asked (they must stop in will-quit)');
+      }
       // An update restart forgets the step too, so its button waits.
       const restartOpen = await jsJSON(`(() => {
         const was = lastUpdateState;
@@ -3306,6 +3371,28 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await js(`__smoke.set('mpps-folder', ''); true`);
       await wait(700);
       say('closing: images carrying another study are refused, and the line says why');
+
+      // A refusal on screen when Discontinue is armed steps aside while the
+      // reason is picked, and Cancel puts it back word for word: thinking
+      // better of a Discontinue must not erase a refused Complete.
+      const aside = await jsJSON(`(() => {
+        const box0 = document.querySelector('#mpps-outcome');
+        const was = { hidden: box0.hidden, cls: box0.className, html: box0.innerHTML };
+        renderCloseOutcome({ code: 1, dry: false, verb: 'complete', peer: 'RISMPPS',
+          stderr: 'N-SET failed: the SCP refused the status (0x0110)\\n' });
+        const box = document.querySelector('#mpps-outcome');
+        const before = box.textContent;
+        document.querySelector('#steps-discontinue').click();
+        const armedHidden = box.hidden;
+        document.querySelector('#steps-discontinue-cancel').click();
+        const out = { armedHidden, back: !box.hidden, same: box.textContent === before, cls: box.className,
+          disarmed: !state.steps.armed };
+        box.hidden = was.hidden; box.className = was.cls; box.innerHTML = was.html;
+        return JSON.stringify(out);
+      })()`);
+      if (!aside.armedHidden || !aside.back || !aside.same || !aside.cls.includes('bad') || !aside.disarmed) {
+        bad(`Cancel on an armed Discontinue lost the refusal that was on screen: ${JSON.stringify(aside)}`);
+      }
 
       // Stopping an exam is a reason picked in words; the code item it stands
       // for is what goes on the command line, where it can still be read.
@@ -3498,16 +3585,22 @@ async function runSmoke(win, app, mainHelpers = {}) {
           openEntryPeer: openEntry && openEntry.peer.calledAe,
           neverReport, neverRemembered, short,
         };
+        window.__smokeKeptSteps = keep;
+        return JSON.stringify(out);
+      })()`);
+      // Taken while the shortfall is still drawn, then the window is put back.
+      await shot('wl-12-shortfall');
+      await js(`(() => {
         // Put the window back the way the live flow left it.
-        state.steps.entries = keep;
+        state.steps.entries = window.__smokeKeptSteps;
+        delete window.__smokeKeptSteps;
         document.querySelector('#mpps-outcome').hidden = true;
         document.querySelector('#mpps-totals').hidden = true;
         setStatus('mpps', null);
         refreshRowPills();
         renderMppsPanel();
-        return JSON.stringify(out);
+        return true;
       })()`);
-      await shot('wl-12-shortfall');
       say(`report: N-SET failure parsed as ${JSON.stringify(reports.openReport)}`);
       say(`report: shortfall outcome ${JSON.stringify(reports.short)}`);
       if (!reports.openReport.stillInProgress || reports.openReport.acknowledged !== 36) {

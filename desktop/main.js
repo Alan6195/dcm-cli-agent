@@ -294,14 +294,16 @@ let splashWindow = null;
 
 /**
  * The procedure steps the window holds open, as the renderer last reported
- * them: { count, peers }.
+ * them: { count, peers, running }. `running` is an exam being performed right
+ * now, and it is in `count` too: its step can already be open on the RIS
+ * while its images are still going.
  *
  * An open step lives in the renderer's memory and nowhere else — there are no
  * record files, and MPPS has no query service — so closing the window forgets
  * it for good. While any is open, closing the window asks first, and an update
  * restart is refused (the renderer keeps its button dead and says why).
  */
-let openSteps = { count: 0, peers: [] };
+let openSteps = { count: 0, peers: [], running: 0 };
 /** Set once the operator chose "Quit anyway", so the close that follows is not asked again. */
 let quitConfirmed = false;
 
@@ -309,6 +311,11 @@ let quitConfirmed = false;
 function quitGuardMessage(open = openSteps) {
   if (!open || !(open.count > 0)) return null;
   const where = open.peers && open.peers.length ? open.peers.join(', ') : 'the RIS';
+  if (open.running > 0) {
+    const others = open.count - 1;
+    return `An exam is still running on ${where}. Quitting stops it partway`
+      + (others > 0 ? ` and forgets ${others === 1 ? 'an open step' : `${others} open steps`}.` : '.');
+  }
   return open.count === 1
     ? `A step is still open on ${where}. Quitting forgets it.`
     : `${open.count} steps are still open on ${where}. Quitting forgets them.`;
@@ -316,7 +323,7 @@ function quitGuardMessage(open = openSteps) {
 
 function createWindow(opts = {}) {
   // A new window holds no steps until its renderer says otherwise.
-  openSteps = { count: 0, peers: [] };
+  openSteps = { count: 0, peers: [], running: 0 };
   quitConfirmed = false;
   // A packaged cold launch can take a few seconds (asar, engine, first
   // paint), and a silent gap between double-click and window reads exactly
@@ -394,6 +401,10 @@ function createWindow(opts = {}) {
     return { action: 'deny' };
   });
 
+  // Every way out comes through here before anything is stopped: a window
+  // close, and app.quit() too (Cmd+Q, the macOS app menu, an update restart),
+  // because the engine children are killed in will-quit, which fires only once
+  // every window has closed. "Go back" therefore leaves a transfer running.
   mainWindow.on('close', (event) => {
     saveWindowBounds();
     // The smoke harness ends with app.exit, which closes nothing, and it closes
@@ -425,7 +436,7 @@ function createWindow(opts = {}) {
   //
   // Nothing is killed here on our own initiative: a long legitimate transfer
   // must not be aborted because the UI stuttered. Closing the window still
-  // works while a renderer is unresponsive, and before-quit stops every child,
+  // works while a renderer is unresponsive, and will-quit stops every child,
   // so the operator's escape hatch is intact either way.
   mainWindow.webContents.on('unresponsive', () => {
     process.stderr.write(`renderer unresponsive with ${children.size} engine child(ren) running\n`);
@@ -1163,7 +1174,7 @@ function initUpdates() {
     if (updateState.status !== 'ready') return { ok: false };
     // A restart forgets an open step exactly as quitting does.
     if (openSteps.count > 0) return { ok: false, reason: 'open-step' };
-    // Silent install, relaunch when done. before-quit still runs, so any
+    // Silent install, relaunch when done. will-quit still runs, so any
     // receiver or transfer child is killed the same as on a normal quit.
     autoUpdater.quitAndInstall(true, true);
     return { ok: true };
@@ -1219,7 +1230,8 @@ app.whenReady().then(() => {
   ipcMain.on('steps:open', (_event, info) => {
     const count = Math.max(0, Number(info && info.count) || 0);
     const peers = Array.isArray(info && info.peers) ? info.peers.map(String).slice(0, 8) : [];
-    openSteps = { count, peers };
+    const running = info && info.running ? 1 : 0;
+    openSteps = { count: Math.max(count, running), peers, running };
   });
 
   ipcMain.handle('dcm:pick', async (_event, opts = {}) => {
@@ -1284,6 +1296,7 @@ app.whenReady().then(() => {
           LEGACY_PRODUCT_DIRS,
           openSteps: () => ({ ...openSteps }),
           quitGuardMessage,
+          stopEveryChild,
         });
       } catch (err) {
         // The harness is not shipped in packaged builds. Say so loudly rather
@@ -1312,7 +1325,13 @@ app.on('window-all-closed', () => {
 });
 
 // Never leave a receiver or transfer running after the app exits.
-app.on('before-quit', () => {
+//
+// will-quit, not before-quit: before-quit fires ahead of the windows' close
+// events, so on macOS (Cmd+Q, or the app menu's Quit) it would kill a running
+// receiver or exam before the quit guard had asked anything, and "Go back"
+// would keep a window whose work was already dead. will-quit fires only once
+// every window has closed, so a quit the guard cancelled never reaches it.
+function stopEveryChild() {
   for (const child of children.values()) {
     try {
       child.kill();
@@ -1320,4 +1339,5 @@ app.on('before-quit', () => {
       /* already gone */
     }
   }
-});
+}
+app.on('will-quit', stopEveryChild);
