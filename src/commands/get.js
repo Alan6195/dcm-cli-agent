@@ -223,6 +223,14 @@ async function execute(parsed) {
       ? CGetRequest.createSeriesGetRequest(studyUid, seriesUid)
       : CGetRequest.createStudyGetRequest(studyUid);
 
+  // C-GET only works if every Storage SOP Class is proposed with this end in
+  // the SCP role, because the instances come back as C-STOREs on this very
+  // association. dcmjs-dimse's constructor happens to default this to true, but
+  // nothing documents that, and if the default ever flipped the failure would
+  // not be a clean refusal: it is a network error and zero instances, which was
+  // measured. So it is asked for by name rather than inherited by accident.
+  request.setAddStorageSopClassesToAssociation(true);
+
   const tally = { written: 0, unreadable: 0, duplicates: 0, claimed: new Map() };
   const failures = [];
   // What the PEER says about the transfer, kept apart from what is on disk.

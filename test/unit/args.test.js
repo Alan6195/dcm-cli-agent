@@ -146,3 +146,21 @@ test('a base64 token keeps its padding instead of looking like a matching key', 
   const { flags } = tokenize(['--require-token', 'abc123==']);
   assert.equal(flags.get('require-token'), 'abc123==');
 });
+
+test('a C-MOVE destination keeps its AE=host:port value, written with a space', () => {
+  // `dcm scp --destination VIEWER=127.0.0.1:11113` is the form scp's own help
+  // documents. Before 'destination' was pair-valued the tokenizer read the value
+  // as a bare matching key, and the receiver refused to start with "needs the
+  // form AE=host:port, not true". The retrieve tests never noticed, because they
+  // built the registry through the harness and never through this parser.
+  const one = tokenize(['scp', '--destination', 'VIEWER=127.0.0.1:11113']);
+  assert.equal(one.flags.get('destination'), 'VIEWER=127.0.0.1:11113');
+
+  const two = tokenize(['scp', '--destination', 'A=h:1', '--destination', 'B=h:2']);
+  assert.deepEqual(two.flags.get('destination'), ['A=h:1', 'B=h:2']);
+
+  // dcm move's plain AE Title is unaffected.
+  const move = tokenize(['move', '--destination', 'DEST-AE', '--study', '1.2.3']);
+  assert.equal(move.flags.get('destination'), 'DEST-AE');
+  assert.equal(move.flags.get('study'), '1.2.3');
+});

@@ -65,7 +65,8 @@ test('tools-dimse registers exactly the DIMSE and local-file tools', () => {
   assert.deepEqual(
     server.tools.map((t) => t.name),
     [
-      'dcm_echo', 'dcm_query', 'dcm_worklist', 'dcm_inventory', 'dcm_tags',
+      'dcm_echo', 'dcm_query', 'dcm_worklist', 'dcm_get', 'dcm_move',
+      'dcm_inventory', 'dcm_tags',
       'dcm_send', 'dcm_anon', 'dcm_edit',
       'dcm_mpps_perform', 'dcm_mpps_start', 'dcm_mpps_update',
       'dcm_mpps_complete', 'dcm_mpps_discontinue',

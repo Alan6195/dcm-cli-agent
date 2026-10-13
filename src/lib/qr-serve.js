@@ -422,15 +422,17 @@ function parseDestination(raw) {
   const ae = text.slice(0, eq).trim();
   const where = text.slice(eq + 1).trim();
   const colon = where.lastIndexOf(':');
-  if (colon <= 0) {
+  if (colon < 0) {
     throw new Error(`--destination ${ae}= needs host:port, not "${where}".`);
   }
   const host = where.slice(0, colon).trim();
+  // Checked before the port so the message names the part that is actually
+  // missing: `AE=:11112` has a port and no host, and should say so.
+  if (!host) throw new Error(`--destination ${ae} has no host before the port: "${where}".`);
   const port = Number(where.slice(colon + 1).trim());
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`--destination ${ae} has a port that is not a port: "${where}".`);
   }
-  if (!host) throw new Error(`--destination ${ae} has no host.`);
   return { ae: ae.toUpperCase(), host, port };
 }
 

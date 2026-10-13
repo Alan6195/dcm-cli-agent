@@ -1,5 +1,63 @@
 # Changelog
 
+## vX.Y.Z — UNRELEASED (replace this heading with the real version before tagging)
+
+The DIMSE side could ask a peer what it held and never pull it back. Now it
+can, and it does not take the peer's word for what arrived.
+
+**`dcm get` — a study, a folder, one command.** C-GET brings the images back as
+C-STORE sub-operations on the same association the request went out on, so
+nothing has to be configured on the peer and nothing has to listen on this
+machine: no destination AE Title for someone else to register, no inbound
+firewall hole, no second port. `--series` and `--instance` narrow it. Files land
+at `<out>/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm`, the
+layout `dcm scp --persist` and `dcm web retrieve` already produce, so however a
+study arrived `dcm info` counts it the same way. The cost is that the peer has
+to implement C-GET and many archives do not — one that does not is reported as
+`0x0122 SOP Class not supported`, not as an empty retrieve, which is the
+difference between knowing to reach for `move` and concluding the study is not
+there.
+
+**`dcm move` — and the reason most C-MOVEs fail.** A C-MOVE carries no address.
+It carries a destination AE *Title*, and the PEER must already resolve it, so
+the usual outcome in the field is that the request is accepted, the archive
+looks the title up, finds nothing, answers `0xA801 Move Destination unknown`,
+and not one image moves. That is named now, with the fix attached: it is a
+configuration change on the archive, not anything this tool can send, and no
+flag here will substitute for it. `--destination <AE>` names somewhere the peer
+already knows; `--receive <dir> --receive-port <port>` instead runs a receiver
+here for the duration of the move — the same receiver `dcm scp` runs, not a more
+permissive stand-in — and that is the only form with arrivals to count.
+
+**The peer's reported counts are evidence, never the verdict.** Both commands
+compare the sub-operations the peer says it completed against the files that
+actually exist, and a gap exits non-zero with the gap named: *"the peer reports
+13 instance(s) sent but 10 are on disk — 3 missing"*. An accepted-but-lossy
+retrieve is the one failure where every number on screen agrees with every other
+one, which is exactly why believing the archive's own count is not good enough.
+A peer that returns no counts at all is reported as that too — "nothing
+contradicted it" is a weaker claim than "verified complete" — and a C-MOVE to a
+third-party destination says plainly that there was no local disk to check
+rather than implying a verification it did not do.
+
+**`dcm scp --serve <dir>` makes the receiver retrievable.** It answers C-GET and
+C-MOVE out of a folder, so the whole loop is testable locally without a real
+archive in it. `--destination AE=host:port` is repeatable and is how a C-MOVE
+destination gets resolved; a title with no entry is answered `0xA801`, which
+makes the commonest C-MOVE failure in the field reproducible on purpose, in one
+command. Without `--serve` retrieves are refused rather than answered emptily,
+because a receiver claiming success for a retrieve it served nothing from would
+be a lie told by this end. And `--retrieve-overcount <n>` reports n *more*
+completed sub-operations than were really sent: the deliberate lie that proves a
+retrieve client notices the gap instead of believing the claim.
+
+Also: `dcm_get` and `dcm_move` are drivable over MCP, with the 0xA801 rule and
+the shortfall rule written into the tool descriptions so an assistant reports a
+short retrieve as the failure it is rather than quoting the peer's count;
+`dcm://usage/get` and `dcm://usage/move` serve those two commands' own help
+text; and the mirror-a-study prompt has stopped telling an assistant that this
+engine's DIMSE side cannot pull a study.
+
 ## v0.16.1
 
 An exam refused with exit 2 and the screen let it happen, from a real station

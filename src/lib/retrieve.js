@@ -1,5 +1,7 @@
 'use strict';
 
+const { formatCode } = require('./status');
+
 /**
  * The one place that decides whether a retrieve succeeded.
  *
@@ -48,10 +50,22 @@ const RetrieveStatus = Object.freeze({
   SOP_CLASS_NOT_SUPPORTED: 0x0122,
 });
 
-/** `0x1234`, for a status in a message. */
+/**
+ * `0xA801`, for a status in a message.
+ *
+ * Delegates to status.formatCode so a status prints the same way here as it
+ * does from `dcm send` or `dcm find`. Two spellings of one code in a single run
+ * of `dcm move` — one from this module, one from status.js — meant neither
+ * could be grepped for reliably.
+ */
 function hex(status) {
   if (status === undefined || status === null) return '(none)';
-  return `0x${(status >>> 0).toString(16).padStart(4, '0')}`;
+  return formatCode(status);
+}
+
+/** True when a status lies in the band whose high byte is `high`. */
+function inBand(status, high) {
+  return status !== undefined && (status & 0xff00) === high;
 }
 
 /**
@@ -63,11 +77,12 @@ function hex(status) {
 function isRefusal(status) {
   if (status === undefined) return false;
   if (status >= 0xc000 && status <= 0xcfff) return true;
+  // Out of resources and identifier mismatch are BANDS: the standard fixes the
+  // high byte and products vary the low one. Matched by range, as status.js
+  // matches them for C-STORE, so 0xA700 is a refusal here exactly as it is there.
+  if (inBand(status, 0xa700) || inBand(status, 0xa900)) return true;
   return [
-    RetrieveStatus.OUT_OF_RESOURCES_MATCHES,
-    RetrieveStatus.OUT_OF_RESOURCES_SUBOPS,
     RetrieveStatus.MOVE_DESTINATION_UNKNOWN,
-    RetrieveStatus.IDENTIFIER_MISMATCH,
     RetrieveStatus.PROCESSING_FAILURE,
     RetrieveStatus.SOP_CLASS_NOT_SUPPORTED,
   ].includes(status);
@@ -170,6 +185,23 @@ function explainStatus(status, ctx = {}) {
       };
 
     default:
+      // The rest of each band. 0xA701 and 0xA702 have their own sentences
+      // above; any other low byte is still "out of resources" and still has
+      // the same fix, and the same goes for the identifier-mismatch band.
+      if (inBand(status, 0xa700)) {
+        return {
+          headline: `The peer ran out of resources and refused the retrieve (${hex(status)}).`,
+          hint: 'Narrow the request to one series at a time and retry.',
+        };
+      }
+      if (inBand(status, 0xa900)) {
+        return {
+          headline: `The peer rejected the identifier as wrong for this SOP Class (${hex(status)}).`,
+          hint:
+            'The retrieve level and the UIDs given do not agree. Check ' +
+            '--study/--series/--instance.',
+        };
+      }
       if (isRefusal(status)) {
         return {
           headline: `The peer refused the retrieve with ${hex(status)}.`,
@@ -232,6 +264,14 @@ function verdict(params) {
     problems.push(`the peer reports ${reported.failures} sub-operation(s) failed`);
   }
 
+  // Sub-operations this end answered as failures. Checked outside the
+  // local-files branch on purpose: an admitted loss is a loss wherever the
+  // images were headed, and letting it depend on expectLocalFiles is exactly the
+  // shape — evidence that never reaches the verdict — this module exists to stop.
+  if (refused > 0) {
+    problems.push(`${refused} sub-operation(s) were answered as failures by this end`);
+  }
+
   let shortfall = 0;
 
   if (expectLocalFiles) {
@@ -245,10 +285,6 @@ function verdict(params) {
         `${tally.duplicates} instance(s) arrived twice under one SOP Instance UID`
       );
     }
-    if (refused > 0) {
-      problems.push(`${refused} sub-operation(s) were answered as failures by this end`);
-    }
-
     // THE COMPARISON. The peer says it completed N sub-operations; N files had
     // better exist. Only meaningful when the peer actually sent counts.
     if (reported.counted && reported.completed > tally.written) {

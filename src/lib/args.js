@@ -111,7 +111,16 @@ function looksLikePair(token) {
  * padding, so `--require-token abc123==` is pair-shaped by accident and the
  * hub would refuse to start with "expects a value".
  */
-const PAIR_VALUED_FLAGS = new Set(['set', 'remove', 'filter', 'value', 'require-token']);
+const PAIR_VALUED_FLAGS = new Set([
+  'set', 'remove', 'filter', 'value', 'require-token',
+  // `dcm scp --destination VIEWER=127.0.0.1:11113` resolves a C-MOVE target,
+  // and its value is pair-shaped by design: AE=host:port. Without this entry the
+  // tokenizer read it as a bare --destination plus a matching key, and the
+  // receiver refused to start with "needs the form AE=host:port, not true" — on
+  // the exact form its own help text documents. `dcm move --destination ARCHIVE`
+  // is unaffected, since an AE Title has no `=`.
+  'destination',
+]);
 
 /** Repeated flags accumulate into an array rather than clobbering. */
 function setFlag(flags, name, value) {

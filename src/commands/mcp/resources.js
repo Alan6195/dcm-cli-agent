@@ -60,6 +60,18 @@ const USAGE_SOURCES = [
     summary: 'C-FIND a peer at study, series, image or worklist level.',
   },
   {
+    slug: 'get',
+    command: 'dcm get',
+    load: () => require('../get'),
+    summary: 'C-GET a study into a folder — a pull that needs nothing configured on the peer.',
+  },
+  {
+    slug: 'move',
+    command: 'dcm move',
+    load: () => require('../move'),
+    summary: 'C-MOVE a study to a destination AE the peer already resolves, optionally receiving it here.',
+  },
+  {
     slug: 'info',
     command: 'dcm info',
     load: () => require('../info'),
@@ -551,7 +563,7 @@ us, or whoever runs the peer.
       argsSchema: {
         direction: z
           .enum(['web-to-dimse', 'dimse-to-web'])
-          .describe('web-to-dimse retrieves over WADO-RS then C-STOREs; dimse-to-web reads a local folder then STOWs.'),
+          .describe('web-to-dimse retrieves over WADO-RS then C-STOREs; dimse-to-web retrieves over C-GET or C-MOVE — or reads a folder that already holds the study — then STOWs.'),
         studyUid: z.string().describe('StudyInstanceUID of the study to move.'),
         webUrl: z.string().describe('DICOMweb base URL, including any path prefix such as /dicom-web.'),
         workDir: z.string().describe('Absolute path of a local folder to stage the study in.'),
@@ -599,10 +611,20 @@ us, or whoever runs the peer.
    you have reason to believe the study is there, note that querying and
    storing are separate permissions before concluding anything.
 
-2. Get the instances into ${a.workDir}. This engine's DIMSE side sends; it does
-   not pull. Either point it at a folder that already holds the study, or have
-   the peer push it to a receiver (dcm scp — see dcm://usage/scp) and use that
-   folder. Ask which of these applies rather than assuming a C-MOVE exists.
+2. Pull the instances into ${a.workDir}. A DIMSE retrieve is available, so this
+   is a step to run rather than a question to ask. Try dcm_get first: a C-GET
+   brings the images back down the association it already opened, so nothing
+   has to be configured on the peer and nothing has to listen here. If it
+   answers 0x0122 the peer does not implement C-GET — fall back to dcm_move with
+   a destinationAe the peer ALREADY resolves, receiveDir ${a.workDir} and a
+   receivePort, and note that an AE Title the archive has never heard of
+   answers 0xA801 and moves nothing, which is a config change there rather than
+   anything fixable from here. Only when the peer implements neither does this
+   become someone else's step: point at a folder that already holds the study,
+   or have the peer push it to a receiver (dcm scp — see dcm://usage/scp) and
+   use that folder. Either retrieve cross-checks the peer's reported
+   sub-operation count against the files that actually landed, so a shortfall
+   is a failure here and not a number to carry into step 3.
 
 3. dcm_inventory over ${a.workDir}. Confirm the StudyInstanceUID matches
    ${a.studyUid} and note the instance count — this is the number every later

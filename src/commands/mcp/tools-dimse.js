@@ -895,6 +895,244 @@ function register(server, z, rt) {
     };
   }
 
+  // ---- Retrieve ----------------------------------------------------------
+
+  // Neither `dcm get` nor `dcm move` is in the runtime's default command
+  // table, for the same reason `dcm mpps` is not: that table is the set the
+  // first tool modules needed rather than a closed list, so a module that
+  // drives a command registers it here instead of reaching around runCommand
+  // and opening a second output capture. Guarded because register() runs once
+  // per server and several times per test run.
+  if (!rt.COMMANDS.get) rt.COMMANDS.get = () => require('../get');
+  if (!rt.COMMANDS.move) rt.COMMANDS.move = () => require('../move');
+
+  /**
+   * The accounting rule both retrieve tools end on.
+   *
+   * This is the part an assistant gets wrong, and it gets it wrong in the one
+   * direction that matters: a retrieve the archive called complete, with
+   * instances missing, reads like a success in every progress log ever
+   * written. The rule is therefore stated in the tool list rather than left to
+   * the result — by the time the numbers arrive the conclusion has usually
+   * already been drawn.
+   *
+   * Said once because the rule is identical for both services and differs only
+   * in which field holds the landed count; two copies of a paragraph this long
+   * drift apart on the first edit.
+   */
+  const RETRIEVE_ACCOUNTING =
+    ' THE PEER\'S REPORTED COUNTS ARE EVIDENCE, NEVER THE VERDICT. Wherever there is a local ' +
+    'folder to check, the number of sub-operations the peer says it completed is compared against ' +
+    'the files that actually exist in it, and a gap is an ERROR RESULT with the gap named in ' +
+    '"shortfall" and "problems" — not a success with a footnote. An error saying 3 instance(s) are ' +
+    'missing means three instances are GENUINELY MISSING: the transfer was accepted and is ' +
+    'incomplete, which is the failure that otherwise goes unnoticed. Do not report it as a ' +
+    'completed retrieve, do not quote the peer\'s own count as the result, and do not carry the ' +
+    'folder forward as if it held the whole study — say how many are missing and re-run. ' +
+    'One field decides how much the numbers prove even when none are missing: "reported.counted" ' +
+    'false means the peer returned NO sub-operation counts at all, so there was nothing to compare ' +
+    'the disk against, and "nothing contradicted it" is not "verified complete" — dcm_query at ' +
+    'series level gives the archive\'s own instance counts to compare against. Instances land as ' +
+    '<folder>/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm, the same layout ' +
+    'dcm_web_retrieve and dcm_receiver_start\'s persist folder produce, so dcm_inventory counts ' +
+    'all three the same way.';
+
+  /**
+   * The study/series/instance narrowing both retrieve services take.
+   *
+   * @returns {Record<string, object>}
+   */
+  const retrieveLevelSchema = () => ({
+    studyUid: z.string().describe('StudyInstanceUID to retrieve. Required: both services address a study and narrow down from there.'),
+    seriesUid: z.string().optional().describe('Narrow to one series within that study.'),
+    instanceUid: z.string().optional().describe(
+      'Narrow to one SOP instance. Requires seriesUid — without it the level of the request is ambiguous, and the peer would be asked something other than what was meant rather than refusing.'
+    ),
+  });
+
+  server.registerTool(
+    'dcm_get',
+    {
+      title: 'DICOM retrieve (C-GET)',
+      description:
+        'WRITES FILES: pull a study — or one series, or one instance — from a DIMSE peer down into a local folder (C-GET). ' +
+        'TRY THIS BEFORE dcm_move. A C-GET brings the images back on the SAME association the request went out on, as C-STORE sub-operations, so NOTHING HAS TO BE CONFIGURED ON THE PEER and nothing has to listen on this machine: no destination AE Title for someone to register, no inbound firewall hole, no receiver to start, no second port. That is what makes "name a study, name a folder" one step. ' +
+        'The cost is that the peer must IMPLEMENT C-GET, and many archives do not — one that does not either refuses the presentation context or answers 0x0122 SOP Class not supported, and either way that is reported as exactly that rather than as an empty retrieve. THAT is the signal to fall back to dcm_move, and it is a statement about the archive, not about the request. ' +
+        'Accepting the presentation context is not a promise to implement the service: a peer can negotiate Study Root GET happily and then answer the request itself with a failure status. So what comes back is the status the peer returned and the number of files that actually exist on disk — never the number it said it would send.' +
+        RETRIEVE_ACCOUNTING,
+      inputSchema: {
+        ...peerSchema(),
+        ...retrieveLevelSchema(),
+        outDir: z.string().describe('Absolute path of the folder to write into. Created if missing. Re-retrieving into a folder that already holds the study overwrites those files rather than duplicating them.'),
+      },
+    },
+    async (a) => {
+      const argv = peerArgv(a);
+      opt(argv, '--study', a.studyUid);
+      opt(argv, '--series', a.seriesUid);
+      opt(argv, '--instance', a.instanceUid);
+      opt(argv, '--out', a.outDir);
+      argv.push('--json');
+      return retrieveResult(await runCommand('get', argv), 'get');
+    }
+  );
+
+  server.registerTool(
+    'dcm_move',
+    {
+      title: 'DICOM retrieve (C-MOVE)',
+      description:
+        'Ask a peer to send a study — or one series, or one instance — to a destination AE (C-MOVE). PREFER dcm_get unless it came back 0x0122: that one needs nothing configured on the peer, and this one needs a configuration change there before the first image moves. ' +
+        'A C-MOVE DOES NOT CARRY AN ADDRESS. It carries a destination AE TITLE, and the PEER must already resolve that title to a host and port it can reach. That single fact causes nearly every failed C-MOVE: the request is accepted, the archive looks the title up, finds nothing, and answers 0xA801 "Move Destination unknown" without one image moving. 0xA801 IS NOT FIXABLE FROM HERE — not with another parameter, not by guessing a different title, not by retrying. It is a configuration change on the ARCHIVE, so report it as that, name the AE Title that was asked for, and say that someone has to register it there. ' +
+        'There are two ways to use this and they fail differently. destinationAe names somewhere the peer already knows, and the images go THERE, not here: nothing local can be checked, so the result carries verified false and arrived null, and a success means only that the peer says it sent them — never read it as "the study arrived intact", because only the destination can say that. receiveDir with receivePort instead runs a receiver on this machine for the duration of the move, defaults the destination to our own calling AE, and writes what arrives into that folder — and that is the only form whose arrivals get counted. ' +
+        'Running a receiver does not tell the archive about it: the peer still has to have that AE Title registered against THIS machine\'s address and THIS port. Two further details turn into a silent zero-instance move when they are got wrong — the sub-operation C-STOREs arrive on a SEPARATE association from the one this request went out on, and they carry MoveOriginatorApplicationEntityTitle set to the peer, so a receiver that allowlists calling AE Titles has to allow the ARCHIVE\'s AE, not ours.' +
+        RETRIEVE_ACCOUNTING,
+      inputSchema: {
+        ...peerSchema(),
+        ...retrieveLevelSchema(),
+        destinationAe: z.string().optional().describe(
+          'Destination AE Title. THE PEER must already resolve it to a host and port; a title it has never heard of answers 0xA801 and moves nothing. Defaults to our calling AE when receiveDir is set.'
+        ),
+        receiveDir: z.string().optional().describe(
+          'WRITES FILES: absolute path of a folder to run a receiver over for the duration of the move. This is the only form whose arrivals can be counted against what the peer claims. Created if missing, and requires receivePort. Files already in it are snapshotted first, so a re-run counts only what THIS move delivered.'
+        ),
+        receivePort: z.number().int().optional().describe(
+          'Port that receiver listens on. Required with receiveDir, and it has to be the port the peer has registered against the destination AE Title — a receiver listening where nobody registered it gives a move that completes and delivers nothing.'
+        ),
+      },
+    },
+    async (a) => {
+      const argv = peerArgv(a);
+      opt(argv, '--study', a.studyUid);
+      opt(argv, '--series', a.seriesUid);
+      opt(argv, '--instance', a.instanceUid);
+      // Giving neither a destination nor a receiver is left to the command,
+      // which explains the choice between the two forms — and points at
+      // dcm_get for a peer that has nothing registered for us — far better
+      // than a schema error could. Same for receivePort without receiveDir.
+      opt(argv, '--destination', a.destinationAe);
+      opt(argv, '--receive', a.receiveDir);
+      opt(argv, '--receive-port', a.receivePort);
+      argv.push('--json');
+      return retrieveResult(await runCommand('move', argv), 'move');
+    }
+  );
+
+  /** Outcomes where the request never got far enough to retrieve anything. */
+  const DID_NOT_RUN = new Set(['rejected', 'aborted', 'timeout', 'network', 'usage']);
+
+  /**
+   * Presents a `dcm get` or `dcm move` result.
+   *
+   * jsonResult drops the document on a non-zero exit and hands back stderr,
+   * which is exactly backwards for these two: the most important way they exit
+   * non-zero is the accepted-but-lossy retrieve, and `shortfall`, `written` /
+   * `arrived`, `reported` and `problems` are the fields that say so. They live
+   * nowhere else, so the envelope always survives. The exit code still decides
+   * isError, because an incomplete retrieve has to read as a failure — that is
+   * the exit-code contract, and softening it here would undo it.
+   *
+   * Those fields are read off the TOP LEVEL rather than out of a payload
+   * object: json.build spreads a command's payload onto the envelope, so it is
+   * env.shortfall and not env.payload.shortfall.
+   *
+   * @param {{code:number, out:string, err:string}} result  From runCommand.
+   * @param {'get'|'move'} service  Which command produced it.
+   * @returns {object}  MCP tool result.
+   */
+  function retrieveResult(result, service) {
+    let parsed;
+    try {
+      parsed = JSON.parse(result.out);
+    } catch {
+      return jsonResult(result);
+    }
+    if (!isEnvelope(parsed)) return jsonResult(result);
+
+    const notes = retrieveNotes(parsed, service);
+    if (result.err && result.err.trim()) notes.push(result.err.trim());
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(parsed, null, 2) + (notes.length ? `\n\n${notes.join('\n\n')}` : ''),
+      }],
+      structuredContent: parsed,
+      isError: result.code !== 0,
+    };
+  }
+
+  /**
+   * Says what a retrieve's numbers mean, from the fields the command emitted.
+   *
+   * Five results here resemble each other and mean different things, and four
+   * of the five get reported as the fifth: a request that never ran, a
+   * shortfall, a peer that returned no counts to compare against, a C-MOVE to
+   * a third party where there was no local disk to check at all, and a clean
+   * complete retrieve. Each of the first four gets a sentence saying what it
+   * does NOT prove, because the document on its own has been read the
+   * optimistic way too often to be left to speak for itself.
+   *
+   * @param {object} p  The parsed envelope.
+   * @param {'get'|'move'} service
+   * @returns {string[]}
+   */
+  function retrieveNotes(p, service) {
+    const notes = [];
+    const verb = service === 'move' ? 'move' : 'retrieve';
+    const where = service === 'move' ? 'arrived' : 'are on disk';
+    const landed = service === 'move' ? p.arrived : p.written;
+
+    if (DID_NOT_RUN.has(p.outcome)) {
+      notes.push(
+        `The ${verb} never ran to completion: outcome "${p.outcome}". NOTHING WAS RETRIEVED AND ` +
+          'NOTHING WAS COMPARED, so this is not an empty study and must not be reported as one — ' +
+          'a peer that refused the association, or tore it down mid-transfer, never answered the ' +
+          'request that was made. detail.associate, detail.transport and dcm://troubleshooting ' +
+          'say which of those happened.'
+      );
+      return notes;
+    }
+
+    if (p.shortfall > 0) {
+      notes.push(
+        `SHORTFALL: ${p.shortfall} instance(s). The peer reports ${p.reported?.completed} ` +
+          `sub-operation(s) completed while ${landed} ${where}. THE STUDY IS INCOMPLETE. The ` +
+          'transfer was accepted, which is exactly why this is a failure rather than a warning — ' +
+          'report the gap rather than the peer\'s count, and treat the folder as partial.'
+      );
+    }
+
+    if (p.reported && p.reported.counted === false) {
+      notes.push(
+        `The peer returned no sub-operation counts, so the only number here is the ${landed} that ` +
+          `${where}. Nothing in this result confirms the study is complete — it was not ` +
+          'contradicted, which is a weaker claim. dcm_query at series level gives the ' +
+          "archive's own instance counts to compare against."
+      );
+    }
+
+    if (service === 'move' && p.verified === false) {
+      notes.push(
+        `The images went to ${p.destinationAe}, not to this machine, so there was no local folder ` +
+          'to check and arrived is null. Everything above is the PEER\'s account of what it did. ' +
+          'A success here does not prove anything landed at the destination — query the ' +
+          'destination itself to find that out, or use receiveDir with receivePort if the ' +
+          'arrivals need counting.'
+      );
+    }
+
+    if (p.ok && landed === 0) {
+      notes.push(
+        'The request succeeded and nothing arrived. The UIDs matched nothing on this peer, or it ' +
+          'holds the study and will not release it to this calling AE Title. Check with ' +
+          'dcm_query for the same StudyInstanceUID before concluding the study is not there.'
+      );
+    }
+
+    return notes;
+  }
+
   // ---- Local files -------------------------------------------------------
   server.registerTool(
     'dcm_inventory',

@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A single-binary DICOM CLI for pushing folders of DICOM around. C-ECHO, C-STORE,
-C-FIND, a receiver that logs everything, worklists and MPPS, DICOMweb
-(STOW/QIDO/WADO), plus inventory and de-identification. No runtime to install
-on the box you're running it from. Windows, macOS and Linux.
+C-FIND, C-GET and C-MOVE, a receiver that logs everything and can be retrieved
+from, worklists and MPPS, DICOMweb (STOW/QIDO/WADO), plus inventory and
+de-identification. No runtime to install on the box you're running it from.
+Windows, macOS and Linux.
 
 I wrote this because every DICOM transfer tool I've used answers the wrong
 question. They tell you the association succeeded. What I need to know is
@@ -469,6 +470,47 @@ dcm scp --port 11112 --reject-after 20
 ```
 
 
+**Serving retrieves.** `--serve <dir>` makes this receiver answer C-GET and
+C-MOVE out of a folder, so it can be retrieved *from* as well as sent to — which
+is what gives `dcm get` and `dcm move` a loopback target:
+
+```bash
+dcm scp --port 11112 --ae QR-SCP --serve ./library
+```
+
+Without `--serve`, retrieves are refused rather than answered emptily: a
+receiver reporting success for a retrieve it served nothing from would be a lie
+told by this end.
+
+A C-MOVE carries only an AE Title, so this receiver has to be told what the
+titles mean. `--destination AE=host:port` is repeatable:
+
+```bash
+dcm scp --port 11112 --ae QR-SCP --serve ./library \
+  --destination VIEWER=127.0.0.1:11113 --destination ARCHIVE2=10.0.0.5:104
+```
+
+```
+  move destinations: VIEWER@127.0.0.1:11113, ARCHIVE2@10.0.0.5:104
+```
+
+A destination it has no entry for is answered `0xA801`, exactly as a real
+archive answers one it has never heard of — which makes the commonest C-MOVE
+failure in the field reproducible locally, on purpose, in one command.
+
+And the deliberate lie, for testing the property the retrieve commands exist to
+enforce:
+
+```bash
+# Claim three MORE completed sub-operations than were actually sent.
+dcm scp --port 11112 --ae QR-SCP --serve ./library --retrieve-overcount 3
+```
+
+A `dcm get` against that puts 10 instances on disk, hears the peer claim 13, and
+exits 1 with `FAILED — the peer reports 13 instance(s) sent but 10 are on disk
+— 3 missing`. A client that takes the peer's word for it exits 0 and tells you
+the study is complete.
+
 **Serving a worklist.** By default this receiver stores but does not index, so
 every C-FIND against it returns zero matches. Give it `--worklist` and it
 answers Modality Worklist queries from a JSON file, which is what you want when
@@ -535,6 +577,135 @@ dcm find --host pacs.example.org --port 11112 --called-ae ARCHIVE PatientID=1234
 ```
 
 Zero matches does not mean your transfer failed. See below.
+
+### dcm get
+
+Pull a study off a peer into a folder. Of the two retrieves, this is the one to
+reach for first.
+
+```bash
+dcm get --host pacs.example.org --port 11112 --called-ae ARCHIVE \
+  --study 1.2.840.113619.2.55.3.604688.1 --out ./pulled
+```
+
+```
+stored on disk      823
+peer completed      823
+destination         /home/you/pulled
+
+OK — 823 instance(s) written to /home/you/pulled
+```
+
+Files land at `<out>/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm`
+— the same layout as `dcm scp --persist` and `dcm web retrieve`, so however a
+study arrived, `dcm info` counts it the same way. `--series` narrows to one
+series, `--series` with `--instance` to one instance.
+
+**Which one, `get` or `move`?**
+
+| | `dcm get` (C-GET) | `dcm move` (C-MOVE) |
+| --- | --- | --- |
+| Where the images go | Back down the association you opened, into `--out` | Wherever the peer resolves the destination AE Title to |
+| Needs configuring on the peer | Nothing | Your destination AE Title, registered against your host and port |
+| Needs configuring here | Nothing | A listening port, if you are receiving it yourself |
+| How it usually fails | The archive doesn't implement C-GET: `0x0122` | The archive has never heard of your AE Title: `0xA801` |
+
+Start with `get`. The images come back as C-STORE sub-operations on the
+association you already opened, so nothing has to be configured on either end,
+which is what makes "name a study, name a folder" one command rather than a
+project. If the peer answers `0x0122` SOP Class not supported then it does not
+implement C-GET — plenty of archives don't — and `move` is the fallback.
+
+Accepting the presentation context isn't a promise to implement the service,
+exactly as with C-FIND: a peer can negotiate Study Root GET happily and then
+answer the request itself with a failure status. What you are told is what the
+peer actually said, not what the negotiation implied.
+
+#### The peer's count is evidence, not the verdict
+
+Both retrieves cross-check. The peer reports how many sub-operations it
+completed; that number is compared against the files that actually exist, and a
+gap is a failure:
+
+```
+stored on disk      820
+peer completed      823
+
+error 3 instance(s) the peer says it sent are not on disk. The transfer was
+      accepted and is incomplete, which is why this exits non-zero rather than
+      reporting the peer's own count as the result.
+
+FAILED — the peer reports 823 instance(s) sent but 820 are on disk — 3 missing
+```
+
+Exit 1. Same rule as the three numbers on `send`, and it is here for the same
+reason: an accepted-but-lossy retrieve is the failure that otherwise goes
+unnoticed, because every number on screen agrees with every other one. A peer
+that returns no sub-operation counts at all gets said out loud too — "nothing
+contradicted it" is a weaker claim than "verified complete", and only one of
+those two is true.
+
+### dcm move
+
+Ask the peer to send a study somewhere. Either to a third party:
+
+```bash
+dcm move --host pacs.example.org --port 11112 --called-ae ARCHIVE \
+  --study 1.2.840.113619.2.55.3.604688.1 --destination PACS-VIEWER
+```
+
+or to a receiver this command runs for you, for the duration of the move:
+
+```bash
+dcm move --host pacs.example.org --port 11112 --called-ae ARCHIVE \
+  --study 1.2.840.113619.2.55.3.604688.1 --receive ./pulled --receive-port 11113
+```
+
+**A C-MOVE does not carry an address.** It carries a destination AE *Title*, and
+the peer has to already resolve that title to a host and port it can reach. That
+one fact is behind nearly every failed C-MOVE: the request is accepted, the
+archive looks the title up, finds nothing, and answers
+
+```
+error The peer does not know where to send the images (0xa801, "Move
+      Destination unknown"): it has no AE Title "PACS-VIEWER".
+error C-MOVE does not carry a host and port — it carries only an AE Title,
+      which the PEER must already resolve to an address it can reach. This is a
+      configuration change on the archive, not something this tool can send.
+```
+
+without one image moving. **There is no flag here that fixes that.** The fix is
+a configuration change on the *archive* — someone over there has to register
+your AE Title against your host and port. Give them all three, and quote the
+code: like reason 3, this is a configuration issue rather than a code issue.
+
+That applies to `--receive` too. Running a receiver on this machine does not
+tell the archive about it, so the destination AE still has to be registered
+against this machine's address and this port. If nobody will register anything
+for you, use `dcm get`.
+
+One more thing that turns into a silent zero-instance move: the sub-operation
+C-STOREs arrive on a *separate* association from the one `move` opened, and they
+carry `MoveOriginatorApplicationEntityTitle` set to the peer. So a receiver that
+allowlists calling AE Titles has to allow the **archive's** AE Title, not this
+tool's.
+
+**What gets checked, and what is only reported.** With `--receive`, the files
+that actually appeared on disk are counted against the sub-operations the peer
+says it completed, as above, and a gap exits non-zero. Without it the images
+went to a third party, there is nothing local to compare, and the output says
+that rather than implying a verification it did not do:
+
+```
+destination   PACS-VIEWER
+receiving     elsewhere — nothing local to check
+```
+
+```
+The images went to PACS-VIEWER, so the only evidence here is what this peer
+reported. Confirm the study arrived by querying the destination itself — a 0
+exit code from this command does not prove anything landed there.
+```
 
 ### dcm mpps
 
@@ -1219,8 +1390,9 @@ xattr -d com.apple.quarantine ./dcm
 | `1` | Ran but didn't fully succeed, including an accepted-but-lossy transfer. |
 | `2` | Bad command line. |
 
-The 0/1 split is deliberately strict. 823 found and 822 acknowledged exits 1.
-It's meant to be safe to drop into a cron job.
+The 0/1 split is deliberately strict. 823 found and 822 acknowledged exits 1,
+and so does a retrieve where the peer claims 823 sub-operations and 820 files
+are on disk. It's meant to be safe to drop into a cron job.
 
 Two things that look like failures and aren't: `dcm update --check` exits 0
 whether or not an update exists, because it answered the question; and a
