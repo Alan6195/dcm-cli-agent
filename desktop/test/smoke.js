@@ -1946,6 +1946,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (down.rows !== rows.length || !/last list that was read/.test(down.list)) {
         bad(`the rows left on screen are not labelled as the previous answer: ${JSON.stringify(down)}`);
       }
+      // The failure's own words in the Output are red too, like the chip and
+      // the line where the list is. A captured run writes them after it has
+      // exited, so they are never drawn as dim narration.
+      await mustWait("document.querySelector('#wl-console .err.loud')",
+        5000, 'the RIS failure to be written red in the Output');
+      const dimFail = await js("document.querySelectorAll('#wl-console .err:not(.loud)').length");
+      if (dimFail) bad(`${dimFail} span(s) of the RIS failure are drawn dim in the Output`);
       // Back to the RIS that is there.
       await js(`(async () => {
         await deletePeer(${JSON.stringify(DEAD_PEER)});
@@ -4696,6 +4703,21 @@ async function runSmoke(win, app, mainHelpers = {}) {
       bad(`Stop reported ${JSON.stringify(stopResult)} for an engine that is in fact gone`);
     }
     if (stopMs > 5000) bad(`Stop took ${stopMs}ms to reach the engine during a flood`);
+    // The run is over, so its button is live again and nothing counts it as
+    // still running. (Stop itself stays up here: the harness showed it before
+    // the run, and the busy state puts back exactly what it found.) And it was
+    // stopped, not failed, so none of what it wrote turned red.
+    const idle = await jsJSON(`(() => {
+      const c = document.querySelector('#view-receive [data-console]');
+      return JSON.stringify({
+        runDisabled: document.querySelector('#view-receive [data-run]').disabled,
+        n: busy.receive ? busy.receive.n : 0,
+        red: c.querySelectorAll('.err.loud').length
+          + consoleStates.get(c).pending.filter((p) => p.loud).length,
+      });
+    })()`);
+    if (idle.runDisabled || idle.n !== 0) bad(`the stopped flood left Receive busy: ${JSON.stringify(idle)}`);
+    if (idle.red) bad(`${idle.red} piece(s) of a run the operator stopped turned red, as if it had failed`);
 
     // --- Pass 3: the same flood at a minimised window. ----------------------
     // requestAnimationFrame is not served to a window that is not compositing,
@@ -4768,6 +4790,50 @@ async function runSmoke(win, app, mainHelpers = {}) {
     }
     if (fromBottom > 40) {
       bad(`after restore the console is ${fromBottom}px from the bottom, not following its output`);
+    }
+
+    // --- Colour: standard error is dim narration until its run fails. -------
+    // A failed run's lines turn red, and only that run's. A console holding
+    // several runs (a sitting's retrieves, the station's steps) must not
+    // repaint an earlier run's record when a later one fails, nor a failure's
+    // when the next run works. A run the operator stopped is not a failure.
+    const sayScript = path.join(work, 'say.js');
+    fs.writeFileSync(sayScript, [
+      "'use strict';",
+      '// Writes argv[2] to stderr and exits with argv[3], as an engine run would.',
+      'process.exitCode = Number(process.argv[3] || 0);',
+      "process.stderr.write(process.argv[2] + '\\n');",
+      '',
+    ].join('\n'));
+    const colours = await jsJSON(`(async () => {
+      showView('receive');
+      clearConsole('receive');
+      const say = (text, code) =>
+        runStreaming('receive', ['__script__', ${JSON.stringify(sayScript)}, text, String(code)]);
+      const codes = [];
+      for (const [text, code] of [['first run worked', 0], ['second run failed', 3], ['third run worked', 0]]) {
+        codes.push((await say(text, code)).code);
+      }
+      await new Promise((r) => setTimeout(r, 600));
+      const c = document.querySelector('#view-receive [data-console]');
+      return JSON.stringify({
+        codes,
+        spans: Array.from(c.children).map((el) => ({ text: el.textContent.trim(), cls: el.className })),
+      });
+    })()`);
+    record(`console colour: ${colours.spans.map((x) => `"${x.text}" ${x.cls}`).join(' · ')}`);
+    const colourOf = (text) => (colours.spans.find((x) => x.text === text) || {}).cls;
+    if (JSON.stringify(colours.codes) !== '[0,3,0]') {
+      bad(`the colour probe runs exited ${JSON.stringify(colours.codes)}, expected [0,3,0]`);
+    }
+    if (colourOf('first run worked') !== 'err') {
+      bad(`a run that worked is not dim, or was repainted by the next one: ${JSON.stringify(colours.spans)}`);
+    }
+    if (colourOf('second run failed') !== 'err loud') {
+      bad(`a run that exited non-zero is not red: ${JSON.stringify(colours.spans)}`);
+    }
+    if (colourOf('third run worked') !== 'err') {
+      bad(`a run that worked turned red after an earlier failure: ${JSON.stringify(colours.spans)}`);
     }
 
     // =====================================================================

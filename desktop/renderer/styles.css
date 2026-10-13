@@ -344,10 +344,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
   line-height: 1.45;
 }
 /* Standard error is where the engine narrates — progress, warnings, retries —
- * so it reads dim. Red is for a line that says something failed, and for all
- * of what a run that exited non-zero wrote (set by runStreaming). */
+ * so it reads dim. Red (.loud) is for a line that says something failed, for
+ * all of what a run that exited non-zero wrote, and for the app's own words
+ * about a failure or a refusal (see appendConsole). */
 .console .err { color: var(--text-dim); }
-.console .err.loud, .console.exit-fail .err { color: var(--red); }
+.console .err.loud { color: var(--red); }
 .console .ok { color: var(--green); }
 .console .warn { color: var(--amber); }
 
@@ -681,10 +682,11 @@ tr.incomplete td:first-child { box-shadow: inset 3px 0 0 var(--red); }
   display: inline-block; white-space: nowrap;
 }
 /* The counts are the verdict on an incomplete row, so they are not allowed to
- * shrink into a footnote the way an inline caveat elsewhere can. */
-td.ack .warn-inline { font-size: 12.5px; font-weight: 700; white-space: nowrap; }
+ * shrink into a footnote the way an inline caveat elsewhere can, and they are
+ * the same red as the row. */
+td.ack .warn-inline { color: var(--red); font-size: 12.5px; font-weight: 700; white-space: nowrap; }
 /* The same run, in the live list above, while the sweep is still going. */
-.speed-progress .run-line .rate.bad { color: var(--amber); }
+.speed-progress .run-line .rate.bad { color: var(--red); }
 /* The caveats belong under the numbers they qualify, inside the same box. */
 .result-table .local-note { margin: 14px 0 0; }
 /* "12 of 16" is one reading and must not break across two lines, where the
@@ -1067,17 +1069,15 @@ tr.pick-row { scroll-margin-block: 28px; }
  * then the output of what did. The command may be folded and the output may be
  * folded; neither may be absent, and nothing that failed is left behind a
  * triangle (see revealConsole). Both read the same way: a quiet label with a
- * triangle, not a panel — the station's Output included. */
-.out-fold { margin-bottom: 20px; }
-.out-fold, #mwl-out { border: none; border-radius: 0; background: transparent; }
-.out-fold > summary, #view-worklist #mwl-out > summary {
+ * triangle, not a panel. The station's Output keeps its own design. */
+.out-fold { margin-bottom: 20px; border: none; border-radius: 0; background: transparent; }
+.out-fold > summary {
   padding: 4px 0; flex-wrap: nowrap;
   color: var(--text-dim); font-weight: 400; font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.9px;
 }
-.out-fold > summary:hover, #view-worklist #mwl-out > summary:hover { color: var(--accent); }
-#mwl-out .adv-sum { text-transform: none; letter-spacing: 0; }
-.out-fold > .adv-body, #view-worklist #mwl-out > .adv-body { border-top: none; padding: 6px 0 0; }
+.out-fold > summary:hover { color: var(--accent); }
+.out-fold > .adv-body { border-top: none; padding: 6px 0 0; }
 .out-fold .console-wrap { border-radius: 7px; }
 
 .cmd-fold { margin-bottom: 16px; }

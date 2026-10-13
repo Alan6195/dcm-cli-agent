@@ -1137,7 +1137,6 @@ function clearConsole(view) {
 
 /** Empties a console and its accounting together, so neither outlives the other. */
 function resetConsole(c) {
-  c.classList.remove('exit-fail');
   const s = consoleStateFor(c);
   if (s.frame) { cancelAnimationFrame(s.frame); s.frame = 0; }
   if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
@@ -1156,13 +1155,22 @@ function resetConsole(c) {
 /**
  * @param {string} view
  * @param {string} text
- * @param {'stdout'|'stderr'} stream
+ * @param {'stdout'|'stderr'|'narration'} stream  'narration' is a running
+ *   engine's own standard error — progress, warnings, retries — and is drawn
+ *   dim, red only for a line that says something failed or once its run exits
+ *   non-zero (see markRunFailed). Anything else written as 'stderr' is this app
+ *   saying why something failed or was refused, or a failed run's output
+ *   written after it ended, and is always red.
  * @param {number} [dropped]  lines the main process discarded before this
  *   chunk, because the window was not taking them fast enough. Folded into the
  *   same total as the console's own trimming, so there is one number to read
  *   and it covers everything that went missing between the engine and the eye.
+ * @param {number} [run]  the streaming run this chunk came from, so that run's
+ *   lines alone can turn red when it fails. A console can hold several runs
+ *   (the retrieves of a sitting, the station's steps), and one run's failure
+ *   says nothing about the others.
  */
-function appendConsole(view, text, stream, dropped) {
+function appendConsole(view, text, stream, dropped, run = 0) {
   const c = consoleEl(view);
   if (!c) return;
   const s = consoleStateFor(c);
@@ -1172,10 +1180,12 @@ function appendConsole(view, text, stream, dropped) {
     scheduleConsoleFlush(c, s);
   }
   if (!text) return;
-  const err = stream === 'stderr';
+  const narration = stream === 'narration';
+  const err = narration || stream === 'stderr';
   for (const piece of splitConsoleText(stripAnsi(text), CONSOLE_PIECE_LINES)) {
-    for (const part of err ? loudRuns(piece) : [{ ...piece, loud: false }]) {
-      s.pending.push({ text: part.text, lines: part.lines, err, loud: part.loud });
+    const parts = narration ? loudRuns(piece) : [{ ...piece, loud: err }];
+    for (const part of parts) {
+      s.pending.push({ text: part.text, lines: part.lines, err, loud: part.loud, run });
       s.pendingLines += part.lines;
     }
   }
@@ -1197,7 +1207,7 @@ function appendConsole(view, text, stream, dropped) {
  *
  * Standard error is where the engine narrates — progress, warnings, retries —
  * so it is drawn dim. Red is kept for a line that says something went wrong,
- * and for everything a run that exited non-zero wrote (see .exit-fail).
+ * and for everything a run that exited non-zero wrote (see markRunFailed).
  */
 const LOUD_LINE = /^(ERR|error|refused|failed)/i;
 const LOUD_ANYWHERE = /^(ERR|error|refused|failed)/im;
@@ -1217,6 +1227,22 @@ function loudRuns(piece) {
     else runs.push({ text: line, lines: 1, loud });
   }
   return runs;
+}
+
+/**
+ * A run exited non-zero: everything it narrated turns red, whether it is still
+ * waiting to be written or already on screen. Only that run's lines — an
+ * earlier retrieve in the same console keeps its own colour, and so does the
+ * next run's.
+ */
+function markRunFailed(view, run) {
+  const c = consoleEl(view);
+  const s = c && consoleStates.get(c);
+  if (!s) return;
+  for (const piece of s.pending) if (piece.run === run && piece.err) piece.loud = true;
+  for (const span of c.children) {
+    if (span.consoleRun === run && span.className === 'err') span.className = 'err loud';
+  }
 }
 
 /**
@@ -1255,6 +1281,7 @@ function flushConsole(c, painting) {
     // A plain property, not a data- attribute: an attribute write would
     // invalidate style for every span we add.
     span.consoleLines = piece.lines;
+    span.consoleRun = piece.run;
     written += piece.lines;
     s.lines += piece.lines;
     frag.appendChild(span);
@@ -1450,6 +1477,7 @@ function stampRun(view, argv) {
 
 /** Runs the operator stopped. Stopping is not failing, so they do not turn the output red. */
 const stopAsked = new Set();
+let consoleRunSeq = 0;
 
 /**
  * Run a command, streaming into the view's console.
@@ -1461,18 +1489,17 @@ function runStreaming(view, argv, { onExit } = {}) {
     const err = makeBounded(RUN_STDERR_LIMIT);
     setBusy(view, true);
     stampRun(view, argv);
-    const box = consoleEl(view);
-    if (box) box.classList.remove('exit-fail');
+    const tag = ++consoleRunSeq;
     const runId = await window.dcm.start(argv, state.info.home || null, {
       onChunk: (stream, text, dropped) => {
         if (stream === 'stdout') out.push(text); else err.push(text);
-        appendConsole(view, text, stream, dropped);
+        appendConsole(view, text, stream === 'stdout' ? 'stdout' : 'narration', dropped, tag);
       },
       onExit: (code) => {
         delete state.activeRuns[view];
         setBusy(view, false);
         const stopped = stopAsked.delete(runId);
-        if (box) box.classList.toggle('exit-fail', code !== 0 && !stopped);
+        if (code !== 0 && !stopped) markRunFailed(view, tag);
         // A non-zero exit is exactly the case the fold must not swallow.
         if (code !== 0) revealConsole(view);
         const result = { code, stdout: out.value, stderr: err.value };
@@ -4638,7 +4665,7 @@ function renderSpeedResults(results) {
     const rate = miss
       ? '<td class="num dim">—</td><td class="num dim">—</td>'
       : `<td class="num">${d.megabytesPerSecond}</td><td class="num">${d.instancesPerSecond}</td>`;
-    // The counts are the row's verdict, so they are amber and they carry the
+    // The counts are the row's verdict, so they are red and they carry the
     // gap in words — "60/100" and "100/100" differ by one character otherwise.
     const ack = miss && miss.missing > 0
       ? `<span class="warn-inline">${d.acknowledged}/${d.found} · ${miss.missing} missing</span>`
@@ -4843,9 +4870,10 @@ async function runSpeedTest() {
       // and --json does not silence it: the per-study shortfall warning naming
       // the width the study really ran at, and any flag a preset displaced.
       // Discarding stderr whenever stdout parsed meant throwing it away on
-      // precisely the runs whose numbers reach the table.
+      // precisely the runs whose numbers reach the table. It is narration, and
+      // dim, unless the run failed.
       if (data && stderr.trim()) {
-        appendConsole('speed', `\n--- ${runs[i].title} ---\n${stderr}`, 'stderr');
+        appendConsole('speed', `\n--- ${runs[i].title} ---\n${stderr}`, code === 0 ? 'narration' : 'stderr');
       }
       results.push({ run: runs[i], data, code });
 
