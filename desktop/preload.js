@@ -40,6 +40,9 @@ contextBridge.exposeInMainWorld('dcm', {
   /** Reveal a file or folder in the OS file manager. */
   reveal: (target) => ipcRenderer.invoke('dcm:reveal', target),
 
+  /** Where `dcm` resolves on this app's PATH — what Claude would start: {path} or {path: null}. */
+  onPath: () => ipcRenderer.invoke('dcm:on-path'),
+
   profiles: {
     get: () => ipcRenderer.invoke('dcm:profiles:get'),
     set: (data) => ipcRenderer.invoke('dcm:profiles:set', data),

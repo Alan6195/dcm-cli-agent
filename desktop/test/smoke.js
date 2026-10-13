@@ -28,7 +28,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 // This file only ever runs inside the main process, which has already loaded
 // electron; taking ipcMain from it is how the native folder dialog is answered
 // without one being put on a screen nobody is looking at. See armPicker().
@@ -125,14 +125,18 @@ const BUDGET = {
   anon: 25,
   speed: 32,
   // Instructions, not a command: the two copy boxes and their one line each,
-  // now that the "Ready" line and the hand-picked tool cards are gone.
+  // now that the "Ready" line and the hand-picked tool cards are gone. The
+  // line saying whether dcm is on PATH is checked, not claimed, and what it
+  // says depends on the machine ("dcm found at <path>", or the 14-word "not
+  // on your PATH" sentence and its link), so this is raised by exactly that
+  // line's own words, counted on screen at measure time — see measureScreen.
   mcp: 42,
   // The screen the others were emptied into. It runs no command, so it is
   // counted whole: section titles, labels, the saved peers, "+ Add a peer".
-  // Its parentheticals and notes are behind its ?, and the add form folds
-  // away once a peer is saved. A number nobody looks at is how a screen
-  // becomes the one it was, at 222 words.
-  settings: 93,
+  // Its parentheticals and notes are behind its ?, and both add forms fold
+  // away — the DICOMweb one even with no server saved. A number nobody looks
+  // at is how a screen becomes the one it was, at 222 words.
+  settings: 87,
 };
 
 /**
@@ -299,6 +303,45 @@ async function shot(name) {
   }
 }
 
+/**
+ * The station list, read the way an operator reads it: is the Status column —
+ * header and every pill — in view without scrolling the table sideways, and
+ * is each text column as wide as what it holds rather than a stretch of
+ * nothing in the middle of the row? The table is read at scrollLeft 0 and put
+ * back. `need` is the widest entry or header in a column, padding included;
+ * the last column is the one that takes the slack.
+ */
+const STATION_COLUMNS = `JSON.stringify((() => {
+  const box = document.querySelector('#view-worklist .table-scroll');
+  const ths = Array.from(document.querySelectorAll('#mwl-table thead th'));
+  const status = ths.find((t) => t.textContent === 'Status');
+  if (!box || !status) return { statusVisible: false, why: 'no list on screen' };
+  const was = box.scrollLeft;
+  box.scrollLeft = 0;
+  const edge = Math.round(box.getBoundingClientRect().left + box.clientWidth);
+  const pills = Array.from(document.querySelectorAll('#mwl-table td.session-cell .pill'))
+    .map((p) => Math.round(p.getBoundingClientRect().right));
+  const statusRight = Math.round(status.getBoundingClientRect().right);
+  const pillRight = Math.max(0, ...pills);
+  const range = document.createRange();
+  const content = (cell) => { range.selectNodeContents(cell); return range.getBoundingClientRect().width; };
+  const rows = Array.from(document.querySelectorAll('#mwl-table tbody tr'));
+  const cols = ths.map((th, i) => {
+    const cs = getComputedStyle(th);
+    const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+    const widest = Math.max(content(th), ...rows.map((tr) => (tr.children[i] ? content(tr.children[i]) : 0)));
+    return { name: th.textContent, width: Math.round(th.getBoundingClientRect().width), need: Math.ceil(widest + pad) };
+  });
+  box.scrollLeft = was;
+  return { statusVisible: statusRight <= edge + 1 && pillRight <= edge + 1, statusRight, pillRight, edge, cols };
+})())`;
+
+/** The text columns (not the pills, not the last) that are wider than what they hold. */
+function slackColumns(seen) {
+  const cols = seen.cols || [];
+  return cols.slice(0, -1).filter((c) => !['Status', 'Modality'].includes(c.name) && c.width > c.need + 8);
+}
+
 function artefact(name, text) {
   fs.writeFileSync(path.join(OUT, name), text == null ? '' : String(text));
 }
@@ -371,6 +414,11 @@ const HELPERS = `(() => {
           .filter((el) => vis(el) && !el.closest('details:not([open])')).length,
         primary: stop ? (stop.textContent || '').trim() : '(none)',
       };
+    },
+
+    /** Words in one element, counted by the same rule as measure(). */
+    words(el) {
+      return el ? (el.textContent.match(WORD) || []).length : 0;
     },
 
     /** Every command fold in a pane: whether it is folded, and what it says folded and open. */
@@ -1021,6 +1069,60 @@ async function runSmoke(win, app, mainHelpers = {}) {
       bad(`the roles did not come back: ${JSON.stringify(roleSteal.restored)}`);
     }
 
+    // DICOMweb servers fold the same way, behind "+ Add a server" — and stay
+    // folded with none saved, because a server is optional and most stations
+    // never set one (a station needs its peers; it does not need a server).
+    // The button opens the form ready to type; Add or Cancel puts it away.
+    const SMOKE_WEB = 'http://127.0.0.1:1/smoke-web';
+    const webForm = await jsJSON(`(async () => {
+      showView('settings');
+      const q = (s) => document.querySelector(s);
+      const vis = (s) => __smoke.vis(q(s));
+      const urlBefore = state.web.url;
+      const rest = { form: vis('#webserver-form'), add: vis('#webserver-new'),
+        addLabel: q('#webserver-new').textContent.trim(), servers: webProfiles().length,
+        list: q('#set-webservers').textContent.trim() };
+      q('#webserver-new').click();
+      const adding = { form: vis('#webserver-form'), add: vis('#webserver-new'), cancel: vis('#webserver-cancel'),
+        focus: document.activeElement === q('#webserver-url') };
+      q('#webserver-url').value = 'typed then cancelled';
+      q('#webserver-cancel').click();
+      const cancelled = { form: vis('#webserver-form'), add: vis('#webserver-new'), left: q('#webserver-url').value };
+      q('#webserver-new').click();
+      q('#webserver-url').value = ${JSON.stringify(SMOKE_WEB)};
+      q('#webserver-add').click();
+      // Saved, then drawn: the list is re-rendered once the file is written.
+      for (let i = 0; i < 200 && !q('[data-web-delete="' + ${JSON.stringify(SMOKE_WEB)} + '"]'); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const saved = { form: vis('#webserver-form'), add: vis('#webserver-new'),
+        listed: q('#set-webservers').textContent.includes(${JSON.stringify(SMOKE_WEB)}) };
+      const del = q('[data-web-delete="' + ${JSON.stringify(SMOKE_WEB)} + '"]');
+      if (del) del.click();
+      for (let i = 0; i < 200 && q('[data-web-delete="' + ${JSON.stringify(SMOKE_WEB)} + '"]'); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return JSON.stringify({ rest, adding, cancelled, saved,
+        after: { servers: webProfiles().length, url: state.web.url, urlBefore } });
+    })()`);
+    say(`settings: DICOMweb form ${JSON.stringify(webForm)}`);
+    if (webForm.rest.servers !== 0) bad(`the harness expected no DICOMweb servers saved yet: ${JSON.stringify(webForm.rest)}`);
+    if (webForm.rest.form || !webForm.rest.add || webForm.rest.addLabel !== '+ Add a server' || webForm.rest.list !== '') {
+      bad(`with no server saved the DICOMweb form is not folded behind "+ Add a server": ${JSON.stringify(webForm.rest)}`);
+    }
+    if (!webForm.adding.form || webForm.adding.add || !webForm.adding.cancel || !webForm.adding.focus) {
+      bad(`"+ Add a server" did not open the form ready to type: ${JSON.stringify(webForm.adding)}`);
+    }
+    if (webForm.cancelled.form || !webForm.cancelled.add || webForm.cancelled.left !== '') {
+      bad(`Cancel did not put the DICOMweb form away empty: ${JSON.stringify(webForm.cancelled)}`);
+    }
+    if (webForm.saved.form || !webForm.saved.add || !webForm.saved.listed) {
+      bad(`adding a server did not list it and fold the form: ${JSON.stringify(webForm.saved)}`);
+    }
+    if (webForm.after.servers !== 0 || webForm.after.url !== webForm.after.urlBefore) {
+      bad(`the harness's DICOMweb server was not removed again: ${JSON.stringify(webForm.after)}`);
+    }
+
     // A peer may need to be talked to as something other than this station.
     // The station's AE Title is the answer for almost every peer and it is
     // what MPPS attributes a step to — but a site whose archive whitelists a
@@ -1076,12 +1178,16 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // =====================================================================
     const budgetProblems = [];
     const wordLog = [];
-    const measureScreen = async (key, paneSel, stopSel) => {
+    // `extra` is for a line that reports what the machine is, whose words are
+    // not the screen's to cut — the Claude screen's "dcm found at <path>".
+    // Its own words, counted the same way, are added to the budget and said.
+    const measureScreen = async (key, paneSel, stopSel, extra = null) => {
       const m = await jsJSON(`JSON.stringify(__smoke.measure(${JSON.stringify(paneSel)}, ${stopSel ? JSON.stringify(stopSel) : 'null'}))`);
       if (!m) bad(`no such pane: ${paneSel}`);
-      const budget = BUDGET[key];
+      const budget = BUDGET[key] == null ? null : BUDGET[key] + (extra ? extra.words : 0);
       const line = `words: ${key} — ${m.words} words, ${m.controls} controls above "${m.primary}"`
-        + (budget == null ? ' (no budget)' : ` (budget ${budget})`);
+        + (budget == null ? ' (no budget)'
+          : extra ? ` (budget ${BUDGET[key]} + ${extra.words} for ${extra.what})` : ` (budget ${budget})`);
       record(line);
       // What was counted, verbatim, so a number that moves can be read rather
       // than guessed at.
@@ -1133,7 +1239,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
           });
         })()`);
         if (st.titles[0] !== 'Rehearsal') bad(`Rehearsal is not the first thing on Settings: ${JSON.stringify(st.titles)}`);
-        if (st.rehearsalLabel !== 'Rehearsal — nothing is sent') bad(`the rehearsal switch reads "${st.rehearsalLabel}"`);
+        // Under its own heading the switch says what it does, once: the
+        // heading names it, the label says nothing is sent.
+        if (st.rehearsalLabel !== 'Nothing is sent') bad(`the rehearsal switch reads "${st.rehearsalLabel}"`);
         if (!st.retrieveAfterEngineer || st.retrieveLabel !== 'Retrieve AE named in MPPS') {
           bad(`the MPPS retrieve AE is not an engineer option: ${JSON.stringify(st)}`);
         }
@@ -1147,7 +1255,125 @@ async function runSmoke(win, app, mainHelpers = {}) {
           if (m.text.includes(inText)) bad(`"${moved}" is still on the Settings screen: ${m.text}`);
         }
       } else if (name === 'mcp') {
-        await measureScreen(name, `#view-${name}`);
+        // The screen's one precondition, checked rather than claimed: is there
+        // a dcm on PATH for Claude to start? Main walks PATH each time the
+        // screen opens; the harness asks the platform's own tool, separately,
+        // and the two must agree — whichever way this machine happens to be.
+        await mustWait("!document.querySelector('#mcp-dcm').hidden && document.querySelector('#mcp-dcm').textContent.trim() !== ''",
+          8000, 'the Claude screen to say whether dcm is on PATH');
+        const probe = await jsJSON(`JSON.stringify((() => {
+          const line = document.querySelector('#mcp-dcm');
+          const btn = line.querySelector('button');
+          return { text: line.textContent.replace(/\\s+/g, ' ').trim(), cls: line.className,
+            path: (line.querySelector('.probe-path') || {}).textContent || '', words: __smoke.words(line),
+            btn: btn ? { help: btn.dataset.help || '', section: btn.dataset.helpSection || '', text: btn.textContent.trim() } : null,
+            beforeFirstTitle: !!(line.compareDocumentPosition(document.querySelector('#view-mcp .section-title'))
+              & Node.DOCUMENT_POSITION_FOLLOWING) };
+        })())`);
+        await measureScreen(name, `#view-${name}`, null, { words: probe.words, what: 'the dcm line' });
+        const harness = process.platform === 'win32'
+          ? spawnSync('where', ['dcm'], { encoding: 'utf8', windowsHide: true, cwd: OUT })
+          : spawnSync('/bin/sh', ['-c', 'command -v dcm'], { encoding: 'utf8', cwd: OUT });
+        const onPath = harness.status === 0
+          ? String(harness.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
+        const same = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+        record(`claude: the screen says "${probe.text}"; the harness's own `
+          + `${process.platform === 'win32' ? 'where dcm' : 'command -v dcm'} found ${onPath.length ? onPath.join(', ') : 'nothing'}`);
+        const MISSING = 'dcm is not on your PATH, so Claude cannot start it. How to install';
+        if (harness.error) bad(`the harness could not run its own PATH check: ${harness.error.message}`);
+        if (!probe.beforeFirstTitle) bad('the dcm line is not above both ways of registering it');
+        if (onPath.length) {
+          if (probe.text !== `dcm found at ${probe.path}` || !/\bfound\b/.test(probe.cls) || probe.btn) {
+            bad(`dcm is on PATH and the Claude screen does not say where: ${JSON.stringify(probe)}`);
+          }
+          // The same file, and named as the disk names it: where prints the
+          // file's own case (dcm.exe), not PATHEXT's (.EXE).
+          const match = onPath.find((p) => same(p, probe.path));
+          if (!match || path.basename(match) !== path.basename(probe.path) || !fs.existsSync(probe.path)) {
+            bad(`the Claude screen names a dcm the platform does not resolve: "${probe.path}" vs ${JSON.stringify(onPath)}`);
+          }
+        } else if (probe.text !== MISSING || !/\bmissing\b/.test(probe.cls) || !probe.btn
+          || probe.btn.help !== 'mcp-help' || probe.btn.section !== 'mcp-install') {
+          bad(`dcm is not on PATH and the Claude screen does not say so with the way to install it: ${JSON.stringify(probe)}`);
+        }
+        // Both forms, whichever this machine shows: what each says, in which
+        // colour, and that the missing form's link opens the help at the
+        // section that installs dcm.
+        const forms = await jsJSON(`(async () => {
+          const line = document.querySelector('#mcp-dcm');
+          const tone = (v) => { const s = document.createElement('span'); s.style.color = 'var(' + v + ')';
+            document.body.appendChild(s); const c = getComputedStyle(s).color; s.remove(); return c; };
+          drawDcmProbe(null);
+          const btn = line.querySelector('button[data-help="mcp-help"]');
+          const missing = { text: line.textContent.replace(/\\s+/g, ' ').trim(), amber: getComputedStyle(line).color === tone('--amber'),
+            linklike: !!(btn && btn.classList.contains('linklike')) };
+          setHelp('mcp-help', false);
+          if (btn) btn.click();
+          const panel = document.querySelector('#mcp-help');
+          const head = document.querySelector('#mcp-install');
+          const pr = panel.getBoundingClientRect();
+          const hr = head.getBoundingClientRect();
+          missing.opens = !panel.hidden;
+          missing.atSection = missing.opens && hr.top >= pr.top - 1 && hr.top <= pr.bottom - 20;
+          missing.installers = /install\\.ps1/.test(panel.textContent) && /install\\.sh/.test(panel.textContent)
+            && !/npm install/.test(panel.textContent);
+          setHelp('mcp-help', false);
+          drawDcmProbe('C:/Tools/dcm.exe');
+          const found = { text: line.textContent.replace(/\\s+/g, ' ').trim(), dim: getComputedStyle(line).color === tone('--text-dim'),
+            link: !!line.querySelector('button') };
+          drawDcmProbe(undefined);
+          const unknown = { hidden: line.hidden };
+          await renderDcmProbe();
+          return JSON.stringify({ missing, found, unknown, restored: line.textContent.replace(/\\s+/g, ' ').trim() });
+        })()`);
+        say(`claude: the two forms ${JSON.stringify(forms)}`);
+        if (forms.missing.text !== MISSING || !forms.missing.amber || !forms.missing.linklike) {
+          bad(`the "not on PATH" line is not the amber sentence with its link: ${JSON.stringify(forms.missing)}`);
+        }
+        if (!forms.missing.opens || !forms.missing.atSection || !forms.missing.installers) {
+          bad(`"How to install" does not open the help at the installers: ${JSON.stringify(forms.missing)}`);
+        }
+        if (forms.found.text !== 'dcm found at C:/Tools/dcm.exe' || !forms.found.dim || forms.found.link) {
+          bad(`the "found" line is not one dim line naming the path: ${JSON.stringify(forms.found)}`);
+        }
+        if (!forms.unknown.hidden) bad('a PATH look that did not happen still drew a status line');
+        if (forms.restored !== probe.text) bad(`the line did not come back to what this machine is: ${forms.restored}`);
+        // The walker itself, against PATHs made up here: only a file, only
+        // with an extension the platform runs, first directory wins, quotes
+        // are not part of a directory, and an empty PATH finds nothing.
+        const { findOnPath } = mainHelpers;
+        if (typeof findOnPath !== 'function') {
+          bad('main did not hand the PATH walker to the harness');
+        } else {
+          const pa = path.join(work, 'path-a');
+          const pb = path.join(work, 'path-b');
+          for (const d of [pa, pb]) fs.mkdirSync(d, { recursive: true });
+          fs.mkdirSync(path.join(pa, 'dcm.exe'), { recursive: true });   // a directory, not a program
+          fs.writeFileSync(path.join(pa, 'dcm.txt'), '');
+          fs.writeFileSync(path.join(pb, 'dcm.cmd'), '@echo off\r\n');
+          fs.writeFileSync(path.join(pb, 'dcm.exe'), '');
+          const win = (p) => findOnPath('dcm', { PATH: p, PATHEXT: '.COM;.EXE;.BAT;.CMD' }, 'win32');
+          const walked = {
+            none: win(''),
+            onlyA: win(pa),
+            both: win(`${pa};${pb}`),
+            quoted: win(`"${pb}"`),
+          };
+          if (process.platform !== 'win32') {
+            fs.writeFileSync(path.join(pa, 'dcm'), '#!/bin/sh\n');
+            fs.chmodSync(path.join(pa, 'dcm'), 0o644);
+            walked.notExecutable = findOnPath('dcm', { PATH: pa }, 'linux');
+            fs.chmodSync(path.join(pa, 'dcm'), 0o755);
+            walked.executable = findOnPath('dcm', { PATH: `${pb}:${pa}` }, 'linux');
+          }
+          say(`claude: the PATH walker ${JSON.stringify(walked)}`);
+          if (walked.none !== null || walked.onlyA !== null) bad(`the PATH walker found a dcm that is not a program: ${JSON.stringify(walked)}`);
+          if (walked.both !== path.join(pb, 'dcm.exe')) bad(`the PATH walker did not resolve PATHEXT in order: ${JSON.stringify(walked)}`);
+          if (walked.quoted !== path.join(pb, 'dcm.exe')) bad(`the PATH walker took a quoted directory literally: ${JSON.stringify(walked)}`);
+          if (process.platform !== 'win32' && (walked.notExecutable !== null || walked.executable !== path.join(pa, 'dcm'))) {
+            bad(`the PATH walker took a file that cannot be run: ${JSON.stringify(walked)}`);
+          }
+        }
         // Nothing on it may claim what it does not check or list what it does
         // not offer. The engine registers a tool per screen's command, MPPS
         // complete and discontinue among them.
@@ -1167,6 +1393,19 @@ async function runSmoke(win, app, mainHelpers = {}) {
       } else {
         await measureScreen(name, `#view-${name}`);
       }
+    }
+
+    // Receive and Hub fold their Output like every other screen until there is
+    // output. An open, empty box reading "Output will appear here." was the
+    // one Output on screen that nothing had written to. (The first line opens
+    // it — asserted where each server is started, below.)
+    const restingOut = await jsJSON(`JSON.stringify({
+      receive: __smoke.outOpen('receive'), webhub: __smoke.outOpen('webhub'),
+      written: __smoke.consoleText('receive').length + __smoke.consoleText('webhub').length,
+    })`);
+    if (restingOut.written) bad(`the harness expected Receive and Hub to have run nothing yet: ${JSON.stringify(restingOut)}`);
+    if (restingOut.receive || restingOut.webhub) {
+      bad(`Receive or Hub shows an open, empty Output before anything ran: ${JSON.stringify(restingOut)}`);
     }
 
     // Every screen that runs a command shows that command, folded, with the
@@ -1524,6 +1763,43 @@ async function runSmoke(win, app, mainHelpers = {}) {
     }
     await shot('send-refusal');
 
+    // …and it goes once its cause does. A folder picked with Browse… is the
+    // field the refusal named, so "Choose a folder to send." under a chosen
+    // folder would be a chip describing a screen that no longer exists. The
+    // output keeps it: that is the record of the session, not the state of it.
+    armPicker();
+    await pressPicker('send-folder', fixtures || path.join(OUT, 'picked-send'));
+    const healed = await jsJSON(`(() => {
+      const chip = document.querySelector('#view-send [data-status]');
+      return JSON.stringify({ shown: !chip.hidden && __smoke.vis(chip), chip: chip.textContent, cls: chip.className,
+        text: __smoke.consoleText('send').trim() });
+    })()`);
+    say(`refusal: a folder picked after "Choose a folder" -> chip ${healed.shown ? `"${healed.chip}"` : 'gone'}`);
+    if (healed.shown) bad(`the refusal outlived the folder it asked for: ${JSON.stringify(healed)}`);
+    if (!/Choose a folder/.test(healed.text)) bad(`clearing the refusal also wiped it from the output: ${JSON.stringify(healed)}`);
+    // Only a refusal, and only its own field. A refusal about the peer is not
+    // answered by a folder, and a failure an engine run reported stays until
+    // the next run, whatever is typed in the meantime.
+    const kept = await jsJSON(`(() => {
+      const chip = document.querySelector('#view-send [data-status]');
+      const read = () => ({ shown: !chip.hidden, text: chip.textContent, cls: chip.className });
+      fail('send', 'Fill in the peer connection: host.\\n', 'peer');
+      __smoke.set('send-folder', ${JSON.stringify(fixtures || path.join(OUT, 'picked-send'))} + '-again');
+      const peerRefusal = read();
+      setStatus('send', 'fail', 'Association rejected');
+      __smoke.set('send-folder', '');
+      const runFailure = read();
+      setStatus('send', null);
+      return JSON.stringify({ peerRefusal, runFailure });
+    })()`);
+    if (!kept.peerRefusal.shown || !/peer connection/.test(kept.peerRefusal.text)) {
+      bad(`a folder took down a refusal about the peer: ${JSON.stringify(kept.peerRefusal)}`);
+    }
+    if (!kept.runFailure.shown || kept.runFailure.text !== 'Association rejected' || !/\bfail\b/.test(kept.runFailure.cls)) {
+      bad(`an engine failure did not outlive an edit to the form: ${JSON.stringify(kept.runFailure)}`);
+    }
+    record('refusal: a refusal goes when its field is filled; a refusal about another field, and a run\'s failure, stay');
+
     // =====================================================================
     // E. Speed as a first-class choice, on the Send screen.
     //
@@ -1841,6 +2117,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // starts an engine child either.
       const speedOff = await jsJSON(`(async () => {
         showView('speed');
+        // What the chip says afterwards is what these three presses said.
+        setStatus('speed', null);
         const btn = document.querySelector('#view-speed [data-run]');
         const spawned = [];
         const orig = runCapture;
@@ -1855,7 +2133,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         }
         const chip = document.querySelector('#view-speed [data-status]');
         return JSON.stringify({
-          disabled: btn.disabled, label: btn.textContent.trim(), spawned,
+          disabled: btn.disabled, label: btn.textContent.trim(), why: btn.title, spawned,
           running: !!state.activeRuns.speed || speedRunning,
           chip: chip.hidden ? '' : chip.textContent, cls: chip.className,
         });
@@ -1869,8 +2147,14 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (speedOff.spawned.length || speedOff.running) {
         bad(`Speed test sent for real under rehearsal: ${JSON.stringify(speedOff.spawned)}`);
       }
-      if (!speedOff.cls.includes('warn') || !/rehearsal/i.test(speedOff.chip)) {
-        bad(`a speed test refused under rehearsal did not say why beside the button: ${speedOff.chip} [${speedOff.cls}]`);
+      // Said once, on the button — by every way in: a chip beside it repeating
+      // "Off during rehearsal" was the same words twice. Why is on the
+      // button's hover, not lost.
+      if (speedOff.chip) {
+        bad(`a speed test refused under rehearsal says so twice, on the button and in a chip: "${speedOff.chip}" [${speedOff.cls}]`);
+      }
+      if (!/sends for real/.test(speedOff.why) || !/Rehearsal/.test(speedOff.why)) {
+        bad(`the disabled Speed test button does not say why it is off: ${JSON.stringify(speedOff.why)}`);
       }
       await js("setStatus('speed', null); clearConsole('speed'); true");
       await js("showView('send'); true");
@@ -2292,6 +2576,47 @@ async function runSmoke(win, app, mainHelpers = {}) {
       say(`all-incomplete chip: ${JSON.stringify(allBad)}`);
       if (allBad.kind !== 'fail') bad(`a sweep with nothing completed is not marked failed: ${JSON.stringify(allBad)}`);
 
+      // A sweep stopped by hand is not a pass. Every run that finished was a
+      // real measurement, but the sweep did not run to the end, so the chip is
+      // the neutral one Receive and Hub show when the operator stops them —
+      // never green. A stopped sweep that also lost instances keeps its amber
+      // "N of M incomplete": the completed runs are genuine, and that is said.
+      const stoppedSweep = await jsJSON(`(() => {
+        const all = ${JSON.stringify(fixture)};
+        const clean = [all[0], all[2]];
+        return JSON.stringify({
+          clean: speedOutcome(clean, true),
+          none: speedOutcome([], true),
+          mixed: speedOutcome(all, true),
+          finished: speedOutcome(clean, false),
+        });
+      })()`);
+      say(`stopped sweep chips: ${JSON.stringify(stoppedSweep)}`);
+      if (stoppedSweep.clean.kind !== 'idle' || stoppedSweep.clean.label !== 'Stopped') {
+        bad(`a sweep stopped by hand reads as ${JSON.stringify(stoppedSweep.clean)}, not a neutral "Stopped"`);
+      }
+      if (stoppedSweep.none.kind !== 'idle' || stoppedSweep.none.label !== 'Stopped') {
+        bad(`a sweep stopped before any run returned reads as ${JSON.stringify(stoppedSweep.none)}`);
+      }
+      if (stoppedSweep.mixed.kind !== 'warn' || stoppedSweep.mixed.label !== 'Stopped · 2 of 4 incomplete') {
+        bad(`a stopped sweep that lost instances no longer says so in amber: ${JSON.stringify(stoppedSweep.mixed)}`);
+      }
+      if (stoppedSweep.finished.kind !== 'ok' || stoppedSweep.finished.label !== 'Done') {
+        bad(`a sweep that ran to the end is not "Done": ${JSON.stringify(stoppedSweep.finished)}`);
+      }
+      const idleChip = await jsJSON(`(() => {
+        setStatus('speed', 'idle', 'Stopped');
+        const chip = document.querySelector('#view-speed [data-status]');
+        const out = { cls: chip.className, colour: getComputedStyle(chip).color };
+        setStatus('speed', 'ok', 'Done');
+        out.okColour = getComputedStyle(chip).color;
+        setStatus('speed', null);
+        return JSON.stringify(out);
+      })()`);
+      if (!/\bidle\b/.test(idleChip.cls) || idleChip.colour === idleChip.okColour) {
+        bad(`the stopped sweep's chip is drawn like a success: ${JSON.stringify(idleChip)}`);
+      }
+
       // Every run the same transfer: there is no winner, so nothing is badged
       // — not even TIED FASTEST — and the note says why.
       const allTied = await jsJSON(`(() => {
@@ -2356,6 +2681,26 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // Settings value, saved with the rest; the Modality filter is set there
       // too; and the state of the last read is the label of Refresh itself,
       // which is not a second cyan button beside "Perform exam".
+      //
+      // The filter is still SAID on the bar. The Modality column goes while a
+      // filter is set, so without one quiet "CT only" beside the date nothing
+      // on the station says the list is narrowed, and a patient booked on MR
+      // reads as missing from the RIS. Words, not a pill or a control; and
+      // gone when no filter is set, so it never claims a narrowing that is not
+      // in the query.
+      const filterNote = () => jsJSON(`JSON.stringify((() => {
+        const el = document.querySelector('#mwl-filter');
+        const date = document.querySelector('#mwl-when');
+        return el ? {
+          shown: __smoke.vis(el), text: el.textContent.trim(), tag: el.tagName, cls: el.className,
+          inBar: !!el.closest('.station-bar'), afterDate: !!(date.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING),
+          size: parseFloat(getComputedStyle(el).fontSize), colour: getComputedStyle(el).color,
+          dim: getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim(),
+          controls: el.querySelectorAll('button, input, select, a').length,
+          cmd: document.querySelector('#mwl-cmd').textContent,
+          modalityColumn: Array.from(document.querySelectorAll('#mwl-table thead th')).some((t) => t.textContent === 'Modality'),
+        } : null;
+      })())`);
       const bar = await jsJSON(`JSON.stringify({
         autoInSettings: !!document.querySelector('#view-settings #mwl-auto'),
         autoSaved: state.settings.autoRefresh,
@@ -2367,6 +2712,37 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!bar.autoInSettings) bad(`the re-read toggle is not in Settings: ${JSON.stringify(bar)}`);
       if (bar.autoSaved !== false) bad(`unchecking the re-read toggle was not saved to Settings: ${JSON.stringify(bar)}`);
       if (bar.pill) bad('the Modality pill is still on the station bar');
+      const filtered = await filterNote();
+      say(`station: with the CT filter the bar says ${JSON.stringify(filtered && filtered.text)}`);
+      if (!filtered || !filtered.shown || filtered.text !== 'CT only' || !filtered.inBar || !filtered.afterDate) {
+        bad(`the station does not say beside the date that its list is CT only: ${JSON.stringify(filtered)}`);
+      } else {
+        if (filtered.tag !== 'SPAN' || filtered.controls || /\b(btn|chip|pill)\b/.test(filtered.cls)) {
+          bad(`the filter is said as a control rather than in words: ${JSON.stringify(filtered)}`);
+        }
+        // The dim small style: --text-dim, smaller than the 12.5px body.
+        const rgb = (hex) => { const h = hex.replace('#', ''); return `rgb(${parseInt(h.slice(0, 2), 16)}, ${parseInt(h.slice(2, 4), 16)}, ${parseInt(h.slice(4, 6), 16)})`; };
+        if (filtered.colour !== rgb(filtered.dim) || !(filtered.size < 12.5)) {
+          bad(`the filter note is not in the dim small style: ${JSON.stringify(filtered)}`);
+        }
+      }
+      // With no filter in Settings: no note, and nothing narrowing the query.
+      // Settings is saved and then pushed to the screens; the command losing
+      // its Modality= is the push having landed, and the note must agree with it.
+      await js(`(() => { __smoke.set('set-modality', ''); return true; })()`);
+      await mustWait('state.settings.modality === "" && !document.querySelector("#mwl-cmd").textContent.includes("Modality=")',
+        8000, 'Settings to drop the modality filter from the query');
+      const unfiltered = await filterNote();
+      if (!unfiltered || unfiltered.shown || unfiltered.text !== '' || /Modality=/.test(unfiltered.cmd)) {
+        bad(`with no modality filter the bar still names one: ${JSON.stringify(unfiltered)}`);
+      }
+      await js(`(() => { __smoke.set('set-modality', 'CT'); return true; })()`);
+      await mustWait('state.settings.modality === "CT" && document.querySelector("#mwl-cmd").textContent.includes("Modality=CT")',
+        8000, 'Settings to put the CT filter back on the query');
+      const refiltered = await filterNote();
+      if (!refiltered || !refiltered.shown || refiltered.text !== 'CT only' || !/Modality=CT/.test(refiltered.cmd)) {
+        bad(`putting the filter back did not say it again: ${JSON.stringify(refiltered)}`);
+      }
       if (!bar.statusInRefresh) bad('the last read is not said on the Refresh button');
       if (/\bprimary\b/.test(bar.refreshCls)) bad(`Refresh is a second primary button: ${bar.refreshCls}`);
       if (bar.clear) bad('the "Clear" button is still on the station');
@@ -2395,6 +2771,16 @@ async function runSmoke(win, app, mainHelpers = {}) {
       list.cells.forEach((c) => say(`  row: ${JSON.stringify(c)}`));
       artefact('worklist-cmd.txt', list.cmd);
       await shot('wl-1-list');
+      // Status in view, and the columns fitted to what they hold: no stretch
+      // of nothing before Status, and the IDs beside it rather than pushed to
+      // the far edge. This is the window's own size (1164x761); the other
+      // sizes are read in the layout pass.
+      const fitted = await jsJSON(STATION_COLUMNS);
+      record(`worklist columns at ${await js('innerWidth')}px: ${(fitted.cols || []).map((c) => `${c.name} ${c.width}/${c.need}`).join(' · ')}`);
+      if (!fitted.statusVisible) bad(`the Status column is out of view without scrolling: ${JSON.stringify(fitted)}`);
+      if (slackColumns(fitted).length) {
+        bad(`a worklist column is wider than anything in it: ${JSON.stringify(slackColumns(fitted))}`);
+      }
       if (list.rows.length !== rows.length) {
         bad(`the worklist query returned ${list.rows.length} rows, expected ${rows.length}`);
       }
@@ -2414,8 +2800,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (JSON.stringify(list.columns) !== JSON.stringify(wantCols)) {
         bad(`the station's columns are not ${wantCols.join(' · ')}: ${JSON.stringify(list.columns)}`);
       }
-      if (!/^\d{2}:\d{2}$/.test(list.status) || !list.refresh.includes(list.status)) {
-        bad(`Refresh does not carry the time of the read: ${JSON.stringify(list)}`);
+      // A button whose state is the read, not a clock: the verb, then the time.
+      if (!/^\d{2}:\d{2}$/.test(list.status) || list.refresh !== `Refresh · ${list.status}`) {
+        bad(`Refresh does not read "Refresh · <time of the read>": ${JSON.stringify(list)}`);
       }
       // Nothing picked: no panel, rather than an empty box under the list.
       if (list.panel) bad('the patient panel is on screen with nobody picked');
@@ -2431,6 +2818,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         const out = { before: top(), beforeW: width(), beforeLabel: document.querySelector('#mwl-status').textContent };
         document.querySelector('#mwl-run').click();
         out.label = document.querySelector('#mwl-status').textContent;
+        out.button = document.querySelector('#mwl-run').textContent.replace(/\\s+/g, ' ').trim();
         out.during = top();
         out.duringW = width();
         return JSON.stringify(out);
@@ -2443,7 +2831,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
         afterLabel: document.querySelector('#mwl-status').textContent,
       })`));
       record(`worklist: the list's top while "${steady.label}" ${steady.during}px, before ${steady.before}px, after ${steady.after}px`);
-      if (steady.label !== 'Fetching…') bad(`Refresh did not say it was fetching: ${JSON.stringify(steady)}`);
+      if (steady.label !== 'Fetching…' || steady.button !== 'Refresh · Fetching…') {
+        bad(`Refresh did not say it was fetching: ${JSON.stringify(steady)}`);
+      }
       if (steady.before !== steady.during || steady.during !== steady.after) {
         bad(`the list moves while Refresh says "Fetching…": ${JSON.stringify(steady)}`);
       }
@@ -2545,6 +2935,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         list: document.querySelector('#mwl-results').textContent.replace(/\\s+/g, ' ').trim(),
         link: !!document.querySelector('#mwl-results .linklike[data-goto="settings"]'),
         label: document.querySelector('#mwl-status').textContent,
+        button: document.querySelector('#mwl-run').textContent.replace(/\\s+/g, ' ').trim(),
         cls: document.querySelector('#mwl-status').className,
         rows: document.querySelectorAll('#mwl-table tr.pick-row').length,
         stale: !!document.querySelector('#mwl-results .table-scroll.stale'),
@@ -2555,7 +2946,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/No RIS set — add it in Settings\./.test(noRis.list) || !noRis.link) {
         bad(`a station with no RIS does not say so where the list is: ${JSON.stringify(noRis)}`);
       }
-      if (noRis.label !== 'Refresh' || /ok|fail|running/.test(noRis.cls)) {
+      // Just the verb: no read to report a time or a failure for.
+      if (noRis.label !== '' || noRis.button !== 'Refresh' || /ok|fail|running/.test(noRis.cls)) {
         bad(`Refresh still shows the last read's state with no RIS to read from: ${JSON.stringify(noRis)}`);
       }
       // The rows still on screen are the answer of a RIS that is no longer
@@ -2739,6 +3131,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         selectRow(document.querySelector('#mwl-table tr.pick-row').dataset.key);
         renderWorklist({ ok: true, matches: [{ PatientName: 'BRAVO^BOB', PatientID: 'P-222' }] });
         const gone = __smoke.measure('#view-worklist', '#mpps-run');
+        gone.type1 = document.querySelector('#mpps-type1-warn').textContent.trim();
         // …and again with the folder unread on top of it, which is the other
         // repair line and the two can be on screen together.
         document.querySelector('#mpps-folder').value = 'C:/nowhere';
@@ -2751,6 +3144,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
         clearSelection();
         return JSON.stringify({ gone, both });
       })()`);
+      // The row names no study, and the note saying so is one short sentence —
+      // it was the station's longest, at two.
+      if (repairWords.gone.type1 !== 'No study UID on this row — taken from the folder if it holds one study.') {
+        bad(`the no-study note is not the one short sentence: ${JSON.stringify(repairWords.gone.type1)}`);
+      }
       // Asserted here rather than pooled: the pooled check ran back in section
       // C, long before this state could be reached.
       for (const [label, key] of [['gone', 'worklist-gone'], ['both', 'worklist-repairs']]) {
@@ -4410,9 +4808,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const scpPort = await freePort();
       await js(`(() => { __smoke.set('scp-port', '${scpPort}'); return true; })()`);
       await js(watchChip('receive'));
+      // Folded first, so an open fold afterwards is the receiver's own doing.
+      await js("consoleEl('receive').closest('details').open = false; true");
       await js("document.querySelector('#view-receive [data-run]').click(); true");
       await mustWait("document.querySelector('#view-receive [data-status]').textContent === 'Listening'", RUN_MS,
         'the receiver to say it is listening');
+      if (!(await js("__smoke.outOpen('receive')"))) bad('the receiver\'s first line of output did not open its Output');
       await js("document.querySelector('#view-receive [data-cancel]').click(); true");
       await mustWait(notRunning('receive'), 30000, 'the receiver to stop');
       const stopped = await jsJSON(chipNow('receive'));
@@ -4463,9 +4864,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
         await js(`(() => { showView('web'); showTab('web', 'webhub');
           __smoke.set('webhub-port', ${JSON.stringify(hubPort)}); __smoke.set('webhub-token', ${JSON.stringify(token)}); return true; })()`);
         await js(watchChip('webhub'));
+        await js("consoleEl('webhub').closest('details').open = false; true");
         await js("document.querySelector('#view-webhub [data-run]').click(); true");
         await mustWait("document.querySelector('#view-webhub [data-status]').textContent === 'Listening'", RUN_MS,
           'the hub to say it is listening');
+        if (!(await js("__smoke.outOpen('webhub')"))) bad('the hub\'s first line of output did not open its Output');
         const log = await jsJSON(chipNow('webhub'));
         if (log.log[0] !== 'Starting…') bad(`the hub said ${log.log[0]} before it was listening`);
         await js("document.querySelector('#webhub-use').click(); true");
@@ -4717,7 +5120,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
         formShown: !document.querySelector('#rename-form').hidden,
         btn: document.querySelector('#view-rename [data-run]').textContent.trim(),
         disabled: document.querySelector('#view-rename [data-run]').disabled,
-        status: document.querySelector('#view-rename [data-status]').textContent,
+        status: document.querySelector('#view-rename [data-status]').hidden
+          ? '' : document.querySelector('#view-rename [data-status]').textContent,
       })`);
       await shot('rename-refused-multi-study');
       record(`rename: two studies -> "${refusal.text.slice(0, 160)}…"`);
@@ -4736,7 +5140,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/merge, not a rename/.test(refusal.help)) {
         bad(`the help no longer says why renaming two studies at once is a merge: ${refusal.help}`);
       }
-      if (refusal.status !== '2 studies') bad(`the two-study refusal chip reads "${refusal.status}"`);
+      // Said once, in the red line: an amber "2 studies" chip beside it said
+      // the same thing again.
+      if (refusal.status !== '') bad(`the two-study refusal is said twice, with a chip reading "${refusal.status}"`);
 
       // ---- One study: what is there, and an inert button until something differs.
       await js(`__smoke.set('rename-folder', ${JSON.stringify(fixtures)}); true`);
@@ -5468,6 +5874,17 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (station.cmdScrolls) {
         layoutProblems.push(`${size.label} worklist: the command preview scrolls inside itself instead of wrapping`);
       }
+      // The Status column, header and pills, in view without scrolling the
+      // table, and no text column wider than what it holds.
+      // eslint-disable-next-line no-await-in-loop
+      const seen = await jsJSON(STATION_COLUMNS);
+      record(`layout ${size.label}: worklist columns ${(seen.cols || []).map((c) => `${c.name} ${c.width}/${c.need}`).join(' · ')}`);
+      if (!seen.statusVisible) {
+        layoutProblems.push(`${size.label} worklist: Status is not in view without scrolling the list — ${JSON.stringify(seen)}`);
+      }
+      if (slackColumns(seen).length) {
+        layoutProblems.push(`${size.label} worklist: column(s) wider than anything in them — ${JSON.stringify(slackColumns(seen))}`);
+      }
       // eslint-disable-next-line no-await-in-loop
       await shot(`layout-${size.label}-worklist`);
       // eslint-disable-next-line no-await-in-loop
@@ -5580,6 +5997,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
             label: (pane.querySelector('#find-retrieve-fold .cmd-label') || {}).textContent || '',
             afterBox: before(box, pane.querySelector('#find-retrieve-fold')) },
           console: pane.querySelector('[data-console]').textContent,
+          outOpen: __smoke.outOpen('retrieve'),
         };
       })())`;
       const screen = () => jsJSON(SCREEN);
@@ -5630,10 +6048,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // Presses the first row's Retrieve and waits for its verdict. The box is
       // blanked first so a verdict left by the previous run cannot be read as
       // this one's.
+      // The Output is folded first, so whether it is open afterwards is what
+      // this retrieve did to it.
       const retrieve = async (label) => {
         await js(`(() => {
           const box = document.querySelector('#find-retrieve-outcome');
           box.hidden = true; box.className = ''; box.innerHTML = '';
+          consoleEl('retrieve').closest('details').open = false;
           document.querySelector('#view-query [data-retrieve]').click();
           return true;
         })()`);
@@ -5764,6 +6185,13 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (!/\bok\b/.test(done.retrieveChip.cls) || done.retrieveChip.text !== 'Done') {
         bad(`the retrieve's end state was not kept on its hidden chip: ${JSON.stringify(done.retrieveChip)}`);
       }
+      // The Output opens on a failure only, as on the station: a clean
+      // retrieve is its one verdict line, and the engine's whole report is
+      // still in the fold for anyone who opens it.
+      if (done.outOpen) bad('a clean retrieve unfolded the Output under its verdict');
+      if (!/stored on disk\s+\d+/.test(done.console) || !/retrieve study/.test(done.console)) {
+        bad(`the clean retrieve's report is not in the folded Output: ${done.console.slice(-300)}`);
+      }
       record(`retrieve: the Retrieve row button put ${gotA}/${expected} instance(s) in the picked folder and read as success`);
       record(`retrieve: "${done.box.head.trim()}" in one line, the folder on "Into … · Change", one chip`);
 
@@ -5777,6 +6205,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (gotB !== expected) bad(`a retrieve into the browsed folder put ${gotB} file(s) there, expected ${expected}`);
       const changed = await screen();
       if (changed.destText !== `Into ${outB} · Change`) bad(`Change did not move the destination line: ${changed.destText}`);
+      if (changed.outOpen) bad('a clean retrieve into a browsed folder unfolded the Output');
       record(`retrieve: Change on the destination line fed the next retrieve (${gotB}/${expected})`);
 
       // 3. A peer that claims more than it sent. Every file arrives — only the
@@ -5826,6 +6255,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`the shortfall body is not "${expected} are in retrieve-c. This is not a complete study.": ${JSON.stringify(lossy.box.text)}`);
       }
       if (lossy.box.quoted) bad('the shortfall box quotes the engine as well, saying it twice');
+      if (!lossy.outOpen) bad('a retrieve that came back incomplete left the Output folded away');
       if (!/are not on disk/.test(lossy.console)) bad(`the engine's shortfall sentence is not in the Output: ${lossy.console.slice(-400)}`);
       if (lossy.box.bg === done.box.bg) bad(`the shortfall box has the success box's colour: ${lossy.box.bg}`);
       oneChip(lossy, 'shortfall');
@@ -6143,6 +6573,7 @@ async function runSmoke(win, app, mainHelpers = {}) {
     await js(`
       showView('receive');
       clearConsole('receive');
+      consoleEl('receive').closest('details').open = false;
       document.querySelector('#view-receive [data-cancel]').hidden = false;
       // A frame-gap probe. If the renderer wedges, frames stop and the gap is
       // the length of the wedge — which is the number the user experienced.
@@ -6277,9 +6708,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
     if (f.retainedLines > FLOOD_CAP + 300) {
       bad(`the console retained ${f.retainedLines} lines, past its ${FLOOD_CAP} cap`);
     }
-    // The Receive screen's Output starts open, because on that screen the log
-    // is the result. A flood must not have shut it.
-    if (!f.outOpen) bad('the receiver\'s Output disclosure closed while output was arriving');
+    // The Receive screen's Output is folded until there is output and the
+    // first line opens it, because on that screen the log is the result. It
+    // was folded before this flood; the flood must have opened it, and must
+    // not have shut it again.
+    if (!f.outOpen) bad('the receiver\'s Output did not open on its first line, or closed while output was arriving');
     // The point of all of it: the window kept answering while that arrived.
     //
     // Asserted on the console's own CPU cost rather than on the round-trip.

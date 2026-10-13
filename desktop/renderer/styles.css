@@ -705,6 +705,13 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
 
 /* ---------------- MCP / Connect ---------------- */
 .mcp-note { color: var(--text-dim); margin: 0 0 10px; font-size: 12.5px; line-height: 1.5; }
+/* Whether Claude can start dcm: found (dim, a green dot) or not (amber). */
+.probe-line { margin: 0 0 14px; font-size: 12.5px; line-height: 1.5; display: flex; align-items: baseline; flex-wrap: wrap; gap: 0 6px; }
+.probe-line.found { color: var(--text-dim); }
+.probe-line.found::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; align-self: center; }
+.probe-line .probe-path { font-family: var(--mono); font-size: 12px; color: var(--text); overflow-wrap: anywhere; }
+.probe-line.missing { color: var(--amber); }
+.probe-line .linklike { font-size: 12.5px; margin: 0; color: var(--accent); }
 .mcp-note code { color: var(--text); background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
 
 .copy-box {
@@ -846,8 +853,14 @@ td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabu
   overflow-x: auto;
   border-bottom: 1px solid var(--border);
 }
-#mwl-table { table-layout: fixed; width: 100%; min-width: 720px; }
-#mwl-table.with-modality { min-width: 784px; }
+/* The column widths, and the minimum width that keeps them, are fitted to the
+ * rows by fitWorklistColumns(); the last column takes the slack. That column
+ * has no right padding — on a wide window its slack is the gap, and on a
+ * tight one its padding was the 10px that cut a procedure short — and no
+ * header ever breaks onto a second line. */
+#mwl-table { table-layout: fixed; width: 100%; }
+#mwl-table th:last-child, #mwl-table td:last-child { padding-right: 0; }
+#mwl-table thead th { white-space: nowrap; }
 #mwl-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* border-bottom vanishes under border-collapse on a sticky cell, so the rule
  * under the header is drawn as an inset shadow instead. */
@@ -1132,6 +1145,9 @@ select {
 .peer-row .btn.small { padding: 4px 10px; font-size: 12px; }
 /* Once peers exist the add form folds away behind this. */
 #peer-add { display: block; margin: -4px 0 0; }
+/* No DICOMweb server saved: no empty list, just "+ Add a server" under the heading. */
+.peer-list:empty { display: none; }
+#webserver-new { display: block; margin: 0; }
 .peer-row .peer-role { flex: none; }
 #view-settings .conn-grid { grid-template-columns: 2fr 1fr 1.3fr 1.5fr; }
 #view-settings .form-row > .btn { align-self: flex-end; }
@@ -1190,9 +1206,15 @@ select {
   border-radius: 12px; padding: 2px 8px; font-size: 10.5px; font-family: var(--mono); cursor: pointer;
 }
 .search-key:hover, .search-key.pinned { color: var(--accent); border-color: var(--accent); }
-/* Refresh carries the last read: its time, "Fetching…", or "Failed" in red. */
-/* As wide as its widest label, so the minute's "Fetching…" never resizes it. */
-.refresh-btn { font-variant-numeric: tabular-nums; transition: none; min-width: 8.5em; }
+/* Refresh carries the last read after its verb: "Refresh · 14:32",
+ * "Refresh · Fetching…", or "Failed" in red. It is always as wide as its
+ * widest label — an invisible copy of that label shares its grid cell — so the
+ * minute's "Fetching…" never resizes it and nothing on the bar reflows. */
+.refresh-btn { display: inline-grid; justify-items: center; font-variant-numeric: tabular-nums; transition: none; }
+.refresh-btn > .refresh-label, .refresh-btn::after { grid-area: 1 / 1; white-space: nowrap; }
+.refresh-btn::after { content: "Refresh \00B7  Fetching\2026"; visibility: hidden; }
+/* "CT only": the list's other filter, said quietly beside the date. */
+.bar-note { color: var(--text-dim); font-size: 11.5px; white-space: nowrap; }
 .refresh-btn .refresh-state.running { color: var(--accent); }
 #mwl-run.failed { color: var(--red); border-color: var(--red); }
 .open-chip { color: var(--amber); border-color: var(--amber); }

@@ -48,6 +48,57 @@ function resolveEngine() {
 
 const ENGINE = resolveEngine();
 
+/**
+ * The file a program started with `env` would run for a bare `name`, or null.
+ *
+ * This is what the Claude screen's status line reports: Claude is told to start
+ * `dcm`, by name, and finds it on PATH or not at all. The bundled engine above
+ * is this app's own and Claude never sees it, which is why the screen's old
+ * "Ready" line, read from that, was not a check of anything.
+ *
+ * PATH is walked here rather than asking `where` or `command -v`. No child
+ * process: nothing to time out, no shell and no rc file run on the way, no
+ * localised output to parse. And it answers the exact question asked:
+ * `where` also searches the current directory first, which would report a
+ * dcm.exe sitting beside this app that a program started elsewhere never
+ * finds. On Windows a bare name is tried with each PATHEXT extension, in
+ * order, which is how the shell resolves it, and the file is named as it is
+ * on disk (PATHEXT says ".EXE"; the file is dcm.exe); elsewhere the file has
+ * to be executable by this user.
+ */
+function findOnPath(name, env = process.env, platform = process.platform) {
+  const sep = platform === 'win32' ? ';' : ':';
+  const dirs = String(env.PATH || env.Path || '')
+    .split(sep)
+    .map((d) => d.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+  const exts = platform === 'win32'
+    ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
+    : [''];
+  // Windows matches names without regard to case; say the one the disk has.
+  const onDisk = (dir, file) => {
+    if (platform !== 'win32') return file;
+    try {
+      return fs.readdirSync(dir).find((f) => f.toLowerCase() === file.toLowerCase()) || file;
+    } catch {
+      return file;
+    }
+  };
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const file = path.join(dir, name + ext);
+      try {
+        if (!fs.statSync(file).isFile()) continue;
+        if (platform !== 'win32') fs.accessSync(file, fs.constants.X_OK);
+        return path.join(dir, onDisk(dir, name + ext));
+      } catch {
+        /* not here */
+      }
+    }
+  }
+  return null;
+}
+
 // The smoke harness is automated verification, not somebody launching the app:
 // it gets its own user-data directory so a test run can never write over real
 // saved profiles, and it skips the single-instance lock so it still runs when
@@ -1223,6 +1274,9 @@ app.whenReady().then(() => {
     packaged: app.isPackaged,
   }));
 
+  // Looked up on every visit to the Claude screen: a handful of stat calls.
+  ipcMain.handle('dcm:on-path', () => ({ path: findOnPath('dcm') }));
+
   ipcMain.handle('dcm:start', startRun);
   ipcMain.handle('dcm:cancel', cancelRun);
 
@@ -1295,6 +1349,7 @@ app.whenReady().then(() => {
           STATE_FILES,
           LEGACY_PRODUCT_DIRS,
           openSteps: () => ({ ...openSteps }),
+          findOnPath,
           quitGuardMessage,
           stopEveryChild,
         });

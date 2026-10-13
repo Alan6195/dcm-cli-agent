@@ -133,9 +133,13 @@
             <button class="chip" data-when="custom">Pick…</button>
           </div>
           <input type="text" id="mwl-date" class="chip-input" placeholder="YYYYMMDD or a range; blank = any date" hidden />
-          <!-- Refresh carries the state of the last read: the time it answered,
-               "Fetching…", or "Failed" in red. -->
-          <button class="btn ghost small refresh-btn" data-run id="mwl-run" title="Read the worklist again"><span aria-hidden="true">↻</span> <span id="mwl-status" class="refresh-state">Refresh</span></button>
+          <!-- "CT only" while Settings narrows the list to one modality. The
+               Modality column goes while a filter is set, so this is the one
+               place the station says its list is narrowed. Words, not a control. -->
+          <span class="bar-note" id="mwl-filter" title="Set in Settings › Worklist modality" hidden></span>
+          <!-- Refresh carries the state of the last read after its verb: the
+               time it answered, "Fetching…", or "Failed" in red. -->
+          <button class="btn ghost small refresh-btn" data-run id="mwl-run" title="Read the worklist again"><span class="refresh-label">Refresh<span class="refresh-sep"></span><span id="mwl-status" class="refresh-state"></span></span></button>
         </div>
         <!-- The search always has a row of its own, so nothing that comes and
              goes on the bar above (the label of Refresh, every minute) can
@@ -423,8 +427,9 @@
           <summary>command <span class="cmd-sum"></span></summary>
           <div class="cmd-preview" data-cmd></div>
         </details>
-        <!-- Open by default: on this screen the log is the result. -->
-        <details class="adv out-fold" open>
+        <!-- Folded like every other screen's until there is output. On this
+             screen the log is the result, so the first line opens it. -->
+        <details class="adv out-fold">
           <summary>Output</summary>
           <div class="adv-body"><div class="console-wrap tall"><pre class="console" data-console></pre></div></div>
         </details>
@@ -657,8 +662,8 @@
             <summary>command <span class="cmd-sum"></span></summary>
             <div class="cmd-preview" data-cmd></div>
           </details>
-          <!-- Open by default: on this tab the log is the result. -->
-          <details class="adv out-fold" open>
+          <!-- Folded until there is output; the first line opens it. -->
+          <details class="adv out-fold">
             <summary>Output</summary>
             <div class="adv-body"><div class="console-wrap tall"><pre class="console" data-console></pre></div></div>
           </details>
@@ -1080,7 +1085,16 @@
           <p>MCP is how an assistant calls a local program as a tool. Any MCP client can use it, not only Claude. Registering this server hands Claude the <code>dcm</code> engine on your PATH — the engine this app is built on, not a service in the cloud. Every call happens on this machine, against the peers you name.</p>
           <p>It requires <code>dcm</code> installed and on your PATH. If <code>claude mcp add</code> is not found, install Claude Code first. The one-line registration is run once; Claude Desktop instead reads the JSON block from its config file, so that one needs a restart to take.</p>
           <p>Claude gets a tool for the command behind every screen here, including retrieve (C-GET and C-MOVE), the worklist and every MPPS step — complete and discontinue too.</p>
+          <h4 id="mcp-install">Installing dcm</h4>
+          <p>One line fetches the binary for this machine, checks it against the published SHA256, installs it under your user profile and puts it on your PATH. No admin rights.</p>
+          <p>Windows (PowerShell): <code>irm https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.ps1 | iex</code></p>
+          <p>macOS / Linux: <code>curl -fsSL https://raw.githubusercontent.com/Alan6195/dcm-cli-agent/master/install.sh | bash</code></p>
+          <p>A program reads PATH when it starts, so open a new terminal and restart Claude and this app afterwards. The line on this screen looks again each time the screen is opened.</p>
         </div>
+
+        <!-- Claude starts the dcm on this machine's PATH. Main looks for it each
+             time this screen is opened, and the line says only what it found. -->
+        <p class="probe-line" id="mcp-dcm" hidden></p>
 
         <div class="section-title">Claude Code (terminal)</div>
         <p class="mcp-note">Run this once.</p>
@@ -1136,7 +1150,7 @@
 
         <div class="section-title">Rehearsal</div>
         <div class="checks">
-          <label><input type="checkbox" id="set-rehearsal" /> Rehearsal — nothing is sent</label>
+          <label><input type="checkbox" id="set-rehearsal" /> Nothing is sent</label>
         </div>
 
         <div class="section-title">This station</div>
@@ -1185,9 +1199,13 @@
 
         <div class="section-title">DICOMweb servers</div>
         <div class="peer-list" id="set-webservers"></div>
-        <div class="form-row">
+        <!-- A DICOMweb server is optional, so its form waits behind one button
+             even with none saved; Add or Cancel puts it away again. -->
+        <button type="button" class="btn ghost small" id="webserver-new">+ Add a server</button>
+        <div class="form-row" id="webserver-form" hidden>
           <label class="grow">Base URL<input type="text" id="webserver-url" placeholder="https://pacs.example.org/dicom-web" /></label>
           <button class="btn ghost" id="webserver-add">Add server</button>
+          <button class="btn ghost" id="webserver-cancel">Cancel</button>
         </div>
 
         <div class="section-title">Defaults</div>

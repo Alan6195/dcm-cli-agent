@@ -281,6 +281,9 @@ function wirePeerChips() {
     const pick = e.target.closest('[data-peer-pick]');
     if (pick) {
       state.peerChoice[viewOf(pick)] = pick.dataset.peerPick;
+      // A peer picked on this screen answers this screen's "Fill in the peer
+      // connection", and no other screen's: each chip is its own.
+      clearRefusalsFor('peer', viewOf(pick));
       closePeerMenus();
       applyProfile(pick.dataset.peerPick);
       return;
@@ -450,6 +453,8 @@ function applyWebProfile(name) {
   const p = webProfiles().find((x) => x.name === name);
   if (!p) return;
   state.web.url = p.url || '';
+  // One server chip state for every DICOMweb tab.
+  clearRefusalsFor('server');
   renderWebChips();
   updateAllPreviews();
 }
@@ -620,6 +625,7 @@ function applySettings() {
   renderStationPlaceholder();
   renderSendAdvSummary();
   renderSpeedParallelHint();
+  renderStationFilter();
   // Rehearsal relabels the verbs, the Archive role moves the images, and the
   // engineer switch appears or goes: the whole panel is repainted.
   renderMppsPanel();
@@ -641,6 +647,24 @@ function applyDefaultPlaceholders() {
 /** The preview is never absent; the engineer option only says whether it starts unfolded. */
 function applyCmdFold() {
   for (const d of $$('.cmd-fold')) d.open = state.settings.cmdExpanded;
+}
+
+/**
+ * "CT only", beside the station's date, while Settings narrows the list to one
+ * modality.
+ *
+ * The Modality column goes while a filter is set — every row would say the
+ * same thing — and with it went the only sign that the list was narrowed. A
+ * patient booked on another modality then read as missing from the RIS. So the
+ * filter is said once, in words, where the other filter (the date) is chosen.
+ * Not a button: it is changed in Settings, where it is set.
+ */
+function renderStationFilter() {
+  const el = $('#mwl-filter');
+  if (!el) return;
+  const m = state.settings.modality;
+  el.hidden = !m;
+  el.textContent = m ? `${m} only` : '';
 }
 
 /** The amber banner across the top of the content area, for as long as rehearsal is on. */
@@ -681,8 +705,21 @@ function renderSettingsPeers() {
         `<span class="peer-row-name" title="${esc(p.url)}">${esc(p.url)}</span>` +
         `<button class="btn ghost small" data-web-delete="${esc(p.name)}">Delete</button>` +
       '</div>').join('')
-    : '<div class="empty-note dense">No DICOMweb servers yet.</div>';
+    // None saved: "+ Add a server" right under the heading says so.
+    : '';
   syncPeerForm();
+}
+
+/**
+ * The add-server form, behind "+ Add a server" the way the peer form folds
+ * behind "+ Add a peer". Unlike a peer, a DICOMweb server is optional — most
+ * stations never set one — so the form waits behind its button even with none
+ * saved. Add or Cancel puts it away.
+ */
+function showWebServerForm(open) {
+  $('#webserver-form').hidden = !open;
+  $('#webserver-new').hidden = open;
+  if (!open) $('#webserver-url').value = '';
 }
 
 /** Name of the saved peer the form is editing, or null while adding. */
@@ -717,6 +754,7 @@ function resetPeerForm() {
 
 /** After the saved peers change: the chips, the lists and every command that names a peer. */
 function afterPeersChanged() {
+  clearRefusalsFor('peer');
   selectPeerForView(state.activeView);
   refreshPeerViews();
   renderStationPlaceholder();
@@ -814,10 +852,17 @@ function wireSettings() {
     const url = $('#webserver-url').value.trim();
     if (!/^https?:\/\//i.test(url)) return;
     await saveWebServer(url);
-    $('#webserver-url').value = '';
+    showWebServerForm(false);
+    // A first server becomes the chip's, which answers "Pick a server".
+    clearRefusalsFor('server');
     refreshPeerViews();
     updateAllPreviews();
   };
+  $('#webserver-new').addEventListener('click', () => {
+    showWebServerForm(true);
+    $('#webserver-url').focus();
+  });
+  $('#webserver-cancel').addEventListener('click', () => showWebServerForm(false));
   $('#webserver-add').addEventListener('click', addWeb);
   $('#webserver-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') addWeb(); });
   $('#set-webservers').addEventListener('click', async (e) => {
@@ -900,6 +945,7 @@ function showView(name) {
   // The station reads its list when it comes on screen and keeps it fresh
   // while it stays there; off screen, the timer stops.
   stationVisibility(name === 'worklist');
+  if (name === 'mcp') renderDcmProbe();
 }
 
 /** Remembers the open screen and tabs, so the next launch opens where this one left off. */
@@ -950,6 +996,9 @@ function consoleEl(view) {
   return viewPart(view, 'console');
 }
 
+/** The screens whose log is their result: see appendConsole. */
+const OPEN_ON_OUTPUT = new Set(['receive', 'webhub']);
+
 /**
  * Opens the disclosure a view's console sits in, so a failure is never folded
  * away.
@@ -975,10 +1024,51 @@ function revealConsole(view) {
  * Said in the chip beside the button, in amber, because that is where the eye
  * already is; a disclosure springing open further down the screen was not.
  * Still written to the output as well, which is the record of the session.
+ *
+ * `fields` names what the refusal is about: element ids (a field, or a box of
+ * them), or 'peer' / 'server' for the connection chips. Filling or changing
+ * one of them takes the refusal down — "Choose a folder to send." under a
+ * folder that has been chosen is a chip describing a screen that no longer
+ * exists. A failure from an engine run is never a refusal and is not touched:
+ * that stays until the next run replaces it.
  */
-function fail(view, msg) {
+function fail(view, msg, ...fields) {
   appendConsole(view, msg, 'stderr');
-  setStatus(view, 'warn', String(msg).trim());
+  const text = String(msg).trim();
+  setStatus(view, 'warn', text);
+  if (fields.length) refusals[view] = { text, fields };
+  else delete refusals[view];
+}
+
+/** The refusal on each view that names its field, as { text, fields }. */
+const refusals = {};
+
+/**
+ * `field` was filled or changed: every refusal about it comes down, on
+ * `onlyView` or on any view. Only if its chip still says that refusal — a
+ * chip a run has written since is that run's, and stays.
+ */
+function clearRefusalsFor(field, onlyView = null) {
+  for (const [view, r] of Object.entries(refusals)) {
+    if ((onlyView && view !== onlyView) || !r.fields.includes(field)) continue;
+    delete refusals[view];
+    const chip = viewPart(view, 'status');
+    if (chip && !chip.hidden && chip.classList.contains('warn') && chip.textContent === r.text) setStatus(view, null);
+  }
+}
+
+/**
+ * Any edit, anywhere: the field and every box it sits in, by id. Capture
+ * phase, so a refusal is taken down before the field's own listeners run —
+ * and a load those start (Edit's, on a picked path) can refuse afresh.
+ */
+function wireRefusals() {
+  const edited = (e) => {
+    if (!Object.keys(refusals).length) return;
+    for (let el = e.target; el && el.nodeType === 1; el = el.parentElement) if (el.id) clearRefusalsFor(el.id);
+  };
+  document.addEventListener('input', edited, true);
+  document.addEventListener('change', edited, true);
 }
 
 /**
@@ -1193,6 +1283,10 @@ function appendConsole(view, text, stream, dropped, run = 0) {
     scheduleConsoleFlush(c, s);
   }
   if (!text) return;
+  // Receive and Hub fold their Output like every other screen until there is
+  // some, and then the first line opens it: on those two the log is the
+  // result. Only the first — a fold shut by hand during a run stays shut.
+  if (OPEN_ON_OUTPUT.has(view) && !s.pending.length && !c.firstChild) revealConsole(view);
   const narration = stream === 'narration';
   const err = narration || stream === 'stderr';
   for (const piece of splitConsoleText(stripAnsi(text), CONSOLE_PIECE_LINES)) {
@@ -1401,11 +1495,17 @@ function renderConsoleNotice(c, s) {
 function setStatus(view, kind, label) {
   const chip = viewPart(view, 'status');
   if (!chip) return;
-  // The station's list has no chip: the state of its last read is the label
-  // of its Refresh button — the time it answered, "Fetching…", or "Failed".
+  // The station's list has no chip: the state of its last read follows the
+  // verb on its Refresh button — "Refresh · 14:32", "Refresh · Fetching…",
+  // "Refresh · Failed". With no read to report it is just "Refresh". The
+  // verb stays, so the time reads as the button's state and not as a clock.
   if (view === 'worklist') {
     chip.className = kind ? `refresh-state ${kind}` : 'refresh-state';
-    chip.textContent = kind ? label : 'Refresh';
+    chip.textContent = kind ? label : '';
+    // Written, not hidden: a hidden " · " is still in the button's text, and
+    // a screen reader would read "Refresh ·" with nothing after it.
+    const sep = $('#mwl-run .refresh-sep');
+    if (sep) sep.textContent = kind ? ' · ' : '';
     $('#mwl-run').classList.toggle('failed', kind === 'fail');
     return;
   }
@@ -1740,7 +1840,7 @@ function wireEcho() {
   $('#view-echo [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
     clearConsole('echo');
-    if (miss.length) { fail('echo', `Fill in: ${miss.join(', ')}.\n`); return; }
+    if (miss.length) { fail('echo', `Fill in: ${miss.join(', ')}.\n`, 'peer'); return; }
     setStatus('echo', 'running', 'Testing…');
     const { code, stdout, stderr } = await runStreaming('echo', BUILDERS.echo());
     setStatus('echo', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : failLabel(stderr, stdout));
@@ -1949,11 +2049,11 @@ function wireSend() {
     const folder = $('#send-folder').value.trim();
     clearConsole('send');
     $('#view-send [data-totals]').hidden = true;
-    if (!folder) { fail('send', 'Choose a folder to send.\n'); return; }
+    if (!folder) { fail('send', 'Choose a folder to send.\n', 'send-folder'); return; }
     const dry = rehearsal();
     if (!dry) {
       const miss = connMissing();
-      if (miss.length) { fail('send', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
+      if (miss.length) { fail('send', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'peer'); return; }
     }
     setStatus('send', 'running', dry ? 'Scanning…' : 'Sending…');
     const { code, stdout, stderr } = await runStreaming('send', BUILDERS.send());
@@ -2620,8 +2720,11 @@ async function runRetrieve(btn) {
 
   // Not cleared: a console holding the report of the last three retrieves is
   // the record of what was pulled in this sitting, and each one is introduced
-  // by name. Revealed, because the stream IS the progress on this screen.
-  revealConsole('retrieve');
+  // by name. Not unfolded either: the Output opens on a failure, as it does on
+  // the station, and a clean retrieve's verdict line is the whole story — the
+  // full report is still in the fold for anyone who opens it.
+  const log = consoleEl('retrieve');
+  if (log) log.hidden = false;
   appendConsole('retrieve', `\n--- retrieve ${what} ${study}${series ? ` / ${series}` : ''} → ${out} ---\n`, 'stdout');
 
   retrieveCancelled = false;
@@ -2665,7 +2768,7 @@ function wireQuery() {
     // command and its verdict stop applying to anything on screen. The folder
     // itself is kept: it is a choice the operator made, not a result.
     resetRetrieveUi();
-    if (miss.length) { fail('query', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
+    if (miss.length) { fail('query', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'peer'); return; }
     setStatus('query', 'running', 'Searching…');
     const argv = [...BUILDERS.query(), '--json'];
     // Stamped before the run, from the connection the command was built with.
@@ -2977,16 +3080,85 @@ function renderWorklistTable() {
 
   // Status sits fourth, before the two ID columns: on a window too narrow for
   // the whole table it is the IDs that scroll out of view, never the column
-  // that says DISCONTINUED.
+  // that says DISCONTINUED. The widths are fitted to the rows just drawn
+  // (fitWorklistColumns); the two pill columns keep fixed ones, so a pill
+  // that changes never moves the row.
   box.innerHTML = noRis + failed +
-    `<div class="table-scroll${stale ? ' stale' : ''}"><table id="mwl-table" class="${showModality ? 'with-modality' : ''}">` +
-    `<colgroup><col style="width:${showDate ? 120 : 88}px">${showModality ? '<col style="width:64px">' : ''}` +
-    '<col style="width:150px"><col><col style="width:140px">' +
-    '<col style="width:90px"><col style="width:90px"></colgroup>' +
+    `<div class="table-scroll${stale ? ' stale' : ''}"><table id="mwl-table">` +
+    `<colgroup><col>${showModality ? '<col data-fixed="64">' : ''}` +
+    '<col><col><col data-fixed="140"><col><col></colgroup>' +
     `<thead><tr><th>Scheduled</th>${showModality ? '<th>Modality</th>' : ''}<th>Patient</th>` +
     '<th>Procedure</th><th>Status</th><th>Accession</th><th>Patient ID</th></tr></thead>' +
     `<tbody>${html}</tbody></table></div>`;
   for (const tr of $$('#mwl-table tr.pick-row')) tr.classList.toggle('row-selected', tr.dataset.key === selKey);
+  fitWorklistColumns();
+}
+
+/** One canvas for measuring text, so a column can be as wide as what it holds. */
+const textMeasure = document.createElement('canvas').getContext('2d');
+
+/** The widest of `strings` as `el` draws them, padding included, in px. */
+function drawnWidth(el, strings) {
+  const cs = getComputedStyle(el);
+  textMeasure.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  textMeasure.letterSpacing = cs.letterSpacing === 'normal' ? '0px' : cs.letterSpacing;
+  const upper = cs.textTransform === 'uppercase';
+  let w = 0;
+  for (const s of strings) w = Math.max(w, textMeasure.measureText(upper ? s.toUpperCase() : s).width);
+  return Math.ceil(w + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) + 2;
+}
+
+/**
+ * The station list's columns, sized to what they hold.
+ *
+ * A fixed table hands every pixel it is not told about to its one auto
+ * column. That was Procedure, so on a wide window Status sat mid-table after a
+ * stretch of nothing and the two ID columns were pushed to the far edge. Now
+ * each text column is as wide as its widest entry or its header, measured in
+ * the font it is drawn in, and the slack goes to the last column, at the right
+ * edge, where it separates nothing.
+ *
+ * When the box is too narrow for all of that, Procedure gives way so the
+ * whole row fits, down to the width of its own header (it ellipsises, with the
+ * whole text on hover). Patient gives way only if Status would otherwise be
+ * pushed out of view: a name cut short to show an ID is the wrong trade. Past
+ * that the table scrolls inside its box, and it is the ID columns that go out
+ * of view, never Status. Re-run when the box changes width (see wireWorklist's
+ * ResizeObserver).
+ */
+function fitWorklistColumns() {
+  const table = $('#mwl-table');
+  if (!table) return;
+  const cols = $$('colgroup col', table);
+  const heads = $$('thead th', table);
+  const rows = $$('tbody tr', table);
+  const widths = heads.map((th, i) => {
+    const fixed = Number(cols[i].dataset.fixed);
+    if (fixed) return fixed;
+    const cells = rows.map((tr) => tr.children[i]).filter(Boolean);
+    const head = drawnWidth(th, [th.textContent]);
+    return Math.max(head, cells.length ? drawnWidth(cells[0], cells.map((td) => td.textContent)) : 0);
+  });
+  const scroller = table.closest('.table-scroll');
+  const avail = scroller ? scroller.clientWidth : 0;
+  const col = (name) => heads.findIndex((th) => th.textContent === name);
+  const through = (n) => widths.slice(0, n).reduce((a, b) => a + b, 0);
+  // Nothing to fit against while the screen is hidden; the observer re-runs
+  // this when it comes on screen.
+  if (avail > 0) {
+    const giveWay = (i, over) => {
+      if (i < 0 || over <= 0) return;
+      const floor = drawnWidth(heads[i], [heads[i].textContent]);
+      widths[i] -= Math.min(over, Math.max(0, widths[i] - floor));
+    };
+    giveWay(col('Procedure'), through(widths.length) - avail);
+    giveWay(col('Patient'), through(col('Status') + 1) - avail);
+  }
+  // Every column but the last is given its width; the last takes what is
+  // left, and the table is never narrower than the row, so it scrolls inside
+  // its box rather than squeezing a column it has already fitted.
+  cols.forEach((c, i) => { c.style.width = i === cols.length - 1 ? '' : `${widths[i]}px`; });
+  table.style.minWidth = `${through(widths.length)}px`;
 }
 
 /**
@@ -3366,6 +3538,22 @@ function stationVisibility(visible) {
 }
 
 function wireWorklist() {
+  // The list's columns are fitted to the width they have, and that changes
+  // with the window and when the screen comes on view (from no width at all).
+  // Only a change of width refits. The refit itself waits for the next frame:
+  // it can add or remove the list's sideways scrollbar, which changes the
+  // box's height, and a size change made inside the observer's own callback
+  // is what Chromium reports as a ResizeObserver loop error.
+  let fitWidth = -1;
+  let fitFrame = 0;
+  new ResizeObserver(() => {
+    const w = $('#mwl-results').clientWidth;
+    if (w === fitWidth) return;
+    fitWidth = w;
+    cancelAnimationFrame(fitFrame);
+    fitFrame = requestAnimationFrame(fitWorklistColumns);
+  }).observe($('#mwl-results'));
+
   for (const chip of $$('#mwl-when .chip')) {
     chip.addEventListener('click', () => {
       $$('#mwl-when .chip').forEach((c) => c.classList.remove('active'));
@@ -3917,8 +4105,8 @@ function renderMppsPanel() {
   // the conformance names for these are in the help panel.
   const notes = [];
   if (!closing) {
-    if (!a.studyInstanceUid) notes.push('This row names no <b>study</b>. The exam takes it from the folder, if the folder holds exactly one.');
-    if (!a.modality) notes.push('This row names no <b>modality</b>. The exam takes it from the folder, if the folder names one.');
+    if (!a.studyInstanceUid) notes.push('<b>No study UID</b> on this row — taken from the folder if it holds one study.');
+    if (!a.modality) notes.push('<b>No modality</b> on this row — taken from the folder if it names one.');
     if (!$('#mpps-stepid').value.trim()) {
       notes.push('<b>This step has no ID.</b> The worklist didn\'t send one — type it in below, or ask the RIS to fill it in. The exam can\'t be started without it.');
       $('#mpps-adv').open = true; // the field that fixes it lives there
@@ -4893,7 +5081,9 @@ function renderSpeedRunButton() {
   const btn = $('#view-speed [data-run]');
   if (!btn) return;
   const off = rehearsal();
+  // Said once, on the button. Why is on its hover: a speed test sends for real.
   btn.textContent = off ? 'Off during rehearsal' : 'Run speed test';
+  btn.title = off ? 'A speed test sends for real, so it is off while Settings › Rehearsal is on.' : '';
   btn.disabled = off || speedRunning;
 }
 
@@ -5248,11 +5438,13 @@ function renderSpeedResults(results) {
  * @returns {{kind:string, label:string}} A setStatus kind and its label.
  */
 function speedOutcome(results, cancelled) {
-  // Stopped before anything returned: no runs, so nothing succeeded either.
-  if (!results.length) return { kind: 'fail', label: cancelled ? 'Stopped' : 'Failed' };
+  // A sweep stopped by hand is neither a result nor a fault — the neutral chip
+  // Receive and Hub show when the operator stops them — unless a run in it
+  // fell short, which is still said below. Green "Stopped" read as a pass.
+  if (!results.length) return cancelled ? { kind: 'idle', label: 'Stopped' } : { kind: 'fail', label: 'Failed' };
   const bad = results.filter((r) => !r.data || ackShortfall(r.data)).length;
   const stopped = cancelled ? 'Stopped · ' : '';
-  if (!bad) return { kind: 'ok', label: cancelled ? 'Stopped' : 'Done' };
+  if (!bad) return cancelled ? { kind: 'idle', label: 'Stopped' } : { kind: 'ok', label: 'Done' };
   const kind = bad === results.length ? 'fail' : 'warn';
   return { kind, label: `${stopped}${bad} of ${results.length} incomplete` };
 }
@@ -5280,6 +5472,7 @@ function wireSpeed() {
     chip.addEventListener('click', () => {
       $$('#speed-mode .chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
+      clearRefusalsFor('speed-mode');
       const mode = chip.dataset.mode;
       $('#speed-syntax-opts').hidden = mode !== 'syntax';
       $('#speed-chunk-opts').hidden = mode !== 'chunk';
@@ -5309,8 +5502,10 @@ function wireSpeed() {
 let speedCancelled = false;
 
 async function runSpeedTest() {
-  // The button is dead under rehearsal; this is for every other way in.
-  if (rehearsal()) { fail('speed', 'Off during rehearsal: a speed test sends for real.\n'); return; }
+  // The button is dead under rehearsal and says so; this is for every other
+  // way in. Nothing is sent and nothing more is said — a chip repeating the
+  // button's "Off during rehearsal" beside it was the same words twice.
+  if (rehearsal()) { renderSpeedRunButton(); return; }
   const folder = $('#speed-folder').value.trim();
   const box = $('#view-speed [data-result]');
   const c = consoleEl('speed');
@@ -5319,18 +5514,19 @@ async function runSpeedTest() {
   c.hidden = true;
 
   if (!folder) {
-    fail('speed', 'Choose a study folder to send.\n');
+    fail('speed', 'Choose a study folder to send.\n', 'speed-folder');
     return;
   }
   const miss = connMissing();
   if (miss.length) {
-    fail('speed', `Fill in the peer connection: ${miss.join(', ')}.\n`);
+    fail('speed', `Fill in the peer connection: ${miss.join(', ')}.\n`, 'peer');
     return;
   }
 
   const runs = speedRuns();
   if (!runs.length) {
-    fail('speed', 'Pick at least one thing to compare.\n');
+    fail('speed', 'Pick at least one thing to compare.\n', 'speed-mode',
+      'speed-syntax-opts', 'speed-chunk-opts', 'speed-parallel-opts', 'speed-repeat-opts');
     return;
   }
 
@@ -5429,7 +5625,7 @@ BUILDERS.webping = () => {
 function wireWebping() {
   $('#view-webping [data-run]').addEventListener('click', async () => {
     clearConsole('webping');
-    if (!state.web.url) { fail('webping', 'Pick a server on the chip.\n'); return; }
+    if (!state.web.url) { fail('webping', 'Pick a server on the chip.\n', 'server'); return; }
     setStatus('webping', 'running', 'Testing…');
     const { code, stdout, stderr } = await runStreaming('webping', BUILDERS.webping());
     setStatus('webping', code === 0 ? 'ok' : 'fail', code === 0 ? 'Reachable' : failLabel(stderr, stdout));
@@ -5461,10 +5657,10 @@ function wireWebsend() {
     const folder = $('#websend-folder').value.trim();
     clearConsole('websend');
     $('#view-websend [data-totals]').hidden = true;
-    if (!folder) { fail('websend', 'Choose a folder to send.\n'); return; }
+    if (!folder) { fail('websend', 'Choose a folder to send.\n', 'websend-folder'); return; }
     // A rehearsal opens no connection, so it needs no server.
     const dry = rehearsal();
-    if (!dry && !state.web.url) { fail('websend', 'Pick a DICOMweb server on the chip, or add one in Settings.\n'); return; }
+    if (!dry && !state.web.url) { fail('websend', 'Pick a DICOMweb server on the chip, or add one in Settings.\n', 'server'); return; }
     setStatus('websend', 'running', dry ? 'Scanning…' : 'Sending…');
     const { code, stdout, stderr } = await runStreaming('websend', BUILDERS.websend());
     // The same accounting, and the same words, as Send: the engine prints the
@@ -5574,7 +5770,7 @@ function wireWebquery() {
   $('#view-webquery [data-run]').addEventListener('click', async () => {
     clearConsole('webquery');
     $('#view-webquery [data-result]').hidden = true;
-    if (!state.web.url) { fail('webquery', 'Pick a server on the chip.\n'); return; }
+    if (!state.web.url) { fail('webquery', 'Pick a server on the chip.\n', 'server'); return; }
     setStatus('webquery', 'running', 'Searching…');
     const { code, stdout, stderr } = await runCapture('webquery', [...BUILDERS.webquery(), '--json']);
 
@@ -5645,6 +5841,7 @@ function wireWebhub() {
     hint.innerHTML = `Clients point at <code>${esc(url)}</code> — <button class="linklike" id="webhub-use">use it on the other tabs</button>`;
     $('#webhub-use').addEventListener('click', () => {
       state.web.url = url;
+      clearRefusalsFor('server');
       renderWebChips();
       updateAllPreviews();
     });
@@ -5791,7 +5988,7 @@ function wireInventory() {
     const t = $('#info-folder').value.trim();
     $('#view-inventory [data-result]').hidden = true;
     const c = consoleEl('inventory'); resetConsole(c); c.hidden = true;
-    if (!t) { fail('inventory', 'Choose a folder or file.\n'); return; }
+    if (!t) { fail('inventory', 'Choose a folder or file.\n', 'info-folder'); return; }
     setStatus('inventory', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('inventory', [...BUILDERS.inventory(), '--json']);
     let json = null;
@@ -5872,7 +6069,7 @@ function wireTags() {
     const t = $('#tags-target').value.trim();
     $('#view-tags [data-result]').hidden = true;
     const c = consoleEl('tags'); resetConsole(c); c.hidden = true;
-    if (!t) { fail('tags', 'Choose a file or folder.\n'); return; }
+    if (!t) { fail('tags', 'Choose a file or folder.\n', 'tags-target'); return; }
     setStatus('tags', 'running', 'Reading…');
     const { code, stdout, stderr } = await runCapture('tags', [...BUILDERS.tags(), '--json']);
     let json = null;
@@ -6383,9 +6580,10 @@ async function scanRenameFolder({ keepConsole = false } = {}) {
     return;
   }
 
-  // Why it is refused (a rename here would be a merge) is in the help.
+  // Why it is refused (a rename here would be a merge) is in the help. The red
+  // line says it, so no chip: an amber "2 studies" beside it said it again.
   if (studies.length > 1) {
-    setStatus('rename', 'warn', `${studies.length} studies`);
+    setStatus('rename', null);
     renderRenameFound(
       `<div class="folder-check bad"><b>This folder holds ${studies.length} studies.</b> `
       + 'Rename one study\'s folder at a time.</div>'
@@ -6457,6 +6655,7 @@ function wireRename() {
     chip.addEventListener('click', () => {
       $$('#rename-dest-row .chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
+      clearRefusalsFor('rename-dest-row');
       renderRenameDest();
       updateAllPreviews();
     });
@@ -6466,17 +6665,17 @@ function wireRename() {
   $('#view-rename [data-run]').addEventListener('click', async () => {
     clearConsole('rename');
     const folder = $('#rename-folder').value.trim();
-    if (!folder) { fail('rename', 'Choose the folder holding the study first.\n'); return; }
+    if (!folder) { fail('rename', 'Choose the folder holding the study first.\n', 'rename-folder'); return; }
     if (!renameState.study) {
-      fail('rename', 'That folder has not been read yet, or it does not hold exactly one study.\n');
+      fail('rename', 'That folder has not been read yet, or it does not hold exactly one study.\n', 'rename-folder');
       return;
     }
     const pairs = renamePairs();
-    if (!pairs.length) { fail('rename', 'Nothing differs from what the study already says.\n'); return; }
+    if (!pairs.length) { fail('rename', 'Nothing differs from what the study already says.\n', 'rename-form'); return; }
 
     const inplace = renameDest() === 'inplace';
     if (!inplace && !$('#rename-out').value.trim()) {
-      fail('rename', 'Choose where to write the renamed copy.\n');
+      fail('rename', 'Choose where to write the renamed copy.\n', 'rename-out', 'rename-dest-row');
       return;
     }
 
@@ -6654,7 +6853,7 @@ async function loadTagsForEditing() {
   const target = $('#edit-target').value.trim();
   clearConsole('edit');
   if (!target) {
-    fail('edit', 'Choose a study folder or a .dcm file first.\n');
+    fail('edit', 'Choose a study folder or a .dcm file first.\n', 'edit-target');
     return;
   }
 
@@ -6683,7 +6882,7 @@ async function loadTagsForEditing() {
 
   const first = (parsed.results || [])[0];
   if (!first) {
-    fail('edit', 'No DICOM instances found there.\n');
+    fail('edit', 'No DICOM instances found there.\n', 'edit-target');
     return;
   }
 
@@ -6735,17 +6934,17 @@ function wireEdit() {
     const target = $('#edit-target').value.trim();
     const out = $('#edit-out').value.trim();
 
-    if (!target) { fail('edit', 'Choose a source folder or file.\n'); return; }
+    if (!target) { fail('edit', 'Choose a source folder or file.\n', 'edit-target'); return; }
     if (!editState.changes.size && !editState.removals.size) {
-      fail('edit', 'Nothing to apply — change a value or tick a tag to remove.\n');
+      fail('edit', 'Nothing to apply — change a value or tick a tag to remove.\n', 'edit-grid');
       return;
     }
-    if (!out) { fail('edit', 'Choose where to write the edited copy.\n'); return; }
+    if (!out) { fail('edit', 'Choose where to write the edited copy.\n', 'edit-out'); return; }
 
     const touchingUid = [...editState.changes.keys(), ...editState.removals]
       .some((kw) => UID_KEYWORDS.has(kw));
     if (touchingUid && !$('#edit-force').checked) {
-      fail('edit', 'Includes a UID — tick Allow editing UIDs.\n');
+      fail('edit', 'Includes a UID — tick Allow editing UIDs.\n', 'edit-force', 'edit-grid');
       appendConsole('edit',
         'Rewriting UIDs on some instances and not others splits a study. To get fresh\n' +
         'UIDs across a whole study consistently, use De-identify instead.\n', 'stderr');
@@ -6804,8 +7003,8 @@ function wireAnon() {
     clearConsole('anon');
     const f = $('#anon-folder').value.trim();
     const out = $('#anon-out').value.trim();
-    if (!f) { fail('anon', 'Choose a folder to de-identify.\n'); return; }
-    if (!out) { fail('anon', 'Choose an output folder.\n'); return; }
+    if (!f) { fail('anon', 'Choose a folder to de-identify.\n', 'anon-folder'); return; }
+    if (!out) { fail('anon', 'Choose an output folder.\n', 'anon-out'); return; }
     setStatus('anon', 'running', 'De-identifying…');
     const { code, stderr } = await runStreaming('anon', BUILDERS.anon());
     setStatus('anon', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : failLabel(stderr));
@@ -6873,6 +7072,36 @@ async function copyText(text) {
 function flash(el, cls = 'copied') {
   el.classList.add(cls);
   setTimeout(() => el.classList.remove(cls), 1100);
+}
+
+/**
+ * The Claude screen's one precondition, checked: is there a `dcm` on PATH?
+ *
+ * Both copy boxes tell Claude to start `dcm` by name, so without one on PATH
+ * the registration takes and every tool call then fails inside Claude, where
+ * this app cannot see it. Main walks PATH (findOnPath, main.js) each time the
+ * screen opens, and the line says exactly what that found: where, or that it
+ * is not there, with the way to install it. If the look itself failed, the line
+ * says nothing — a status nobody checked is the "Ready" this screen used to
+ * show and was right to lose.
+ */
+async function renderDcmProbe() {
+  let found;
+  try { found = (await window.dcm.onPath()).path; } catch { found = undefined; }
+  drawDcmProbe(found);
+}
+
+/** The line for what the look found: a path, null for nothing, undefined for no look. */
+function drawDcmProbe(found) {
+  const line = $('#mcp-dcm');
+  if (!line) return;
+  if (found === undefined) { line.hidden = true; return; }
+  line.hidden = false;
+  line.className = `probe-line ${found ? 'found' : 'missing'}`;
+  line.innerHTML = found
+    ? `dcm found at <span class="probe-path">${esc(found)}</span>`
+    : 'dcm is not on your PATH, so Claude cannot start it. '
+      + '<button type="button" class="linklike" data-help="mcp-help" data-help-section="mcp-install">How to install</button>';
 }
 
 function wireCopy() {
@@ -6951,6 +7180,9 @@ function wireHelp() {
     const open = btn.classList.contains('help-btn') ? panel.hidden : true;
     setHelp(panel.id, open);
     if (open && !btn.classList.contains('help-btn')) panel.scrollIntoView({ block: 'nearest' });
+    // A link that answers one question opens the panel at that answer.
+    const section = open && btn.dataset.helpSection && document.getElementById(btn.dataset.helpSection);
+    if (section) panel.scrollTop += section.getBoundingClientRect().top - panel.getBoundingClientRect().top - 12;
   });
 
   document.addEventListener('keydown', (e) => {
@@ -7183,6 +7415,7 @@ async function boot() {
   wireSettings();
 
   wireHelp();
+  wireRefusals();
   wireEcho();
   wireSend();
   wireReceive();
