@@ -461,6 +461,9 @@
           <p><b>Matching keys</b> are DICOM keyword = value. Wildcards <code>*</code> and <code>?</code> are allowed, and dates take a range: <code>20260101-20260201</code>. An empty value asks the peer to return that attribute rather than match on it — which is how you find out what it will tell you.</p>
           <p><b>Level</b> decides what a match is: a study, a series, an image, or a scheduled procedure step (Worklist). Worklist here is the raw query; the Worklist screen is the same C-FIND with the scheduling keys routed into the Scheduled Procedure Step Sequence, which is what an MWL SCP expects.</p>
           <p><b>Limit</b> stops reading after that many matches. It is a client-side stop, so the peer may already have done the work.</p>
+          <p><b>Retrieve</b> appears on each study or series row, because those rows carry the UID the peer files the images under. A Worklist row does not — a scheduled step is not a study yet, even when the RIS has already minted its UID — and neither is offered on image rows. The folder you pick is written as <code>&lt;folder&gt;/&lt;study&gt;/&lt;series&gt;/&lt;instance&gt;.dcm</code>, the same layout the receiver's <b>Save arriving images to</b> produces.</p>
+          <p><b>C-GET, and why there is no C-MOVE button.</b> A retrieve here is a C-GET: the images come back down the same association the request went out on, so <b>nothing has to be configured on the peer</b> and nothing has to be listening on this machine. C-MOVE is the other way to ask, and it is a different deal — the peer opens a <i>fresh</i> association to an AE Title it must already have registered for you, at a host and port its administrator typed in. An archive that has never heard of you answers <code>0xA801 Move Destination unknown</code> and not one image moves. So C-MOVE is left off this screen rather than offered as a choice that usually fails first. The cost of C-GET is that the peer has to implement it and many archives do not; one that does not will say <code>0x0122 SOP Class not supported</code>, which is reported as exactly that. When that is the answer, the engine's <code>dcm move</code> does the C-MOVE from a terminal, with <code>--destination</code> and a receiver of its own.</p>
+          <p><b>What counts as success.</b> The number of files on disk is the result; the sub-operation counts the peer reports are evidence, never the verdict. If the peer says it sent thirteen and ten arrive, the retrieve has failed and says that three are missing — an accepted transfer can still be an incomplete one. A retrieve also writes files in rehearsal mode, because C-GET has no dry run; it still only reads from the peer.</p>
         </div>
         <p class="pane-lede">C-FIND. Reads what a peer holds; changes nothing.</p>
         <div class="conn-host" data-conn data-role="archive"></div>
@@ -482,6 +485,42 @@
         <div class="actions">
           <button class="btn primary" data-run>Run C-FIND</button>
           <span class="status-chip" data-status hidden></span>
+        </div>
+        <!-- Retrieving, below the primary button on purpose.
+             ===========================================================
+             Everything from here to the results table exists only once a
+             query has come back with something that CAN be retrieved — a
+             study or series row carrying a Study Instance UID. It is placed
+             after the "Run C-FIND" row so the screen an operator walks up to
+             is unchanged: one button, and the words above it are the same
+             words as before. There is no second primary button and no choice
+             of service; the Retrieve button on each result row is the whole
+             control, and why it is a C-GET rather than a C-MOVE is explained
+             in the help panel behind the ?.
+
+             The folder is asked for once. Pressing Retrieve with this box
+             empty opens the picker and then runs, so the gesture is still
+             "pick the row, press the thing"; every later retrieve reuses the
+             folder, which is why it is shown rather than only remembered. -->
+        <div id="find-retrieve" hidden>
+          <div class="form-row">
+            <label class="grow">Retrieved images go to
+              <div class="path-pick">
+                <input type="text" id="find-out" placeholder="Pick a folder — or press Retrieve and choose one" />
+                <button class="btn ghost" data-pick="find-out" data-pick-mode="create">Browse…</button>
+                <button class="btn ghost" data-reveal="find-out">Open</button>
+              </div>
+            </label>
+          </div>
+          <div class="actions" id="find-retrieve-actions" hidden>
+            <span class="status-chip" id="find-retrieve-status" hidden></span>
+            <button class="btn danger small" id="find-retrieve-cancel" hidden>Stop</button>
+          </div>
+          <div class="outcome" id="find-retrieve-outcome" hidden></div>
+          <details class="cmd-fold" id="find-retrieve-fold" hidden>
+            <summary>retrieve command <span class="cmd-sum"></span></summary>
+            <div class="cmd-preview" id="find-retrieve-cmd"></div>
+          </details>
         </div>
         <div class="result-table" data-result hidden></div>
         <details class="cmd-fold">

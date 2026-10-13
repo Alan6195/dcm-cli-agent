@@ -378,6 +378,43 @@ td { user-select: text; font-variant-numeric: tabular-nums; }
 tr:hover td { background: rgba(255,255,255,0.02); }
 td.mono, th.mono { font-family: var(--mono); }
 
+/* A table too wide for the window scrolls inside this box. The worklist screen
+ * worked this out first and scoped the class to itself; the query results had
+ * the same problem and no such box, so twelve columns of match simply ran off
+ * the right of the screen. The rule is the page's, not one screen's, so it
+ * lives here. #view-worklist still adds its own height and sticky-header
+ * behaviour on top. */
+.table-scroll { overflow-x: auto; }
+
+/* Query and DICOMweb results. width:max-content lets the table be as wide as
+ * its widest row needs and the box above do the scrolling; min-width keeps a
+ * narrow result (one or two short columns) filling the panel as it always did.
+ * Cells do not wrap: a Study Description folding onto three lines made every
+ * row a different height and bought nothing, since the column it was stealing
+ * width from is a UID that cannot usefully be wrapped either. */
+.find-table { width: max-content; min-width: 100%; }
+.find-table td, .find-table th { white-space: nowrap; }
+
+/* The per-row action on the query results — today the Retrieve button.
+ *
+ * Sticky at the left edge of the scroll box, because the reason the box
+ * scrolls is that these rows are twelve columns wide with a 64-character UID
+ * among them: reading the Study Description means scrolling the button out of
+ * the window, and then pressing it means scrolling back. The background is
+ * opaque for the same reason it has to be — scrolled cells pass UNDERNEATH
+ * it, and a transparent sticky cell shows them through. The hover rule is
+ * repeated here with the class specificity the generic `tr:hover td` cannot
+ * reach, so a hovered row stays one continuous row. */
+.find-table .act-cell {
+  position: sticky; left: 0; z-index: 1;
+  background-color: var(--bg); padding-right: 14px;
+}
+/* The same 2% white the generic rule paints, laid over the opaque colour
+ * instead of mixed into a hard-coded one, so it stays right if --bg moves. */
+.find-table tr:hover .act-cell {
+  background-image: linear-gradient(rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.02));
+}
+
 .study-card {
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   padding: 14px 16px; margin-bottom: 12px;

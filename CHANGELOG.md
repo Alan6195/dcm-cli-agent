@@ -40,9 +40,10 @@ contradicted it" is a weaker claim than "verified complete" — and a C-MOVE to 
 third-party destination says plainly that there was no local disk to check
 rather than implying a verification it did not do.
 
-**`dcm scp --serve <dir>` makes the receiver retrievable.** It answers C-GET and
-C-MOVE out of a folder, so the whole loop is testable locally without a real
-archive in it. `--destination AE=host:port` is repeatable and is how a C-MOVE
+**`dcm scp --serve <dir>` makes the receiver an archive.** It answers study,
+series and image C-FIND, C-GET and C-MOVE out of a folder, so the whole loop —
+search for the patient, then pull what came back — is testable locally without
+a real archive in it. `--destination AE=host:port` is repeatable and is how a C-MOVE
 destination gets resolved; a title with no entry is answered `0xA801`, which
 makes the commonest C-MOVE failure in the field reproducible on purpose, in one
 command. Without `--serve` retrieves are refused rather than answered emptily,

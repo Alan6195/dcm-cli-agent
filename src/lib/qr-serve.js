@@ -1,12 +1,13 @@
 'use strict';
 
 const log = require('./log');
+const worklist = require('./worklist');
 const { scan } = require('./scan');
 const { runAssociation, resolveTimeouts, dcmjsDimse } = require('./dimse');
 const { RetrieveStatus } = require('./retrieve');
 
 const { CStoreRequest } = dcmjsDimse.requests;
-const { CGetResponse, CMoveResponse } = dcmjsDimse.responses;
+const { CGetResponse, CMoveResponse, CFindResponse } = dcmjsDimse.responses;
 const { Status } = dcmjsDimse.constants;
 
 /**
@@ -404,6 +405,222 @@ async function serveMove({ scp, request, callback, config, stats }) {
 }
 
 /**
+ * The attributes this receiver can answer at each Study Root level, and where
+ * each one comes from in what the scanner read.
+ *
+ * Deliberately small. These are what an operator types into a search and what
+ * `dcm find` asks for by default, and every one of them is something the
+ * scanner already read off disk. A key outside this table is not answered with
+ * an invented value: it comes back zero-length, which is what "this archive
+ * does not hold that attribute" means on the wire.
+ */
+const FIND_LEVELS = {
+  STUDY: {
+    StudyInstanceUID: (s) => s.studyInstanceUid,
+    PatientName: (s) => s.patientName,
+    PatientID: (s) => s.patientId,
+    StudyDate: (s) => s.studyDate,
+    StudyDescription: (s) => s.studyDescription,
+    AccessionNumber: (s) => s.accessionNumber,
+    ModalitiesInStudy: (s) => [...(s.modalities ?? [])].filter(Boolean),
+    NumberOfStudyRelatedSeries: (s) => String(seriesOf(s).length),
+    NumberOfStudyRelatedInstances: (s) => String(s.instances.length),
+  },
+  SERIES: {
+    StudyInstanceUID: (s) => s.studyInstanceUid,
+    SeriesInstanceUID: (s, se) => se.seriesInstanceUid,
+    SeriesNumber: (s, se) => (se.seriesNumber === undefined ? undefined : String(se.seriesNumber)),
+    Modality: (s, se) => se.modality,
+    SeriesDescription: (s, se) => se.seriesDescription,
+    NumberOfSeriesRelatedInstances: (s, se) => String(se.instances.length),
+  },
+  IMAGE: {
+    StudyInstanceUID: (s, se, i) => i.studyInstanceUid,
+    SeriesInstanceUID: (s, se, i) => i.seriesInstanceUid,
+    SOPInstanceUID: (s, se, i) => i.sopInstanceUid,
+    SOPClassUID: (s, se, i) => i.sopClassUid,
+    InstanceNumber: (s, se, i) => (i.instanceNumber === undefined ? undefined : String(i.instanceNumber)),
+  },
+};
+
+/** Keys that are part of the request's shape rather than something to match. */
+const FIND_NON_MATCHING = new Set(['QueryRetrieveLevel', 'SpecificCharacterSet']);
+
+/** The study's series, whether the scanner kept them as a Map or an array. */
+function seriesOf(study) {
+  const s = study.series;
+  if (!s) return [];
+  return s instanceof Map ? [...s.values()] : Array.isArray(s) ? s : Object.values(s);
+}
+
+/**
+ * True when one value satisfies one matching key.
+ *
+ * The rules are the worklist matcher's, reused rather than restated, so a
+ * pattern means the same thing to a study query as it does to a worklist
+ * query on the same receiver: `*` and `?` wildcards, a hyphenated date range,
+ * a Person Name matched against any of its component groups, and a UID key
+ * that may carry a backslash-separated list of UIDs (PS3.4 C.2.2.2.2).
+ */
+function satisfies(key, actual, criterion) {
+  const want = criterion.trim();
+  if (Array.isArray(actual)) return actual.some((v) => satisfies(key, v, want));
+  const have = actual === undefined || actual === null ? '' : String(actual);
+  if (key.endsWith('UID')) return want.split('\\').map((u) => u.trim()).includes(have.trim());
+  if (key.endsWith('Date')) return worklist.matchesDate(have, want);
+  if (key === 'PatientName') return worklist.matchesPersonName(have, want);
+  return worklist.matchesText(have, want);
+}
+
+/**
+ * Answers a Study Root C-FIND out of the served folder.
+ *
+ * This is what makes --serve a whole Query/Retrieve stand-in rather than half
+ * of one. Before it, a folder could be retrieved from and never searched,
+ * which meant a client could pull a study only if it already knew the UID —
+ * and the obvious flow, search for the patient and then pull what came back,
+ * could not be exercised against this receiver at all.
+ *
+ * A key this receiver does not hold is not used to filter. That is what most
+ * archives do with an optional key they do not support, and the alternative —
+ * matching nothing because one unsupported key was present — would make every
+ * query from a client that asks for more than this table answers come back
+ * empty. The keys that were ignored are returned so the caller can say so.
+ *
+ * @param {string} serveDir
+ * @param {object} elements The identifier's naturalised elements.
+ * @returns {{level: string, matches: Array<object>, ignored: string[], problem?: {status: number, comment: string}}}
+ */
+function findMatches(serveDir, elements) {
+  const level = String(elements?.QueryRetrieveLevel ?? '').trim().toUpperCase() || 'STUDY';
+  const table = FIND_LEVELS[level];
+  if (!table) {
+    return {
+      level,
+      matches: [],
+      ignored: [],
+      problem: {
+        status: RetrieveStatus.IDENTIFIER_MISMATCH,
+        comment: `level ${level} is not served; use STUDY, SERIES or IMAGE`,
+      },
+    };
+  }
+
+  // Requested keys, in the order asked, and the subset that actually filters.
+  const requested = [];
+  const criteria = [];
+  const ignored = [];
+  for (const [key, value] of Object.entries(elements ?? {})) {
+    if (key.startsWith('_') || FIND_NON_MATCHING.has(key)) continue;
+    requested.push(key);
+    if (worklist.isUniversal(value)) continue;
+    if (!table[key]) {
+      ignored.push(key);
+      continue;
+    }
+    criteria.push({ key, value: worklist.textOf(value) });
+  }
+
+  let result;
+  try {
+    result = scan(serveDir);
+  } catch (err) {
+    return {
+      level,
+      matches: [],
+      ignored,
+      problem: {
+        status: RetrieveStatus.PROCESSING_FAILURE,
+        comment: `cannot read the served folder: ${err.message}`.slice(0, 64),
+      },
+    };
+  }
+
+  // One candidate per entity at the requested level, each able to answer the
+  // keys of its own level.
+  const candidates = [];
+  for (const study of result.studies.values()) {
+    if (level === 'STUDY') {
+      candidates.push((key) => table[key]?.(study));
+      continue;
+    }
+    for (const series of seriesOf(study)) {
+      if (level === 'SERIES') {
+        candidates.push((key) => table[key]?.(study, series));
+        continue;
+      }
+      for (const instance of series.instances ?? []) {
+        candidates.push((key) => table[key]?.(study, series, instance));
+      }
+    }
+  }
+
+  const matches = [];
+  for (const read of candidates) {
+    if (!criteria.every(({ key, value }) => satisfies(key, read(key), value))) continue;
+
+    // The answer carries every key that was asked for: known ones filled in,
+    // unknown ones zero-length. The level's unique key is always present, so
+    // a client that forgot to ask for it can still act on the row.
+    const row = { QueryRetrieveLevel: level };
+    const keys = new Set(requested);
+    keys.add(level === 'STUDY' ? 'StudyInstanceUID' : level === 'SERIES' ? 'SeriesInstanceUID' : 'SOPInstanceUID');
+    for (const key of keys) {
+      const value = table[key] ? read(key) : undefined;
+      row[key] = value === undefined || value === null ? '' : value;
+    }
+    matches.push(row);
+  }
+
+  return { level, matches, ignored };
+}
+
+/**
+ * Serves a non-worklist C-FIND from --serve.
+ *
+ * Returns the response list rather than calling back, so the receiver's own
+ * answerFind() keeps sending it — which is what keeps --abort-find-after and
+ * --find-status working against a served folder exactly as they do against a
+ * worklist.
+ *
+ * @param {object} params
+ * @param {object} params.request
+ * @param {object} params.config
+ * @param {object} params.stats
+ * @param {Function} params.Dataset  dcmjs-dimse's Dataset class.
+ * @returns {{pendings: object[], final: object}}
+ */
+function serveFind({ request, config, stats, Dataset }) {
+  const identifier = request.getDataset?.();
+  const elements = identifier?.getElements?.() ?? {};
+  const transferSyntaxUid = identifier?.getTransferSyntaxUid?.();
+  const { level, matches, ignored, problem } = findMatches(config.serve, elements);
+
+  const final = CFindResponse.fromRequest(request);
+  if (problem) {
+    final.setStatus(problem.status);
+    final.setErrorComment?.(problem.comment.slice(0, 64));
+    log.info(`${log.color.cyan('<-')} C-FIND ${level} refused: ${problem.comment}`);
+    return { pendings: [], final };
+  }
+
+  const pendings = matches.map((row) => {
+    const pending = CFindResponse.fromRequest(request);
+    pending.setStatus(Status.Pending);
+    pending.setDataset(new Dataset(row, transferSyntaxUid));
+    return pending;
+  });
+  final.setStatus(Status.Success);
+
+  stats.findMatches = (stats.findMatches ?? 0) + matches.length;
+  log.info(
+    `${log.color.cyan('->')} C-FIND ${level}: ${matches.length} match(es) from the served folder` +
+      (ignored.length ? ` (not held, so not matched on: ${ignored.join(', ')})` : '')
+  );
+  return { pendings, final };
+}
+
+/**
  * Parses a --destination AE=host:port into a registry entry.
  *
  * @param {string} raw
@@ -438,6 +655,8 @@ function parseDestination(raw) {
 
 module.exports = {
   matchInstances,
+  findMatches,
+  serveFind,
   makeSubOperationTally,
   serveGet,
   serveMove,

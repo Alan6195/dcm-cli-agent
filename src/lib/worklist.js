@@ -806,6 +806,7 @@ module.exports = {
   readMatchingKeys,
   selectItems,
   matchesText,
+  matchesPersonName,
   matchesDate,
   isUniversal,
   textOf,

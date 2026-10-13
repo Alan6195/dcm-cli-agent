@@ -14,7 +14,9 @@ const {
   verdict,
   makeReportedCounts,
 } = require('../../src/lib/retrieve');
-const { matchInstances, makeSubOperationTally, parseDestination } = require('../../src/lib/qr-serve');
+const {
+  matchInstances, findMatches, makeSubOperationTally, parseDestination,
+} = require('../../src/lib/qr-serve');
 const { generate } = require('../../tools/make-fixtures');
 
 /**
@@ -1012,4 +1014,88 @@ test('every malformed destination throws, and the message says what the form is'
   // The message has to name the offending text, not just the rule.
   assert.throws(() => parseDestination('AE=host:abc'), /"host:abc"/);
   assert.throws(() => parseDestination('nonsense'), /"nonsense"/);
+});
+
+// ---------------------------------------------------------------------------
+// findMatches: the C-FIND half of --serve.
+// ---------------------------------------------------------------------------
+
+test('a study-level C-FIND with no keys answers the study with what the folder holds', async () => {
+  const fixture = await served();
+  const { level, matches, problem } = findMatches(fixture.dir, {
+    QueryRetrieveLevel: 'STUDY', PatientID: '', NumberOfStudyRelatedInstances: '',
+  });
+
+  assert.equal(problem, undefined);
+  assert.equal(level, 'STUDY');
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].StudyInstanceUID, fixture.studyUid, 'the unique key is always returned');
+  assert.equal(matches[0].NumberOfStudyRelatedInstances, String(fixture.total));
+  assert.ok(matches[0].PatientID, 'a requested key the folder holds is filled in');
+});
+
+test('C-FIND matching keys use the same wildcard rules as the worklist', async () => {
+  const fixture = await served();
+  const { matches: hit } = findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', PatientID: 'SYN*' });
+  const { matches: miss } = findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', PatientID: 'NOPE*' });
+  const { matches: single } = findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', PatientID: 'SYNTH000?' });
+
+  assert.equal(hit.length, 1);
+  assert.equal(miss.length, 0);
+  assert.equal(single.length, 1, '? matches exactly one character');
+});
+
+test('a date range matches inclusively and an open end is unbounded', async () => {
+  const fixture = await served();
+  const [{ StudyDate: date }] = findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', StudyDate: '' }).matches;
+  assert.match(date, /^[0-9]{8}$/);
+
+  for (const range of [`${date}-${date}`, `${date}-`, `-${date}`, date]) {
+    assert.equal(findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', StudyDate: range }).matches.length, 1, range);
+  }
+  assert.equal(findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', StudyDate: '19000101-19000102' }).matches.length, 0);
+});
+
+test('a UID key takes a backslash-separated list of UIDs', async () => {
+  const fixture = await served();
+  const list = ['1.2.3.4', fixture.studyUid].join(String.fromCharCode(92));
+  assert.equal(findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', StudyInstanceUID: list }).matches.length, 1);
+  assert.equal(findMatches(fixture.dir, { QueryRetrieveLevel: 'STUDY', StudyInstanceUID: '1.2.3.4' }).matches.length, 0);
+});
+
+test('series and image levels answer one row per series and per instance', async () => {
+  const fixture = await served();
+  const series = findMatches(fixture.dir, { QueryRetrieveLevel: 'SERIES', StudyInstanceUID: fixture.studyUid });
+  const images = findMatches(fixture.dir, {
+    QueryRetrieveLevel: 'IMAGE', StudyInstanceUID: fixture.studyUid, SeriesInstanceUID: fixture.seriesUid,
+  });
+
+  assert.equal(series.matches.length, 2);
+  for (const row of series.matches) {
+    assert.ok(row.SeriesInstanceUID, 'every series row carries its own unique key');
+    assert.equal(row.StudyInstanceUID, fixture.studyUid);
+  }
+  assert.equal(images.matches.length, 3);
+  assert.ok(images.matches.every((row) => row.SeriesInstanceUID === fixture.seriesUid));
+});
+
+test('a key the folder does not hold is returned empty and does not filter', async () => {
+  // Most archives ignore an optional key they do not support. Matching
+  // nothing because one was present would make every rich client query come
+  // back empty, which reads as "the study is not here".
+  const fixture = await served();
+  const { matches, ignored } = findMatches(fixture.dir, {
+    QueryRetrieveLevel: 'STUDY', ReferringPhysicianName: 'SMITH*',
+  });
+
+  assert.equal(matches.length, 1);
+  assert.deepEqual(ignored, ['ReferringPhysicianName']);
+  assert.equal(matches[0].ReferringPhysicianName, '');
+});
+
+test('a level the Study Root model does not have is refused, not guessed at', async () => {
+  const fixture = await served();
+  const { matches, problem } = findMatches(fixture.dir, { QueryRetrieveLevel: 'PATIENT' });
+  assert.equal(matches.length, 0);
+  assert.equal(problem.status, RetrieveStatus.IDENTIFIER_MISMATCH);
 });

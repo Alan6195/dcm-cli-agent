@@ -470,9 +470,12 @@ dcm scp --port 11112 --reject-after 20
 ```
 
 
-**Serving retrieves.** `--serve <dir>` makes this receiver answer C-GET and
-C-MOVE out of a folder, so it can be retrieved *from* as well as sent to — which
-is what gives `dcm get` and `dcm move` a loopback target:
+**Serving a folder as an archive.** `--serve <dir>` makes this receiver answer
+study, series and image C-FIND, C-GET and C-MOVE out of a folder, so it can be
+searched and retrieved *from* as well as sent to — which is what gives
+`dcm find`, `dcm get` and `dcm move` a loopback target. A query key the folder
+does not hold comes back empty and is not matched on, the way most archives
+treat an optional key they do not support:
 
 ```bash
 dcm scp --port 11112 --ae QR-SCP --serve ./library

@@ -33,6 +33,7 @@ const log = require('../../src/lib/log');
 const { tokenize } = require('../../src/lib/args');
 const { generate } = require('../../tools/make-fixtures');
 
+const find = require('../../src/commands/find');
 const get = require('../../src/commands/get');
 const move = require('../../src/commands/move');
 
@@ -713,5 +714,49 @@ test('get refuses an instance-level retrieve without its series, same as move', 
     const env = oneDocument(captured, 'get --instance without --series');
     assert.equal(env.outcome, 'usage');
     assert.match(env.message, /--series is required with it/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The whole loop: search, then pull what the search returned
+// ---------------------------------------------------------------------------
+
+test('a served folder can be searched and the study it returns pulled back', async () => {
+  // The flow an operator actually runs: find the patient, then retrieve the
+  // row. Every UID here comes from the query answer, not from the fixture
+  // manifest, so this proves the two halves of Query/Retrieve agree with each
+  // other on the same receiver, which is what the desktop Query screen depends
+  // on when it puts a Retrieve button on a result row.
+  await withTempDir('dcm-qr-loop', async (dir) => {
+    const serve = path.join(dir, 'serve');
+    const out = path.join(dir, 'out');
+    const manifest = await fixtures(serve);
+
+    const scp = await startScp({ ae: 'QR-SCP', serve });
+    try {
+      const found = await runCaptured(find, [
+        '--host', '127.0.0.1', '--port', String(scp.port), '--called-ae', 'QR-SCP',
+        '--json', 'PatientID=*',
+      ]);
+      assert.equal(found.code, 0, `the search must succeed:\n${found.output}`);
+      const answer = oneDocument(found, 'find');
+      assert.equal(answer.outcome, 'matched');
+      assert.equal(answer.matches.length, 1);
+      const studyUid = answer.matches[0].StudyInstanceUID;
+      assert.equal(studyUid, manifest.studies[0].studyInstanceUid);
+
+      const pulled = await runCaptured(get, [
+        '--host', '127.0.0.1', '--port', String(scp.port), '--called-ae', 'QR-SCP',
+        '--study', studyUid, '--out', out,
+      ]);
+      assert.equal(pulled.code, 0, `the retrieve of the searched study must succeed:\n${pulled.output}`);
+      assert.equal(dcmFilesUnder(out).length, manifest.totalInstances);
+      assert.equal(
+        Number(answer.matches[0].NumberOfStudyRelatedInstances), manifest.totalInstances,
+        'the count the search advertised is the count the retrieve delivered'
+      );
+    } finally {
+      scp.close();
+    }
   });
 });

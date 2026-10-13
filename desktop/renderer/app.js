@@ -108,6 +108,13 @@ const state = {
     fetched: false, at: null, error: null, detached: false,
   },
 
+  // The peer the rows on the Query screen came from, and the level that was
+  // asked. Kept because the peer chip can be moved after a query: the rows on
+  // screen name UIDs that only one archive filed, and retrieving one of them
+  // from a different archive is a question about the wrong peer. Compared
+  // before a retrieve runs; see retrievePeerMismatch().
+  find: { peer: null },
+
   // The last `mpps` run, the UID the next one will carry, what the chosen
   // folder turned out to hold, and — when the engineer option allows it —
   // which way past a study mismatch was chosen.
@@ -909,6 +916,13 @@ const VIEW_PARTS = {
   worklist: { cmd: '#mwl-cmd', status: '#mwl-status', console: '#wl-console' },
   mpps: { cmd: '#mpps-cmd', status: '#mpps-status', console: '#wl-console' },
   steps: { status: '#steps-status', console: '#wl-console' },
+  // The query screen's second command: a C-GET pulling one row of its own
+  // results. Its own preview and its own chip, because the C-FIND's must keep
+  // saying what the C-FIND did — but the query screen's console, for the same
+  // reason the station shares one: one workspace, one output pane. It is also
+  // its own key in state.activeRuns, so Stop stops the retrieve and not
+  // whatever else this screen may have running.
+  retrieve: { cmd: '#find-retrieve-cmd', status: '#find-retrieve-status', console: '#view-query [data-console]' },
 };
 
 function viewPart(view, kind) {
@@ -1785,21 +1799,390 @@ function addKvRow(container, { k = '', v = '', keyPh = 'Keyword', valPh = 'value
   container.appendChild(row);
 }
 
+// --------------------------------------------------------------------------
+// Retrieving a row of the results (C-GET)
+// --------------------------------------------------------------------------
+// A study- or series-level match already carries the UID the peer files the
+// images under, so the row IS the request: press Retrieve, choose a folder
+// once, and `dcm get` pulls that study down the same association it asks on.
+//
+// Only C-GET is offered. C-MOVE is the other way to ask and it is a different
+// deal — the peer opens a fresh association to an AE Title an administrator
+// must already have registered for us, so on an archive that has never heard
+// of this station it answers 0xA801 Move Destination unknown and nothing
+// moves. Putting both on this screen would mean a choice whose honest default
+// is always the first one, plus a destination AE field, a receive port and a
+// firewall hole to make the second one work at all. It is left to `dcm move`
+// in a terminal, and the help panel says so, including what to do when an
+// archive answers 0x0122 because it does not implement C-GET.
+//
+// THE PART THAT MATTERS: the verdict is the engine's exit code, never a count
+// read out of its report. `dcm get` exits 1 for a retrieve that was accepted
+// and came up short — the peer claims it sent thirteen, ten are on disk — and
+// a screen that rounded that up to "Done" because images did arrive would be
+// telling an operator a study is complete when it is not.
+
+/** The query levels whose rows name something the peer can be asked for. */
+const RETRIEVABLE_LEVELS = new Set(['study', 'series']);
+
+/**
+ * Is a retrieve started from this screen still in flight?
+ *
+ * Asked before the retrieve strip is hidden, in both places that hide it. The
+ * Stop button lives INSIDE that strip, so hiding it while a C-GET is running
+ * takes away the only way to stop an engine that is holding an association
+ * open on somebody's archive — and the two ways to reach that are both
+ * ordinary: run the query again, or run one whose results have nothing
+ * retrievable in them.
+ */
+function retrieveInFlight() {
+  return Boolean(state.activeRuns.retrieve);
+}
+
+/**
+ * A UID read off a result row, or '' when the row has none worth sending.
+ *
+ * `find --json` renders every value for reading, so a UID arrives as a string
+ * or it is not a UID. Validated rather than trusted, because an empty value is
+ * a perfectly ordinary answer here — an empty matching key asks the peer to
+ * RETURN that attribute, and a peer is free to return it blank — and
+ * `dcm get --study ""` is a usage error rather than a retrieve. A button that
+ * cannot work is worse than no button.
+ */
+function rowUid(match, key) {
+  const value = typeof (match && match[key]) === 'string' ? match[key].trim() : '';
+  return value.length <= 64 && /^[0-9]+(\.[0-9]+)*$/.test(value) ? value : '';
+}
+
 function renderFindResults(json) {
   const box = $('#view-query [data-result]');
   const matches = Array.isArray(json?.matches) ? json.matches : (Array.isArray(json) ? json : []);
   if (!matches.length) {
     box.hidden = false;
+    // Nothing to retrieve, said here as well as in resetRetrieveUi(), so this
+    // function leaves the screen consistent on its own rather than relying on
+    // having been called after the reset.
+    $('#find-retrieve').hidden = !retrieveInFlight();
     box.innerHTML = '<div class="empty-note">0 matches. (A peer can accept images and still return no matches — storing and indexing are different.)</div>';
     return;
   }
+  // The level the ENGINE queried, taken from its own envelope rather than from
+  // the radio button. The radio can be moved after a run — and moving it is
+  // the most natural next thing to do — which would relabel rows with a level
+  // they did not come from, and that decides whether a row names a study at
+  // all. findLevel() is the fallback for a payload without one.
+  const level = typeof json?.level === 'string' ? json.level : findLevel();
+  const offers = RETRIEVABLE_LEVELS.has(level);
   const cols = [];
   for (const m of matches) for (const k of Object.keys(m)) if (!cols.includes(k)) cols.push(k);
-  const head = cols.map((c) => `<th>${esc(c)}</th>`).join('');
-  const rows = matches.map((m) =>
-    `<tr>${cols.map((c) => `<td class="mono">${esc(m[c] ?? '')}</td>`).join('')}</tr>`).join('');
+  const head = (offers ? '<th class="act-cell"></th>' : '') + cols.map((c) => `<th>${esc(c)}</th>`).join('');
+  let offered = 0;
+  const rows = matches.map((m) => {
+    let act = '';
+    if (offers) {
+      const study = rowUid(m, 'StudyInstanceUID');
+      // A series row is retrieved AS a series: the row is one series, and
+      // pulling its whole study instead would quietly hand over more than was
+      // asked for. Study Root series-level C-FIND carries the study UID too —
+      // the engine requires StudyInstanceUID in a --series query — so both
+      // UIDs are here to be read off the row rather than guessed at.
+      const series = level === 'series' ? rowUid(m, 'SeriesInstanceUID') : '';
+      if (study) offered += 1;
+      act = `<td class="act-cell">${study
+        ? `<button class="btn small" data-retrieve="${esc(study)}"${series ? ` data-series="${esc(series)}"` : ''}`
+          + ` title="C-GET this ${series ? 'series' : 'study'} into the folder above">Retrieve</button>`
+        : ''}</td>`;
+    }
+    return `<tr>${act}${cols.map((c) => `<td class="mono">${esc(m[c] ?? '')}</td>`).join('')}</tr>`;
+  }).join('');
+  // The folder box, Stop and the verdict only exist while there is something
+  // on screen they could act on. A Worklist or image-level result gets none of
+  // it, and neither does a study-level result whose rows came back without a
+  // usable Study Instance UID — unless a retrieve is still running, which
+  // keeps its own Stop button on screen.
+  $('#find-retrieve').hidden = offered === 0 && !retrieveInFlight();
   box.hidden = false;
-  box.innerHTML = `<div class="section-title">${matches.length} match(es)</div><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+  // Scrolls inside its own box rather than off the side of the window. A
+  // study-level match carries a 64-character Study Instance UID alongside
+  // eleven other columns, so there is no window width at which this fits, and
+  // with no scroll container the right-hand columns ran past the edge of the
+  // screen with no way to reach them. Same answer the worklist table already
+  // settled on, and the same distinction: the table keeps a width it can be
+  // read at, and the page itself still never scrolls sideways.
+  box.innerHTML =
+    `<div class="section-title">${matches.length} match(es)</div>` +
+    `<div class="table-scroll"><table class="find-table">` +
+    `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+/** Everything the last retrieve left on screen, cleared when a query reruns. */
+function resetRetrieveUi() {
+  // The verdict belongs to rows that are about to be replaced, so it goes
+  // first and unconditionally.
+  $('#find-retrieve-outcome').hidden = true;
+  // A retrieve that is still running keeps its chip, its command and — the
+  // reason this is a condition at all — its Stop button.
+  if (retrieveInFlight()) return;
+  $('#find-retrieve').hidden = true;
+  $('#find-retrieve-actions').hidden = true;
+  $('#find-retrieve-cancel').hidden = true;
+  // The fold keeps the last retrieve command, so it goes too: a command naming
+  // a study that is no longer in the table is a command for nothing.
+  $('#find-retrieve-fold').hidden = true;
+  setStatus('retrieve', null);
+}
+
+/**
+ * The destination folder, asking for one if there is none yet.
+ *
+ * Pressing Retrieve on a row is the whole gesture, so an empty box opens the
+ * picker and the run continues into whatever comes back; it is not a refusal
+ * to be read and corrected. Returns '' when the dialog was dismissed, which is
+ * a decision not to retrieve rather than an error.
+ */
+async function ensureRetrieveOut() {
+  const field = $('#find-out');
+  const typed = field.value.trim();
+  if (typed) return typed;
+  const res = await window.dcm.pick({
+    mode: 'create', title: 'Where should retrieved images go?', defaultPath: state.info.home,
+  });
+  if (!res || !res.path) return '';
+  field.value = res.path;
+  // Both events, in the order typing produces them — the same rule
+  // wirePickers() keeps, and for the same reason. Nothing on this screen
+  // listens for either one today, and that is exactly when this gets dropped
+  // and stays dropped: the next listener added to this field would silently
+  // never see a folder chosen through the picker.
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  field.dispatchEvent(new Event('change', { bubbles: true }));
+  return res.path;
+}
+
+/** `dcm get` for one result row, into one folder. */
+function retrieveArgv({ study, series, out }) {
+  const argv = ['get', ...connArgs(), '--study', study];
+  if (series) argv.push('--series', series);
+  argv.push('--out', out);
+  // The idle timeout from Settings › Defaults, the one every other screen
+  // inherits through fieldOr(). This screen has no field of its own for it —
+  // a timeout box on a workflow surface is an engineer's control — so the
+  // default is read directly.
+  const defaults = (state.settings && state.settings.defaults) || {};
+  if (defaults.timeout) argv.push('--timeout', String(defaults.timeout));
+  return argv;
+}
+
+/**
+ * The peer that answered the query, if it is no longer the peer on the chip.
+ *
+ * Returns a sentence to refuse with, or ''. Host, port and called AE identify
+ * an archive; the calling AE is ours and can differ without making these rows
+ * somebody else's. A UID means nothing outside the archive that issued it, so
+ * sending one to a peer that was swapped in after the query is a question
+ * about the wrong machine — and the likely answer, an empty retrieve, looks
+ * exactly like a study the peer has deleted.
+ */
+function retrievePeerMismatch() {
+  const was = state.find.peer;
+  if (!was) return '';
+  const now = state.conn;
+  const same = was.host === now.host && String(was.port) === String(now.port)
+    && was.calledAe === now.calledAe;
+  if (same) return '';
+  return `These rows came from ${connLabel(was)}, and this screen now points at `
+    + `${connLabel(now)}. Nothing was sent. Run the query again against `
+    + `${connLabel(now)}, or put the chip back.`;
+}
+
+/**
+ * The engine's own closing report, as numbers.
+ *
+ * Parsed from the printed report rather than from --json so that the console
+ * carries the whole report an operator can read and paste; what is parsed out
+ * of it only ever decorates a verdict that the EXIT CODE has already decided.
+ * Every field is null when its line is absent, and a missing "peer completed"
+ * is the meaningful case: it means the peer returned no sub-operation counts,
+ * so there is nothing to compare the disk against and the box has to say so
+ * rather than implying a check that did not happen.
+ */
+function parseRetrieveReport(stdout) {
+  const text = stripAnsi(String(stdout || ''));
+  const num = (re) => {
+    const m = text.match(re);
+    return m ? Number(m[1]) : null;
+  };
+  const dest = text.match(/^destination\s+(.+)$/m);
+  return {
+    written: num(/^stored on disk\s+(\d+)\s*$/m),
+    completed: num(/^peer completed\s+(\d+)\s*$/m),
+    failed: num(/^peer failed\s+(\d+)\s*$/m),
+    duplicates: num(/^duplicate arrivals\s+(\d+)\s*$/m),
+    unreadable: num(/^unreadable\s+(\d+)\s*$/m),
+    dest: dest ? dest[1].trim() : '',
+  };
+}
+
+/**
+ * One verdict for the retrieve, from the exit code.
+ *
+ * The exit code is the contract — 0 means completed and nothing lost, 1 means
+ * it ran and did not fully succeed, INCLUDING accepted-but-lossy — so it is
+ * the only thing allowed to decide which box this is. The numbers underneath
+ * are the engine's, printed as it printed them, and both are shown on success:
+ * "ten on disk" beside "the peer said ten" is the whole claim, and when the
+ * peer said nothing at all that absence is the thing to report.
+ */
+function renderRetrieveOutcome({ code, stdout, stderr, cancelled, what, out }) {
+  const box = $('#find-retrieve-outcome');
+  const r = parseRetrieveReport(stdout);
+  const dest = r.dest || out;
+  const said = engineErrorText(stderr);
+  const quote = (text) => `<div class="engine-said">${esc(text)}</div>`;
+  box.hidden = false;
+
+  if (cancelled) {
+    // Stopped by hand. Whatever had already landed is still on disk and is
+    // part of a study, which is not the same thing as a study.
+    box.className = 'outcome bad';
+    box.innerHTML = '<span class="outcome-head">Stopped — the retrieve was cancelled.</span>'
+      + `Whatever had already arrived is in <b>${esc(dest)}</b> and is a partial ${esc(what)}. `
+      + 'Retrieve it again to finish it; files that arrive twice are overwritten, not doubled.';
+    setStatus('retrieve', 'fail', 'Stopped');
+    return;
+  }
+
+  if (code === 0) {
+    box.className = 'outcome ok';
+    const head = r.written == null
+      ? `Retrieved into ${esc(dest)}.`
+      : `${r.written} instance(s) written to ${esc(dest)}.`;
+    const body = r.completed == null
+      ? 'The peer returned no sub-operation counts, so the number above is only what is on '
+        + 'disk — nothing here says the ' + esc(what) + ' is complete. Compare it against the '
+        + "archive's own count, or query the series level for its instance counts."
+      : `The peer reports ${r.completed} sub-operation(s) completed, and that many are on disk.`;
+    box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
+    setStatus('retrieve', 'ok', 'Done');
+    return;
+  }
+
+  box.className = 'outcome bad';
+  revealConsole('retrieve');
+  let head = `The ${esc(what)} was not fully retrieved.`;
+  let body = said ? quote(said) : 'The output says why.';
+
+  if (code === 2) {
+    head = 'Refused — nothing was sent.';
+  } else if (r.completed != null && r.written != null && r.completed > r.written) {
+    // The case this whole feature is built around. It is not a caveat on a
+    // success: images arrived, the peer accepted the request, and the study on
+    // disk is still missing part of itself.
+    const gap = r.completed - r.written;
+    head = `Incomplete — ${gap} of ${r.completed} instance(s) are missing.`;
+    body = `The peer reports it sent ${r.completed}; ${r.written} are in `
+      + `<b>${esc(dest)}</b>. <b>This is not a complete ${esc(what)}</b> — the transfer was `
+      + 'accepted and came up short, which is why the engine exits non-zero rather than '
+      + "reporting the peer's own count as the result."
+      + (said ? quote(said) : '');
+  } else if (r.written === 0) {
+    head = 'Nothing arrived.';
+    body = `The request was answered and no images came back. The ${esc(what)} is not on this `
+      + 'peer any more, or it holds it and will not release it to this calling AE Title.'
+      + (said ? quote(said) : '');
+  } else if (r.unreadable || r.duplicates) {
+    head = 'Arrived, but not all of it could be written.';
+    body = [
+      r.unreadable ? `${r.unreadable} instance(s) could not be written` : '',
+      r.duplicates ? `${r.duplicates} arrived twice under one SOP Instance UID` : '',
+    ].filter(Boolean).join(', ') + `. ${r.written} are in <b>${esc(dest)}</b>.`
+      + (said ? quote(said) : '');
+  }
+  box.innerHTML = `<span class="outcome-head">${head}</span>${body}`;
+  setStatus('retrieve', 'fail', 'Failed');
+}
+
+/**
+ * Was the retrieve in flight stopped by hand?
+ *
+ * Set by the Stop button and read once the run returns, because a killed
+ * engine and a failed one both come back non-zero and they do not mean the
+ * same thing to the person standing there: one of them is a folder holding
+ * part of a study on purpose.
+ */
+let retrieveCancelled = false;
+
+/**
+ * Runs the retrieve one result row asks for.
+ *
+ * One at a time, on purpose: a C-GET holds an association open and writes into
+ * a folder, and two of them firing at the same row would both claim the same
+ * files. The other buttons go dead for the duration so the table says that.
+ */
+async function runRetrieve(btn) {
+  // Reachable even with every button disabled: a query run while a retrieve is
+  // in flight rebuilds the table, and the new buttons start out live.
+  if (retrieveInFlight()) {
+    revealConsole('retrieve');
+    appendConsole('retrieve', 'A retrieve is already running — let it finish, or press Stop.\n', 'stderr');
+    return;
+  }
+  const study = btn.dataset.retrieve;
+  const series = btn.dataset.series || '';
+  const what = series ? 'series' : 'study';
+  if (!study) return;
+
+  const miss = connMissing();
+  if (miss.length) {
+    fail('retrieve', `Fill in the peer connection: ${miss.join(', ')}.\n`);
+    return;
+  }
+  const mismatch = retrievePeerMismatch();
+  if (mismatch) {
+    const box = $('#find-retrieve-outcome');
+    box.hidden = false;
+    box.className = 'outcome bad';
+    box.innerHTML = '<span class="outcome-head">Not retrieved — the peer changed.</span>' + esc(mismatch);
+    // The chip lives in that row, so the row has to be on screen before a
+    // status is put into it: an unhidden chip inside a hidden parent is a
+    // verdict nobody can read.
+    $('#find-retrieve-actions').hidden = false;
+    setStatus('retrieve', 'fail', 'Wrong peer');
+    return;
+  }
+
+  const out = await ensureRetrieveOut();
+  if (!out) {
+    revealConsole('retrieve');
+    appendConsole('retrieve', 'No folder chosen — nothing was retrieved.\n', 'stderr');
+    return;
+  }
+
+  const argv = retrieveArgv({ study, series, out });
+  setPreview('retrieve', argv);
+  $('#find-retrieve-fold').hidden = false;
+  $('#find-retrieve-outcome').hidden = true;
+  $('#find-retrieve-actions').hidden = false;
+  $('#find-retrieve-cancel').hidden = false;
+  setStatus('retrieve', 'running', `Retrieving ${what}…`);
+  const buttons = $$('#view-query [data-retrieve]');
+  for (const b of buttons) b.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = 'Retrieving…';
+
+  // Not cleared: a console holding the report of the last three retrieves is
+  // the record of what was pulled in this sitting, and each one is introduced
+  // by name. Revealed, because the stream IS the progress on this screen.
+  revealConsole('retrieve');
+  appendConsole('retrieve', `\n--- retrieve ${what} ${study}${series ? ` / ${series}` : ''} → ${out} ---\n`, 'stdout');
+
+  retrieveCancelled = false;
+  const { code, stdout, stderr } = await runStreaming('retrieve', argv);
+
+  for (const b of buttons) b.disabled = false;
+  btn.textContent = label;
+  $('#find-retrieve-cancel').hidden = true;
+  renderRetrieveOutcome({ code, stdout, stderr, cancelled: retrieveCancelled && code !== 0, what, out });
 }
 
 function wireQuery() {
@@ -1810,11 +2193,21 @@ function wireQuery() {
 
   $('#view-query [data-run]').addEventListener('click', async () => {
     const miss = connMissing();
-    clearConsole('query');
+    // The console is shared with the retrieve, so it is only emptied when
+    // nothing is streaming into it. Wiping the output of a run that is still
+    // going is how a transfer report goes missing, and this screen's retrieve
+    // report is the accounting for images now on this disk.
+    if (!retrieveInFlight()) clearConsole('query');
     $('#view-query [data-result]').hidden = true;
+    // The rows are about to be replaced, so the folder box, the last retrieve
+    // command and its verdict stop applying to anything on screen. The folder
+    // itself is kept: it is a choice the operator made, not a result.
+    resetRetrieveUi();
     if (miss.length) { fail('query', `Fill in the peer connection: ${miss.join(', ')}.\n`); return; }
     setStatus('query', 'running', 'Querying…');
     const argv = [...BUILDERS.query(), '--json'];
+    // Stamped before the run, from the connection the command was built with.
+    state.find.peer = { ...state.conn };
     const { code, stdout, stderr } = await runCapture('query', argv);
     setStatus('query', code === 0 ? 'ok' : 'fail', code === 0 ? 'Done' : 'Failed');
     try {
@@ -1823,6 +2216,20 @@ function wireQuery() {
       const c = consoleEl('query'); c.hidden = false;
       revealConsole('query'); appendConsole('query', stdout || stderr || 'No output.\n', code === 0 ? 'stdout' : 'stderr');
     }
+  });
+
+  // Delegated: the table is rebuilt from scratch by every query, so a listener
+  // bound to the buttons themselves would be bound to buttons that no longer
+  // exist. [data-run] is deliberately not used for these — the screen has one
+  // primary button and this is not it.
+  $('#view-query [data-result]').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-retrieve]');
+    if (btn && !btn.disabled) runRetrieve(btn);
+  });
+
+  $('#find-retrieve-cancel').addEventListener('click', (e) => {
+    retrieveCancelled = true;
+    stopRun('retrieve', e.currentTarget);
   });
 }
 
@@ -4422,7 +4829,17 @@ function renderWebQueryResults(json) {
   const rows = matches.map((m) =>
     `<tr>${cols.map((c) => `<td class="mono">${esc(m[c] ?? '')}</td>`).join('')}</tr>`).join('');
   box.hidden = false;
-  box.innerHTML = `<div class="section-title">${matches.length} match(es)</div><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+  // Scrolls inside its own box rather than off the side of the window. A
+  // study-level match carries a 64-character Study Instance UID alongside
+  // eleven other columns, so there is no window width at which this fits, and
+  // with no scroll container the right-hand columns ran past the edge of the
+  // screen with no way to reach them. Same answer the worklist table already
+  // settled on, and the same distinction: the table keeps a width it can be
+  // read at, and the page itself still never scrolls sideways.
+  box.innerHTML =
+    `<div class="section-title">${matches.length} match(es)</div>` +
+    `<div class="table-scroll"><table class="find-table">` +
+    `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function wireWebquery() {

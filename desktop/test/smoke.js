@@ -832,8 +832,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
     await startPeer('RIS', ['scp', '--port', risPort, '--ae', 'RISMPPS',
       '--worklist', worklistFile, '--persist', path.join(work, 'ris-store')],
     path.join(work, 'peer-ris'));
+    // The Archive also serves the fixtures folder, so it can be searched and
+    // retrieved FROM as well as sent to — which is what the Query screen's
+    // Retrieve row action needs a real archive behind it to prove (section K1b).
     await startPeer('ARCHIVE', ['scp', '--port', archivePort, '--ae', 'ARCHIVE',
-      '--persist', path.join(work, 'archive-store')],
+      '--persist', path.join(work, 'archive-store'),
+      ...(fixtures ? ['--serve', fixtures] : [])],
     path.join(work, 'peer-archive'));
 
     // Settings is set through its own form, because that is the only way an
@@ -4024,6 +4028,169 @@ async function runSmoke(win, app, mainHelpers = {}) {
     record(`layout: no page-level horizontal scrolling on any screen at ${SIZES.map((s) => s.label).join(', ')}`);
 
     // =====================================================================
+    // K1b. Query, then Retrieve — end to end, against real receivers.
+    //
+    // The Query screen puts a Retrieve button on every study and series row,
+    // and pressing it runs `dcm get` into a folder the operator picks. That is
+    // driven here against the Archive child, which serves the fixtures folder
+    // (`scp --serve`) for C-FIND and C-GET alike, so the UID on the button is
+    // the one the archive issued and the files on disk are the ones it sent.
+    //
+    // Three things are proved. A clean retrieve reads as success and every
+    // file is really there. The Browse… beside the destination box feeds the
+    // next retrieve, which is the picker the generic sweep below does not
+    // press. And a peer that over-reports what it sent — the accepted-but-lossy
+    // case the engine's accounting exists to catch — reads as INCOMPLETE on
+    // screen and never as success. That one gets a receiver of its own,
+    // started with --retrieve-overcount, because no correct peer produces it
+    // and a harness that waited for one would never test it.
+    // =====================================================================
+    {
+      if (!fixtures) bad('the Query → Retrieve section needs DCM_SMOKE_FIXTURES to serve from');
+      armPicker();
+
+      const countDcm = (root) => {
+        let n = 0;
+        const walk = (dir) => {
+          let entries = [];
+          try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+          for (const e of entries) {
+            const full = path.join(dir, e.name);
+            if (e.isDirectory()) walk(full);
+            else if (e.name.toLowerCase().endsWith('.dcm')) n += 1;
+          }
+        };
+        walk(root);
+        return n;
+      };
+      const expected = countDcm(fixtures);
+      if (!expected) bad(`no DICOM files under ${fixtures} to serve`);
+
+      // Runs the Query screen's C-FIND and waits for retrievable rows.
+      const query = async (label) => {
+        await js(`(() => {
+          showView('query');
+          document.querySelector('input[name="find-level"][value="study"]').click();
+          for (const v of document.querySelectorAll('#find-keys input')) v.value = '';
+          updateAllPreviews();
+          document.querySelector('#view-query [data-run]').click();
+          return true;
+        })()`);
+        await mustWait("document.querySelectorAll('#view-query [data-retrieve]').length > 0",
+          RUN_MS, `${label}: the query to return a retrievable row`);
+        return jsJSON(`JSON.stringify({
+          uids: Array.from(document.querySelectorAll('#view-query [data-retrieve]')).map((b) => b.dataset.retrieve),
+          cmd: document.querySelector('#view-query [data-cmd]').textContent,
+        })`);
+      };
+
+      // Presses the first row's Retrieve and waits for its verdict. The box is
+      // blanked first so a verdict left by the previous run cannot be read as
+      // this one's.
+      const retrieve = async (label) => {
+        await js(`(() => {
+          const box = document.querySelector('#find-retrieve-outcome');
+          box.hidden = true; box.className = ''; box.innerHTML = '';
+          document.querySelector('#view-query [data-retrieve]').click();
+          return true;
+        })()`);
+        await mustWait("!document.querySelector('#find-retrieve-outcome').hidden && !retrieveInFlight()",
+          RUN_MS, `${label}: the retrieve to finish`);
+        return jsJSON(`JSON.stringify({
+          cls: document.querySelector('#find-retrieve-outcome').className,
+          text: document.querySelector('#find-retrieve-outcome').textContent,
+          out: document.querySelector('#find-out').value,
+          cmd: document.querySelector('#find-retrieve-cmd').textContent,
+        })`);
+      };
+
+      // 1. A clean retrieve, with the destination box empty: pressing the row
+      //    opens the picker and carries on into whatever it answers.
+      await js('delete state.peerChoice.query; true');
+      await js(`(() => { const f = document.querySelector('#find-out'); f.value = ''; return true; })()`);
+      const found = await query('archive');
+      say(`retrieve: the archive's C-FIND offered ${found.uids.length} row(s): ${found.cmd}`);
+      if (found.uids.length !== 1) bad(`expected one retrievable study, got ${JSON.stringify(found.uids)}`);
+      await shot('query-results');
+
+      const outA = path.join(work, 'retrieve-a');
+      fs.rmSync(outA, { recursive: true, force: true });
+      pickAnswer = outA;
+      const clean = await retrieve('clean');
+      say(`retrieve: clean -> [${clean.cls}] ${clean.text.slice(0, 140)}`);
+      if (!/\bok\b/.test(clean.cls)) bad(`a clean retrieve did not read as success: [${clean.cls}] ${clean.text}`);
+      if (clean.out !== outA) bad(`the picked folder did not land in #find-out: ${JSON.stringify(clean.out)}`);
+      if (!/\bget\b/.test(clean.cmd) || !clean.cmd.includes(found.uids[0])) {
+        bad(`the retrieve command does not name the row's study: ${clean.cmd}`);
+      }
+      const gotA = countDcm(outA);
+      if (gotA !== expected) bad(`a clean retrieve put ${gotA} file(s) on disk, expected ${expected}`);
+      if (!fs.existsSync(path.join(outA, found.uids[0]))) {
+        bad(`retrieved files are not laid out under the study UID in ${outA}`);
+      }
+      await shot('query-retrieved');
+      record(`retrieve: the Retrieve row button put ${gotA}/${expected} instance(s) in the picked folder and read as success`);
+
+      // 2. Browse… beside the destination box feeds the next retrieve.
+      const outB = path.join(work, 'retrieve-b');
+      fs.rmSync(outB, { recursive: true, force: true });
+      await pressPicker('find-out', outB);
+      const browsed = await retrieve('browsed');
+      if (!/\bok\b/.test(browsed.cls)) bad(`a retrieve into a browsed folder did not succeed: [${browsed.cls}] ${browsed.text}`);
+      const gotB = countDcm(outB);
+      if (gotB !== expected) bad(`a retrieve into the browsed folder put ${gotB} file(s) there, expected ${expected}`);
+      record(`retrieve: Browse… beside the destination fed the next retrieve (${gotB}/${expected})`);
+
+      // 3. A peer that claims more than it sent. Every file arrives — only the
+      //    count is a lie — so nothing but the comparison can fail it, and the
+      //    screen has to say the study is incomplete.
+      const liarPort = await freePort();
+      await startPeer('LIAR', ['scp', '--port', liarPort, '--ae', 'LIAR', '--serve', fixtures,
+        '--retrieve-overcount', '2'], path.join(work, 'peer-liar'));
+      await addPeer('127.0.0.1', liarPort, 'LIAR', '');
+      const LIAR_PEER = `LIAR @ 127.0.0.1:${liarPort}`;
+      await js(`(() => {
+        showView('query');
+        document.querySelector('#view-query .peer-chip-btn').click();
+        const menu = document.querySelector('#view-query .peer-menu');
+        menu.querySelector('[data-peer-pick="' + ${JSON.stringify(LIAR_PEER)}.replace(/"/g, '&quot;') + '"]').click();
+        return true;
+      })()`);
+      const liarFound = await query('liar');
+      if (!liarFound.cmd.includes(`--port ${liarPort}`)) bad(`the query did not go to the over-reporting peer: ${liarFound.cmd}`);
+      const outC = path.join(work, 'retrieve-c');
+      fs.rmSync(outC, { recursive: true, force: true });
+      await js(`(() => {
+        const f = document.querySelector('#find-out');
+        f.value = ${JSON.stringify(outC)};
+        f.dispatchEvent(new Event('input', { bubbles: true }));
+        f.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+      const short = await retrieve('shortfall');
+      say(`retrieve: over-reporting peer -> [${short.cls}] ${short.text.slice(0, 160)}`);
+      if (/\bok\b/.test(short.cls)) bad(`an over-reporting peer's retrieve read as SUCCESS: ${short.text}`);
+      if (!/Incomplete/.test(short.text) || !/2 of/.test(short.text)) {
+        bad(`a shortfall of 2 was not named as one: ${short.text}`);
+      }
+      const gotC = countDcm(outC);
+      if (gotC !== expected) bad(`the over-reporting peer delivered ${gotC} file(s), expected all ${expected}`);
+      await shot('query-retrieve-shortfall');
+      record(`retrieve: a peer reporting 2 more than it sent reads "Incomplete — 2 of ${expected + 2}", never success`);
+
+      // Put Settings and the chip back the way the rest of the run expects.
+      await js('delete state.peerChoice.query; showView("settings"); true');
+      await js(`(() => {
+        const del = document.querySelector('[data-peer-delete="' + ${JSON.stringify(LIAR_PEER)}.replace(/"/g, '&quot;') + '"]');
+        if (del) del.click();
+        return true;
+      })()`);
+      await mustWait(`!state.profiles.some((p) => p.name === ${JSON.stringify(LIAR_PEER)})`, 8000,
+        'the over-reporting peer to be removed again');
+      await js('showView("worklist"); true');
+    }
+
+    // =====================================================================
     // K2. Every other Browse… button.
     //
     // wirePickers is shared: repairing the station repaired it by making a
@@ -4047,7 +4214,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const pickPath = fixtures || work;
       // Where each picker-fed field lives. mpps-folder is not here: it is
       // driven end to end against the real RIS in section H, which needs a
-      // selected worklist row this one has no business creating.
+      // selected worklist row this one has no business creating. find-out is
+      // not here either: K1b presses it in the middle of a real retrieve.
       const PICKERS = [
         ['send-folder', "showView('send')"],
         ['scp-persist', "showView('receive')"],
@@ -4067,7 +4235,8 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // Nothing may be added to index.html without being pressed here.
       const inDom = await jsJSON(`JSON.stringify(Array.from(new Set(
         Array.from(document.querySelectorAll('[data-pick]')).map((b) => b.dataset.pick))))`);
-      const covered = new Set([...PICKERS.map(([id]) => id), 'mpps-folder']);
+      // find-out is driven end to end in K1b, against a real retrieve.
+      const covered = new Set([...PICKERS.map(([id]) => id), 'mpps-folder', 'find-out']);
       const uncovered = inDom.filter((id) => !covered.has(id));
       if (uncovered.length) bad(`picker(s) nothing presses: ${uncovered.join(', ')}`);
       if (covered.size !== inDom.length) {

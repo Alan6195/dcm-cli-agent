@@ -213,8 +213,9 @@ sender, and as a way to see exactly what a system is emitting. With --worklist
 it also answers Modality Worklist queries and records the Modality Performed
 Procedure Steps a modality reports back against them.
 
-With --serve it also answers C-GET and C-MOVE, so it can stand in for an
-archive a client retrieves from rather than only for one it sends to.
+With --serve it also answers study, series and image C-FIND, C-GET and
+C-MOVE, so it can stand in for an archive a client searches and retrieves from
+rather than only for one it sends to.
 
 Usage:
   dcm scp --port <port> [--ae <AE>] [--persist <dir>] [--worklist <file>]
@@ -235,11 +236,15 @@ Options:
                              Performed procedure steps are written alongside
                              them as <dir>/mpps/<SOP Instance UID>.json.
                              Default: acknowledge and discard.
-  --serve <dir>              Answer C-GET and C-MOVE requests from this folder,
-                             turning the receiver into something that can be
-                             retrieved FROM as well as sent to. Matching is on
-                             Study, Series and SOP Instance UID only; an
-                             identifier with no StudyInstanceUID is refused
+  --serve <dir>              Answer C-FIND, C-GET and C-MOVE from this folder,
+                             turning the receiver into an archive that can be
+                             searched and retrieved FROM as well as sent to.
+                             C-FIND matches the usual study, series and image
+                             keys with the worklist's wildcard and date-range
+                             rules; a key this folder does not hold is
+                             returned empty and not matched on. A retrieve
+                             matches on Study, Series and SOP Instance UID
+                             only, and one with no StudyInstanceUID is refused
                              rather than widened to the whole folder.
                              Default: retrieves are refused — a receiver that
                              reported success for a retrieve it served nothing
@@ -716,6 +721,16 @@ function makeScpClass(config, stats) {
       }
 
       log.info(`${log.color.cyan('<-')} C-FIND from ${this.association?.getCallingAeTitle()}`);
+
+      // With --serve the folder is an archive, so a study, series or image
+      // query is answered from it. Without it this stays a store-and-forward
+      // receiver that holds nothing it will admit to.
+      if (config.serve && !isWorklist) {
+        const { pendings, final } = qrServe.serveFind({ request, config, stats, Dataset });
+        this.answerFind(callback, pendings, final);
+        return;
+      }
+
       log.info(
         log.color.dim(
           '     this receiver stores but does not index, so it returns zero matches — ' +
@@ -1645,7 +1660,9 @@ async function run(parsed) {
         `  worklist         : ${
           worklistSource
             ? `${worklistSource.items.length} item(s) from ${worklistSource.file}`
-            : log.color.dim('(none — C-FIND returns zero matches)')
+            : log.color.dim(serve
+              ? '(none — study, series and image C-FIND answered from --serve)'
+              : '(none — C-FIND returns zero matches)')
         }`
       );
       log.info(
