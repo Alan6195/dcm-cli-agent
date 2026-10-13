@@ -254,6 +254,18 @@ async function shot(name) {
       js('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))'),
       wait(1000),
     ]).catch(() => {});
+    // A frame drawn inside a CSS transition shows the state half way: a button
+    // re-enabled a moment ago was pictured still dimmed, as if it were dead.
+    // Every finite transition and animation still running is waited out, then
+    // two more frames. Infinite ones (the pulsing dot) are not waited for.
+    await Promise.race([
+      js(`Promise.all(document.getAnimations()
+        .filter((a) => a.playState === 'running' && a.effect
+          && Number.isFinite(a.effect.getComputedTiming().endTime))
+        .map((a) => a.finished.catch(() => {})))
+        .then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))`),
+      wait(1000),
+    ]).catch(() => {});
     const image = await Promise.race([
       WIN.webContents.capturePage(),
       new Promise((r) => setTimeout(() => r(null), 15000)),
@@ -1984,6 +1996,36 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (list.panel) bad('the patient panel is on screen with nobody picked');
       await primaries('the list');
 
+      // The list re-reads itself every minute, and Refresh says "Fetching…"
+      // while it does. Nothing on the bar may reflow for that: a row that
+      // moves down and back up under a hand about to pick it is how the wrong
+      // patient gets picked. Read before, during and after a real read.
+      const steady = await jsJSON(`(() => {
+        const top = () => Math.round(document.querySelector('#mwl-table').getBoundingClientRect().top);
+        const width = () => Math.round(document.querySelector('#mwl-run').getBoundingClientRect().width);
+        const out = { before: top(), beforeW: width(), beforeLabel: document.querySelector('#mwl-status').textContent };
+        document.querySelector('#mwl-run').click();
+        out.label = document.querySelector('#mwl-status').textContent;
+        out.during = top();
+        out.duringW = width();
+        return JSON.stringify(out);
+      })()`);
+      await mustWait("!document.querySelector('#mwl-status').className.includes('running')",
+        RUN_MS, 'the re-read to answer');
+      Object.assign(steady, await jsJSON(`JSON.stringify({
+        after: Math.round(document.querySelector('#mwl-table').getBoundingClientRect().top),
+        afterW: Math.round(document.querySelector('#mwl-run').getBoundingClientRect().width),
+        afterLabel: document.querySelector('#mwl-status').textContent,
+      })`));
+      record(`worklist: the list's top while "${steady.label}" ${steady.during}px, before ${steady.before}px, after ${steady.after}px`);
+      if (steady.label !== 'Fetching…') bad(`Refresh did not say it was fetching: ${JSON.stringify(steady)}`);
+      if (steady.before !== steady.during || steady.during !== steady.after) {
+        bad(`the list moves while Refresh says "Fetching…": ${JSON.stringify(steady)}`);
+      }
+      if (steady.beforeW !== steady.duringW || steady.duringW !== steady.afterW) {
+        bad(`Refresh changes width with its label: ${JSON.stringify(steady)}`);
+      }
+
       // A RIS that does not answer is not an empty worklist.
       //
       // The engine says which it is — outcome "network", ok false — and the
@@ -2117,13 +2159,23 @@ async function runSmoke(win, app, mainHelpers = {}) {
 
       // How many rows to ask for is one Settings field, and it lands on the
       // command line like everything else that changes what is sent.
+      // A Settings value reaches the command through commitSettings, which
+      // saves before it applies, so the command is polled for rather than
+      // read after a fixed wait that a slow save outlasts.
+      const UNTIL = `const until = async (test) => {
+        const t0 = Date.now();
+        while (!test(document.querySelector('#mwl-cmd').textContent) && Date.now() - t0 < 8000) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        return document.querySelector('#mwl-cmd').textContent;
+      };`;
       const limited = await jsJSON(`(async () => {
+        ${UNTIL}
         __smoke.set('set-mwl-limit', '2');
-        await new Promise((r) => setTimeout(r, 400));
-        const on = document.querySelector('#mwl-cmd').textContent;
+        const on = await until((c) => c.includes('--limit 2'));
         __smoke.set('set-mwl-limit', '');
-        await new Promise((r) => setTimeout(r, 400));
-        return JSON.stringify({ on, off: document.querySelector('#mwl-cmd').textContent });
+        const off = await until((c) => !c.includes('--limit'));
+        return JSON.stringify({ on, off });
       })()`);
       if (!limited.on.includes('--limit 2') || limited.off.includes('--limit')) {
         bad(`"worklist rows to fetch" does not reach the query: ${JSON.stringify(limited)}`);
@@ -2155,12 +2207,12 @@ async function runSmoke(win, app, mainHelpers = {}) {
 
       // "Only this station" is a Settings switch that shows up in the command.
       const onlyStation = await jsJSON(`(async () => {
+        ${UNTIL}
         __smoke.set('set-only-station', true);
-        await new Promise((r) => setTimeout(r, 400));
-        const on = document.querySelector('#mwl-cmd').textContent;
+        const on = await until((c) => c.includes('ScheduledStationAETitle'));
         __smoke.set('set-only-station', false);
-        await new Promise((r) => setTimeout(r, 400));
-        return JSON.stringify({ on, off: document.querySelector('#mwl-cmd').textContent });
+        const off = await until((c) => !c.includes('ScheduledStationAETitle'));
+        return JSON.stringify({ on, off });
       })()`);
       if (!onlyStation.on.includes('ScheduledStationAETitle=CT01') || onlyStation.off.includes('ScheduledStationAETitle')) {
         bad(`"only this station" does not move the query: ${JSON.stringify(onlyStation)}`);
@@ -3203,6 +3255,20 @@ async function runSmoke(win, app, mainHelpers = {}) {
       say(`close preview:\n${started.closeCmd}`);
       artefact('steps-close-cmd.txt', started.closeCmd);
       await shot('wl-7-in-progress');
+      // The chip came with the step, and the list stayed where it was: it is
+      // measured with the chip and, for one synchronous moment, without it.
+      const chipShift = await jsJSON(`(() => {
+        const top = () => Math.round(document.querySelector('#mwl-table').getBoundingClientRect().top);
+        const chip = document.querySelector('#mwl-open-chip');
+        const out = { shown: !chip.hidden, withChip: top() };
+        chip.hidden = true;
+        out.withoutChip = top();
+        chip.hidden = !out.shown;
+        return JSON.stringify(out);
+      })()`);
+      if (!chipShift.shown || chipShift.withChip !== chipShift.withoutChip) {
+        bad(`the open-steps chip moves the list: ${JSON.stringify(chipShift)}`);
+      }
       if (started.status !== 'IN PROGRESS') bad(`start did not leave the step open: ${started.status}`);
       if (started.mode !== 'close') bad('an open step did not put the panel into closing mode');
       if (started.openHidden || !/Open steps: 1/.test(started.openChip)) {
@@ -3305,6 +3371,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
       await shot('wl-8-completed');
       if (completed.status !== 'COMPLETED') bad(`the step did not complete: ${completed.status}`);
       if (!completed.cls.includes('ok')) bad(`a completed close is not styled as a success: ${completed.cls}`);
+      // The same one line a perform ends with, counts included; where it was
+      // closed is not repeated when that is the RIS on the chip.
+      if (completed.outcome.replace(/\s+/g, ' ').trim() !== 'Completed — 10 of 10 images acknowledged.') {
+        bad(`a completed close does not say it the way a perform does: "${completed.outcome}"`);
+      }
       if (!/COMPLETED/.test(completed.pill)) bad(`the row pill did not follow the close: "${completed.pill}"`);
       if (!completed.openHidden) bad('the open-steps chip still counts a step that was closed');
       if (completed.mode !== 'perform') bad('a closed step still offers a way to close it again');
@@ -3466,6 +3537,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (discontinued.status !== 'DISCONTINUED') bad(`the step was not discontinued: ${discontinued.status}`);
       // DISCONTINUED is a failure, and is never rounded up.
       if (!discontinued.cls.includes('bad')) bad(`DISCONTINUED is not styled as a failure: ${discontinued.cls}`);
+      if (!/^Step DISCONTINUED\./.test(discontinued.outcome.trim()) || /RISMPPS @/.test(discontinued.outcome)) {
+        bad(`a discontinue does not say DISCONTINUED, or names the RIS the chip already names: "${discontinued.outcome}"`);
+      }
       if (!/DISCONTINUED/.test(discontinued.pill)) bad(`the row pill does not carry it: "${discontinued.pill}"`);
       if (!discontinued.open) bad('a discontinued step is still counted as open');
       // The chip this used to leave was green. It goes, and what it held is red.
@@ -3504,20 +3578,45 @@ async function runSmoke(win, app, mainHelpers = {}) {
         + `(a completed step leaves the worklist); ${after.rows} on screen`);
       await shot('wl-11-requeried');
       // The selected row's step was closed from here. If the RIS has dropped
-      // it since, that is the ordinary thing after a close, not a fault: no
-      // amber note — but Perform stays dead, and says why on the button.
-      const leftAfterClose = await jsJSON(`JSON.stringify({
-        detached: state.mwl.detached || false,
-        step: (stepFor(selectedWorklistItem()) || {}).status || '',
-        note: !document.querySelector('#mwl-detached-note').hidden,
-        dead: document.querySelector('#mpps-run').disabled,
-        why: document.querySelector('#mpps-run').title || '',
-      })`);
-      record(`worklist re-queried: the selected row is ${leftAfterClose.detached || 'still listed'} (${leftAfterClose.step})`);
+      // it since, Perform stays dead and says why on the button. After a
+      // COMPLETED that drop is the ordinary thing, not a fault: no amber note.
+      // After a DISCONTINUED, Perform exam is the retry, so the note stays as
+      // the one visible reason it is dead. The row here is whichever the flow
+      // left selected; the other status is read off the same row, the panel
+      // redrawn with it for one synchronous moment and then put back.
+      const leftAfterClose = await jsJSON(`(() => {
+        const e = stepFor(selectedWorklistItem());
+        const read = () => ({
+          step: (e || {}).status || '',
+          note: !document.querySelector('#mwl-detached-note').hidden,
+          noteText: document.querySelector('#mwl-detached-note').textContent,
+          dead: document.querySelector('#mpps-run').disabled,
+          why: document.querySelector('#mpps-run').title || '',
+        });
+        const out = { detached: state.mwl.detached || false, shown: read() };
+        if (e && (e.status === 'COMPLETED' || e.status === 'DISCONTINUED')) {
+          const was = e.status;
+          e.status = was === 'COMPLETED' ? 'DISCONTINUED' : 'COMPLETED';
+          renderMppsPanel();
+          out.other = read();
+          e.status = was;
+          renderMppsPanel();
+        }
+        return JSON.stringify(out);
+      })()`);
+      record(`worklist re-queried: the selected row is ${leftAfterClose.detached || 'still listed'} (${leftAfterClose.shown.step})`);
       if (leftAfterClose.detached === 'gone') {
-        if (leftAfterClose.note) bad(`a row this window closed raised the "no longer lists" alarm: ${JSON.stringify(leftAfterClose)}`);
-        if (!leftAfterClose.dead || !/not in the list/.test(leftAfterClose.why)) {
-          bad(`Perform went live for a row the list no longer holds: ${JSON.stringify(leftAfterClose)}`);
+        if (!leftAfterClose.other) bad(`the selected row's step was not closed from here: ${JSON.stringify(leftAfterClose)}`);
+        for (const v of [leftAfterClose.shown, leftAfterClose.other].filter(Boolean)) {
+          if (v.step === 'COMPLETED' && v.note) {
+            bad(`a row this window completed raised the "no longer lists" alarm: ${JSON.stringify(v)}`);
+          }
+          if (v.step === 'DISCONTINUED' && (!v.note || !/no longer lists/.test(v.noteText) || !/Performing is blocked/.test(v.noteText))) {
+            bad(`a discontinued row the RIS dropped has a dead Perform exam and no visible reason: ${JSON.stringify(v)}`);
+          }
+          if (!v.dead || !/not in the list/.test(v.why)) {
+            bad(`Perform went live for a row the list no longer holds: ${JSON.stringify(v)}`);
+          }
         }
       }
 
@@ -3620,7 +3719,9 @@ async function runSmoke(win, app, mainHelpers = {}) {
       const s = reports.short;
       if (!s.cls.includes('bad')) bad(`a shortfall is not styled as a failure: ${s.cls}`);
       if (!/failure/i.test(s.head)) bad(`a shortfall does not read as a failure: ${s.head}`);
-      if (!s.body.includes('211 of 214')) bad(`the shortfall counts are not shown: ${s.body}`);
+      if (!s.body.includes('211 of 214 images were acknowledged. 3 are unaccounted for.')) {
+        bad(`the shortfall counts are not shown, in the screen's own word: ${s.body}`);
+      }
       if (!/no override/i.test(s.body)) bad(`the shortfall does not say there is no override: ${s.body}`);
       if (s.status !== 'DISCONTINUED') bad(`the status chip rounds a shortfall up: ${s.status}`);
       if (!s.cards.some((c) => c.startsWith('fail:211'))) {
@@ -3651,7 +3752,21 @@ async function runSmoke(win, app, mainHelpers = {}) {
         bad(`the dead RIS did not read as a failure: ${JSON.stringify({ cls: kept.cls, list: kept.list.slice(0, 200) })}`);
       }
       if (kept.text !== examText) bad('a list read that failed wiped the exam report out of the Output');
-      record('station: a failed list read leaves the last exam\'s report in the Output untouched');
+      // Leaving the patient does not hand the Output back to the list: the
+      // report is still the last exam's, and the next failed read leaves it.
+      const outBefore = await js("__smoke.outOpen('mpps')");
+      await js(`clearSelection(); document.querySelector('#mwl-run').click(); true`);
+      await mustWait("!document.querySelector('#mwl-status').className.includes('running')",
+        RUN_MS, 'the second read against a dead RIS to come back');
+      const keptAfterLeave = await jsJSON(`JSON.stringify({
+        text: __smoke.consoleText('mpps'),
+        cls: document.querySelector('#mwl-status').className,
+        open: __smoke.outOpen('mpps'),
+      })`);
+      if (!keptAfterLeave.cls.includes('fail')) bad(`the second dead read did not fail: ${keptAfterLeave.cls}`);
+      if (keptAfterLeave.text !== examText) bad('a failed list read after the patient was left wiped the exam report');
+      if (!outBefore && keptAfterLeave.open) bad('a failed list read sprang the Output open');
+      record('station: a failed list read leaves the last exam\'s report in the Output untouched, picked or not');
       await js(`(async () => {
         await deletePeer(${JSON.stringify(DEAD_PEER2)});
         setPeerRole(${JSON.stringify(RIS_PEER)}, 'ris');
@@ -3659,6 +3774,32 @@ async function runSmoke(win, app, mainHelpers = {}) {
         afterPeersChanged();
       })(); true`);
       await mustWait(`connLabel(state.conn) === ${JSON.stringify(RIS_PEER)}`, 8000, 'the RIS chip to come back after the dead peer');
+      // A read that answered and could not be drawn is a failure said where
+      // the list is, in red on Refresh, and it leaves the exam report too.
+      await js(`(() => {
+        window.__smokeRenderWorklist = renderWorklist;
+        window.renderWorklist = () => { throw new Error('the harness refused to draw it'); };
+        document.querySelector('#mwl-run').click();
+        return true;
+      })()`);
+      await mustWait("!document.querySelector('#mwl-status').className.includes('running')",
+        RUN_MS, 'the read that cannot be drawn to come back');
+      const undrawn = await jsJSON(`(() => {
+        window.renderWorklist = window.__smokeRenderWorklist;
+        delete window.__smokeRenderWorklist;
+        return JSON.stringify({
+          text: __smoke.consoleText('mpps'),
+          status: document.querySelector('#mwl-status').textContent,
+          cls: document.querySelector('#mwl-status').className,
+          list: document.querySelector('#mwl-results').textContent,
+          open: __smoke.outOpen('mpps'),
+        });
+      })()`);
+      if (!undrawn.cls.includes('fail') || undrawn.status !== 'Failed' || !/could not be drawn/.test(undrawn.list)) {
+        bad(`a list that could not be drawn did not read as a failure where the list is: ${JSON.stringify({ ...undrawn, text: '' })}`);
+      }
+      if (undrawn.text !== examText) bad('a list that could not be drawn wiped the exam report out of the Output');
+      if (!outBefore && undrawn.open) bad('a list that could not be drawn sprang the Output open over an exam report');
       await js(`document.querySelector('#mwl-run').click(); true`);
       await mustWait("document.querySelector('#mwl-status').className.includes('ok')", RUN_MS,
         'the worklist to answer from the real RIS again');

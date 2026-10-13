@@ -1179,7 +1179,10 @@ select {
 .station-bar .conn-host { margin: 0; }
 .station-bar .chip-row { margin: 0; }
 .station-bar .chip-row.seg .chip { padding: 6px 12px; }
-.search { position: relative; flex: 1; min-width: 260px; }
+/* The search's own row: the open-steps chip beside it only narrows the box. */
+.station-find { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.station-find .chip { margin: 0; flex: none; }
+.search { position: relative; flex: 1; min-width: 0; }
 .search input { width: 100%; padding-right: 118px; }
 /* The key the text will be sent as. Pinned once clicked; otherwise the box's own guess. */
 .search-key {
@@ -1189,7 +1192,8 @@ select {
 }
 .search-key:hover, .search-key.pinned { color: var(--accent); border-color: var(--accent); }
 /* Refresh carries the last read: its time, "Fetching…", or "Failed" in red. */
-.refresh-btn { font-variant-numeric: tabular-nums; transition: none; }
+/* As wide as its widest label, so the minute's "Fetching…" never resizes it. */
+.refresh-btn { font-variant-numeric: tabular-nums; transition: none; min-width: 8.5em; }
 .refresh-btn .refresh-state.running { color: var(--accent); }
 #mwl-run.failed { color: var(--red); border-color: var(--red); }
 .open-chip { color: var(--amber); border-color: var(--amber); }

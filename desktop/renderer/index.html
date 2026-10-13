@@ -136,11 +136,17 @@
           <!-- Refresh carries the state of the last read: the time it answered,
                "Fetching…", or "Failed" in red. -->
           <button class="btn ghost small refresh-btn" data-run id="mwl-run" title="Read the worklist again"><span aria-hidden="true">↻</span> <span id="mwl-status" class="refresh-state">Refresh</span></button>
-          <button type="button" class="chip open-chip" id="mwl-open-chip" hidden aria-pressed="false"></button>
+        </div>
+        <!-- The search always has a row of its own, so nothing that comes and
+             goes on the bar above (the label of Refresh, every minute) can
+             push the list down under a hand about to pick a row. The open-steps
+             chip shares this row and only narrows the box. -->
+        <div class="station-find">
           <span class="search">
             <input type="text" id="mwl-search" placeholder="Patient name, ID or accession" />
             <button type="button" class="search-key" id="mwl-search-key" hidden title="The key this text is sent as — click to change"></button>
           </span>
+          <button type="button" class="chip open-chip" id="mwl-open-chip" hidden aria-pressed="false"></button>
         </div>
         <details class="cmd-fold">
           <summary>command <span class="cmd-sum"></span></summary>

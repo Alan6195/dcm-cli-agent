@@ -107,8 +107,9 @@ const state = {
     matches: [], selected: null, filterOpen: false, searchKey: null, timer: null,
     fetched: false, at: null, error: null, detached: false,
     // No RIS peer to ask; and whose words the shared Output is holding —
-    // 'list' (a failed read) or 'exam' (a perform or close), which a list
-    // read may not wipe.
+    // 'list' (a failed read) or 'exam' (a perform or close). Once an exam has
+    // written there it is the exam's until the next exam: a list read, least
+    // of all the timer's, never wipes it.
     noRis: false, consoleOwner: null, queryModality: null,
   },
 
@@ -3018,8 +3019,10 @@ function selectRow(key) {
   if (same) return;
 
   // A new patient: the last run's verdict was about someone else, and so is
-  // whatever the Output was showing — it is kept, folded. Details folds too;
-  // renderMppsPanel opens it again for a row that is missing what it holds.
+  // whatever the Output was showing — it is kept, folded, and an exam's report
+  // there stays the exam's until the next exam: no list read writes over it.
+  // Details folds too; renderMppsPanel opens it again for a row that is
+  // missing what it holds.
   $('#mpps-outcome').hidden = true;
   $('#mpps-totals').hidden = true;
   setStatus('mpps', null);
@@ -3027,7 +3030,6 @@ function selectRow(key) {
   state.steps.armed = false;
   $('#mwl-out').open = false;
   $('#mpps-adv').open = false;
-  releaseConsole();
 
   seedRowFields(row.item);
 
@@ -3040,15 +3042,6 @@ function selectRow(key) {
   if (!folder.value.trim()) folder.focus();
 }
 
-/**
- * The exam report in the Output was about the patient just left, and it is
- * folded now, so a failed list read may write there again. Not while that
- * exam is still running: its report is still being written.
- */
-function releaseConsole() {
-  if (!state.activeRuns.mpps && !state.activeRuns.steps && !state.mpps.running) state.mwl.consoleOwner = null;
-}
-
 function clearSelection() {
   state.mwl.selected = null;
   state.mwl.detached = false;
@@ -3059,7 +3052,6 @@ function clearSelection() {
   mppsScanFor = null;
   state.steps.armed = false;
   $('#mwl-out').open = false;
-  releaseConsole();
   for (const tr of $$('#mwl-table tr.pick-row')) {
     tr.classList.remove('row-selected');
     tr.setAttribute('aria-pressed', 'false');
@@ -3112,11 +3104,20 @@ async function fetchWorklist({ auto = false } = {}) {
       renderWorklist(json);
       setStatus('worklist', 'ok', hhmm);
     } catch (err) {
+      // Said where the list is, the same red block as a RIS that is down, and
+      // never over an exam's report in the Output.
       setStatus('worklist', 'fail', 'Failed');
-      const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
-      state.mwl.consoleOwner = 'list';
-      revealConsole();
-      appendConsole('worklist', `The worklist was read but could not be drawn: ${err.message}`, 'stderr');
+      state.mwl.error = `The worklist was read but could not be drawn: ${err.message}`;
+      let drawn = true;
+      try { renderWorklistTable(); } catch { drawn = false; }
+      if (state.mwl.consoleOwner !== 'exam') {
+        const c = consoleEl('worklist'); resetConsole(c); c.hidden = false;
+        state.mwl.consoleOwner = 'list';
+        appendConsole('worklist', `${state.mwl.error}\n`, 'stderr');
+        // Only when not even the red block could be drawn is the Output the
+        // one place left that says why.
+        if (!drawn) revealConsole();
+      }
     }
   } else {
     // Said where the list is, in red with the engine's own words, and on
@@ -3725,12 +3726,13 @@ function renderMppsPanel() {
 
   // The list may no longer say which row this patient is; the panel says so
   // rather than the selection quietly moving to whoever is there now. Not
-  // for a row whose step this window just closed: the RIS dropping it then is
-  // the ordinary thing, the verdict box says what happened, and the dead
-  // Perform still carries the reason on its title.
+  // for a row this window COMPLETED: the RIS dropping it then is the ordinary
+  // thing, and the verdict box says what happened. A DISCONTINUED row keeps
+  // the line, because there Perform exam is the retry, and this is the one
+  // visible reason it is dead.
   const detached = $('#mwl-detached-note');
-  const closedHere = e && (e.status === 'COMPLETED' || e.status === 'DISCONTINUED');
-  detached.hidden = !state.mwl.detached || (state.mwl.detached === 'gone' && Boolean(closedHere));
+  const completedHere = Boolean(e && e.status === 'COMPLETED');
+  detached.hidden = !state.mwl.detached || (state.mwl.detached === 'gone' && completedHere);
   if (state.mwl.detached === 'gone') {
     // The row was identified and has left the list. Performing is blocked in
     // verbBlock, so this says so; closing is not, because an N-SET goes to the
@@ -3992,7 +3994,9 @@ function renderMppsOutcome({ code, report, dryRun, verb, stderr = '' }) {
     // A shortfall is the one place words are cheap. It stays long on purpose,
     // it stays red, and it is never rounded up to a caveat on a success.
     head = 'Step DISCONTINUED — this is a failure.';
-    body = (report.shortfall ? `${esc(report.shortfall)} ` : '') +
+    // The engine's sentence, with the word this screen uses everywhere else
+    // for what is in the folder. The engine's own text is in the Output.
+    body = (report.shortfall ? `${esc(report.shortfall.replace(/\binstances\b/g, 'images'))} ` : '') +
       '<b>No override:</b> perform the exam again to resend, or call PACS.';
   } else if (report.neverOpened) {
     head = 'N-CREATE failed — no step was opened.';
@@ -4380,8 +4384,12 @@ function renderStepsClose() {
   applyVerbGuards();
 }
 
-/** The verdict on a close, in the same box the perform uses. */
-function renderCloseOutcome({ code, dry, verb, peer, extra = '', stderr = '' }) {
+/**
+ * The verdict on a close, in the same box and the same words the perform uses.
+ * Where it was closed is said only when that is not the RIS on the chip, as
+ * the banner does: the N-SET goes where the N-CREATE went.
+ */
+function renderCloseOutcome({ code, dry, verb, peer, counts = null, extra = '', stderr = '' }) {
   const box = $('#mpps-outcome');
   box.hidden = false;
   const said = engineErrorText(stderr);
@@ -4391,9 +4399,18 @@ function renderCloseOutcome({ code, dry, verb, peer, extra = '', stderr = '' }) 
     return;
   }
   if (code === 0) {
-    const status = verb === 'complete' ? 'COMPLETED' : 'DISCONTINUED';
-    box.className = verb === 'complete' ? 'outcome ok' : 'outcome bad';
-    box.innerHTML = `<span class="outcome-head">Step ${status}.</span>Closed on ${esc(peer)}. ${extra}`;
+    const where = peer !== stationRisLabel() ? ` Closed on ${esc(peer)}.` : '';
+    if (verb === 'complete') {
+      box.className = 'outcome ok';
+      box.innerHTML = counts && counts.acknowledged != null && counts.found != null
+        ? `<span class="outcome-head">Completed — ${esc(String(counts.acknowledged))} of ${esc(String(counts.found))} images acknowledged.</span>${where}`
+        : `<span class="outcome-head">Completed.</span>${where}`;
+    } else {
+      // A shortfall that forced it is the perform's failure, and is said in
+      // the perform's words; an exam the operator stopped is just stopped.
+      box.className = 'outcome bad';
+      box.innerHTML = `<span class="outcome-head">Step DISCONTINUED${extra ? ' — this is a failure' : ''}.</span>${extra}${where}`;
+    }
   } else {
     box.className = 'outcome bad';
     // The same rule as perform: the engine's own sentence, not a pointer at a
@@ -4450,7 +4467,7 @@ async function runClose(verb) {
       if (!ok) {
         // The same rule as perform: a shortfall cannot be COMPLETED.
         verb = 'discontinue';
-        extra = `${t.acknowledged ?? '?'} of ${t.found ?? '?'} instances were acknowledged, so the step could not be completed. <b>There is no override.</b>`;
+        extra = `${t.acknowledged ?? '?'} of ${t.found ?? '?'} images were acknowledged, so the step could not be completed. <b>There is no override.</b>`;
         appendConsole('steps', `\n${extra.replace(/<[^>]+>/g, '')} Discontinuing instead.\n`, 'stderr');
         argv = stepsCloseArgv('discontinue', { seriesFrom: adding });
       } else {
@@ -4478,7 +4495,7 @@ async function runClose(verb) {
     state.steps.armed = false;
     refreshRowPills();
   }
-  renderCloseOutcome({ code, dry, verb, peer, extra, stderr });
+  renderCloseOutcome({ code, dry, verb, peer, counts: e.counts || null, extra, stderr });
   renderMppsPanel();
   updateAllPreviews();
 }
