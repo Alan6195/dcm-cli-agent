@@ -44,6 +44,7 @@ async function startScp(config = {}) {
     finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
     mppsCreated: 0, mppsCompleted: 0, mppsDiscontinued: 0, mppsRefused: 0,
     worklistWithheld: 0,
+    gets: 0, moves: 0, subOpsSent: 0, retrieveRefused: 0, movesRefused: 0,
   };
 
   const full = {
@@ -57,6 +58,17 @@ async function startScp(config = {}) {
     // Keep a worklist item answering queries after its performed procedure step
     // has finished. The receiver defaults to withholding it, as `dcm scp` does.
     keepPerformed: config.keepPerformed ?? false,
+    // The folder C-GET and C-MOVE are answered from, and the AE Title registry
+    // a C-MOVE destination is resolved through. Absent by default so a test
+    // that does not opt in gets the same retrieve-refusing receiver `dcm scp`
+    // gives without --serve.
+    serve: config.serve,
+    destinations: config.destinations instanceof Map
+      ? config.destinations
+      : new Map(Object.entries(config.destinations ?? {}).map(([ae, t]) => [ae.toUpperCase(), t])),
+    // Over-report completed sub-operations by this many. The lie a retrieve
+    // client's disk-versus-reported comparison has to catch.
+    retrieveOvercount: config.retrieveOvercount,
   };
 
   const server = new Server(makeScpClass(full, stats));

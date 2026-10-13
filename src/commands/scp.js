@@ -10,10 +10,12 @@ const status = require('../lib/status');
 const { formatCode } = require('../lib/status');
 const { safeUidSegment, validateUid } = require('../lib/uid');
 const { dcmjsDimse } = require('../lib/dimse');
+const qrServe = require('../lib/qr-serve');
 
 const { Server, Scp, Dataset } = dcmjsDimse;
 const {
-  CEchoResponse, CFindResponse, CStoreResponse, NCreateResponse, NSetResponse,
+  CEchoResponse, CFindResponse, CStoreResponse, CMoveResponse,
+  NCreateResponse, NSetResponse,
 } = dcmjsDimse.responses;
 const {
   Status,
@@ -57,7 +59,8 @@ const MAX_ERROR_COMMENT = 64;
 const FLAGS = ['port', 'ae', 'persist', 'accept-calling-ae', 'reject-after',
   'prefer-syntax', 'prefer-uncompressed', 'worklist', 'keep-performed',
   'refuse-nset', 'refuse-nset-scope', 'refuse-ncreate',
-  'find-status', 'abort-find-after'];
+  'find-status', 'abort-find-after', 'serve', 'destination',
+  'retrieve-overcount'];
 
 /**
  * Trims an error comment to what the element can legally carry.
@@ -210,8 +213,12 @@ sender, and as a way to see exactly what a system is emitting. With --worklist
 it also answers Modality Worklist queries and records the Modality Performed
 Procedure Steps a modality reports back against them.
 
+With --serve it also answers C-GET and C-MOVE, so it can stand in for an
+archive a client retrieves from rather than only for one it sends to.
+
 Usage:
   dcm scp --port <port> [--ae <AE>] [--persist <dir>] [--worklist <file>]
+  dcm scp --port <port> --serve <dir> [--destination <AE=host:port>]
 
 Options:
   --port <port>              Port to listen on.                        [env DCM_SCP_PORT]
@@ -228,6 +235,28 @@ Options:
                              Performed procedure steps are written alongside
                              them as <dir>/mpps/<SOP Instance UID>.json.
                              Default: acknowledge and discard.
+  --serve <dir>              Answer C-GET and C-MOVE requests from this folder,
+                             turning the receiver into something that can be
+                             retrieved FROM as well as sent to. Matching is on
+                             Study, Series and SOP Instance UID only; an
+                             identifier with no StudyInstanceUID is refused
+                             rather than widened to the whole folder.
+                             Default: retrieves are refused — a receiver that
+                             reported success for a retrieve it served nothing
+                             from would be a lie told by this end.
+  --destination <AE=host:port>
+                             Resolve a C-MOVE destination AE Title to an
+                             address. May be repeated. A C-MOVE carries only an
+                             AE Title, so an unregistered one is answered
+                             0xA801 "Move Destination unknown" — which is the
+                             commonest C-MOVE failure in the field and worth
+                             being able to produce on purpose.
+                               --destination VIEWER=127.0.0.1:11113
+  --retrieve-overcount <n>   Report n MORE completed sub-operations than were
+                             actually sent, on C-GET and C-MOVE. A deliberate
+                             lie, for testing that a retrieve client notices
+                             the gap between what a peer claims and what landed
+                             instead of believing the claim. Default: 0.
   --worklist <file>          Serve a Modality Worklist from a JSON file, so
                              C-FIND queries for the worklist are answered with
                              real matches instead of nothing.
@@ -932,6 +961,49 @@ function makeScpClass(config, stats) {
     }
 
     /**
+     * C-GET: send the matched instances back down this association.
+     *
+     * Delegated whole to lib/qr-serve, which owns the sub-operation sequencing
+     * both retrieve services share. Nothing is answered unless --serve named a
+     * folder: a receiver that reported success for a retrieve it served
+     * nothing from would be the exact lie the client's accounting exists to
+     * catch, told by this end instead.
+     */
+    cGetRequest(request, callback) {
+      qrServe.serveGet({ scp: this, request, callback, config, stats });
+    }
+
+    /**
+     * C-MOVE: open a fresh association to the destination and store there.
+     *
+     * An AE Title this receiver has no --destination for is answered 0xA801,
+     * which is both correct and the only way to rehearse the field's most
+     * common C-MOVE failure deliberately.
+     */
+    cMoveRequest(request, callback) {
+      // serveMove is async because it opens an outbound association. The
+      // library's handler contract is callback-based and ignores a returned
+      // promise, so a rejection here would otherwise be an unhandled one that
+      // leaves the client waiting for a response that is never coming.
+      Promise.resolve(qrServe.serveMove({ scp: this, request, callback, config, stats }))
+        .catch((err) => {
+          stats.errors += 1;
+          log.error(`C-MOVE handler failed: ${err?.message ?? err}`);
+          try {
+            const final = CMoveResponse.fromRequest(request);
+            final.setStatus(Status.ProcessingFailure);
+            final.setRemaining(0);
+            final.setCompleted(0);
+            final.setWarnings(0);
+            final.setFailures(0);
+            callback([final]);
+          } catch {
+            // The association is already gone; nothing left to answer on.
+          }
+        });
+    }
+
+    /**
      * MPPS N-CREATE: a modality reporting that it has started imaging.
      *
      * The SCU generates the SOP Instance UID for the step, so this receiver's
@@ -1400,6 +1472,7 @@ async function run(parsed) {
     finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
     mppsCreated: 0, mppsCompleted: 0, mppsDiscontinued: 0, mppsRefused: 0,
     worklistWithheld: 0, faultsInjected: 0,
+    gets: 0, moves: 0, subOpsSent: 0, retrieveRefused: 0, movesRefused: 0,
   };
 
   const preferUncompressed = args.resolve(flags, {
@@ -1432,10 +1505,61 @@ async function run(parsed) {
     );
   }
 
+  // --serve turns this from a destination into a source: the folder a C-GET or
+  // C-MOVE is answered from. Resolved and checked up front, because a receiver
+  // that accepts retrieves and then cannot read its own folder would report the
+  // failure once per request instead of once at startup.
+  const serveRaw = args.resolve(flags, { name: 'serve' });
+  const serve = serveRaw ? path.resolve(serveRaw) : undefined;
+  if (serve && !fs.existsSync(serve)) {
+    throw new args.UsageError(
+      `--serve "${serveRaw}" does not exist. It names the folder this receiver answers ` +
+        'C-GET and C-MOVE requests from.'
+    );
+  }
+
+  // --destination AE=host:port, repeatable. A C-MOVE carries only an AE Title,
+  // so without a registry there is nowhere to send and every move is correctly
+  // answered 0xA801 — which is itself worth being able to produce on purpose.
+  // Fault injection: report more completed sub-operations than were sent. No
+  // correct peer does this, which is exactly why it has to be producible — it
+  // is the one retrieve failure a client cannot otherwise be tested against.
+  const retrieveOvercount = args.resolve(flags, {
+    name: 'retrieve-overcount', type: 'number',
+  });
+  if (retrieveOvercount !== undefined && (!Number.isInteger(retrieveOvercount) || retrieveOvercount < 0)) {
+    throw new args.UsageError(
+      '--retrieve-overcount takes a non-negative whole number of instances to over-report.'
+    );
+  }
+
+  const destinationRaw = flags.get('destination');
+  const destinationList = destinationRaw === undefined
+    ? []
+    : (Array.isArray(destinationRaw) ? destinationRaw : [destinationRaw]);
+  const destinations = new Map();
+  for (const entry of destinationList) {
+    let parsed;
+    try {
+      parsed = qrServe.parseDestination(entry);
+    } catch (err) {
+      throw new args.UsageError(err.message);
+    }
+    destinations.set(parsed.ae, { host: parsed.host, port: parsed.port });
+  }
+
+  if (destinations.size && !serve) {
+    log.warn(
+      `--destination names ${destinations.size} move target(s) but no --serve folder is set, ` +
+        'so there is nothing to move and every C-MOVE fails once the destination resolves.'
+    );
+  }
+
   const config = {
     ae, acceptCallingAe, persist, rejectAfter, preferUncompressed, preferSyntax,
     worklist: worklistSource, keepPerformed,
     refuseNSet, refuseNCreate, findStatus, abortFindAfter,
+    serve, destinations, retrieveOvercount,
   };
   const server = new Server(makeScpClass(config, stats));
 
@@ -1453,6 +1577,17 @@ async function run(parsed) {
       log.out(`  C-ECHO                : ${stats.echoes}`);
       log.out(`  C-STORE stored        : ${stats.stored}`);
       log.out(`  C-STORE refused       : ${stats.refused}`);
+      if (stats.gets || stats.moves || serve) {
+        log.out(`  C-GET served          : ${stats.gets}`);
+        log.out(`  C-MOVE served         : ${stats.moves}`);
+        log.out(`  retrieve sub-ops sent : ${stats.subOpsSent}`);
+        if (stats.movesRefused) {
+          log.out(`  C-MOVE dest unknown   : ${stats.movesRefused}`);
+        }
+        if (stats.retrieveRefused) {
+          log.out(`  retrieves refused     : ${stats.retrieveRefused}`);
+        }
+      }
       log.out(`  C-FIND                : ${stats.finds}`);
       if (worklistSource) {
         log.out(`  worklist matches sent : ${stats.worklistMatches}`);
@@ -1499,6 +1634,13 @@ async function run(parsed) {
       log.info(`  called AE Title  : ${ae ?? log.color.dim('(any)')}`);
       log.info(`  calling AE allow : ${acceptCallingAe.length ? acceptCallingAe.join(', ') : log.color.dim('(any)')}`);
       log.info(`  persist          : ${persist ?? log.color.dim('(discard after acknowledging)')}`);
+      log.info(`  serve (C-GET/MOVE): ${serve ?? log.color.dim('(retrieves refused)')}`);
+      if (destinations.size) {
+        const listed = [...destinations.entries()]
+          .map(([ae, t]) => `${ae}@${t.host}:${t.port}`)
+          .join(', ');
+        log.info(`  move destinations: ${listed}`);
+      }
       log.info(
         `  worklist         : ${
           worklistSource

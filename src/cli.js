@@ -26,6 +26,8 @@ const COMMANDS = {
   send: () => require('./commands/send'),
   scp: () => require('./commands/scp'),
   find: () => require('./commands/find'),
+  get: () => require('./commands/get'),
+  move: () => require('./commands/move'),
   info: () => require('./commands/info'),
   tags: () => require('./commands/tags'),
   edit: () => require('./commands/edit'),
@@ -50,6 +52,8 @@ Commands:
   send      Send a folder tree to a peer (C-STORE), grouped by study
   scp       Run a permissive receiver that logs everything
   find      Query a peer (C-FIND) at study, series or worklist level
+  get       Retrieve a study from a peer into a folder (C-GET)
+  move      Ask a peer to send a study to a destination AE (C-MOVE)
   info      Inventory a folder or file: modalities, counts, sizes, syntaxes
   tags      Dump the DICOM tags in a file or folder
   edit      Change or remove tags and write the result

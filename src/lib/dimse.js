@@ -142,6 +142,18 @@ function resolveTimeouts(opts = {}) {
  *                                          two moments are not the same one.
  * @param {function} [params.onProgress]    Called on any inbound response, to
  *                                          feed the caller's own idle detection.
+ * @param {function} [params.onStoreRequest] Called as (request, callback) for a
+ *                                          C-STORE arriving on THIS association,
+ *                                          which is how C-GET delivers: the
+ *                                          images come back down the same
+ *                                          connection the request went out on,
+ *                                          as sub-operations, rather than over a
+ *                                          second association to a listener. The
+ *                                          handler owns answering, and must call
+ *                                          callback with a CStoreResponse — a
+ *                                          sub-operation left unanswered stalls
+ *                                          the retrieve until the idle watchdog
+ *                                          gives up on it.
  * @param {object} [params.securityOptions] TLS options, passed through.
  * @returns {Promise<{outcome: object, association: object|undefined, statistics: object|undefined}>}
  */
@@ -156,6 +168,7 @@ function runAssociation(params) {
     onAccepted,
     onEnded,
     onProgress,
+    onStoreRequest,
     securityOptions,
   } = params;
 
@@ -238,6 +251,20 @@ function runAssociation(params) {
         // Any response at all counts as the peer being alive.
         request.on('response', touch);
         client.addRequest(request);
+      }
+
+      if (onStoreRequest) {
+        client.on('cStoreRequest', (request, callback) => {
+          // An arriving instance is the peer being alive, and on a large
+          // retrieve it is the ONLY sign of it: the C-GET response that
+          // carries the remaining/completed counts arrives between
+          // sub-operations, so a study of several hundred instances can go
+          // minutes between responses while images stream the whole time.
+          // Without this the idle watchdog would abort a perfectly healthy
+          // retrieve.
+          touch();
+          onStoreRequest(request, callback);
+        });
       }
 
       client.on('connected', () => {
