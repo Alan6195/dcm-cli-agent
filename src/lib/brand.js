@@ -16,8 +16,10 @@ const log = require('./log');
  * sequences in a log file helps nobody.
  */
 
-const PRODUCT = 'AscendI';
-const TOOL = 'DICOM CLI Agent';
+const PRODUCT = 'DICOM Tool';
+// Not "DICOM CLI Agent" any more: under a product called DICOM Tool that would
+// read "DICOM Tool DICOM CLI Agent" in a log line.
+const TOOL = 'CLI Agent';
 const TAGLINE = 'DICOM network operations for folders of DICOM files';
 
 /** Accent used for the wordmark, rules and prompts. */
@@ -48,12 +50,12 @@ function banner(version) {
   // Padding must be measured on the plain text. Colouring first and then
   // padding counts the ANSI escape bytes as visible characters, which is why
   // hand-tuned banner widths drift the moment the version string changes.
-  // Hand-spaced, and the spacing is load-bearing: the row() padding below is
-  // measured against this exact string, so a wordmark of a different length
-  // moves the right edge of the box. ASCENDI is seven letters, as ASTERIS was,
-  // so the rename kept the width — the test that checks every line renders to
-  // the same width is what proves it, not this comment.
-  const wordmark = '  ◈ A S C E N D I';
+  // Hand-spaced. row() pads every line to WIDTH from its own plain length, so
+  // a wordmark of any length up to WIDTH keeps the box square — the earlier
+  // seven-letter names (ASTERIS, ASCENDI) were never what held the edge in
+  // place. The test that checks every line renders to the same width is what
+  // proves it, not this comment.
+  const wordmark = '  ◈ D I C O M   T O O L';
   const subtitle = `  ${TOOL} · v${version}`;
 
   const row = (plain, paint) =>

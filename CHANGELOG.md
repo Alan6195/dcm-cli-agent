@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.17.1
+
+**AscendI DICOM is now DICOM Tool.** The window, the Start menu, the splash,
+the sidebar, the installers and the CLI banner say DICOM Tool; release files
+are named `DICOM-Tool-<version>-…`. Nothing about how it works has changed.
+
+On Windows it arrives as an ordinary update. The installer still carries the
+identity Windows uses to recognise this app, so DICOM Tool replaces AscendI
+DICOM in place rather than installing beside it, and nothing needs
+uninstalling first. Three things do change, because the program file is now
+`DICOM Tool.exe`:
+
+- **Windows Firewall sees a new program.** Its rules belong to a program's
+  path, and the receiver runs as this file, so the allow rule AscendI DICOM
+  had does not cover DICOM Tool. If you use Receive, the first one after the
+  update may raise a firewall prompt — allow it on your private or domain
+  network, or on a managed PC ask IT to allow `DICOM Tool.exe`. Left
+  unanswered, a firewalled receiver starts normally and then hears nothing
+  from the modality. Sending, the worklist and MPPS are outbound and are not
+  affected. The app says this once, in the update banner.
+- **Taskbar pins point at the old file.** Pin DICOM Tool again; the Start menu
+  and desktop shortcuts are replaced for you.
+- **Close AscendI DICOM before running the installer by hand.** It looks for a
+  running DICOM Tool, not a running AscendI DICOM, so it closes the old one
+  without the usual question — and without the warning about an open
+  procedure step. Updating from inside the app is unaffected.
+
+Your saved PACS peers, station identity, defaults and window layout come with
+it. Windows and macOS keep an app's data in a folder named after the app, so a
+rename on its own would open on an empty Settings screen; on first launch
+DICOM Tool copies them across from the AscendI DICOM folder — or from an
+Asteris one, on a machine that never ran AscendI — and leaves the old folder
+exactly as it was.
+
+On macOS the old app stays until you remove it. A Mac app is a folder named
+after the product, so dragging `DICOM Tool.app` into Applications puts it
+beside `AscendI DICOM.app` rather than replacing it. Open the new one first —
+that is when your settings are carried across — then drag the old one to the
+Trash and add DICOM Tool to the Dock: a pin left on the old app keeps opening
+it, and it offers this same update again. The update banner says so when the
+old app is still there.
+
 ## v0.17.0
 
 The DIMSE side could ask a peer what it held and never pull it back. Now it

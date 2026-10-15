@@ -139,7 +139,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ascendi-dicom-${{ matrix.label }}
+          name: dicom-tool-${{ matrix.label }}
           path: desktop/out/*
           if-no-files-found: warn
 

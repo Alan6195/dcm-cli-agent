@@ -119,7 +119,7 @@ It never phones home on its own — a check happens when you ask for one.
 
 ## Prefer a window?
 
-The same engine ships as a desktop app — **AscendI DICOM** — for the
+The same engine ships as a desktop app — **DICOM Tool** — for the
 people on the team who won't touch a terminal. Every screen builds the real
 `dcm` command, shows it, and runs it, so what the app does and what the CLI
 does can never drift apart. Download the installer for your platform from
@@ -138,8 +138,8 @@ having to read them first.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ◈ A S C E N D I                                         │
-│  DICOM CLI Agent · v0.2.0                                │
+│  ◈ D I C O M   T O O L                                   │
+│  CLI Agent · v0.2.0                                      │
 └──────────────────────────────────────────────────────────┘
 
   What would you like to do?

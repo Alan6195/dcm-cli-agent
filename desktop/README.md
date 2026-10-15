@@ -1,4 +1,4 @@
-# AscendI DICOM
+# DICOM Tool
 
 A windowed front end for the `dcm` engine. Same DIMSE code as the CLI, no second
 implementation: every screen builds the exact `dcm` command a person would type,
@@ -17,12 +17,12 @@ closed appears inline the moment it applies. DICOMweb credentials come from the
 environment the app was launched from (`DCM_WEB_TOKEN`, or
 `DCM_WEB_USER`/`DCM_WEB_PASS`) — there is deliberately no token field.
 
-The product name is "AscendI DICOM". Typing "ascendi" into the Windows Start
-menu finds it, and nothing else on the machine answers to that; the `dcm` CLI
-is only ever found by typing `dcm`, so the two cannot be confused when both
-are installed. It shipped as "Asteris DICOM" through v0.5 and as "Asteris
-DICOM App" from v0.6 — see **Updating from an Asteris build** below for what
-happens to the data those versions saved.
+The product name is "DICOM Tool". Typing "dicom tool" into the Windows Start
+menu finds it; the `dcm` CLI is only ever found by typing `dcm`, so the two
+cannot be confused when both are installed. It shipped as "Asteris DICOM"
+through v0.5, as "Asteris DICOM App" from v0.6 through v0.15, and as "AscendI
+DICOM" in v0.16 and v0.17 — see **Updating from an older build** below for
+what happens to the data those versions saved.
 
 Launch behavior worth knowing, all deliberate:
 
@@ -37,11 +37,12 @@ Launch behavior worth knowing, all deliberate:
 - closing the window while a procedure step is still open asks first: an open
   step lives only in that window, and quitting forgets it.
 
-## Updating from an Asteris build
+## Updating from an older build
 
-The app used to be called Asteris DICOM App, and before that Asteris DICOM.
-The rename to AscendI DICOM is an ordinary update: same installed program,
-new name and new icon in the Start menu. Nothing has to be uninstalled first.
+The app used to be called AscendI DICOM, before that Asteris DICOM App, and
+before that Asteris DICOM. On Windows, the rename to DICOM Tool is an ordinary
+update: same installed program, new name and new icon in the Start menu.
+Nothing has to be uninstalled first.
 
 Two things make that true, and both are deliberate.
 
@@ -49,17 +50,40 @@ Two things make that true, and both are deliberate.
 builder's `appId` in `desktop/package.json` is unchanged at
 `com.asteris.dcm.desktop`, because that identifier — not the visible name — is
 what Windows and NSIS match on to decide whether an installer is upgrading
-what is already there. A new `appId` would install AscendI beside Asteris,
-leave the old copy receiving no further updates, and make every user find and
-remove it by hand. The old identifier is kept until retiring it is a decision
-someone makes on purpose, with a plan for the copies already installed.
+what is already there. A new `appId` would install DICOM Tool beside the old
+app, leave the old copy receiving no further updates, and make every user find
+and remove it by hand. The old identifier is kept until retiring it is a
+decision someone makes on purpose, with a plan for the copies already
+installed.
 
 **Your saved data is carried across.** Electron derives the user-data folder
 from the product name, so the rename moves it:
 
 ```
-%APPDATA%\Asteris DICOM App\   →   %APPDATA%\AscendI DICOM\
+%APPDATA%\AscendI DICOM\   →   %APPDATA%\DICOM Tool\
 ```
+
+**On Windows the program file is renamed too, and Windows Firewall notices.**
+It is `DICOM Tool.exe` now, and firewall rules belong to a program's path. The
+receiver runs as this same file, so an allow rule the old name had does not
+cover it, and a firewalled receiver starts without an error and then simply
+never hears from the modality. If you use Receive, allow DICOM Tool when
+Windows asks after the update — on a managed PC, ask IT to allow
+`DICOM Tool.exe`. Outbound work (send, worklist, MPPS) is not affected. The
+same is true of taskbar pins, which point at the old file: pin DICOM Tool
+again. Close the old app before running the new installer by hand; it looks
+for a running DICOM Tool, so it closes AscendI DICOM without asking, open
+procedure step or not. Updating from inside the app is unaffected. The first
+launch under the new name says the firewall part in its update banner.
+
+**On macOS the old app stays until you remove it.** A Mac app is a folder
+named after the product, so the disk image now holds `DICOM Tool.app`, and
+dragging it into Applications puts it beside `AscendI DICOM.app` rather than
+replacing it. Drag the old one to the Trash once the new one has opened —
+your saved peers and settings have already been carried across by then, from
+the old app's data folder, which is left untouched — and add DICOM Tool to the
+Dock, since a pin on the old app keeps opening it, and it keeps offering this
+same update. The update banner says so when the old app is still there.
 
 Left alone, that reads as a wipe — the app opens with no PACS peers, no
 station AE Title, none of your defaults. So on first launch under the new
@@ -252,18 +276,20 @@ A real Developer ID is a later step if this goes past the support team.
 
 ## Installing on macOS
 
-**First launch will show a warning, and that is expected.** macOS reports
-"AscendI DICOM can't be opened because Apple cannot check it for malicious
-software", or names an unidentified developer. To get past it:
+**First launch will show a warning, and that is expected.** macOS reports that
+Apple could not verify "DICOM Tool" is free of malware, or names an
+unidentified developer. To get past it:
 
-- **right-click (or Control-click) the app → Open**, then click **Open** in the
-  dialog. Double-clicking will not offer that choice; the right-click menu is
-  what makes the Open button appear. You only do this once.
+- open **System Settings → Privacy & Security**, scroll to the message naming
+  the app, and click **Open Anyway**. On macOS 15 Sequoia this is the only way
+  through the interface: the old right-click → Open shortcut was removed. On
+  earlier versions, right-click (or Control-click) the app → **Open** also
+  works. You only do this once per installed copy.
 - or, from Terminal, clear the quarantine flag the browser attached to the
   download:
 
   ```bash
-  xattr -cr "/Applications/AscendI DICOM.app"
+  xattr -cr "/Applications/DICOM Tool.app"
   ```
 
 **If you downloaded v0.14.1 or earlier, you need one extra step.** Those builds

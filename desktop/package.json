@@ -1,9 +1,9 @@
 {
   "name": "ascendi-dcm-desktop",
-  "productName": "AscendI DICOM",
-  "version": "0.17.0",
+  "productName": "DICOM Tool",
+  "version": "0.17.1",
   "private": true,
-  "description": "Desktop app for the AscendI DICOM CLI Agent — echo, inventory, send, receive, worklist, tags, edit, de-identify and DICOMweb (STOW/QIDO/WADO), with a live transfer report.",
+  "description": "Desktop app for the DICOM Tool CLI Agent — echo, inventory, send, receive, worklist, tags, edit, de-identify and DICOMweb (STOW/QIDO/WADO), with a live transfer report.",
   "author": "AscendI",
   "license": "MIT",
   "repository": "https://github.com/Alan6195/dcm-cli-agent",
@@ -35,9 +35,17 @@
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8"
   },
+  "//name": [
+    "name stays ascendi-dcm-desktop through the DICOM Tool rename, deliberately.",
+    "No user ever sees it, but electron-updater names its download cache after it",
+    "(a <name>-updater folder in LOCALAPPDATA). Renaming it would orphan the cache an",
+    "installed copy already holds, 100-200 MB left behind for good, and cost every",
+    "user a full download instead of a differential one. The product name users",
+    "see is productName below."
+  ],
   "//appId": [
     "build.appId below is deliberately still com.asteris.dcm.desktop, and the",
-    "AscendI rename did not touch it. appId is the application identity Windows",
+    "AscendI and DICOM Tool renames did not touch it. appId is the identity Windows",
     "and NSIS match on to decide whether an installer upgrades what is already",
     "there or installs a second, unrelated program. Change it and every existing",
     "install stops seeing updates, the new one lands beside it, and each user has",
@@ -51,7 +59,7 @@
   ],
   "build": {
     "appId": "com.asteris.dcm.desktop",
-    "productName": "AscendI DICOM",
+    "productName": "DICOM Tool",
     "copyright": "Copyright © AscendI",
     "publish": [
       {
@@ -96,7 +104,7 @@
           ]
         }
       ],
-      "artifactName": "AscendI-DICOM-${version}-${arch}-setup.${ext}"
+      "artifactName": "DICOM-Tool-${version}-${arch}-setup.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -104,10 +112,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "AscendI DICOM"
+      "shortcutName": "DICOM Tool"
     },
     "portable": {
-      "artifactName": "AscendI-DICOM-${version}-${arch}-portable.${ext}"
+      "artifactName": "DICOM-Tool-${version}-${arch}-portable.${ext}"
     },
     "mac": {
       "target": [
@@ -120,7 +128,7 @@
         }
       ],
       "category": "public.app-category.medical",
-      "artifactName": "AscendI-DICOM-${version}-${arch}.${ext}"
+      "artifactName": "DICOM-Tool-${version}-${arch}.${ext}"
     }
   }
 }

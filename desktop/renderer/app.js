@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * AscendI DICOM — renderer.
+ * DICOM Tool — renderer.
  *
  * No Node here. Everything goes through window.dcm (see preload.js). Each view
  * builds the exact `dcm` argument vector a person would type, shows it, and
@@ -7449,7 +7449,7 @@ async function wireUpdates() {
   const wn = await window.dcm.update.whatsnew();
   if (wn && wn.to) {
     const banner = $('#whatsnew-banner');
-    $('#whatsnew-text').textContent = `Updated to v${wn.to}.`;
+    $('#whatsnew-text').textContent = whatsNewText(wn);
     banner.hidden = false;
     $('#whatsnew-open').addEventListener('click', () => window.dcm.update.openReleases(wn.to));
     $('#whatsnew-dismiss').addEventListener('click', () => {
@@ -7457,6 +7457,15 @@ async function wireUpdates() {
       window.dcm.update.whatsnewAck();
     });
   }
+}
+
+/**
+ * The one-time update banner's sentence. A rename's note (renameNotice in
+ * main.js) follows the version, because the first launch under a new name is
+ * the only moment it is worth saying.
+ */
+function whatsNewText(wn) {
+  return `Updated to v${wn.to}.${wn.note ? ` ${wn.note}` : ''}`;
 }
 
 // --------------------------------------------------------------------------

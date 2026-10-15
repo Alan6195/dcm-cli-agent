@@ -746,8 +746,8 @@ async function pressPicker(targetId, folder, readExpr = '({})') {
 //
 // They keep the old product name deliberately. v0.15.0 shipped as
 // Asteris-DICOM-App-*, those sha512s belong to those exact files, and editing
-// them to match the AscendI rename would turn a real fixture into a made-up
-// one. The post-rename naming is checked separately, further down.
+// them to match a later rename would turn a real fixture into a made-up one.
+// The post-rename naming is checked separately, further down.
 // ---------------------------------------------------------------------------
 const V15_ASSET_NAMES = [
   'Asteris-DICOM-App-0.15.0-arm64.dmg',
@@ -6396,6 +6396,14 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       const gotC = countDcm(outC);
       if (gotC !== expected) bad(`the over-reporting peer delivered ${gotC} file(s), expected all ${expected}`);
+      // The verdict box draws the moment the engine exits, but the Output is
+      // buffered and painted on the next animation frame (flushConsole), so the
+      // engine's closing report can trail the box by a frame. Reading the
+      // screen at once raced that paint and failed intermittently with the
+      // box already right. So the report is waited for — bounded, so a report
+      // that never arrives still fails here — and only then is the screen read.
+      await mustWait("/are not on disk/.test(document.querySelector('#view-query [data-console]').textContent)",
+        10000, "the engine's closing report to reach the Output after a shortfall");
       const lossy = await screen();
       await shot('query-retrieve-shortfall');
       // Red, and said once: the head with the gap, then where the rest are and
@@ -7242,10 +7250,10 @@ async function runSmoke(win, app, mainHelpers = {}) {
     // =====================================================================
     // Carrying user data across a product rename.
     //
-    // Electron derives userData from productName, so the AscendI rename moved
-    // %APPDATA%\Asteris DICOM App\ to %APPDATA%\AscendI DICOM\. To the person
-    // updating, an un-migrated rename does not look like a rename — it looks
-    // like the app forgot every PACS peer they ever typed in.
+    // Electron derives userData from productName, so each rename moves it —
+    // most recently %APPDATA%\AscendI DICOM\ to %APPDATA%\DICOM Tool\. To the
+    // person updating, an un-migrated rename does not look like a rename — it
+    // looks like the app forgot every PACS peer they ever typed in.
     //
     // main.js hands over the migration as a pure function over paths, which is
     // the only way to test it honestly: it is checked here against throwaway
@@ -7257,8 +7265,26 @@ async function runSmoke(win, app, mainHelpers = {}) {
     } else {
       const appData = path.join(work, 'appdata');
       const dirFor = (product) => path.join(appData, product);
-      const NEW_PRODUCT = 'AscendI DICOM';
+      // The name this build runs under, read from the build config rather than
+      // typed here: it is what Electron derives userData from.
+      const NEW_PRODUCT = require('../package.json').build.productName;
+      // The name the last release shipped under, and so the folder an update
+      // actually comes from.
+      const PREVIOUS = 'AscendI DICOM';
       const legacyDirs = () => LEGACY_PRODUCT_DIRS.map((n) => dirFor(n));
+
+      // The list itself. Newest first, the previous name at its head, and never
+      // the current name: carrying a folder onto itself is a no-op at best.
+      record(`rename: ${NEW_PRODUCT} carries data forward from ${JSON.stringify(LEGACY_PRODUCT_DIRS)}`);
+      if (LEGACY_PRODUCT_DIRS[0] !== PREVIOUS) {
+        bad(`the newest old name must come first, and it is ${PREVIOUS}: ${JSON.stringify(LEGACY_PRODUCT_DIRS)}`);
+      }
+      if (LEGACY_PRODUCT_DIRS.includes(NEW_PRODUCT)) {
+        bad(`the current product name ${NEW_PRODUCT} is listed as a legacy one`);
+      }
+      for (const old of ['Asteris DICOM App', 'Asteris DICOM']) {
+        if (!LEGACY_PRODUCT_DIRS.includes(old)) bad(`an older rename was dropped from the list: ${old}`);
+      }
       const put = (product, file, body) => {
         fs.mkdirSync(dirFor(product), { recursive: true });
         fs.writeFileSync(path.join(dirFor(product), file), JSON.stringify(body));
@@ -7271,11 +7297,11 @@ async function runSmoke(win, app, mainHelpers = {}) {
       // 1. The update everyone will actually perform: the new directory does
       //    not exist yet, and every file the app owns has to arrive.
       clean();
-      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'ARCHIVE', host: '10.0.0.9', port: 11112 }] });
-      put('Asteris DICOM App', 'settings.json', { stationAe: 'CT01' });
-      put('Asteris DICOM App', 'app-state.json', { activeView: 'worklist' });
+      put(PREVIOUS, 'profiles.json', { profiles: [{ name: 'ARCHIVE', host: '10.0.0.9', port: 11112 }] });
+      put(PREVIOUS, 'settings.json', { stationAe: 'CT01' });
+      put(PREVIOUS, 'app-state.json', { activeView: 'worklist' });
       // Chromium's own state lives in the same directory and must stay put.
-      fs.writeFileSync(path.join(dirFor('Asteris DICOM App'), 'Cookies'), 'not ours');
+      fs.writeFileSync(path.join(dirFor(PREVIOUS), 'Cookies'), 'not ours');
       const first = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
       record(`rename: carried ${first.carried.map((c) => c.file).join(', ') || 'nothing'} into a fresh ${NEW_PRODUCT} directory`);
       for (const file of STATE_FILES) {
@@ -7287,15 +7313,15 @@ async function runSmoke(win, app, mainHelpers = {}) {
       if (fs.existsSync(path.join(dirFor(NEW_PRODUCT), 'Cookies'))) {
         bad("the migration copied Chromium's own state, which belongs to the build that wrote it");
       }
-      if (!get('Asteris DICOM App', 'profiles.json')) {
+      if (!get(PREVIOUS, 'profiles.json')) {
         bad('the migration moved the old file instead of copying it; a rollback would find nothing');
       }
 
       // 2. The direction that loses data if it is wrong. A file already under
       //    the new name was written by a newer run and must win.
       clean();
-      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'STALE' }] });
-      put('Asteris DICOM App', 'settings.json', { stationAe: 'OLD-AE' });
+      put(PREVIOUS, 'profiles.json', { profiles: [{ name: 'STALE' }] });
+      put(PREVIOUS, 'settings.json', { stationAe: 'OLD-AE' });
       put(NEW_PRODUCT, 'profiles.json', { profiles: [{ name: 'CURRENT' }] });
       const second = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
       if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.name !== 'CURRENT') {
@@ -7306,14 +7332,23 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       record(`rename: an existing profiles.json survived untouched while ${second.carried.map((c) => c.file).join(', ')} still came across`);
 
-      // 3. Two renames deep, and the empty case. Newest legacy name wins; a
-      //    first-ever install must not so much as create a directory.
+      // 3. Several renames deep, and the empty case. Newest legacy name wins;
+      //    a machine that skipped a release still finds the newest name it
+      //    has; a first-ever install must not so much as create a directory.
+      clean();
+      put('Asteris DICOM', 'profiles.json', { profiles: [{ name: 'V05' }] });
+      put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'V06' }] });
+      put(PREVIOUS, 'profiles.json', { profiles: [{ name: 'V16' }] });
+      migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
+      if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.name !== 'V16') {
+        bad('with three old names present the migration did not take the newest');
+      }
       clean();
       put('Asteris DICOM', 'profiles.json', { profiles: [{ name: 'V05' }] });
       put('Asteris DICOM App', 'profiles.json', { profiles: [{ name: 'V06' }] });
       migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
       if ((get(NEW_PRODUCT, 'profiles.json') || {}).profiles?.[0]?.name !== 'V06') {
-        bad('with both old names present the migration took the older one');
+        bad('a machine that never ran the AscendI build did not get its newest data');
       }
       clean();
       const fresh = migrateStateFiles(dirFor(NEW_PRODUCT), legacyDirs());
@@ -7328,7 +7363,48 @@ async function runSmoke(win, app, mainHelpers = {}) {
         }
         if (report && report.carried.length) bad(`the migration carried something from ${JSON.stringify(junk)}`);
       }
-      record('rename: the newer of two old names wins, a fresh install migrates nothing, and bad input cannot fail the launch');
+      record('rename: the newest of three old names wins, a skipped release still migrates, a fresh install migrates nothing, and bad input cannot fail the launch');
+
+      // What the one-time update banner says on the first launch under the new
+      // name. The data is carried; these are the two consequences that are
+      // still the operator's to act on, and each is said only where it is true.
+      const { renameNotice, renamedFromOf } = mainHelpers;
+      if (typeof renameNotice !== 'function' || typeof renamedFromOf !== 'function') {
+        bad('main did not hand the rename notice to the harness');
+      } else {
+        const from = renamedFromOf({ carried: [{ file: 'profiles.json', from: path.join(dirFor(PREVIOUS), 'profiles.json') }] });
+        if (from !== PREVIOUS) bad(`the notice would name the wrong old product: ${from}`);
+        if (renamedFromOf({ carried: [] }) !== null || renamedFromOf(null) !== null) {
+          bad('a launch that carried nothing would still announce a rename');
+        }
+        const noticeFor = (platform, oldAppPath) => renameNotice({ platform, productName: NEW_PRODUCT, renamedFrom: PREVIOUS, oldAppPath });
+        const win = noticeFor('win32');
+        const macThere = noticeFor('darwin', `/Applications/${PREVIOUS}.app`);
+        const macGone = noticeFor('darwin', null);
+        record(`rename notice, Windows: ${win}`);
+        record(`rename notice, macOS with the old app still there: ${macThere}`);
+        // Windows: a firewalled receiver starts without an error and then hears
+        // nothing, so the notice has to name the firewall and the screen.
+        if (!/Windows Firewall/.test(win) || !/Receive/.test(win) || !win.startsWith(`${PREVIOUS} is now ${NEW_PRODUCT}.`)) {
+          bad(`the Windows rename notice does not warn that the receiver may now be firewalled: ${win}`);
+        }
+        if (!macThere.includes(`/Applications/${PREVIOUS}.app`) || !/Trash/.test(macThere) || !/Dock/.test(macThere)) {
+          bad(`the macOS rename notice does not say where the old app is and what to do: ${macThere}`);
+        }
+        if (macGone !== `${PREVIOUS} is now ${NEW_PRODUCT}.` || /Trash/.test(macGone)) {
+          bad(`with the old app already gone the macOS notice still tells the operator to remove it: ${macGone}`);
+        }
+        if (renameNotice({ platform: 'win32', productName: NEW_PRODUCT, renamedFrom: null }) !== '') {
+          bad('an ordinary update, with no rename, still got a rename notice');
+        }
+        const banner = await jsJSON(`JSON.stringify([
+          whatsNewText({ to: '9.9.9' }),
+          whatsNewText({ to: '9.9.9', note: 'X is now Y.' }),
+        ])`);
+        if (banner[0] !== 'Updated to v9.9.9.' || banner[1] !== 'Updated to v9.9.9. X is now Y.') {
+          bad(`the update banner does not carry the rename note after the version: ${JSON.stringify(banner)}`);
+        }
+      }
       clean();
     }
 
@@ -7387,26 +7463,35 @@ async function runSmoke(win, app, mainHelpers = {}) {
       }
       record('mac update: an unknown architecture, a missing image and an empty release all fall back to the page');
 
-      // The rename must not break this. The fixtures above are the real
-      // v0.15.0 release, published under the old product name, and they stay
-      // that way — those sha512s belong to those exact files. What changes
-      // after the rename is the artifactName in package.json, so the same
-      // release shape is checked again under the new one. The picker matches
-      // on the architecture suffix and never on the product name, which is
-      // why it survives; this is the check that says so out loud.
-      const renamed = [
-        'AscendI-DICOM-0.15.2-arm64.dmg',
-        'AscendI-DICOM-0.15.2-arm64.dmg.blockmap',
-        'AscendI-DICOM-0.15.2-x64.dmg',
-        'AscendI-DICOM-0.15.2-x64.dmg.blockmap',
-        'AscendI-DICOM-0.15.2-x64-setup.exe',
-        'AscendI-DICOM-0.15.2-x64-portable.exe',
-        'dcm-macos-arm64', 'dcm-macos-x64', 'latest-mac.yml',
-      ].map((name) => ({ name, browser_download_url: `https://example/${name}` }));
-      const renamedPicks = { arm64: pick('arm64', renamed), x64: pick('x64', renamed) };
-      record(`mac update, post-rename assets: arm64 -> ${renamedPicks.arm64}, x64 -> ${renamedPicks.x64}`);
-      if (renamedPicks.arm64 !== 'AscendI-DICOM-0.15.2-arm64.dmg' || renamedPicks.x64 !== 'AscendI-DICOM-0.15.2-x64.dmg') {
-        bad(`the rename broke the macOS asset picker: ${JSON.stringify(renamedPicks)}`);
+      // A rename must not break this. The fixtures above are the real
+      // v0.15.0 release, published under an old product name, and they stay
+      // that way — those sha512s belong to those exact files. What a rename
+      // changes is the artifactName in package.json, so the same release shape
+      // is checked again under every name it has had since: AscendI, and the
+      // name THIS build publishes under, read from its own package.json rather
+      // than typed here, so the next rename is checked without anyone
+      // remembering to. The picker matches on the architecture suffix and never
+      // on the product name, which is why it survives; this says so out loud.
+      const pkg = require('../package.json');
+      const artifact = (template, arch, ext) => template
+        .replace('${version}', '9.9.9').replace('${arch}', arch).replace('${ext}', ext);
+      const releaseShapes = {
+        AscendI: (arch, ext) => `AscendI-DICOM-0.17.0-${arch}.${ext}`,
+        current: (arch, ext) => artifact(pkg.build.mac.artifactName, arch, ext),
+      };
+      for (const [label, name] of Object.entries(releaseShapes)) {
+        const assets = [
+          name('arm64', 'dmg'), `${name('arm64', 'dmg')}.blockmap`,
+          name('x64', 'dmg'), `${name('x64', 'dmg')}.blockmap`,
+          artifact(pkg.build.win.artifactName, 'x64', 'exe'),
+          artifact(pkg.build.portable.artifactName, 'x64', 'exe'),
+          'dcm-macos-arm64', 'dcm-macos-x64', 'latest-mac.yml',
+        ].map((n) => ({ name: n, browser_download_url: `https://example/${n}` }));
+        const picks = { arm64: pick('arm64', assets), x64: pick('x64', assets) };
+        record(`mac update, ${label} assets: arm64 -> ${picks.arm64}, x64 -> ${picks.x64}`);
+        if (picks.arm64 !== name('arm64', 'dmg') || picks.x64 !== name('x64', 'dmg')) {
+          bad(`the ${label} release naming broke the macOS asset picker: ${JSON.stringify(picks)}`);
+        }
       }
 
       // The feed. The x64 case is the one that matters: it is the last entry

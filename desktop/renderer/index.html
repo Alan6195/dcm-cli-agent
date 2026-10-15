@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
-  <title>AscendI DICOM</title>
+  <title>DICOM Tool</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -16,8 +16,8 @@
       <div class="brand">
         <div class="brand-mark">◈</div>
         <div class="brand-text">
-          <div class="brand-name">ASCENDI</div>
-          <div class="brand-sub">DICOM</div>
+          <div class="brand-name">DICOM</div>
+          <div class="brand-sub">TOOL</div>
         </div>
       </div>
 
@@ -1235,7 +1235,7 @@
           <h4>The warning you will get, and how to get past it</h4>
           <p>Opening the app the first time, macOS says <b>"Apple could not verify … is free of malware"</b>. That is Gatekeeper reporting the missing Developer ID, not a claim about this build. Open <b>System Settings → Privacy &amp; Security</b>, scroll to the message naming the app, and click <b>Open Anyway</b>. macOS 15 Sequoia removed the old right-click → Open shortcut, so that is the only route through the interface.</p>
           <p>From a terminal, the equivalent is to strip the quarantine attribute the download put on it:</p>
-          <p><code>xattr -cr "/Applications/AscendI DICOM.app"</code></p>
+          <p><code>xattr -cr "/Applications/DICOM Tool.app"</code></p>
           <p>Both do the same thing: tell macOS you accept an app Apple has not notarised. You only do it once per installed copy — and once per update, since each update is a new copy.</p>
         </div>
 

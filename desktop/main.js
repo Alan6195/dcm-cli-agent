@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * AscendI DICOM — Electron main process.
+ * DICOM Tool — Electron main process.
  *
  * The whole point of this app is to put a friendly face on the existing CLI
  * engine without forking it. Every action the UI takes runs the exact same
@@ -262,7 +262,7 @@ const gotInstanceLock = SMOKE || app.requestSingleInstanceLock();
 if (!gotInstanceLock) {
   // Say so on stderr: `npm start` while the installed app is open loses this
   // race too, and a silent exit code 0 there looks exactly like a bug.
-  process.stderr.write('AscendI DICOM is already running; fronting the existing window.\n');
+  process.stderr.write('DICOM Tool is already running; fronting the existing window.\n');
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -311,13 +311,14 @@ function writeProfiles(data) {
 // --- Carrying the operator's data across a product rename ------------------
 //
 // Electron derives userData from productName, so renaming the product moves
-// the whole directory: %APPDATA%\Asteris DICOM App\ becomes
-// %APPDATA%\AscendI DICOM\, and everything the operator saved stays behind in
-// a folder the new build never looks at. From their side that is not a rename,
-// it is a wipe — the PACS peers they typed in are gone.
+// the whole directory: %APPDATA%\AscendI DICOM\ becomes %APPDATA%\DICOM Tool\,
+// and everything the operator saved stays behind in a folder the new build
+// never looks at. From their side that is not a rename, it is a wipe — the
+// PACS peers they typed in are gone.
 //
 // The v0.5 → v0.6 rename got a one-file version of this. The AscendI rename
-// generalised it, because by now there are three files and two older names.
+// generalised it, because by then there were three files and two older names;
+// the DICOM Tool rename only had to add one more name to the list below.
 
 /**
  * The files this app owns in its user-data directory.
@@ -335,11 +336,11 @@ const STATE_FILES = ['profiles.json', 'settings.json', 'app-state.json'];
  * Product names this app has shipped under, newest first.
  *
  * "Asteris DICOM" was v0.5 and earlier; "Asteris DICOM App" was v0.6 through
- * the AscendI rename. Newest first is deliberate: a machine that has been
- * through both renames has both directories, and the one to trust is the one
- * written most recently.
+ * v0.15; "AscendI DICOM" was v0.16 and v0.17. Newest first is deliberate: a
+ * machine that has been through several renames has several directories, and
+ * the one to trust is the one written most recently.
  */
-const LEGACY_PRODUCT_DIRS = ['Asteris DICOM App', 'Asteris DICOM'];
+const LEGACY_PRODUCT_DIRS = ['AscendI DICOM', 'Asteris DICOM App', 'Asteris DICOM'];
 
 /**
  * Copy state files from earlier user-data directories into the current one.
@@ -390,6 +391,60 @@ function migrateStateFiles(targetDir, legacyDirs) {
  * opens with an empty peer list, and in the failure case the old directory is
  * still sitting there to be recovered from by hand.
  */
+/**
+ * What a product rename means on this machine, said once, on the first launch
+ * under the new name. '' when there is nothing to say.
+ *
+ * The copy-forward above keeps the operator's data, and two things a rename
+ * changes are still theirs to deal with, so the one-time update banner names
+ * them rather than leaving them to be discovered:
+ *
+ *   - Windows: the program file is renamed with the product, and Windows
+ *     Firewall rules belong to a program path. The receiver runs as this same
+ *     executable, so the allow rule the old name had does not cover the new
+ *     one — and a receiver that is firewalled starts without an error and then
+ *     simply never hears from the modality. Outbound work (worklist, MPPS,
+ *     send) is not affected; listening is.
+ *   - macOS: an app is a folder named after the product, so the new one landed
+ *     beside the old one rather than replacing it, and a Dock pin still opens
+ *     the old one — which offers this same update again and makes it look as
+ *     if the update never took. Said only when the old app is actually there.
+ *
+ * Pure, so the harness can drive every platform's wording without being on it.
+ *
+ * @param {{platform: string, productName: string, renamedFrom: string|null, oldAppPath?: string|null}} p
+ * @returns {string}
+ */
+function renameNotice({ platform, productName, renamedFrom, oldAppPath = null }) {
+  if (!renamedFrom) return '';
+  const lead = `${renamedFrom} is now ${productName}.`;
+  if (platform === 'win32') {
+    return `${lead} Windows Firewall sees it as a new program, so if a modality cannot send to `
+      + `Receive, allow ${productName} when Windows asks — on a managed PC, ask IT to.`;
+  }
+  if (platform === 'darwin' && oldAppPath) {
+    return `${lead} The old app is still at ${oldAppPath}. Your settings are here now, so move it `
+      + `to the Trash and add ${productName} to the Dock.`;
+  }
+  return lead;
+}
+
+/** The product name the carried files came from, or null if nothing was carried. */
+function renamedFromOf(migrated) {
+  const first = migrated && migrated.carried && migrated.carried[0];
+  return first ? path.basename(path.dirname(first.from)) : null;
+}
+
+/** Where the old app bundle still sits on a Mac, if it does. */
+function oldMacAppPath(name) {
+  if (process.platform !== 'darwin' || !name) return null;
+  const candidates = [
+    path.join('/Applications', `${name}.app`),
+    path.join(app.getPath('home'), 'Applications', `${name}.app`),
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
 function migrateLegacyUserData() {
   // The smoke harness runs against a throwaway userData directory. Without
   // this, every smoke run would pull the real installed app's profiles and
@@ -539,7 +594,7 @@ function createWindow(opts = {}) {
       // not a thing anyone needs.
       closable: false,
       backgroundColor: '#0e1420',
-      title: 'AscendI DICOM',
+      title: 'DICOM Tool',
       webPreferences: { contextIsolation: true, sandbox: true },
     });
     splashWindow.loadFile(path.join(__dirname, 'renderer', 'splash.html'));
@@ -556,7 +611,7 @@ function createWindow(opts = {}) {
     minHeight: 620,
     show: !withSplash,
     backgroundColor: '#0e1420',
-    title: 'AscendI DICOM',
+    title: 'DICOM Tool',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -610,7 +665,7 @@ function createWindow(opts = {}) {
       defaultId: 0,
       cancelId: 0,
       noLink: true,
-      title: 'AscendI DICOM',
+      title: 'DICOM Tool',
       message: ask,
     });
     if (choice === 0) {
@@ -1028,8 +1083,10 @@ async function checkForUpdateViaApi() {
 // is the one running, which Windows will not let it overwrite.
 
 // The suffixes come from electron-builder: the mac artifactName in
-// package.json is AscendI-DICOM--., built for arm64
-// and x64. If that name ever changes, this is the other half that has to.
+// package.json is DICOM-Tool-${version}-${arch}.${ext}, built for arm64
+// and x64. Only the suffix is matched, so the product renames (Asteris, then
+// AscendI, then DICOM Tool) never touched this; if the suffix ever changes,
+// this is the other half that has to.
 const MAC_ARCH_SUFFIX = { arm64: '-arm64.dmg', x64: '-x64.dmg' };
 
 /**
@@ -1403,8 +1460,21 @@ app.whenReady().then(() => {
   // happened (possibly silently on quit), and the renderer says so once.
   const lastVersion = readAppState().lastVersion || null;
   if (lastVersion !== app.getVersion()) writeAppState({ lastVersion: app.getVersion() });
-  if (app.isPackaged && lastVersion && lastVersion !== app.getVersion()) {
-    whatsNew = { from: lastVersion, to: app.getVersion() };
+  // A first launch under a new product name is an update even when the old
+  // app-state.json had no lastVersion to compare against, because it is the
+  // one launch where the rename's consequences need saying.
+  const renamedFrom = renamedFromOf(migrated);
+  if (app.isPackaged && ((lastVersion && lastVersion !== app.getVersion()) || renamedFrom)) {
+    whatsNew = {
+      from: lastVersion,
+      to: app.getVersion(),
+      note: renameNotice({
+        platform: process.platform,
+        productName: app.getName(),
+        renamedFrom,
+        oldAppPath: oldMacAppPath(renamedFrom),
+      }),
+    };
   }
 
   ipcMain.handle('dcm:info', () => ({
@@ -1493,6 +1563,8 @@ app.whenReady().then(() => {
           openSteps: () => ({ ...openSteps }),
           findOnPath,
           probeDcm,
+          renameNotice,
+          renamedFromOf,
           quitGuardMessage,
           stopEveryChild,
         });
