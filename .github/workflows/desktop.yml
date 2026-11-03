@@ -84,6 +84,61 @@ jobs:
         # resolve a newer version of anything with a caret range.
         run: npm ci
 
+      # Real signing switches on by itself once the repository has the secrets
+      # (desktop/README.md, "Turning on code signing"). With none of them set
+      # this step adds nothing and the build is exactly the unsigned one.
+      # Values reach the shell through env and only ever go to GITHUB_ENV or
+      # to electron-builder flags; nothing here echoes them.
+      - name: Signing, if configured
+        shell: bash
+        env:
+          AZURE_SIGN_ENDPOINT: ${{ secrets.AZURE_SIGN_ENDPOINT }}
+          AZURE_SIGN_ACCOUNT: ${{ secrets.AZURE_SIGN_ACCOUNT }}
+          AZURE_SIGN_PROFILE: ${{ secrets.AZURE_SIGN_PROFILE }}
+          AZURE_SIGN_PUBLISHER: ${{ secrets.AZURE_SIGN_PUBLISHER }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          signed=""
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "$AZURE_SIGN_ACCOUNT" ]; then
+            # Azure Trusted Signing, written into this checkout's copy of the
+            # build config (never committed) so no value is ever shell-split.
+            # publisherName also goes into app-update.yml, which is what makes
+            # the installed app check each update's signature; an unsigned
+            # build has none, so it checks nothing.
+            node -e '
+              const fs = require("fs"); const f = "desktop/package.json";
+              const p = JSON.parse(fs.readFileSync(f, "utf8")); const e = process.env;
+              p.build.win.azureSignOptions = { endpoint: e.AZURE_SIGN_ENDPOINT,
+                codeSigningAccountName: e.AZURE_SIGN_ACCOUNT, certificateProfileName: e.AZURE_SIGN_PROFILE,
+                publisherName: e.AZURE_SIGN_PUBLISHER };
+              fs.writeFileSync(f, JSON.stringify(p, null, 2));'
+            signed=1
+            { echo "AZURE_TENANT_ID=$AZURE_TENANT_ID"; echo "AZURE_CLIENT_ID=$AZURE_CLIENT_ID"; echo "AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET"; } >> "$GITHUB_ENV"
+            echo "Windows: signing with Azure Trusted Signing"
+          fi
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$MAC_CSC_LINK" ]; then
+            # Developer ID certificate. With CSC_LINK set, ad-hoc-sign-mac.js
+            # stands down and electron-builder signs; APPLE_* makes it notarize.
+            { echo "CSC_LINK=$MAC_CSC_LINK"; echo "CSC_KEY_PASSWORD=$MAC_CSC_KEY_PASSWORD"; } >> "$GITHUB_ENV"
+            if [ -n "$APPLE_ID" ]; then
+              { echo "APPLE_ID=$APPLE_ID"; echo "APPLE_APP_SPECIFIC_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD"; echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"; } >> "$GITHUB_ENV"
+              node -e '
+                const fs = require("fs"); const f = "desktop/package.json";
+                const p = JSON.parse(fs.readFileSync(f, "utf8"));
+                p.build.mac.notarize = true; fs.writeFileSync(f, JSON.stringify(p, null, 2));'
+            fi
+            signed=1
+            echo "macOS: signing with a Developer ID$([ -n "$APPLE_ID" ] && echo ' and notarizing')"
+          fi
+          if [ -z "$signed" ]; then echo "No signing secrets: building unsigned (ad-hoc on macOS), as before."; fi
+
       - name: Build installers
         working-directory: desktop
         # --publish never: with a publish block in package.json, electron-builder
@@ -94,9 +149,9 @@ jobs:
         run: npm run dist -- --publish never
         env:
           # Don't go hunting the runner's keychain for a certificate. This is a
-          # "stop searching" flag, not a "never sign" flag — with CSC_NAME or
-          # mac.identity set, electron-builder 25 still signs for real, so this
-          # does not block a future Developer ID setup.
+          # "stop searching" flag, not a "never sign" flag — with CSC_LINK,
+          # CSC_NAME or mac.identity set, electron-builder still signs for real,
+          # which is how the signing step above turns it on.
           #
           # It also does not mean the app ships unsigned any more: the afterPack
           # hook (desktop/ad-hoc-sign-mac.js) ad-hoc signs the .app before the

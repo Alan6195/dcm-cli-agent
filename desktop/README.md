@@ -237,15 +237,20 @@ still never reads a config file — that property is unchanged.
 
 ## Run it in development
 
-From this folder:
+From the repository root:
 
 ```bash
-npm install      # installs Electron and links the engine from ..
-npm start        # launches the app
+npm run app      # installs this folder's dependencies when needed, then npm start
 ```
 
-`npm install` pulls the engine in as a local dependency (`file:..`), so its
-DIMSE code and the one WebAssembly codec module come along automatically.
+Or from this folder, `npm ci && npm start`. `npm start` vendors the engine
+from `..` into `engine/` first (copy-engine.js). Electron downloads its own
+binary the first time it runs.
+
+The engine runs as an Electron `utilityProcess` (`engine-host.js`), not as
+the Electron binary under `ELECTRON_RUN_AS_NODE`. Packaged builds switch
+that variable off with Electron's RunAsNode fuse, along with NODE_OPTIONS,
+`--inspect` and loading app code from outside the asar; see `after-pack.js`.
 
 ## Build installers
 
@@ -275,6 +280,9 @@ configured, and throws — failing the build — if signing or verification fail
 A real Developer ID is a later step if this goes past the support team.
 
 ## Installing on macOS
+
+**macOS 13 Ventura or newer.** Electron 45, which the app is built on, dropped
+macOS 12.
 
 **First launch will show a warning, and that is expected.** macOS reports that
 Apple could not verify "DICOM Tool" is free of malware, or names an
@@ -315,6 +323,35 @@ codesign --force --deep --sign - "/Applications/Asteris DICOM App.app"
 (`--deep` is deprecated by Apple and the build itself signs inner-out instead,
 but for a one-off local rescue on a bundle you are not distributing it is the
 short command that works.)
+
+### Turning on code signing
+
+The release workflow (`.github/workflows/desktop.yml`) signs on its own once
+these repository secrets exist. Until then it builds exactly what the table
+below describes. This has not run with real credentials yet, so the first
+signed release is the test.
+
+**Windows, through Azure Trusted Signing.** Set `AZURE_SIGN_ENDPOINT` (e.g.
+`https://eus.codesigning.azure.net`), `AZURE_SIGN_ACCOUNT`,
+`AZURE_SIGN_PROFILE`, `AZURE_SIGN_PUBLISHER` (the certificate's subject CN,
+exactly), and a service principal: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+`AZURE_CLIENT_SECRET`.
+
+- SmartScreen stops warning once the certificate has built some reputation.
+- The publisher name is written into the update feed's config. From then on,
+  each installed copy refuses an update that isn't signed by that publisher.
+  An unsigned build has no publisher name, so today it checks only the
+  checksum in `latest.yml`, which comes from the same release page.
+
+**macOS, with a Developer ID.**
+
+- `MAC_CSC_LINK` is the base64 .p12 of a "Developer ID Application"
+  certificate, and `MAC_CSC_KEY_PASSWORD` is its password.
+- To notarize as well, add `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD` and
+  `APPLE_TEAM_ID`.
+- With these set, `ad-hoc-sign-mac.js` stands down and electron-builder signs
+  the app.
+- Fuses are flipped before either kind of signing (`after-pack.js`).
 
 ### What is and is not signed
 

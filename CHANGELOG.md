@@ -5,6 +5,60 @@
 For running `dcm mcp` in an assistant whose input can be steered by what it
 reads, and for the supply chain behind the binaries.
 
+- **Clone and use.** `.mcp.json` starts the MCP server from the checkout, and
+  installs its dependencies on first start, so Claude Code in this repo has
+  the DICOM tools with no setup. `.claude/settings.json`:
+  - pre-approves the read-only and loopback tools; sends, retrieves and edits
+    still ask;
+  - raises the MCP startup timeout to cover that first install.
+
+  `CLAUDE.md` explains the tools and the data rules. `npm run app` starts the
+  desktop app from source.
+- **`dcm anon` is now keyed and thorough.**
+  - **Keyed pseudonyms.** Pseudonyms and replacement UIDs are HMAC-SHA256 with
+    a secret key. Before, they were an unkeyed SHA-256 with a salt published in
+    the source, so anyone with the output could brute-force MRNs back and link
+    original UIDs. Set `DCM_ANON_KEY` for pseudonyms that repeat across runs
+    and machines. Without it, each run uses a random key: consistent within
+    the run, unlinkable between runs.
+  - **Every depth.** It walks every sequence at every depth: UIDs (including
+    multi-valued ones), person names, and the blank and remove lists.
+    References inside sequences now point at the remapped UIDs.
+  - **More attributes, per PS3.15 Annex E:**
+    - age, sex, weight and size;
+    - station AE title, requested procedure ID and other patient IDs;
+    - identification and institution code sequences;
+    - SR text;
+    - overlay (60xx) and curve (50xx) groups, which can carry burned-in text.
+  - **Dates** are shifted by a per-patient offset, so intervals survive.
+    `--keep-dates` keeps them.
+  - **`--keep-patient-characteristics`** (MCP: `keepPatientCharacteristics`)
+    keeps age, sex, size, weight, ethnic group, sex-neutered, smoking and
+    pregnancy status, per the PS3.15 Annex E Retain Patient Characteristics
+    Option, so PET SUV stays computable. By default they are removed.
+
+  Output from earlier versions will not match.
+- **`dcm move --receive` binds where it is told.** `--receive-host` chooses
+  the interface. Under MCP it follows `DCM_MCP_RECEIVER_HOST`, with
+  127.0.0.1 as the default. It warns when the peer is another machine and
+  cannot reach a loopback receiver.
+- **Desktop app on Electron 45**, up from 33, which was end of life. This
+  requires **macOS 13 or newer**. electron-builder 26 clears the critical
+  `tar` advisories and the high ones in the build tools.
+  - The engine now runs as a `utilityProcess` instead of the Electron binary
+    under `ELECTRON_RUN_AS_NODE`.
+  - So packaged builds can switch that off with fuses, along with
+    `NODE_OPTIONS`, `--inspect` and loading app code from outside the
+    integrity-checked asar.
+  - 15 moderate advisories remain, all one old `minimatch` inside
+    electron-builder's packaging tools. It only ever matches the build config
+    at build time.
+- **Signing is ready to switch on.** The desktop workflow signs Windows
+  through Azure Trusted Signing, and signs and notarizes macOS, as soon as the
+  repository has the secrets (see desktop/README.md). Once Windows is signed,
+  installed copies refuse an update that isn't signed by the same publisher.
+  Until the secrets exist the build is unchanged.
+
 - **DICOMweb credentials are pinned to `DCM_WEB_URL`.** Under `dcm mcp`, a
   tool call naming another URL is sent without the token. With no
   `DCM_WEB_URL` set, credentials are never sent at all. On the CLI, a `--url`
