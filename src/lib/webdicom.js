@@ -47,6 +47,43 @@ const TAGS = Object.freeze({
 // QIDO-then-WADO run would otherwise nag on every association-equivalent.
 let warnedCleartextHttp = false;
 
+// Set by `dcm mcp`. An assistant picks the URL there, and the URL can be
+// steered by whatever text it last read (a tag value, a QIDO row), so the
+// environment's credentials must not follow it to an arbitrary host.
+let agentMode = false;
+
+/**
+ * Tightens DICOMweb for an MCP server process: credentials travel only to the
+ * origin of DCM_WEB_URL, and --insecure needs DCM_WEB_INSECURE=1 in the
+ * server's environment rather than a tool argument alone.
+ */
+function enableAgentMode() {
+  agentMode = true;
+}
+
+/**
+ * Whether the environment's credentials may be sent to `target`.
+ *
+ * With DCM_WEB_URL set, only its origin qualifies: a --url naming another host
+ * gets no Authorization header. Without it, a person typing --url at a shell
+ * has chosen the host themselves, so the credentials go along; under MCP they
+ * never do, since nothing pins them to a host.
+ *
+ * @param {URL} target
+ * @returns {boolean}
+ */
+function credentialsAllowedFor(target) {
+  const pinned = process.env.DCM_WEB_URL;
+  if (pinned) {
+    try {
+      return new URL(pinned).origin === target.origin;
+    } catch {
+      return false;
+    }
+  }
+  return !agentMode;
+}
+
 /**
  * Resolves the shared DICOMweb connection options.
  *
@@ -87,7 +124,18 @@ function resolveWebOptions(flags) {
 
   const headers = {};
   let authSource = 'none';
-  if (process.env.DCM_WEB_TOKEN) {
+  const haveCredentials = Boolean(
+    process.env.DCM_WEB_TOKEN || (process.env.DCM_WEB_USER && process.env.DCM_WEB_PASS)
+  );
+  if (haveCredentials && !credentialsAllowedFor(parsed)) {
+    log.warn(
+      `credentials from the environment are not sent to ${parsed.origin}: they are pinned to ` +
+        (process.env.DCM_WEB_URL
+          ? `DCM_WEB_URL (${process.env.DCM_WEB_URL}).`
+          : 'DCM_WEB_URL, which this MCP server was started without.') +
+        ' The request goes unauthenticated.'
+    );
+  } else if (process.env.DCM_WEB_TOKEN) {
     headers.Authorization = `Bearer ${process.env.DCM_WEB_TOKEN}`;
     authSource = 'bearer';
   } else if (process.env.DCM_WEB_USER && process.env.DCM_WEB_PASS) {
@@ -110,6 +158,12 @@ function resolveWebOptions(flags) {
   });
 
   let insecure = args.resolve(flags, { name: 'insecure', type: 'boolean', fallback: false });
+  if (insecure && agentMode && process.env.DCM_WEB_INSECURE !== '1') {
+    throw new args.UsageError(
+      'insecure (skip TLS verification) is refused: the MCP server was not started with ' +
+        'DCM_WEB_INSECURE=1. Set it in the server environment to allow this against a self-signed test server.'
+    );
+  }
   if (insecure) {
     if (parsed.protocol === 'https:') {
       log.warn(
@@ -137,6 +191,12 @@ function resolveWebOptions(flags) {
   return { baseUrl, headers, timeoutMs, insecure, authSource };
 }
 
+/** @returns {number} The largest response body webRequest will buffer, in bytes. */
+function maxResponseBytes() {
+  const mb = Number(process.env.DCM_WEB_MAX_RESPONSE_MB);
+  return (Number.isFinite(mb) && mb > 0 ? mb : 2048) * 1048576;
+}
+
 /**
  * One HTTP request, promisified over node:http/node:https.
  *
@@ -150,7 +210,9 @@ function resolveWebOptions(flags) {
  * The response body is always buffered in full. Retrieve responses are
  * bounded by study size, which for v1 is an acceptable ceiling; if
  * multi-gigabyte studies become routine this is the seam where a streaming
- * parser would slot in.
+ * parser would slot in. A server that never stops sending is cut off at
+ * DCM_WEB_MAX_RESPONSE_MB (default 2048) with code 'DCM_WEB_TOO_LARGE',
+ * rather than being allowed to exhaust the process's memory.
  *
  * @param {object} opts
  * @param {string} opts.method
@@ -186,7 +248,22 @@ function webRequest({ method, url, headers = {}, timeoutMs = 60000, insecure = f
 
     const req = transport.request(target, options, (res) => {
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
+      const limit = maxResponseBytes();
+      let received = 0;
+      res.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > limit) {
+          const err = new Error(
+            `${target.host} sent more than ${limit / 1048576} MB; stopped reading. ` +
+              'Raise DCM_WEB_MAX_RESPONSE_MB if a study really is that large.'
+          );
+          err.code = 'DCM_WEB_TOO_LARGE';
+          req.destroy(err);
+          fail(err);
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('error', fail);
       res.on('end', () => {
         if (settled) return;
@@ -593,6 +670,7 @@ function translateTransportFailure(err) {
 }
 
 module.exports = {
+  enableAgentMode,
   resolveWebOptions,
   webRequest,
   joinUrl,

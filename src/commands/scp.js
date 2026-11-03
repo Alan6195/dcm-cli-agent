@@ -56,7 +56,7 @@ const MPPS_SOP_CLASS = SopClass.ModalityPerformedProcedureStep;
  */
 const MAX_ERROR_COMMENT = 64;
 
-const FLAGS = ['port', 'ae', 'persist', 'accept-calling-ae', 'reject-after',
+const FLAGS = ['port', 'host', 'ae', 'persist', 'accept-calling-ae', 'reject-after',
   'prefer-syntax', 'prefer-uncompressed', 'worklist', 'keep-performed',
   'refuse-nset', 'refuse-nset-scope', 'refuse-ncreate',
   'find-status', 'abort-find-after', 'serve', 'destination',
@@ -223,6 +223,9 @@ Usage:
 
 Options:
   --port <port>              Port to listen on.                        [env DCM_SCP_PORT]
+  --host <address>           Interface to bind, e.g. 127.0.0.1 to accept
+                             connections from this machine only.
+                             Default: every interface.                 [env DCM_SCP_HOST]
   --ae <AE>                  Only answer to this called AE Title.
                              Others are rejected as "called AE not recognized".
                              Default: answer to any called AE Title.
@@ -1386,6 +1389,10 @@ async function run(parsed) {
     'port'
   );
 
+  // Undefined binds every interface, which is what a receiver for real
+  // modalities needs. `dcm mcp` passes 127.0.0.1 unless told otherwise.
+  const host = args.resolve(flags, { name: 'host', env: 'DCM_SCP_HOST' }) || undefined;
+
   const aeRaw = args.resolve(flags, { name: 'ae' });
   const ae = aeRaw ? args.validateAeTitle(aeRaw, 'ae') : undefined;
 
@@ -1646,6 +1653,7 @@ async function run(parsed) {
 
     server.on('listening', () => {
       log.info(`${log.color.green('listening')} on port ${port}`);
+      log.info(`  bind host        : ${host ?? log.color.dim('(every interface)')}`);
       log.info(`  called AE Title  : ${ae ?? log.color.dim('(any)')}`);
       log.info(`  calling AE allow : ${acceptCallingAe.length ? acceptCallingAe.join(', ') : log.color.dim('(any)')}`);
       log.info(`  persist          : ${persist ?? log.color.dim('(discard after acknowledging)')}`);
@@ -1707,7 +1715,9 @@ async function run(parsed) {
       log.info('  press Ctrl+C to stop');
     });
 
-    server.listen(port, {
+    // dcmjs-dimse hands its first argument straight to net.Server#listen, so
+    // an options object is how a bind address gets through.
+    server.listen(host ? { port, host } : port, {
       logCommandDatasets: log.isVerbose(),
       logDatasets: false,
     });

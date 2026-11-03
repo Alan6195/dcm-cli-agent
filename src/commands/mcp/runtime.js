@@ -106,12 +106,72 @@ function jsonResult({ code, out, err }) {
 /**
  * Push flag/value pairs only when the value is set.
  *
+ * Always as one `--flag=value` token. Pushed as two, a value the assistant
+ * supplied that begins with `--` would parse as a flag of its own — and so
+ * reach switches (--serve, --destination) the tool deliberately does not
+ * offer.
+ *
  * @param {string[]} argv  Argument vector being built, mutated in place.
  * @param {string} flag  The switch to push.
  * @param {*} value  Pushed as a string when it is not undefined/null/''.
  */
 function opt(argv, flag, value) {
-  if (value !== undefined && value !== null && value !== '') argv.push(flag, String(value));
+  if (value !== undefined && value !== null && value !== '') argv.push(`${flag}=${value}`);
 }
 
-module.exports = { COMMANDS, serialize, runCommand, textResult, jsonResult, opt };
+/**
+ * An assistant-supplied value that goes into argv as a token of its own
+ * (a path, a UID): refused if it could be read as a flag.
+ *
+ * @param {*} value
+ * @param {string} what  Named in the refusal.
+ * @returns {string}
+ */
+function pos(value, what) {
+  const s = String(value);
+  if (s.startsWith('-')) throw new Error(`${what} may not begin with "-": ${JSON.stringify(s)}`);
+  return s;
+}
+
+/**
+ * A `key=value` matching or query pair. Keys are keywords, tags or
+ * sequence paths (ScheduledProcedureStepSequence/Modality), none of which
+ * begin with "-" or contain "=", so one that does is refused rather than
+ * parsed as a flag or re-split.
+ *
+ * @param {string} key
+ * @param {*} value
+ * @returns {string}
+ */
+function pair(key, value) {
+  if (!key || key.startsWith('-') || key.includes('=')) {
+    throw new Error(`not an attribute keyword, tag or path: ${JSON.stringify(key)}`);
+  }
+  return `${key}=${value}`;
+}
+
+/**
+ * Enforces DCM_MCP_ALLOWED_HOSTS when it is set: a comma-separated list of
+ * the hosts (names or addresses, matched case-insensitively) this server may
+ * send DICOM to or query. Unset, any host is allowed — the default, since a
+ * test bench usually points at whatever is to hand.
+ *
+ * Exists because a tag value or a peer's response can ask the assistant to
+ * send a folder somewhere; with the list set, that request fails here.
+ *
+ * @param {string} host  Hostname or address, without port.
+ */
+function checkHost(host) {
+  const raw = process.env.DCM_MCP_ALLOWED_HOSTS;
+  if (!raw) return;
+  const allowed = raw.split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+  const h = String(host).trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!allowed.includes(h)) {
+    throw new Error(
+      `${host} is not in DCM_MCP_ALLOWED_HOSTS (${allowed.join(', ')}). ` +
+        'Add it to the MCP server environment to allow it.'
+    );
+  }
+}
+
+module.exports = { COMMANDS, serialize, runCommand, textResult, jsonResult, opt, pos, pair, checkHost };

@@ -40,6 +40,14 @@ const DEFAULT_TAIL = 20;
 /** Upper bound on a caller-requested tail, so one call cannot dump everything. */
 const MAX_TAIL = 200;
 
+/**
+ * Where receivers started through MCP bind. Loopback by default: nothing on
+ * the network can then fill the disk, read a loaded worklist or plant text in
+ * the logs the assistant reads back. Set DCM_MCP_RECEIVER_HOST=0.0.0.0 in the
+ * server environment when a modality or PACS elsewhere must reach it.
+ */
+const RECEIVER_HOST = process.env.DCM_MCP_RECEIVER_HOST || '127.0.0.1';
+
 /** How long to wait for a freshly spawned server to report that it is listening. */
 const START_TIMEOUT_MS = 15000;
 
@@ -473,6 +481,7 @@ function register(server, z, rt) {
         'It also speaks MPPS: N-CREATE opens a step, N-SET updates and closes it, and completing a step retires the matching worklist item, ' +
         'so the whole scheduled-to-performed loop can be rehearsed here with no RIS. keepPerformed leaves the item in place while the query itself is what is being tested. ' +
         'Without persist it acknowledges and discards the bytes. Omit port to have a free one picked for you. ' +
+        'It binds 127.0.0.1 only, unless this MCP server was started with DCM_MCP_RECEIVER_HOST set, so a sender on another machine cannot reach it by default. ' +
         'FAULT INJECTION: refuseNCreate, refuseNSet, findStatus, abortFindAfter and rejectAfter make it fail on purpose, which is how a client is tested against ' +
         'the answers a real peer gives on a bad day. Every one is off by default, every injected refusal is counted separately and names the flag in its Error Comment, ' +
         'and this tool repeats what was armed in its own answer — because an injected refusal must never be read as a finding about the client. ' +
@@ -522,10 +531,10 @@ function register(server, z, rt) {
     },
     async (a) => {
       const port = a.port ?? (await freePort());
-      const argv = ['scp', '--port', String(port)];
+      const argv = ['scp', `--port=${port}`, `--host=${RECEIVER_HOST}`];
       opt(argv, '--ae', a.ae);
       opt(argv, '--persist', a.persist ? path.resolve(a.persist) : undefined);
-      for (const ae of a.acceptCallingAe || []) argv.push('--accept-calling-ae', ae);
+      for (const ae of a.acceptCallingAe || []) argv.push(`--accept-calling-ae=${ae}`);
       opt(argv, '--worklist', a.worklist ? path.resolve(a.worklist) : undefined);
       if (a.keepPerformed) argv.push('--keep-performed');
 
@@ -541,7 +550,7 @@ function register(server, z, rt) {
       opt(argv, '--find-status', a.findStatus);
       opt(argv, '--abort-find-after', a.abortFindAfter);
 
-      const address = `127.0.0.1:${port}`;
+      const address = `${RECEIVER_HOST === '0.0.0.0' ? '127.0.0.1' : RECEIVER_HOST}:${port}`;
       const started = await launch({ kind: 'receiver', argv, port, address });
       if (!started.ok) return failure(started.text);
 
@@ -595,7 +604,7 @@ function register(server, z, rt) {
     },
     async (a) => {
       const port = a.port ?? (await freePort());
-      const argv = ['web', 'serve', '--port', String(port)];
+      const argv = ['web', 'serve', `--port=${port}`];
       opt(argv, '--persist', a.persist ? path.resolve(a.persist) : undefined);
       opt(argv, '--root', a.root ? path.resolve(a.root) : undefined);
       opt(argv, '--require-token', a.requireToken);

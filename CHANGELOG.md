@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — security
+
+For running `dcm mcp` in an assistant whose input can be steered by what it
+reads, and for the supply chain behind the binaries.
+
+- **DICOMweb credentials are pinned to `DCM_WEB_URL`.** Under `dcm mcp`, a
+  tool call naming another URL is sent without the token. With no
+  `DCM_WEB_URL` set, credentials are never sent at all. On the CLI, a `--url`
+  that differs from a set `DCM_WEB_URL` gets no credentials either.
+- **Receivers started through MCP bind 127.0.0.1.** Before this they listened
+  on every interface, while the tool reported `127.0.0.1`. `dcm scp --host`
+  (or `DCM_SCP_HOST`) chooses the interface on the CLI, where the default is
+  still every interface. `DCM_MCP_RECEIVER_HOST` sets it for MCP.
+- **A tool argument can no longer become a CLI flag.** A value that began with
+  `--`, such as an AE Title of `--serve=C:\`, used to parse as a flag and
+  reach options the tools deliberately don't offer.
+- **`DCM_MCP_ALLOWED_HOSTS`** limits which hosts the DIMSE and DICOMweb tools
+  may contact.
+- **Skipping TLS verification from MCP needs `DCM_WEB_INSECURE=1`** in the
+  server's environment.
+- **DICOMweb responses are capped** at `DCM_WEB_MAX_RESPONSE_MB` (default 2048)
+  rather than buffered without limit.
+- **The local DICOMweb hub refuses a foreign Host header** (421), which closes
+  DNS rebinding from a web page.
+- **The MCP server tells the client** that DICOM data in tool output is
+  untrusted and not instructions.
+- **Desktop app:** the study Modality was put into the page without escaping,
+  so a crafted file could navigate the window to a remote page that then had
+  the app's IPC bridge. Fixes:
+  - the value is now escaped;
+  - the window can no longer navigate or open new windows;
+  - IPC only answers the app's own page;
+  - `DCM_NO_SANDBOX` is ignored by installed builds.
+- **Installers fail closed.** `install.sh` and `install.ps1` refuse a release
+  with no checksum, or no checksum line for the asset, where they used to skip
+  verification. On Windows PowerShell 5.1, `install.ps1` used to receive the
+  checksum file as bytes, match nothing and install without verifying. That
+  is fixed.
+- **Dependencies:**
+  - `@modelcontextprotocol/sdk` 1.32.2, which clears the advisories in its
+    express, hono, qs, ip-address and proxy-addr tree;
+  - `zod` 4.6.7;
+  - `dcmjs` 0.52.2, overridden through `dcmjs-dimse` and `dcmjs-codecs`;
+  - `adm-zip` 0.6.1;
+  - `electron-updater` 6.8.11.
+
+  `npm audit --omit=dev` reports nothing for the CLI or the app.
+- **CI:**
+  - every action is pinned to a commit SHA;
+  - workflow tokens are read-only except in the publish jobs;
+  - checkouts no longer keep their credentials;
+  - the release builds drop the npm cache;
+  - the desktop build uses `npm ci`;
+  - CI fails on a high advisory in shipped dependencies;
+  - Dependabot covers npm and Actions;
+  - releases carry build-provenance attestations (`gh attestation verify`).
+
 ## v0.17.1
 
 **AscendI DICOM is now DICOM Tool.** The window, the Start menu, the splash,

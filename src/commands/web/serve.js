@@ -167,6 +167,27 @@ const FAILURE = Object.freeze({
   PROCESSING_FAILURE: 272, // 0x0110 — unparseable or unstorable part
 });
 
+/** Host names a loopback-bound hub accepts in the Host header. */
+const LOOPBACK_NAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+/**
+ * The hostname part of a Host header or bind address, lower-cased and without
+ * port or IPv6 brackets. Unparseable input yields '' (which matches nothing).
+ *
+ * @param {string} hostHeader
+ * @returns {string}
+ */
+function hostnameOf(hostHeader) {
+  const raw = String(hostHeader).trim();
+  // A bare IPv6 bind address (::1) is not valid inside an http:// authority.
+  const authority = raw.includes(':') && !raw.startsWith('[') && raw.split(':').length > 2 ? `[${raw}]` : raw;
+  try {
+    return new URL(`http://${authority}`).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Builds the DICOMweb hub as a plain node:http server. Exported so tests can
  * drive the shipped request handler in-process — the same reason scp.js
@@ -177,7 +198,7 @@ const FAILURE = Object.freeze({
  * `path` is present only when the bytes were kept (--persist or --root);
  * without it the instance is queryable but not retrievable.
  *
- * @param {object} config { persistDir?, rootDir?, requireToken?, rejectAfter?, maxBodyBytes? }
+ * @param {object} config { persistDir?, rootDir?, requireToken?, rejectAfter?, maxBodyBytes?, loopbackOnly? }
  * @param {object} stats  Mutable counters shared with the caller.
  * @returns {import('http').Server}
  */
@@ -791,6 +812,15 @@ function createWebServer(config, stats) {
     const url = new URL(req.url, 'http://hub.invalid');
     const isStow = req.method === 'POST';
 
+    // DNS rebinding: a web page can point its own hostname at 127.0.0.1 and
+    // then read this hub from the browser. A loopback hub only answers to a
+    // loopback name, which a rebound page cannot send.
+    if (config.loopbackOnly && req.headers.host && !LOOPBACK_NAMES.has(hostnameOf(req.headers.host))) {
+      stats.clientErrors += 1;
+      answerText(res, 421, 'Misdirected Request: this hub only answers to localhost / 127.0.0.1.', '(foreign Host header)');
+      return;
+    }
+
     // STOW logs its arrival with the part count, once the body is parsed.
     if (!isStow) {
       log.info(`${log.color.cyan('<-')} ${req.method} ${req.url}`);
@@ -942,7 +972,8 @@ async function run(parsed) {
     queries: 0, retrievedInstances: 0, notFound: 0, clientErrors: 0, errors: 0,
   };
 
-  const config = { persistDir, rootDir, requireToken, rejectAfter, maxBodyBytes };
+  const loopbackOnly = LOOPBACK_NAMES.has(hostnameOf(host));
+  const config = { persistDir, rootDir, requireToken, rejectAfter, maxBodyBytes, loopbackOnly };
   const server = createWebServer(config, stats);
 
   return new Promise((resolve) => {

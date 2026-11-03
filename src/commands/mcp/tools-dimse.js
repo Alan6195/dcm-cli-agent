@@ -348,7 +348,7 @@ function resolveScheduledDate(value) {
  * @returns {void}
  */
 function register(server, z, rt) {
-  const { runCommand, textResult, jsonResult, opt } = rt;
+  const { runCommand, textResult, jsonResult, opt, pos, pair, checkHost } = rt;
 
   /**
    * Connection parameters shared by every tool that opens an association.
@@ -376,7 +376,8 @@ function register(server, z, rt) {
    * @returns {string[]}
    */
   const peerArgv = (a) => {
-    const argv = ['--host', a.host, '--port', String(a.port), '--called-ae', a.calledAe];
+    checkHost(a.host);
+    const argv = [`--host=${a.host}`, `--port=${a.port}`, `--called-ae=${a.calledAe}`];
     opt(argv, '--calling-ae', a.callingAe);
     opt(argv, '--timeout', a.timeout);
     opt(argv, '--connect-timeout', a.connectTimeout);
@@ -537,7 +538,7 @@ function register(server, z, rt) {
     // Attached form is not available: `set` is pair-valued in the tokenizer, so
     // the next token is taken as its value even though it looks like a
     // matching key. Two tokens is therefore both correct and repeatable.
-    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push(`--set=${pair(k, v)}`);
     return a.raw ? '--json-raw' : '--json';
   };
 
@@ -619,7 +620,7 @@ function register(server, z, rt) {
       opt(argv, '--limit', a.limit);
       const output = inspectionArgv(argv, a);
       expectationArgv(argv, a);
-      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
+      for (const [k, v] of Object.entries(a.keys || {})) argv.push(pair(k, v));
       argv.push(output);
       return queryResult(await runCommand('find', argv));
     }
@@ -741,7 +742,7 @@ function register(server, z, rt) {
       // answers.
       const output = inspectionArgv(argv, { ...a, raw: true });
       expectationArgv(argv, a);
-      for (const [k, v] of pairs) argv.push(`${k}=${v}`);
+      for (const [k, v] of pairs) argv.push(pair(k, v));
       argv.push(output);
 
       return worklistResult(await runCommand('find', argv), a);
@@ -1148,7 +1149,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
+      const argv = [pos(a.path, 'path')];
       if (a.series) argv.push('--series');
       opt(argv, '--chunk', a.chunk);
       if (a.recurse === false) argv.push('--no-recurse');
@@ -1175,7 +1176,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
+      const argv = [pos(a.path, 'path')];
       opt(argv, '--filter', a.filter);
       opt(argv, '--value', a.value);
       if (a.privateOnly) argv.push('--private');
@@ -1210,7 +1211,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path, ...peerArgv(a)];
+      const argv = [pos(a.path, 'path'), ...peerArgv(a)];
       opt(argv, '--chunk', a.chunk);
       opt(argv, '--retry', a.retry);
       opt(argv, '--parallel', a.parallel);
@@ -1248,7 +1249,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path, '--out', a.out];
+      const argv = [pos(a.path, 'path'), `--out=${a.out}`];
       opt(argv, '--prefix', a.prefix);
       if (a.keepDescriptions) argv.push('--keep-descriptions');
       if (a.keepPrivate) argv.push('--keep-private');
@@ -1275,9 +1276,9 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
-      for (const [k, v] of Object.entries(a.set || {})) argv.push('--set', `${k}=${v}`);
-      for (const k of a.remove || []) argv.push('--remove', k);
+      const argv = [pos(a.path, 'path')];
+      for (const [k, v] of Object.entries(a.set || {})) argv.push(`--set=${pair(k, v)}`);
+      for (const k of a.remove || []) argv.push(`--remove=${k}`);
       // Neither given is left to the command, which explains the choice
       // between copying and overwriting far better than a schema error could.
       opt(argv, '--out', a.out);
@@ -1466,7 +1467,7 @@ function register(server, z, rt) {
     // whatever the flags and the worklist produced. Two tokens rather than the
     // attached form, because `set` is pair-valued in the tokenizer and the
     // token after it is taken as its value.
-    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push(`--set=${pair(k, v)}`);
 
     return { argv, stdin, row, handle };
   };
@@ -1841,7 +1842,7 @@ function register(server, z, rt) {
         throw err;
       }
 
-      const argv = ['perform', a.folder, ...peerArgv(a), ...plan.argv];
+      const argv = ['perform', pos(a.folder, 'folder'), ...peerArgv(a), ...plan.argv];
       opt(argv, '--store-host', a.storeHost);
       opt(argv, '--store-port', a.storePort);
       opt(argv, '--store-called-ae', a.storeCalledAe);
@@ -1950,7 +1951,7 @@ function register(server, z, rt) {
     async (a) => {
       const argv = ['update'];
       // Positional, and it must precede the flags the tokenizer reads.
-      if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+      if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(pos(a.mppsUid, 'mppsUid'));
       argv.push(...peerArgv(a));
 
       opt(argv, '--series-from', a.seriesFrom);
@@ -1994,7 +1995,7 @@ function register(server, z, rt) {
   const finishArgv = (verb, a) => {
     const argv = [verb];
     // The UID is positional and must precede the flags the tokenizer reads.
-    if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+    if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(pos(a.mppsUid, 'mppsUid'));
     argv.push(...peerArgv(a));
 
     opt(argv, '--series-from', a.seriesFrom);
