@@ -51,7 +51,7 @@
     "model-context-protocol"
   ],
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.115.0",
+    "@anthropic-ai/sdk": "^1.3.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "dcmjs": "^0.52.2",
     "dcmjs-dimse": "^0.3.4",
