@@ -23,12 +23,49 @@ const { spawn, execFile } = require('node:child_process');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs');
+const { fileURLToPath } = require('node:url');
 
 // Headless CI/smoke runs need Chromium's setuid sandbox disabled (e.g. running
-// as root in a container). Never enabled in a normal launch.
-if (process.env.DCM_NO_SANDBOX) {
+// as root in a container). Never enabled in a normal launch, and an installed
+// build ignores it: an environment variable must not be able to switch off
+// the renderer sandbox for a user's copy.
+if (process.env.DCM_NO_SANDBOX && !app.isPackaged) {
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('disable-gpu');
+}
+
+// Only the app's own page may drive IPC. Every handler below can start engine
+// runs, write settings or open dialogs, so a foreign page in the window — one
+// reached by a navigation the guards in createWindow somehow missed — must get
+// nothing. Wrapping ipcMain itself covers every handler, including ones added
+// later, rather than relying on each to remember the check.
+const TRUSTED_PAGE = path.join(__dirname, 'renderer', 'index.html');
+
+/** @param {Electron.IpcMainEvent|Electron.IpcMainInvokeEvent} event */
+function fromTrustedPage(event) {
+  const url = event.senderFrame && event.senderFrame.url;
+  if (!url || !url.startsWith('file:')) return false;
+  let sender;
+  try {
+    sender = fileURLToPath(url.split(/[?#]/)[0]);
+  } catch {
+    return false;
+  }
+  const same = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  return same(path.resolve(sender), path.resolve(TRUSTED_PAGE));
+}
+
+for (const method of ['handle', 'handleOnce', 'on', 'once']) {
+  const register = ipcMain[method].bind(ipcMain);
+  ipcMain[method] = (channel, listener) =>
+    register(channel, (event, ...rest) => {
+      if (!fromTrustedPage(event)) {
+        console.warn(`ipc ${channel} refused: sent by ${event.senderFrame && event.senderFrame.url}`);
+        if (method.startsWith('handle')) throw new Error('IPC refused: not sent by the app');
+        return undefined;
+      }
+      return listener(event, ...rest);
+    });
 }
 
 /** Resolve the engine's CLI entry script and its version, robustly. */
@@ -642,11 +679,14 @@ function createWindow(opts = {}) {
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Open external links in the OS browser, never in-app.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
+  // The window shows index.html and nothing else, ever. The page has no
+  // links and never navigates, so any navigation is something injected — and
+  // a page it reached would run with the preload's bridge. Refuse them all.
+  // New windows likewise: the one place the app opens a browser
+  // (update:open-releases) builds its own fixed URL in main.
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+  mainWindow.webContents.on('will-redirect', (event) => event.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   // Every way out comes through here before anything is stopped: a window
   // close, and app.quit() too (Cmd+Q, the macOS app menu, an update restart),

@@ -5955,7 +5955,7 @@ function renderInventory(j) {
       + `${pid.conflict ? `· ${identityClash(pid.values)}` : (pid.value ? `· ${esc(pid.value)}` : '')}</h3>
       <div class="uid">${esc(s.studyInstanceUid)}</div>
       <div class="study-meta">
-        <span><b>${(s.modalities || []).join(', ') || '—'}</b> modality</span>
+        <span><b>${esc((s.modalities || []).join(', ')) || '—'}</b> modality</span>
         <span><b>${s.seriesCount ?? (s.series ? s.series.length : '—')}</b> series</span>
         <span><b>${s.instanceCount ?? '—'}</b> instances</span>
         <span><b>${humanBytes(s.bytes)}</b></span>
@@ -6314,7 +6314,7 @@ function renameStudyCard(s) {
       <span>${desc}</span>
       <span>accession ${acc}</span>
       <span>date ${s.studyDate ? `<b>${esc(s.studyDate)}</b>` : '<b class="miss">none</b>'}</span>
-      <span><b>${(s.modalities || []).join(', ') || '—'}</b></span>
+      <span><b>${esc((s.modalities || []).join(', ')) || '—'}</b></span>
       <span><b>${s.seriesCount ?? '—'}</b> series</span>
       <span><b>${s.instanceCount ?? '—'}</b> instances</span>
     </div>
