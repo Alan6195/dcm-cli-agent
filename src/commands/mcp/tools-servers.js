@@ -723,4 +723,4 @@ function register(server, z, rt) {
   );
 }
 
-module.exports = { register, resolveCliCommand, MAX_SERVERS };
+module.exports = { register, resolveCliCommand, MAX_SERVERS, RECEIVER_HOST };

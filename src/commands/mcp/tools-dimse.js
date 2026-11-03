@@ -12,7 +12,7 @@
 
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { resolveCliCommand } = require('./tools-servers');
+const { resolveCliCommand, RECEIVER_HOST } = require('./tools-servers');
 
 /**
  * Transfer syntax names `dcm send --transfer-syntax` accepts, for the schema
@@ -995,7 +995,7 @@ function register(server, z, rt) {
           'Destination AE Title. THE PEER must already resolve it to a host and port; a title it has never heard of answers 0xA801 and moves nothing. Defaults to our calling AE when receiveDir is set.'
         ),
         receiveDir: z.string().optional().describe(
-          'WRITES FILES: absolute path of a folder to run a receiver over for the duration of the move. This is the only form whose arrivals can be counted against what the peer claims. Created if missing, and requires receivePort. Files already in it are snapshotted first, so a re-run counts only what THIS move delivered.'
+          'WRITES FILES: absolute path of a folder to run a receiver over for the duration of the move. This is the only form whose arrivals can be counted against what the peer claims. Created if missing, and requires receivePort. Files already in it are snapshotted first, so a re-run counts only what THIS move delivered. The receiver binds 127.0.0.1 unless this MCP server was started with DCM_MCP_RECEIVER_HOST, so a peer on another machine can only deliver when that is set (e.g. 0.0.0.0).'
         ),
         receivePort: z.number().int().optional().describe(
           'Port that receiver listens on. Required with receiveDir, and it has to be the port the peer has registered against the destination AE Title — a receiver listening where nobody registered it gives a move that completes and delivers nothing.'
@@ -1014,6 +1014,7 @@ function register(server, z, rt) {
       opt(argv, '--destination', a.destinationAe);
       opt(argv, '--receive', a.receiveDir);
       opt(argv, '--receive-port', a.receivePort);
+      if (a.receiveDir) opt(argv, '--receive-host', RECEIVER_HOST);
       argv.push('--json');
       return retrieveResult(await runCommand('move', argv), 'move');
     }
@@ -1238,12 +1239,14 @@ function register(server, z, rt) {
     {
       title: 'De-identify a folder',
       description:
-        'WRITES FILES: copies a folder into out with patient identifiers removed and UIDs remapped deterministically. The source folder is never modified, but out is created and filled. Best-effort, not certified: it does not touch pixel data, so burned-in annotations and scanned paperwork still carry identifiers, and identifiers nested inside sequences such as Structured Reports may survive. Inspect a sample with dcm_tags before sharing anything.',
+        'WRITES FILES: copies a folder into out with patient identifiers removed, following the DICOM PS3.15 Annex E Basic Profile at every depth of every sequence. Patient IDs, names and every instance UID (including references to them) are replaced with keyed HMAC pseudonyms: under a random key per run unless the DCM_ANON_KEY environment variable is set on the server, so two runs only give matching pseudonyms when that key is shared. Dates are shifted into the past by a per-patient offset unless keepDates. Patient age, sex, size and weight are removed unless keepPatientCharacteristics (needed for PET SUV). Overlays, curves and private tags are removed. The source folder is never modified, but out is created and filled. Best-effort, not certified: it does not touch pixel data, so burned-in annotations and scanned paperwork still carry identifiers. Inspect a sample with dcm_tags before sharing anything.',
       inputSchema: {
         path: z.string().describe('Source folder.'),
         out: z.string().describe('Destination folder, created if needed. Must be outside the source.'),
         prefix: z.string().optional().describe('Pseudonym prefix (default ANON).'),
         keepDescriptions: z.boolean().optional().describe('Keep Study/Series descriptions, which are removed by default.'),
+        keepDates: z.boolean().optional().describe('Keep dates unchanged. By default every date is shifted into the past by an offset that is the same for every file of one patient, so intervals survive.'),
+        keepPatientCharacteristics: z.boolean().optional().describe('Keep patient age, sex, size, weight, ethnic group, sex neutered, smoking and pregnancy status (the PS3.15 Annex E Retain Patient Characteristics Option), which are removed by default. Needed when PET SUV must still be computable.'),
         keepPrivate: z.boolean().optional().describe('Keep private and unrecognised tags, which are removed by default.'),
         recurse: z.boolean().optional().describe('Recurse into subfolders (default true).'),
       },
@@ -1252,6 +1255,8 @@ function register(server, z, rt) {
       const argv = [pos(a.path, 'path'), `--out=${a.out}`];
       opt(argv, '--prefix', a.prefix);
       if (a.keepDescriptions) argv.push('--keep-descriptions');
+      if (a.keepDates) argv.push('--keep-dates');
+      if (a.keepPatientCharacteristics) argv.push('--keep-patient-characteristics');
       if (a.keepPrivate) argv.push('--keep-private');
       if (a.recurse === false) argv.push('--no-recurse');
       return textResult(await runCommand('anon', argv), { successText: 'De-identified.' });

@@ -17,10 +17,13 @@ const { Server } = dcmjsDimse;
 const { CMoveRequest } = dcmjsDimse.requests;
 const { Status } = dcmjsDimse.constants;
 
+/** Addresses that only this machine can reach. */
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
+
 const FLAGS = [
   'host', 'port', 'called-ae', 'calling-ae',
   'study', 'series', 'instance',
-  'destination', 'receive', 'receive-port',
+  'destination', 'receive', 'receive-port', 'receive-host',
   'timeout', 'connect-timeout', 'association-timeout',
 ];
 
@@ -70,6 +73,8 @@ Options:
   --receive <dir>        Run a receiver here and write arrivals into <dir>.
   --receive-port <port>  Port for that receiver. Required with --receive.
                                                             [env DCM_SCP_PORT]
+  --receive-host <addr>  Interface that receiver binds. Default: every
+                         interface, since the peer is usually another machine.
   --timeout <ms>         Silence allowed before giving up. Default: 60000.
   --json                 Emit the move accounting as JSON.
   --verbose              Log the full association negotiation.
@@ -145,10 +150,10 @@ function dcmFilesUnder(root) {
  * sub-operations here is the shipped receiver rather than a stand-in that
  * might be more permissive than the real one.
  *
- * @param {{dir: string, port: number, ae: string}} config
+ * @param {{dir: string, port: number, ae: string, host?: string}} config
  * @returns {Promise<{stats: object, close: function}>}
  */
-async function startReceiver({ dir, port, ae }) {
+async function startReceiver({ dir, port, ae, host }) {
   const stats = {
     associations: 0, rejected: 0, echoes: 0, stored: 0,
     finds: 0, worklistMatches: 0, refused: 0, aborts: 0, errors: 0,
@@ -181,7 +186,8 @@ async function startReceiver({ dir, port, ae }) {
     server.once('error', reject);
     server.on('listening', resolve);
     try {
-      server.listen(port, { logCommandDatasets: log.isVerbose(), logDatasets: false });
+      // dcmjs-dimse hands this straight to net.Server#listen; see scp.js.
+      server.listen(host ? { port, host } : port, { logCommandDatasets: log.isVerbose(), logDatasets: false });
     } catch (err) {
       reject(err);
     }
@@ -298,6 +304,7 @@ async function execute(parsed) {
         'receiver it would be the port for.'
     );
   }
+  const receiveHost = args.resolve(flags, { name: 'receive-host' }) || undefined;
 
   const destinationRaw = args.resolve(flags, { name: 'destination' });
   if (!destinationRaw && !receiveDir) {
@@ -381,7 +388,7 @@ async function execute(parsed) {
     // let a previous run's files cover a shortfall in this one.
     before = dcmFilesUnder(receiveDir);
     try {
-      receiver = await startReceiver({ dir: receiveDir, port: receivePort, ae: destinationAe });
+      receiver = await startReceiver({ dir: receiveDir, port: receivePort, ae: destinationAe, host: receiveHost });
     } catch (err) {
       log.error(
         `could not listen on port ${receivePort}: ${err.message}. ` +
@@ -391,6 +398,12 @@ async function execute(parsed) {
       return 1;
     }
     log.info(`receiver listening on port ${receivePort} as AE ${destinationAe}`);
+    if (receiveHost && LOOPBACK.has(receiveHost) && !LOOPBACK.has(String(host).toLowerCase())) {
+      log.warn(
+        `the receiver is bound to ${receiveHost}, so ${host} cannot connect to deliver. ` +
+          'Under dcm mcp, start the server with DCM_MCP_RECEIVER_HOST=0.0.0.0 to receive from another machine.'
+      );
+    }
   }
 
   let arrivals = new Set();
