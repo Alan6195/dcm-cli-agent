@@ -24,6 +24,12 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    # 6.8.11 fails the desktop smoke harness: the clean retrieve's report goes
+    # missing from the Output pane. CI does not run that harness, so a
+    # Dependabot PR would pass CI anyway. Held back until someone works out why.
+    ignore:
+      - dependency-name: electron-updater
+        versions: [">=6.8.10"]
     groups:
       minor-and-patch:
         update-types: [minor, patch]

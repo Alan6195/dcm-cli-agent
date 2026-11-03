@@ -44,7 +44,11 @@ reads, and for the supply chain behind the binaries.
   - `zod` 4.6.7;
   - `dcmjs` 0.52.2, overridden through `dcmjs-dimse` and `dcmjs-codecs`;
   - `adm-zip` 0.6.1;
-  - `electron-updater` 6.8.11.
+  - `js-yaml` 4.3.2, under `electron-updater`.
+
+  `electron-updater` stays on 6.8.9. 6.8.11 has no security fix this needs,
+  and the desktop smoke harness fails on it: the retrieve report goes missing
+  from the Output pane.
 
   `npm audit --omit=dev` reports nothing for the CLI or the app.
 - **CI:**
