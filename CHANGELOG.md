@@ -1,5 +1,120 @@
 # Changelog
 
+## Unreleased — security
+
+For running `dcm mcp` in an assistant whose input can be steered by what it
+reads, and for the supply chain behind the binaries.
+
+- **Clone and use.** `.mcp.json` starts the MCP server from the checkout, and
+  installs its dependencies on first start, so Claude Code in this repo has
+  the DICOM tools with no setup. `.claude/settings.json`:
+  - pre-approves the read-only and loopback tools; sends, retrieves and edits
+    still ask;
+  - raises the MCP startup timeout to cover that first install.
+
+  `CLAUDE.md` explains the tools and the data rules. `npm run app` starts the
+  desktop app from source.
+- **`dcm anon` is now keyed and thorough.**
+  - **Keyed pseudonyms.** Pseudonyms and replacement UIDs are HMAC-SHA256 with
+    a secret key. Before, they were an unkeyed SHA-256 with a salt published in
+    the source, so anyone with the output could brute-force MRNs back and link
+    original UIDs. Set `DCM_ANON_KEY` for pseudonyms that repeat across runs
+    and machines. Without it, each run uses a random key: consistent within
+    the run, unlinkable between runs.
+  - **Every depth.** It walks every sequence at every depth: UIDs (including
+    multi-valued ones), person names, and the blank and remove lists.
+    References inside sequences now point at the remapped UIDs.
+  - **More attributes, per PS3.15 Annex E:**
+    - age, sex, weight and size;
+    - station AE title, requested procedure ID and other patient IDs;
+    - identification and institution code sequences;
+    - SR text;
+    - overlay (60xx) and curve (50xx) groups, which can carry burned-in text.
+  - **Dates** are shifted by a per-patient offset, so intervals survive.
+    `--keep-dates` keeps them.
+  - **`--keep-patient-characteristics`** (MCP: `keepPatientCharacteristics`)
+    keeps age, sex, size, weight, ethnic group, sex-neutered, smoking and
+    pregnancy status, per the PS3.15 Annex E Retain Patient Characteristics
+    Option, so PET SUV stays computable. By default they are removed.
+
+  Output from earlier versions will not match.
+- **`dcm move --receive` binds where it is told.** `--receive-host` chooses
+  the interface. Under MCP it follows `DCM_MCP_RECEIVER_HOST`, with
+  127.0.0.1 as the default. It warns when the peer is another machine and
+  cannot reach a loopback receiver.
+- **Desktop app on Electron 45**, up from 33, which was end of life. This
+  requires **macOS 13 or newer**. electron-builder 26 clears the critical
+  `tar` advisories and the high ones in the build tools.
+  - The engine now runs as a `utilityProcess` instead of the Electron binary
+    under `ELECTRON_RUN_AS_NODE`.
+  - So packaged builds can switch that off with fuses, along with
+    `NODE_OPTIONS`, `--inspect` and loading app code from outside the
+    integrity-checked asar.
+  - 15 moderate advisories remain, all one old `minimatch` inside
+    electron-builder's packaging tools. It only ever matches the build config
+    at build time.
+- **Signing is ready to switch on.** The desktop workflow signs Windows
+  through Azure Trusted Signing, and signs and notarizes macOS, as soon as the
+  repository has the secrets (see desktop/README.md). Once Windows is signed,
+  installed copies refuse an update that isn't signed by the same publisher.
+  Until the secrets exist the build is unchanged.
+
+- **DICOMweb credentials are pinned to `DCM_WEB_URL`.** Under `dcm mcp`, a
+  tool call naming another URL is sent without the token. With no
+  `DCM_WEB_URL` set, credentials are never sent at all. On the CLI, a `--url`
+  that differs from a set `DCM_WEB_URL` gets no credentials either.
+- **Receivers started through MCP bind 127.0.0.1.** Before this they listened
+  on every interface, while the tool reported `127.0.0.1`. `dcm scp --host`
+  (or `DCM_SCP_HOST`) chooses the interface on the CLI, where the default is
+  still every interface. `DCM_MCP_RECEIVER_HOST` sets it for MCP.
+- **A tool argument can no longer become a CLI flag.** A value that began with
+  `--`, such as an AE Title of `--serve=C:\`, used to parse as a flag and
+  reach options the tools deliberately don't offer.
+- **`DCM_MCP_ALLOWED_HOSTS`** limits which hosts the DIMSE and DICOMweb tools
+  may contact.
+- **Skipping TLS verification from MCP needs `DCM_WEB_INSECURE=1`** in the
+  server's environment.
+- **DICOMweb responses are capped** at `DCM_WEB_MAX_RESPONSE_MB` (default 2048)
+  rather than buffered without limit.
+- **The local DICOMweb hub refuses a foreign Host header** (421), which closes
+  DNS rebinding from a web page.
+- **The MCP server tells the client** that DICOM data in tool output is
+  untrusted and not instructions.
+- **Desktop app:** the study Modality was put into the page without escaping,
+  so a crafted file could navigate the window to a remote page that then had
+  the app's IPC bridge. Fixes:
+  - the value is now escaped;
+  - the window can no longer navigate or open new windows;
+  - IPC only answers the app's own page;
+  - `DCM_NO_SANDBOX` is ignored by installed builds.
+- **Installers fail closed.** `install.sh` and `install.ps1` refuse a release
+  with no checksum, or no checksum line for the asset, where they used to skip
+  verification. On Windows PowerShell 5.1, `install.ps1` used to receive the
+  checksum file as bytes, match nothing and install without verifying. That
+  is fixed.
+- **Dependencies:**
+  - `@modelcontextprotocol/sdk` 1.32.2, which clears the advisories in its
+    express, hono, qs, ip-address and proxy-addr tree;
+  - `zod` 4.6.7;
+  - `dcmjs` 0.52.2, overridden through `dcmjs-dimse` and `dcmjs-codecs`;
+  - `adm-zip` 0.6.1;
+  - `js-yaml` 4.3.2, under `electron-updater`.
+
+  `electron-updater` stays on 6.8.9. 6.8.11 has no security fix this needs,
+  and the desktop smoke harness fails on it: the retrieve report goes missing
+  from the Output pane.
+
+  `npm audit --omit=dev` reports nothing for the CLI or the app.
+- **CI:**
+  - every action is pinned to a commit SHA;
+  - workflow tokens are read-only except in the publish jobs;
+  - checkouts no longer keep their credentials;
+  - the release builds drop the npm cache;
+  - the desktop build uses `npm ci`;
+  - CI fails on a high advisory in shipped dependencies;
+  - Dependabot covers npm and Actions;
+  - releases carry build-provenance attestations (`gh attestation verify`).
+
 ## v0.17.1
 
 **AscendI DICOM is now DICOM Tool.** The window, the Start menu, the splash,

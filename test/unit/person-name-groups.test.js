@@ -344,14 +344,32 @@ test('de-identification does not merge two patients who share a romaji spelling'
     await studyNamed(one, JP);
     await studyNamed(two, 'Yamada^Tarou=山田^太一=やまだ^たいち');
 
+    // Pseudonyms are keyed, and without DCM_ANON_KEY every run draws a fresh
+    // random key — so two runs would differ whatever the hash covers, and this
+    // test would pass even if the kanji were ignored again. One shared key
+    // makes the two runs comparable: only the name can tell them apart.
+    const savedKey = process.env.DCM_ANON_KEY;
+    process.env.DCM_ANON_KEY = 'synthetic-person-name-groups-test-key';
     const anonymised = async (src, out) => {
       const { code } = await runCommand(anon, [src, '--out', out]);
       assert.equal(code, 0);
       return JSON.parse((await runCommand(info, [out, '--json'])).stdout).studies[0].patientName;
     };
 
-    const a = await anonymised(one, path.join(dir, 'anon-one'));
-    const b = await anonymised(two, path.join(dir, 'anon-two'));
+    let a;
+    let b;
+    let again;
+    try {
+      a = await anonymised(one, path.join(dir, 'anon-one'));
+      b = await anonymised(two, path.join(dir, 'anon-two'));
+      again = await anonymised(one, path.join(dir, 'anon-one-again'));
+    } finally {
+      if (savedKey === undefined) delete process.env.DCM_ANON_KEY;
+      else process.env.DCM_ANON_KEY = savedKey;
+    }
+    // The control: under one key the same patient is the same pseudonym, so
+    // the inequality below is about the name and not about the key.
+    assert.equal(again, a, 'one patient under one key must map to one pseudonym');
     assert.notEqual(a, b, 'two patients came out of de-identification as one');
     // Both are still replaced outright — the point is which hash they got, not
     // that anything of the original survived.

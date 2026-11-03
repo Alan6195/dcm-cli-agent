@@ -9,8 +9,10 @@ on:
         description: 'Tag to release (e.g. v0.2.0)'
         required: true
 
+# Builds only read. The write token is granted to the publish job alone, so
+# test code and dependency install scripts never run holding it.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -48,13 +50,14 @@ jobs:
             arch: x64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           architecture: ${{ matrix.arch }}
-          cache: npm
 
       - run: npm ci
       - run: npm test
@@ -67,8 +70,9 @@ jobs:
       # instead.
       - name: The binary's version must match the tag
         shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           EXPECTED="${TAG#v}"
           BIN="dist/dcm"
           [ "${{ runner.os }}" = "Windows" ] && BIN="dist/dcm.exe"
@@ -105,7 +109,7 @@ jobs:
                 || { echo "::error::${{ matrix.asset }} is not arm64: $info"; exit 1; } ;;
           esac
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.asset }}
           path: out/${{ matrix.asset }}
@@ -116,11 +120,17 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # sign the provenance attestation (Sigstore)
+      attestations: write # store it against the repo
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -133,6 +143,15 @@ jobs:
           ls -la
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      # SHA256SUMS only proves a download matches the release page. A build
+      # provenance attestation proves the binary was built by this workflow
+      # from this repo at this commit, so a swapped release asset fails
+      # `gh attestation verify` even if its checksum file was swapped too.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'artifacts/dcm-*'
 
       - name: Publish
         env:

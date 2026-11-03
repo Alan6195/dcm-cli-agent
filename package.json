@@ -35,7 +35,9 @@
     "fixtures": "node tools/make-fixtures.js",
     "bundle": "node tools/build.js bundle",
     "build": "node tools/build.js all",
-    "clean": "node tools/build.js clean"
+    "clean": "node tools/build.js clean",
+    "app": "node tools/app.js",
+    "mcp": "node tools/mcp-launch.js"
   },
   "keywords": [
     "dicom",
@@ -50,16 +52,17 @@
   ],
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "dcmjs": "^0.50.3",
-    "dcmjs-dimse": "^0.3.3",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "dcmjs": "^0.52.2",
+    "dcmjs-dimse": "^0.3.4",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
     "postject": "^1.0.0-alpha.6"
   },
   "overrides": {
-    "adm-zip": "^0.6.0"
+    "adm-zip": "^0.6.1",
+    "dcmjs": "$dcmjs"
   }
 }

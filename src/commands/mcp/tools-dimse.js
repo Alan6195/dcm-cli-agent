@@ -12,7 +12,7 @@
 
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { resolveCliCommand } = require('./tools-servers');
+const { resolveCliCommand, RECEIVER_HOST } = require('./tools-servers');
 
 /**
  * Transfer syntax names `dcm send --transfer-syntax` accepts, for the schema
@@ -348,7 +348,7 @@ function resolveScheduledDate(value) {
  * @returns {void}
  */
 function register(server, z, rt) {
-  const { runCommand, textResult, jsonResult, opt } = rt;
+  const { runCommand, textResult, jsonResult, opt, pos, pair, checkHost } = rt;
 
   /**
    * Connection parameters shared by every tool that opens an association.
@@ -376,7 +376,8 @@ function register(server, z, rt) {
    * @returns {string[]}
    */
   const peerArgv = (a) => {
-    const argv = ['--host', a.host, '--port', String(a.port), '--called-ae', a.calledAe];
+    checkHost(a.host);
+    const argv = [`--host=${a.host}`, `--port=${a.port}`, `--called-ae=${a.calledAe}`];
     opt(argv, '--calling-ae', a.callingAe);
     opt(argv, '--timeout', a.timeout);
     opt(argv, '--connect-timeout', a.connectTimeout);
@@ -537,7 +538,7 @@ function register(server, z, rt) {
     // Attached form is not available: `set` is pair-valued in the tokenizer, so
     // the next token is taken as its value even though it looks like a
     // matching key. Two tokens is therefore both correct and repeatable.
-    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push(`--set=${pair(k, v)}`);
     return a.raw ? '--json-raw' : '--json';
   };
 
@@ -619,7 +620,7 @@ function register(server, z, rt) {
       opt(argv, '--limit', a.limit);
       const output = inspectionArgv(argv, a);
       expectationArgv(argv, a);
-      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
+      for (const [k, v] of Object.entries(a.keys || {})) argv.push(pair(k, v));
       argv.push(output);
       return queryResult(await runCommand('find', argv));
     }
@@ -741,7 +742,7 @@ function register(server, z, rt) {
       // answers.
       const output = inspectionArgv(argv, { ...a, raw: true });
       expectationArgv(argv, a);
-      for (const [k, v] of pairs) argv.push(`${k}=${v}`);
+      for (const [k, v] of pairs) argv.push(pair(k, v));
       argv.push(output);
 
       return worklistResult(await runCommand('find', argv), a);
@@ -994,7 +995,7 @@ function register(server, z, rt) {
           'Destination AE Title. THE PEER must already resolve it to a host and port; a title it has never heard of answers 0xA801 and moves nothing. Defaults to our calling AE when receiveDir is set.'
         ),
         receiveDir: z.string().optional().describe(
-          'WRITES FILES: absolute path of a folder to run a receiver over for the duration of the move. This is the only form whose arrivals can be counted against what the peer claims. Created if missing, and requires receivePort. Files already in it are snapshotted first, so a re-run counts only what THIS move delivered.'
+          'WRITES FILES: absolute path of a folder to run a receiver over for the duration of the move. This is the only form whose arrivals can be counted against what the peer claims. Created if missing, and requires receivePort. Files already in it are snapshotted first, so a re-run counts only what THIS move delivered. The receiver binds 127.0.0.1 unless this MCP server was started with DCM_MCP_RECEIVER_HOST, so a peer on another machine can only deliver when that is set (e.g. 0.0.0.0).'
         ),
         receivePort: z.number().int().optional().describe(
           'Port that receiver listens on. Required with receiveDir, and it has to be the port the peer has registered against the destination AE Title — a receiver listening where nobody registered it gives a move that completes and delivers nothing.'
@@ -1013,6 +1014,7 @@ function register(server, z, rt) {
       opt(argv, '--destination', a.destinationAe);
       opt(argv, '--receive', a.receiveDir);
       opt(argv, '--receive-port', a.receivePort);
+      if (a.receiveDir) opt(argv, '--receive-host', RECEIVER_HOST);
       argv.push('--json');
       return retrieveResult(await runCommand('move', argv), 'move');
     }
@@ -1148,7 +1150,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
+      const argv = [pos(a.path, 'path')];
       if (a.series) argv.push('--series');
       opt(argv, '--chunk', a.chunk);
       if (a.recurse === false) argv.push('--no-recurse');
@@ -1175,7 +1177,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
+      const argv = [pos(a.path, 'path')];
       opt(argv, '--filter', a.filter);
       opt(argv, '--value', a.value);
       if (a.privateOnly) argv.push('--private');
@@ -1210,7 +1212,7 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path, ...peerArgv(a)];
+      const argv = [pos(a.path, 'path'), ...peerArgv(a)];
       opt(argv, '--chunk', a.chunk);
       opt(argv, '--retry', a.retry);
       opt(argv, '--parallel', a.parallel);
@@ -1237,20 +1239,24 @@ function register(server, z, rt) {
     {
       title: 'De-identify a folder',
       description:
-        'WRITES FILES: copies a folder into out with patient identifiers removed and UIDs remapped deterministically. The source folder is never modified, but out is created and filled. Best-effort, not certified: it does not touch pixel data, so burned-in annotations and scanned paperwork still carry identifiers, and identifiers nested inside sequences such as Structured Reports may survive. Inspect a sample with dcm_tags before sharing anything.',
+        'WRITES FILES: copies a folder into out with patient identifiers removed, following the DICOM PS3.15 Annex E Basic Profile at every depth of every sequence. Patient IDs, names and every instance UID (including references to them) are replaced with keyed HMAC pseudonyms: under a random key per run unless the DCM_ANON_KEY environment variable is set on the server, so two runs only give matching pseudonyms when that key is shared. Dates are shifted into the past by a per-patient offset unless keepDates. Patient age, sex, size and weight are removed unless keepPatientCharacteristics (needed for PET SUV). Overlays, curves and private tags are removed. The source folder is never modified, but out is created and filled. Best-effort, not certified: it does not touch pixel data, so burned-in annotations and scanned paperwork still carry identifiers. Inspect a sample with dcm_tags before sharing anything.',
       inputSchema: {
         path: z.string().describe('Source folder.'),
         out: z.string().describe('Destination folder, created if needed. Must be outside the source.'),
         prefix: z.string().optional().describe('Pseudonym prefix (default ANON).'),
         keepDescriptions: z.boolean().optional().describe('Keep Study/Series descriptions, which are removed by default.'),
+        keepDates: z.boolean().optional().describe('Keep dates unchanged. By default every date is shifted into the past by an offset that is the same for every file of one patient, so intervals survive.'),
+        keepPatientCharacteristics: z.boolean().optional().describe('Keep patient age, sex, size, weight, ethnic group, sex neutered, smoking and pregnancy status (the PS3.15 Annex E Retain Patient Characteristics Option), which are removed by default. Needed when PET SUV must still be computable.'),
         keepPrivate: z.boolean().optional().describe('Keep private and unrecognised tags, which are removed by default.'),
         recurse: z.boolean().optional().describe('Recurse into subfolders (default true).'),
       },
     },
     async (a) => {
-      const argv = [a.path, '--out', a.out];
+      const argv = [pos(a.path, 'path'), `--out=${a.out}`];
       opt(argv, '--prefix', a.prefix);
       if (a.keepDescriptions) argv.push('--keep-descriptions');
+      if (a.keepDates) argv.push('--keep-dates');
+      if (a.keepPatientCharacteristics) argv.push('--keep-patient-characteristics');
       if (a.keepPrivate) argv.push('--keep-private');
       if (a.recurse === false) argv.push('--no-recurse');
       return textResult(await runCommand('anon', argv), { successText: 'De-identified.' });
@@ -1275,9 +1281,9 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = [a.path];
-      for (const [k, v] of Object.entries(a.set || {})) argv.push('--set', `${k}=${v}`);
-      for (const k of a.remove || []) argv.push('--remove', k);
+      const argv = [pos(a.path, 'path')];
+      for (const [k, v] of Object.entries(a.set || {})) argv.push(`--set=${pair(k, v)}`);
+      for (const k of a.remove || []) argv.push(`--remove=${k}`);
       // Neither given is left to the command, which explains the choice
       // between copying and overwriting far better than a schema error could.
       opt(argv, '--out', a.out);
@@ -1466,7 +1472,7 @@ function register(server, z, rt) {
     // whatever the flags and the worklist produced. Two tokens rather than the
     // attached form, because `set` is pair-valued in the tokenizer and the
     // token after it is taken as its value.
-    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push('--set', `${k}=${v}`);
+    for (const [k, v] of Object.entries(a.injectVerbatim || {})) argv.push(`--set=${pair(k, v)}`);
 
     return { argv, stdin, row, handle };
   };
@@ -1841,7 +1847,7 @@ function register(server, z, rt) {
         throw err;
       }
 
-      const argv = ['perform', a.folder, ...peerArgv(a), ...plan.argv];
+      const argv = ['perform', pos(a.folder, 'folder'), ...peerArgv(a), ...plan.argv];
       opt(argv, '--store-host', a.storeHost);
       opt(argv, '--store-port', a.storePort);
       opt(argv, '--store-called-ae', a.storeCalledAe);
@@ -1950,7 +1956,7 @@ function register(server, z, rt) {
     async (a) => {
       const argv = ['update'];
       // Positional, and it must precede the flags the tokenizer reads.
-      if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+      if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(pos(a.mppsUid, 'mppsUid'));
       argv.push(...peerArgv(a));
 
       opt(argv, '--series-from', a.seriesFrom);
@@ -1994,7 +2000,7 @@ function register(server, z, rt) {
   const finishArgv = (verb, a) => {
     const argv = [verb];
     // The UID is positional and must precede the flags the tokenizer reads.
-    if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(String(a.mppsUid));
+    if (a.mppsUid !== undefined && a.mppsUid !== '') argv.push(pos(a.mppsUid, 'mppsUid'));
     argv.push(...peerArgv(a));
 
     opt(argv, '--series-from', a.seriesFrom);

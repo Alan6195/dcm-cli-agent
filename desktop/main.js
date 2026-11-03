@@ -10,25 +10,65 @@
  * here to drift out of sync with the tool the support team already trusts.
  *
  * How the engine is invoked:
- *   Electron ships its own Node. With ELECTRON_RUN_AS_NODE=1 the Electron
- *   binary behaves as plain Node, so we spawn it against the engine's own
- *   entry script (bin/dcm.js) and stream its stdout/stderr back to the
- *   renderer line by line. That gives live progress for `send` and a
- *   long-lived, cancellable child for the `scp` receiver, with the engine
- *   code reused verbatim.
+ *   Electron ships its own Node. Each run is a utilityProcess, a Node child
+ *   of this app, started on the engine's own entry script (bin/dcm.js); its
+ *   stdout/stderr stream back to the renderer line by line. That gives live
+ *   progress for `send` and a long-lived, cancellable child for the `scp`
+ *   receiver, with the engine code reused verbatim. (It used to be the
+ *   Electron binary itself under ELECTRON_RUN_AS_NODE=1. The packaged build now
+ *   switches that variable off with the RunAsNode fuse, because it let anyone
+ *   run arbitrary code as this app; see after-pack.js.)
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell, net, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, net, screen, utilityProcess } = require('electron');
+const { EventEmitter } = require('node:events');
 const { spawn, execFile } = require('node:child_process');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs');
+const { fileURLToPath } = require('node:url');
 
 // Headless CI/smoke runs need Chromium's setuid sandbox disabled (e.g. running
-// as root in a container). Never enabled in a normal launch.
-if (process.env.DCM_NO_SANDBOX) {
+// as root in a container). Never enabled in a normal launch, and an installed
+// build ignores it: an environment variable must not be able to switch off
+// the renderer sandbox for a user's copy.
+if (process.env.DCM_NO_SANDBOX && !app.isPackaged) {
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('disable-gpu');
+}
+
+// Only the app's own page may drive IPC. Every handler below can start engine
+// runs, write settings or open dialogs, so a foreign page in the window — one
+// reached by a navigation the guards in createWindow somehow missed — must get
+// nothing. Wrapping ipcMain itself covers every handler, including ones added
+// later, rather than relying on each to remember the check.
+const TRUSTED_PAGE = path.join(__dirname, 'renderer', 'index.html');
+
+/** @param {Electron.IpcMainEvent|Electron.IpcMainInvokeEvent} event */
+function fromTrustedPage(event) {
+  const url = event.senderFrame && event.senderFrame.url;
+  if (!url || !url.startsWith('file:')) return false;
+  let sender;
+  try {
+    sender = fileURLToPath(url.split(/[?#]/)[0]);
+  } catch {
+    return false;
+  }
+  const same = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  return same(path.resolve(sender), path.resolve(TRUSTED_PAGE));
+}
+
+for (const method of ['handle', 'handleOnce', 'on', 'once']) {
+  const register = ipcMain[method].bind(ipcMain);
+  ipcMain[method] = (channel, listener) =>
+    register(channel, (event, ...rest) => {
+      if (!fromTrustedPage(event)) {
+        console.warn(`ipc ${channel} refused: sent by ${event.senderFrame && event.senderFrame.url}`);
+        if (method.startsWith('handle')) throw new Error('IPC refused: not sent by the app');
+        return undefined;
+      }
+      return listener(event, ...rest);
+    });
 }
 
 /** Resolve the engine's CLI entry script and its version, robustly. */
@@ -642,11 +682,14 @@ function createWindow(opts = {}) {
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Open external links in the OS browser, never in-app.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
+  // The window shows index.html and nothing else, ever. The page has no
+  // links and never navigates, so any navigation is something injected — and
+  // a page it reached would run with the preload's bridge. Refuse them all.
+  // New windows likewise: the one place the app opens a browser
+  // (update:open-releases) builds its own fixed URL in main.
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+  mainWindow.webContents.on('will-redirect', (event) => event.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   // Every way out comes through here before anything is stopped: a window
   // close, and app.quit() too (Cmd+Q, the macOS app menu, an update restart),
@@ -780,6 +823,81 @@ function makeChunkPump(runId, send) {
 }
 
 /**
+ * Starts `modulePath` as a Node child of this app, on Electron's own Node.
+ *
+ * Returns an object shaped like the ChildProcess the rest of this file was
+ * written against, so startRun and stopChild did not have to change:
+ * stdout/stderr streams, pid, exitCode/signalCode, kill(), and 'exit' and
+ * 'close' events. As with a ChildProcess, 'close' waits until the process has
+ * exited AND both pipes have ended, so no output can arrive after it. A
+ * process this side killed reports the signal it was sent and a null code,
+ * which is what spawn() reported and what the renderer reads as "stopped".
+ *
+ * @param {string} modulePath
+ * @param {string[]} args
+ * @param {{cwd: string, env: object}} options
+ */
+function launchEngine(modulePath, args, { cwd, env }) {
+  const proc = utilityProcess.fork(modulePath, args, {
+    cwd,
+    env,
+    stdio: 'pipe',
+    serviceName: 'DICOM Tool engine',
+  });
+  const child = new EventEmitter();
+  child.stdout = proc.stdout;
+  child.stderr = proc.stderr;
+  child.exitCode = null;
+  child.signalCode = null;
+  Object.defineProperty(child, 'pid', { get: () => proc.pid });
+
+  let killSignal = null;
+  let exited = false;
+  let closed = false;
+  const ended = new Set();
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    child.emit('close', child.exitCode, child.signalCode);
+  };
+  const maybeClose = () => {
+    if (exited && ended.size === 2) close();
+  };
+  for (const [name, stream] of [['stdout', proc.stdout], ['stderr', proc.stderr]]) {
+    const done = () => {
+      ended.add(name);
+      maybeClose();
+    };
+    stream.once('end', done);
+    stream.once('close', done);
+  }
+  proc.once('exit', (code) => {
+    exited = true;
+    if (killSignal) child.signalCode = killSignal;
+    else child.exitCode = code;
+    child.emit('exit', child.exitCode, child.signalCode);
+    maybeClose();
+    // A grandchild holding a pipe open must not keep the run "running" forever.
+    setTimeout(close, 2000).unref();
+  });
+
+  child.kill = (signal = 'SIGTERM') => {
+    if (exited) return false;
+    killSignal = signal;
+    if (signal === 'SIGKILL' && proc.pid) {
+      try {
+        process.kill(proc.pid, 'SIGKILL');
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return proc.kill();
+  };
+  return child;
+}
+
+/**
  * Starts an engine command and streams its output to the calling renderer.
  *
  * @param {Electron.IpcMainInvokeEvent} event
@@ -799,17 +917,17 @@ function startRun(event, payload) {
   const script = SMOKE_UNPACKAGED && argv[0] === '__script__' ? argv[1] : null;
   const spawnArgs = script ? [script, ...argv.slice(2)] : [ENGINE.entry, ...argv];
 
-  const child = spawn(process.execPath, spawnArgs, {
+  // engine-host.js runs the command and supplies the exit a utility process
+  // would otherwise never make; see the note at its top.
+  const child = launchEngine(path.join(__dirname, 'engine-host.js'), spawnArgs, {
     cwd,
     env: {
       ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
       NO_COLOR: '1',
       // Keep the engine from probing for a TTY-driven menu; a piped stdin is
       // already non-interactive, this is belt and suspenders.
       DCM_NONINTERACTIVE: '1',
     },
-    windowsHide: true,
   });
 
   children.set(runId, child);

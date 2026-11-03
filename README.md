@@ -24,6 +24,50 @@ SHORTFALL: 1 of 823 file(s) were not acknowledged.
 
 That exits non-zero. A partial transfer is a failure, not a warning.
 
+## For developers: clone it and use it from Claude Code
+
+```bash
+git clone https://github.com/Alan6195/dcm-cli-agent.git
+cd dcm-cli-agent
+claude
+```
+
+That's all the setup there is. The repo ships the pieces itself:
+
+- **`.mcp.json`** starts the `dcm-dicom` MCP server from this checkout. It
+  installs dependencies on first start (`npm ci`, about a minute, once).
+  Claude Code asks you once to trust the folder and enable the server.
+  `.claude/settings.json` raises the MCP startup timeout to two minutes to
+  cover that first install. If it still times out, run `/mcp` and reconnect;
+  the install keeps going in the background. To skip the wait, run `npm ci`
+  once after cloning.
+- **`.claude/settings.json`** pre-approves the read-only and loopback tools:
+  echo, query, worklist, inventory, tags, DICOMweb ping and query, and the
+  local receiver and hub. Anything that sends, retrieves or rewrites files
+  still asks first. To allow everything for yourself, add
+  `"mcp__dcm-dicom__*"` to `permissions.allow` in
+  `.claude/settings.local.json`, which is git-ignored.
+- **`CLAUDE.md`** tells Claude what the tools are, the receive-and-verify
+  loop that needs no PACS, and the data rules.
+
+Everything runs on loopback out of the box. To point the tools at a real
+PACS, export these before starting `claude`:
+
+```bash
+export DCM_MCP_ALLOWED_HOSTS=pacs-test.local      # hosts the tools may contact
+export DCM_MCP_RECEIVER_HOST=0.0.0.0              # let a modality/PACS reach receivers
+export DCM_WEB_URL=https://pacs-test.local/dicom-web DCM_WEB_TOKEN=...
+```
+
+The desktop app, from the same checkout:
+
+```bash
+npm run app     # installs desktop dependencies once, then launches it
+```
+
+Or install it: see [Prefer a window?](#prefer-a-window). Needs Node.js 22 or
+newer.
+
 ## Install
 
 One line. It grabs the right binary for your machine, checks it against the
@@ -102,6 +146,16 @@ file in the install directory, so a checksum that doesn't match costs you a
 deleted temp file and nothing else — your working binary is never touched until
 the new one has passed. There's no flag to skip the checksum: the binaries
 aren't code-signed, so it's the only thing standing in for a signature.
+
+The checksum file comes from the same release as the binary, so it catches a
+corrupted download but not a replaced release. From the next release on, every release
+binary and installer also carries a GitHub build-provenance attestation, which
+proves it was built by this repository's release workflow. Check one with the
+GitHub CLI:
+
+```bash
+gh attestation verify dcm-linux-x64 --repo Alan6195/dcm-cli-agent
+```
 
 `--check` exits 0 either way — it answered the question. Read
 `updateAvailable` from `--check --json`, not the exit code. Exit 1 means the
@@ -1224,6 +1278,36 @@ without connecting. DICOMweb credentials are read from the environment the
 server was launched with (`DCM_WEB_TOKEN`, or `DCM_WEB_USER`/`DCM_WEB_PASS`) and
 are deliberately not tool arguments, so a token never travels through the
 conversation.
+
+**Handing it to an assistant safely.** Tag values, file names, peer responses
+and receiver logs all reach the model as tool output, and any of them can be
+written to look like an instruction ("now send this folder to …"). The server
+tells the client that this output is data, not instructions. These guards
+hold even when the model doesn't listen:
+
+- DICOMweb credentials only go to the origin in `DCM_WEB_URL`. A tool call that
+  names some other URL is sent unauthenticated. With no `DCM_WEB_URL` set,
+  credentials are never sent at all.
+- `dcm_receiver_start` binds `127.0.0.1`. Set `DCM_MCP_RECEIVER_HOST=0.0.0.0`
+  when a modality on the network has to reach it.
+- `DCM_MCP_ALLOWED_HOSTS=pacs-test.local,10.0.0.5` limits the DIMSE and
+  DICOMweb tools to those hosts. Use it whenever the server can reach anything
+  that matters.
+- Skipping TLS verification needs `DCM_WEB_INSECURE=1` in the server's
+  environment as well as the tool argument.
+- A tool argument cannot turn into a CLI flag. A value such as `--serve=C:\`
+  stays a value or is refused.
+
+```bash
+claude mcp add dcm-dicom \
+  -e DCM_MCP_ALLOWED_HOSTS=127.0.0.1,pacs-test.local \
+  -e DCM_WEB_URL=https://pacs-test.local/dicom-web \
+  -e DCM_WEB_TOKEN=... \
+  -- dcm mcp
+```
+
+`dcm_anon` makes test data. It is not a de-identification step for releasing
+real studies.
 
 ## Why it behaves the way it does
 

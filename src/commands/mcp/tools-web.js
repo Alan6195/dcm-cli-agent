@@ -49,7 +49,27 @@ const CREDS_NOTE =
  * @returns {void}
  */
 function register(server, z, rt) {
-  const { runCommand, textResult, jsonResult, opt } = rt;
+  const { runCommand, textResult, jsonResult, opt, pos, pair, checkHost } = rt;
+
+  /**
+   * A URL the assistant passed, checked against DCM_MCP_ALLOWED_HOSTS. Omitted,
+   * the command falls back to DCM_WEB_URL, which the environment set and so
+   * needs no check. One that does not parse is left for the command to refuse.
+   *
+   * @param {string|undefined} url
+   * @returns {string|undefined}
+   */
+  const webUrl = (url) => {
+    if (url === undefined || url === '') return url;
+    let host;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return url;
+    }
+    checkHost(host);
+    return url;
+  };
 
   // ---- DICOMweb ----------------------------------------------------------
   // Credentials are read from the environment the MCP server was launched
@@ -73,7 +93,7 @@ function register(server, z, rt) {
     },
     async (a) => {
       const argv = ['ping'];
-      opt(argv, '--url', a.url);
+      opt(argv, '--url', webUrl(a.url));
       opt(argv, '--timeout', a.timeout);
       if (a.insecure) argv.push('--insecure');
       return textResult(await runCommand('web', argv));
@@ -107,8 +127,8 @@ function register(server, z, rt) {
       },
     },
     async (a) => {
-      const argv = ['send', a.folder];
-      opt(argv, '--url', a.url);
+      const argv = ['send', pos(a.folder, 'folder')];
+      opt(argv, '--url', webUrl(a.url));
       opt(argv, '--chunk', a.chunk);
       opt(argv, '--retry', a.retry);
       opt(argv, '--timeout', a.timeout);
@@ -160,8 +180,8 @@ function register(server, z, rt) {
       // followed by a key=value token is the one ordering where the tokenizer
       // has to decide whether the key is the switch's value.
       const argv = ['query'];
-      opt(argv, '--url', a.url);
-      for (const [k, v] of Object.entries(a.keys || {})) argv.push(`${k}=${v}`);
+      opt(argv, '--url', webUrl(a.url));
+      for (const [k, v] of Object.entries(a.keys || {})) argv.push(pair(k, v));
       opt(argv, '--limit', a.limit);
       opt(argv, '--offset', a.offset);
       // --include is repeatable in the engine, so one switch per attribute is
@@ -202,7 +222,7 @@ function register(server, z, rt) {
     },
     async (a) => {
       const argv = ['retrieve'];
-      opt(argv, '--url', a.url);
+      opt(argv, '--url', webUrl(a.url));
       opt(argv, '--study', a.studyUid);
       opt(argv, '--series', a.seriesUid);
       opt(argv, '--instance', a.instanceUid);
