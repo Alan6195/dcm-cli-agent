@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.dcm-installing
 
 # Build output / single-executable artifacts
 dist/

@@ -24,6 +24,50 @@ SHORTFALL: 1 of 823 file(s) were not acknowledged.
 
 That exits non-zero. A partial transfer is a failure, not a warning.
 
+## For developers: clone it and use it from Claude Code
+
+```bash
+git clone https://github.com/Alan6195/dcm-cli-agent.git
+cd dcm-cli-agent
+claude
+```
+
+That's all the setup there is. The repo ships the pieces itself:
+
+- **`.mcp.json`** starts the `dcm-dicom` MCP server from this checkout. It
+  installs dependencies on first start (`npm ci`, about a minute, once).
+  Claude Code asks you once to trust the folder and enable the server.
+  `.claude/settings.json` raises the MCP startup timeout to two minutes to
+  cover that first install. If it still times out, run `/mcp` and reconnect;
+  the install keeps going in the background. To skip the wait, run `npm ci`
+  once after cloning.
+- **`.claude/settings.json`** pre-approves the read-only and loopback tools:
+  echo, query, worklist, inventory, tags, DICOMweb ping and query, and the
+  local receiver and hub. Anything that sends, retrieves or rewrites files
+  still asks first. To allow everything for yourself, add
+  `"mcp__dcm-dicom__*"` to `permissions.allow` in
+  `.claude/settings.local.json`, which is git-ignored.
+- **`CLAUDE.md`** tells Claude what the tools are, the receive-and-verify
+  loop that needs no PACS, and the data rules.
+
+Everything runs on loopback out of the box. To point the tools at a real
+PACS, export these before starting `claude`:
+
+```bash
+export DCM_MCP_ALLOWED_HOSTS=pacs-test.local      # hosts the tools may contact
+export DCM_MCP_RECEIVER_HOST=0.0.0.0              # let a modality/PACS reach receivers
+export DCM_WEB_URL=https://pacs-test.local/dicom-web DCM_WEB_TOKEN=...
+```
+
+The desktop app, from the same checkout:
+
+```bash
+npm run app     # installs desktop dependencies once, then launches it
+```
+
+Or install it: see [Prefer a window?](#prefer-a-window). Needs Node.js 22 or
+newer.
+
 ## Install
 
 One line. It grabs the right binary for your machine, checks it against the

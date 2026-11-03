@@ -1,0 +1,24 @@
+{
+  "env": {
+    "MCP_TIMEOUT": "120000"
+  },
+  "enabledMcpjsonServers": [
+    "dcm-dicom"
+  ],
+  "permissions": {
+    "allow": [
+      "mcp__dcm-dicom__dcm_echo",
+      "mcp__dcm-dicom__dcm_query",
+      "mcp__dcm-dicom__dcm_worklist",
+      "mcp__dcm-dicom__dcm_inventory",
+      "mcp__dcm-dicom__dcm_tags",
+      "mcp__dcm-dicom__dcm_web_ping",
+      "mcp__dcm-dicom__dcm_web_query",
+      "mcp__dcm-dicom__dcm_receiver_start",
+      "mcp__dcm-dicom__dcm_web_hub_start",
+      "mcp__dcm-dicom__dcm_servers_list",
+      "mcp__dcm-dicom__dcm_server_status",
+      "mcp__dcm-dicom__dcm_server_stop"
+    ]
+  }
+}
