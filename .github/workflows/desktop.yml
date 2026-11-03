@@ -10,6 +10,10 @@ on:
         type: boolean
         default: false
 
+# Builds only read; the release job below asks for write on its own.
+permissions:
+  contents: read
+
 # The engine is reused verbatim by the desktop app (file:.. dependency), so the
 # app is built straight from this repo. Installers are per-OS.
 #
@@ -46,13 +50,13 @@ jobs:
             label: macos
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
 
       # The desktop version is load-bearing: it becomes the version in
       # latest.yml, which is the sole input to the installed app's update decision. A tag on
@@ -62,8 +66,9 @@ jobs:
       - name: The app's version must match the tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.ref_name }}"
           EXPECTED="${TAG#desktop-}"
           EXPECTED="${EXPECTED#v}"
           ACTUAL="$(node -p "require('./desktop/package.json').version")"
@@ -75,7 +80,9 @@ jobs:
 
       - name: Install desktop dependencies
         working-directory: desktop
-        run: npm install
+        # ci, not install: the lockfile is the contract. install would quietly
+        # resolve a newer version of anything with a caret range.
+        run: npm ci
 
       - name: Build installers
         working-directory: desktop
@@ -137,7 +144,7 @@ jobs:
             -exec cp {} out/ \; || true
           ls -la out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dicom-tool-${{ matrix.label }}
           path: desktop/out/*
@@ -150,17 +157,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write # create the release and upload assets
+      id-token: write # sign the provenance attestation (Sigstore)
+      attestations: write # store it against the repo
     steps:
       # The release body comes from a file in the repo, so the repo has to be
       # checked out here. Checkout goes first: it cleans the workspace, which
       # would wipe the downloaded artifacts if it ran after them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
+
+      # Lets anyone check an installer came from this workflow and this repo:
+      #   gh attestation verify DICOM-Tool-<v>-x64-setup.exe --repo Alan6195/dcm-cli-agent
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.exe
+            artifacts/*.dmg
 
       - name: Publish installers
         env:

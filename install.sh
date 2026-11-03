@@ -75,22 +75,23 @@ step "Downloading $asset"
 curl -fsSL "$url" -o "$tmp/$asset" || die "download failed: $url"
 
 # --- Verify -------------------------------------------------------------------
+# Fails closed: a release with no checksum file, or a checksum file with no
+# line for this asset, is refused rather than installed unverified.
 sums_url="https://github.com/$REPO/releases/download/$tag/SHA256SUMS.txt"
-if curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS.txt" 2>/dev/null; then
-  step "Verifying checksum"
-  expected="$(grep "$asset" "$tmp/SHA256SUMS.txt" | awk '{print $1}' | head -1)"
-  if [ -n "$expected" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-    else
-      actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
-    fi
-    [ "$actual" = "$expected" ] || die "checksum mismatch: expected $expected, got $actual. Not installing."
-    dim "OK  $actual"
-  fi
+curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS.txt" \
+  || die "$tag publishes no SHA256SUMS.txt, so the download cannot be verified. Not installing. Pick a newer release with DCM_VERSION."
+step "Verifying checksum"
+# Match the filename field exactly (sha256sum may prefix it with '*' for
+# binary mode), not as a substring of the line.
+expected="$(awk -v a="$asset" '{ f = $2; sub(/^\*/, "", f) } f == a { print $1; exit }' "$tmp/SHA256SUMS.txt")"
+[ -n "$expected" ] || die "SHA256SUMS.txt for $tag has no entry for $asset. Not installing."
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
 else
-  dim "no SHA256SUMS.txt for this release; skipping verification"
+  actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
 fi
+[ "$actual" = "$expected" ] || die "checksum mismatch: expected $expected, got $actual. Not installing."
+dim "OK  $actual"
 
 # --- Install ------------------------------------------------------------------
 step "Installing to $INSTALL_DIR"

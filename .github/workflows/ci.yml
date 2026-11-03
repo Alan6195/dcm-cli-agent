@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Tests and builds need to read the repo and nothing else. Without this block
+# the token gets whatever the repository default is, which may be write.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -16,14 +21,23 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
 
       - run: npm ci
+
+      # Fail the build on a known high or critical advisory in anything that
+      # ships (dependencies, not devDependencies). Dependabot raises the PRs;
+      # this stops one being merged around.
+      - name: Audit shipped dependencies
+        if: runner.os == 'Linux'
+        run: npm audit --omit=dev --audit-level=high
 
       # The suite starts real DIMSE receivers on loopback and transfers
       # synthetic studies through them, so it is a genuine end-to-end check on

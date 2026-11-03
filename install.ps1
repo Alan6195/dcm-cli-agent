@@ -68,22 +68,33 @@ try {
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $downloaded -UseBasicParsing
 
     # --- Verify ---------------------------------------------------------------
+    # Fails closed: a release with no checksum file, or a checksum file with
+    # no line for this asset, is refused rather than installed unverified.
     $sums = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' }
-    if ($sums) {
-        Write-Step 'Verifying checksum'
-        $sumsText = (Invoke-WebRequest -Uri $sums.browser_download_url -UseBasicParsing).Content
-        $expected = ($sumsText -split "`n" |
-            Where-Object { $_ -match [regex]::Escape($assetName) } |
-            Select-Object -First 1) -split '\s+' | Select-Object -First 1
-
-        $actual = (Get-FileHash $downloaded -Algorithm SHA256).Hash.ToLower()
-        if ($expected -and $actual -ne $expected.ToLower()) {
-            throw "Checksum mismatch. Expected $expected but got $actual. Not installing."
-        }
-        Write-Note "OK  $actual"
-    } else {
-        Write-Note 'No SHA256SUMS.txt published for this release; skipping verification'
+    if (-not $sums) {
+        throw "$tag publishes no SHA256SUMS.txt, so the download cannot be verified. Not installing. Pick a newer release with -Version."
     }
+    Write-Step 'Verifying checksum'
+    $sumsBytes = (Invoke-WebRequest -Uri $sums.browser_download_url -UseBasicParsing).Content
+    # A .txt asset is served as application/octet-stream, which Windows
+    # PowerShell hands back as bytes rather than a string.
+    $sumsText = if ($sumsBytes -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($sumsBytes) } else { [string]$sumsBytes }
+    # Match the filename field exactly (sha256sum may prefix it with '*'),
+    # not as a substring of the line.
+    $expected = $null
+    foreach ($line in ($sumsText -split "`r?`n")) {
+        $fields = $line.Trim() -split '\s+', 2
+        if ($fields.Count -eq 2 -and $fields[1].TrimStart('*') -ceq $assetName) { $expected = $fields[0]; break }
+    }
+    if (-not $expected) {
+        throw "SHA256SUMS.txt for $tag has no entry for $assetName. Not installing."
+    }
+
+    $actual = (Get-FileHash $downloaded -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected.ToLower()) {
+        throw "Checksum mismatch. Expected $expected but got $actual. Not installing."
+    }
+    Write-Note "OK  $actual"
 
     # --- Install --------------------------------------------------------------
     Write-Step "Installing to $InstallDir"
