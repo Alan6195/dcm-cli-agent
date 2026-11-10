@@ -22,7 +22,7 @@
     "pack": "electron-builder --dir"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.115.0",
+    "@anthropic-ai/sdk": "^1.4.0",
     "dcmjs": "^0.52.2",
     "dcmjs-codecs": "^0.0.8",
     "dcmjs-dimse": "^0.3.4",
