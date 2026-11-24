@@ -53,12 +53,12 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "dcmjs": "^0.52.2",
+    "dcmjs": "^0.52.3",
     "dcmjs-dimse": "^0.3.4",
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "postject": "^1.0.0-alpha.6"
   },
   "overrides": {
